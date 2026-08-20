@@ -29,6 +29,7 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { ensureFullPageCropBox, hasUserManualCrop } from "@shared/cropBox";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -242,6 +243,9 @@ export default function JobDetails() {
             window.dispatchEvent(new CustomEvent("glitchy:queue-update", {
               detail: { position: data.position }
             }));
+          } else {
+            // Left the in-memory queue — refresh so the page is not stuck on "Queued..."
+            queryClient.invalidateQueries({ queryKey: ["job", jobId] });
           }
         } catch {}
       }, 3000);
@@ -257,10 +261,15 @@ export default function JobDetails() {
       return () => clearInterval(interval);
     } else if (job?.status === "complete" || job?.status === "failed") {
       setProgress(100);
+      if (job.status === "failed") {
+        window.dispatchEvent(new CustomEvent("glitchy:compile-error", {
+          detail: { message: job.errorMessage || "Processing failed" },
+        }));
+      }
     } else {
       setProgress(0);
     }
-  }, [job?.status]);
+  }, [job?.status, job?.id, job?.errorMessage]);
 
   useEffect(() => {
     if (job?.status === "processing") {
@@ -387,22 +396,30 @@ export default function JobDetails() {
   useEffect(() => {
     if (!job || job.status !== "complete" || autoSelectTriggeredRef.current) return;
     if (selectedBleedMethod !== "auto") return;
+    // Quick-check-only uploads are status=complete but have no corrected artwork.
+    // Auto-selecting bleed here starts a compile that never finishes → "its stuck".
+    if (!job.correctedPath) return;
     const variants = job.auditResults?.bleedVariants;
     const hasVariants = variants && Object.keys(variants).length > 0;
     if (hasVariants) return;
     const recommended = job.auditResults?.recommendedBleedMethod || "mirror";
     autoSelectTriggeredRef.current = true;
     handleBleedMethodSelect(recommended);
-  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
+  }, [job?.id, job?.status, job?.correctedPath, job?.auditResults?.bleedVariants, selectedBleedMethod]);
 
   const noneCountRef = useRef(0);
+  const compilingCountRef = useRef(0);
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
     if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
+    compilingCountRef.current = 0;
     const MAX_NONE_POLLS = 8;
+    // 90 × 2s = 180s, matching server COMPILE_TIMEOUT_MS so the Review button
+    // cannot stay on "Preparing artwork..." forever.
+    const MAX_COMPILING_POLLS = 90;
     const poll = async () => {
       try {
         const res = await fetch(`/api/jobs/${job.id}/precompile-status?strategy=${encodeURIComponent(selectedBleedMethod)}`);
@@ -415,6 +432,7 @@ export default function JobDetails() {
           setCompileDownloadUrl(`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`);
           queryClient.invalidateQueries({ queryKey: ["job", job.id] });
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
           cancelled = true;
         } else if (data.state === "failed") {
           setPreCompileState("failed");
@@ -423,9 +441,11 @@ export default function JobDetails() {
           setCompileError(data.error || data.message || "Pre-compilation failed");
           window.dispatchEvent(new CustomEvent("glitchy:compile-error", { detail: { message: data.error || "Compilation failed" } }));
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
           cancelled = true;
         } else if (data.state === "none") {
           noneCountRef.current++;
+          compilingCountRef.current = 0;
           if (noneCountRef.current >= MAX_NONE_POLLS) {
             setPreCompileState("ready");
             setPreCompileMessage("Artwork ready for download.");
@@ -438,6 +458,17 @@ export default function JobDetails() {
           setPreCompileState("compiling");
           setPreCompileMessage(data.message || "");
           noneCountRef.current = 0;
+          compilingCountRef.current++;
+          if (compilingCountRef.current >= MAX_COMPILING_POLLS) {
+            setPreCompileState("failed");
+            setCompileState("FAILURE");
+            setCompileError("Compilation is taking too long. Please try again.");
+            window.dispatchEvent(new CustomEvent("glitchy:compile-error", {
+              detail: { message: "Compilation is taking too long. Please try again." },
+            }));
+            compilingCountRef.current = 0;
+            cancelled = true;
+          }
         }
       } catch {}
     };
@@ -512,13 +543,8 @@ export default function JobDetails() {
       const colorProfile = oo.colorProfile || "cmyk";
 
       const savedCrop = oo;
-      const cropPayload = (savedCrop?.cropX != null && savedCrop?.cropWidth > 0) ? {
-        cropX: savedCrop.cropX,
-        cropY: savedCrop.cropY,
-        cropWidth: savedCrop.cropWidth,
-        cropHeight: savedCrop.cropHeight,
-      } : undefined;
-      console.log(`[COMPILE] Proceed to Download handoff: hasCrop=${!!cropPayload}, trimSize=${trimW}×${trimH}mm, strategy=${strategy}${cropPayload ? `, crop=(${cropPayload.cropX},${cropPayload.cropY}) ${cropPayload.cropWidth}×${cropPayload.cropHeight}` : ''}`);
+      const cropPayload = ensureFullPageCropBox(savedCrop);
+      console.log(`[COMPILE] Proceed to Download handoff: hasCrop=${hasUserManualCrop(cropPayload)}, trimSize=${trimW}×${trimH}mm, strategy=${strategy}${hasUserManualCrop(cropPayload) ? `, crop=(${cropPayload.cropX},${cropPayload.cropY}) ${cropPayload.cropWidth}×${cropPayload.cropHeight}` : ', NO_CROP_FULL_PAGE'}`);
 
       const res = await apiRequest("POST", `/api/jobs/${job.id}/compile-print-pdf`, {
         selectedStrategy: strategy,
@@ -1110,8 +1136,13 @@ export default function JobDetails() {
                       targetWidth: trimW,
                       targetHeight: trimH,
                     };
-                    const hasCropData = opts.cropX != null && opts.cropWidth > 0;
-                    console.log(`[PHASE2] Fix Everything handoff: hasCrop=${hasCropData}, targetSize=${opts.targetWidth}×${opts.targetHeight}mm${hasCropData ? `, crop=(${opts.cropX?.toFixed?.(4)},${opts.cropY?.toFixed?.(4)}) ${opts.cropWidth?.toFixed?.(4)}×${opts.cropHeight?.toFixed?.(4)}` : ''}`);
+                    const cropBox = ensureFullPageCropBox(opts);
+                    opts.cropX = cropBox.cropX;
+                    opts.cropY = cropBox.cropY;
+                    opts.cropWidth = cropBox.cropWidth;
+                    opts.cropHeight = cropBox.cropHeight;
+                    const hasCropData = hasUserManualCrop(opts);
+                    console.log(`[PHASE2] Fix Everything handoff: hasCrop=${hasCropData}, targetSize=${opts.targetWidth}×${opts.targetHeight}mm${hasCropData ? `, crop=(${opts.cropX?.toFixed?.(4)},${opts.cropY?.toFixed?.(4)}) ${opts.cropWidth?.toFixed?.(4)}×${opts.cropHeight?.toFixed?.(4)}` : ', NO_CROP_FULL_PAGE'}`);
                     setAutoFixApplied(true);
                     processJob.mutate({ id: job.id, bleedOptions: opts }, {
                       onSuccess: () => {

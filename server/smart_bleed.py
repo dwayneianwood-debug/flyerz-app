@@ -57,6 +57,7 @@ _load_project_dotenv()
 
 from pdf_geometry_sanitize import sanitize_pdf_box_geometry
 from prepress_checks import build_prepress_checks, build_pdfx_check
+from crop_box import has_user_manual_crop
 
 
 def _timer_log(label: str, t0: float) -> None:
@@ -7350,10 +7351,9 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
     manual_crop_w = bleed_opts.get("cropWidth") if bleed_opts else None
     manual_crop_h = bleed_opts.get("cropHeight") if bleed_opts else None
     try:
-        has_manual_crop = all(
-            v is not None and float(v) >= 0
-            for v in [manual_crop_x, manual_crop_y, manual_crop_w, manual_crop_h]
-        ) and float(manual_crop_w) > 0 and float(manual_crop_h) > 0
+        has_manual_crop = has_user_manual_crop(
+            crop_x=manual_crop_x, crop_y=manual_crop_y, crop_w=manual_crop_w, crop_h=manual_crop_h
+        )
     except (TypeError, ValueError):
         has_manual_crop = False
 
@@ -7806,10 +7806,9 @@ def process_page_worker(page_data: dict) -> dict:
     manual_crop_w = bleed_opts.get("cropWidth") if bleed_opts else None
     manual_crop_h = bleed_opts.get("cropHeight") if bleed_opts else None
     try:
-        has_manual_crop = all(
-            v is not None and float(v) >= 0
-            for v in [manual_crop_x, manual_crop_y, manual_crop_w, manual_crop_h]
-        ) and float(manual_crop_w) > 0 and float(manual_crop_h) > 0
+        has_manual_crop = has_user_manual_crop(
+            crop_x=manual_crop_x, crop_y=manual_crop_y, crop_w=manual_crop_w, crop_h=manual_crop_h
+        )
     except (TypeError, ValueError):
         has_manual_crop = False
     if has_manual_crop:

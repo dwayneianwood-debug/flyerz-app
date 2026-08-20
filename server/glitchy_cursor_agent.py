@@ -50,6 +50,9 @@ PLACEHOLDER_REPOS = {
     "https://github.com/your-org/your-repo",
 }
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from crop_box import resolve_missing_crop_box
+
 
 def ensure_cursor_rules(project_root: Optional[str] = None) -> str:
     """Write .cursor/rules/prepress.mdc under project_root (default: cwd)."""
@@ -64,10 +67,7 @@ def ensure_cursor_rules(project_root: Optional[str] = None) -> str:
 
 def resolve_crop_box(crop_box: Any, page_state: Optional[dict]) -> Any:
     """Populate full-page crop_box for No Crop routes when crop_box is missing."""
-    state = page_state or {}
-    if not crop_box and state.get("is_no_crop"):
-        return state.get("full_page_dimensions")
-    return crop_box
+    return resolve_missing_crop_box(crop_box, page_state)
 
 
 def build_agent_prompt(
@@ -247,6 +247,19 @@ class TestGlitchyAgentIntegration(unittest.TestCase):
         self.assertIn("[0, 0, 595, 842]", sent_text)
         self.assertIn("Artwork bleed offset does not look right", sent_text)
         self.assertIn(".cursor/rules/prepress.mdc", sent_text)
+
+    def test_job_page_missing_crop_box_infers_full_page(self):
+        """Glitchy 'its stuck' reports on /job/:id with crop_box None must get a full-page box."""
+        page_state = {
+            "page": "/job/208",
+            "jobId": 208,
+            "href": "http://localhost:5000/job/208",
+        }
+        resolved = resolve_crop_box(None, page_state)
+        self.assertEqual(resolved, [0.0, 0.0, 1.0, 1.0])
+        prompt = build_agent_prompt("its stuck", crop_box=None, gs_logs="", page_state=page_state)
+        self.assertIn("[0.0, 0.0, 1.0, 1.0]", prompt)
+        self.assertIn("its stuck", prompt)
 
     def test_rejects_missing_api_key(self):
         with self.assertRaises(ValueError):

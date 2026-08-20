@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { FULL_PAGE_CROP_BOX } from "@shared/cropBox";
 
 type CatMode = "head" | "walking" | "sleeping" | "stretching";
 
@@ -308,6 +309,7 @@ export default function GlitchyWidget() {
       } else if (d.overallPassed === false) {
         setChecklistPassOverride(false);
         setAchievementPhase(null);
+        setProcessState((prev) => (prev === "PROCESSING" || prev === "QUEUED" ? "IDLE" : prev));
         fetchChecklist();
       } else {
         fetchChecklist();
@@ -564,7 +566,20 @@ export default function GlitchyWidget() {
       setIsInteracting(false);
       return;
     }
-    if (processState === "PROCESSING") return;
+    if (processState === "PROCESSING" || processState === "QUEUED") {
+      setIsInteracting(true);
+      idleRef.current = 0;
+      setChatBoxVisible((v) => {
+        if (v) {
+          setIsInteracting(false);
+          return false;
+        }
+        fetchChecklist();
+        return true;
+      });
+      setBubbleVisible(false);
+      return;
+    }
 
     if (catMode !== "head") {
       idleRef.current = 0;
@@ -629,6 +644,12 @@ export default function GlitchyWidget() {
     const text = feedbackRef.current?.value;
     if (!text) return;
     const jobId = getJobIdFromUrl();
+    const fullPage = [
+      FULL_PAGE_CROP_BOX.cropX,
+      FULL_PAGE_CROP_BOX.cropY,
+      FULL_PAGE_CROP_BOX.cropWidth,
+      FULL_PAGE_CROP_BOX.cropHeight,
+    ];
     await fetch("/api/glitchy-report", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -637,10 +658,15 @@ export default function GlitchyWidget() {
         page: window.location.pathname,
         timestamp: new Date().toLocaleString(),
         jobId,
+        crop_box: jobId ? fullPage : null,
+        is_no_crop: !!jobId,
+        full_page_dimensions: fullPage,
         page_state: {
           page: window.location.pathname,
           jobId,
           href: window.location.href,
+          is_no_crop: !!jobId,
+          full_page_dimensions: fullPage,
         },
       }),
     });

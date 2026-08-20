@@ -20,7 +20,16 @@ import time
 import math
 
 from fai_temp_utils import init_fai_temp_dir, is_scratch_temp_file
+from crop_box import has_user_manual_crop
+
 FAI_TEMP_DIR = init_fai_temp_dir()
+
+
+def _cli_manual_crop(args) -> bool:
+    """True when CLI crop args are a real user crop, not the full-page no-crop box."""
+    return has_user_manual_crop(
+        crop_x=args.crop_x, crop_y=args.crop_y, crop_w=args.crop_w, crop_h=args.crop_h
+    )
 
 
 def _cover_scale_image_to_trim_px(img, target_w_px: int, target_h_px: int, *, log_label: str = "[COMPILE]"):
@@ -1178,7 +1187,7 @@ def main():
     print(f"DEBUG: Crop args received: crop_x={args.crop_x}, crop_y={args.crop_y}, crop_w={args.crop_w}, crop_h={args.crop_h}", flush=True)
     print(f"DEBUG: Trim args received: trim_w={args.trim_w}, trim_h={args.trim_h}", flush=True)
     print(f"CRITICAL DEBUG: Starting from ORIGINAL file. Input path = {args.input}", flush=True)
-    if args.crop_x >= 0:
+    if _cli_manual_crop(args):
         print(f"CRITICAL DEBUG: CROPPING ORIGINAL FILE {args.input} AT {args.crop_x},{args.crop_y} size {args.crop_w}x{args.crop_h}", flush=True)
     if args.auto_shifter > 0:
         print(f"[AUTO-SHIFTER] Safe zone scale-down: {args.auto_shifter}% — content will be shifted inward (stub: ready for implementation)", flush=True)
@@ -1236,7 +1245,7 @@ def main():
         work_path = input_path
         _tmp_chain = []
 
-        _has_crop = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+        _has_crop = _cli_manual_crop(args)
         if is_pdf and _has_crop:
             import fitz as _fitz_precrop
             import gc as _gc_precrop
@@ -1297,7 +1306,7 @@ def main():
                 raise ValueError(f"Could not read image: {input_path}")
             sys.stderr.write(f"PROFILE: [COMPILE] OpenCV imread took {(time.time() - _prof_cv_read_t0)*1000:.1f}ms\n")
 
-            if args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0:
+            if _cli_manual_crop(args):
                 h_img, w_img = img.shape[:2]
                 raw_cx, raw_cy, raw_cw, raw_ch = args.crop_x, args.crop_y, args.crop_w, args.crop_h
                 if raw_cx <= 1.0 and raw_cy <= 1.0 and raw_cw <= 1.0 and raw_ch <= 1.0:
@@ -1331,7 +1340,7 @@ def main():
 
             img = _auto_trim_white_margins(img, white_thresh=250)
 
-            _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+            _manual_crop_active = _cli_manual_crop(args)
 
             if args.trim_w > 0 and args.trim_h > 0:
                 target_w_px = int(math.ceil((args.trim_w / 25.4) * 300))
@@ -1605,7 +1614,7 @@ def main():
                                 img_bgr = cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)
                                 del pix, img_rgba, img_data
             
-                            if page_num == 0 and args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0:
+                            if page_num == 0 and _cli_manual_crop(args):
                                 p_h, p_w = img_bgr.shape[:2]
                                 raw_pcx, raw_pcy, raw_pcw, raw_pch = args.crop_x, args.crop_y, args.crop_w, args.crop_h
                                 if raw_pcx <= 1.0 and raw_pcy <= 1.0 and raw_pcw <= 1.0 and raw_pch <= 1.0:
@@ -1628,7 +1637,7 @@ def main():
                                     img_bgr = img_bgr[pcy:pcy + pch, pcx:pcx + pcw]
                                     sys.stderr.write(f"[COMPILE] PDF page 1 manual crop applied: ({pcx},{pcy}) {pcw}x{pch} -> {img_bgr.shape[1]}x{img_bgr.shape[0]}\n")
             
-                            _pdf_manual_crop_active = page_num == 0 and args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+                            _pdf_manual_crop_active = page_num == 0 and _cli_manual_crop(args)
             
                             img_bgr = _auto_trim_white_margins(img_bgr, white_thresh=250)
             

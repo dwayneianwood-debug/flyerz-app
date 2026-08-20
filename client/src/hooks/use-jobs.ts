@@ -75,10 +75,12 @@ export function useJob(id: number) {
       const res = await fetch(url, { credentials: "include" });
       return handleResponse<FileJobResponse>(res);
     },
-    // Poll every 2 seconds if the job is still processing or pending
+    // Poll every 2 seconds while the job is queued, pending, or processing.
+    // "queued" must be included — otherwise the job page stays stuck on
+    // "Queued for processing..." after the server dequeues the work.
     refetchInterval: (query) => {
-      const status = query.state?.data?.status;
-      if (status === "pending" || status === "processing") {
+      const status = query.state?.data?.status as string | undefined;
+      if (status === "pending" || status === "processing" || status === "queued") {
         return 2000;
       }
       return false;

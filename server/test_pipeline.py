@@ -3037,6 +3037,115 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_stuck_job_no_crop_route():
+    """Glitchy 'its stuck' on /job/:id with crop_box=None — No Crop route + UI deadlock."""
+    print(f"\n{BOLD}{CYAN}Section 27: Stuck job / No-Crop full-page crop_box{RESET}")
+    print(f"{'─'*60}")
+
+    from crop_box import (
+        FULL_PAGE_CROP_BOX,
+        FULL_PAGE_CROP_LIST,
+        ensure_crop_box,
+        has_user_manual_crop,
+        is_full_page_crop_box,
+        resolve_missing_crop_box,
+    )
+    from glitchy_cursor_agent import resolve_crop_box, build_agent_prompt
+
+    record("stuck_job", "Full-page crop_box constant is 0,0,1,1",
+           FULL_PAGE_CROP_BOX["cropX"] == 0
+           and FULL_PAGE_CROP_BOX["cropY"] == 0
+           and FULL_PAGE_CROP_BOX["cropWidth"] == 1
+           and FULL_PAGE_CROP_BOX["cropHeight"] == 1)
+
+    record("stuck_job", "is_full_page_crop_box detects 0,0,1,1",
+           is_full_page_crop_box(0, 0, 1, 1))
+
+    record("stuck_job", "is_full_page_crop_box rejects user crop 0.1,0.1,0.8,0.8",
+           not is_full_page_crop_box(0.1, 0.1, 0.8, 0.8))
+
+    record("stuck_job", "has_user_manual_crop is False for full-page box",
+           not has_user_manual_crop({"cropX": 0, "cropY": 0, "cropWidth": 1, "cropHeight": 1}))
+
+    record("stuck_job", "has_user_manual_crop is True for a drawn crop",
+           has_user_manual_crop({"cropX": 0.1, "cropY": 0.1, "cropWidth": 0.8, "cropHeight": 0.8}))
+
+    filled = ensure_crop_box({})
+    record("stuck_job", "ensure_crop_box populates missing crop_box with full page",
+           filled.get("cropX") == 0 and filled.get("cropWidth") == 1 and filled.get("cropHeight") == 1,
+           str(filled))
+
+    job_state = {"page": "/job/208", "jobId": 208, "href": "http://localhost:5000/job/208"}
+    resolved = resolve_missing_crop_box(None, job_state)
+    record("stuck_job", "resolve_missing_crop_box infers full-page on /job/:id with crop_box None",
+           resolved == FULL_PAGE_CROP_LIST,
+           f"got {resolved}")
+
+    prompt = build_agent_prompt("its stuck", crop_box=None, gs_logs="", page_state=job_state)
+    record("stuck_job", "Glitchy agent prompt no longer reports Active crop_box: None",
+           "Active crop_box: None" not in prompt and "its stuck" in prompt,
+           prompt[prompt.find("Active crop_box"):prompt.find("Active crop_box") + 80] if "Active crop_box" in prompt else "missing")
+
+    record("stuck_job", "resolve_crop_box matches resolve_missing_crop_box",
+           resolve_crop_box(None, job_state) == resolve_missing_crop_box(None, job_state))
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    upload_src = open(os.path.join(root, "client", "src", "components", "file-upload.tsx"), encoding="utf-8").read()
+    jobs_src = open(os.path.join(root, "client", "src", "hooks", "use-jobs.ts"), encoding="utf-8").read()
+    details_src = open(os.path.join(root, "client", "src", "pages", "job-details.tsx"), encoding="utf-8").read()
+    glitchy_src = open(os.path.join(root, "client", "src", "components", "glitchy-widget.tsx"), encoding="utf-8").read()
+    routes_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "routes.ts"), encoding="utf-8").read()
+    fp_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fileProcessor.ts"), encoding="utf-8").read()
+    compile_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "compile_press_pdf.py"), encoding="utf-8").read()
+    bleed_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "smart_bleed.py"), encoding="utf-8").read()
+
+    record("stuck_job", "No Crop Needed button sets FULL_PAGE_CROP_BOX",
+           "FULL_PAGE_CROP_BOX" in upload_src and "button-skip-crop" in upload_src)
+
+    record("stuck_job", "Upload always attaches crop_box (isNoCrop when user did not draw)",
+           "isNoCrop" in upload_src and "NO_CROP_FULL_PAGE" in upload_src)
+
+    record("stuck_job", "useJob polls queued status (unstick queued spinner)",
+           'status === "queued"' in jobs_src)
+
+    record("stuck_job", "Job details does not auto-compile quick-check-only jobs",
+           "if (!job.correctedPath) return;" in details_src)
+
+    record("stuck_job", "Precompile compiling state has a poll timeout",
+           "MAX_COMPILING_POLLS" in details_src)
+
+    record("stuck_job", "Queued jobs invalidate the job query when dequeued",
+           'queryClient.invalidateQueries({ queryKey: ["job", jobId] })' in details_src
+           or "queryClient.invalidateQueries({ queryKey: [\"job\", jobId] })" in details_src)
+
+    record("stuck_job", "Glitchy leaves PROCESSING when audit overallPassed is false",
+           'prev === "PROCESSING"' in glitchy_src or "prev === 'PROCESSING'" in glitchy_src)
+
+    record("stuck_job", "Glitchy reports include full_page_dimensions crop_box",
+           "full_page_dimensions" in glitchy_src and "FULL_PAGE_CROP_BOX" in glitchy_src)
+
+    record("stuck_job", "sanitizeBleedOptions persists full-page crop_box when missing",
+           "NO_CROP_FULL_PAGE" in routes_src and "FULL_PAGE_CROP_BOX" in routes_src)
+
+    record("stuck_job", "fileProcessor treats full-page crop as not a user crop",
+           "hasUserManualCrop" in fp_src)
+
+    record("stuck_job", "compile CLI ignores full-page crop for manual-crop routing",
+           "def _cli_manual_crop" in compile_src and "has_user_manual_crop" in compile_src)
+
+    record("stuck_job", "smart_bleed has_manual_crop uses has_user_manual_crop (skips 0,0,1,1)",
+           "has_user_manual_crop" in bleed_src)
+
+    record("stuck_job", "LAW 1: MaxBitmap still 50MB after stuck-job fix",
+           "MaxBitmap=50000000" in bleed_src or "MaxBitmap 50000000" in bleed_src)
+
+    record("stuck_job", "LAW 1: BufferSpace still 50MB after stuck-job fix",
+           "BufferSpace=50000000" in bleed_src)
+
+    record("stuck_job", "LAW 1: NumRenderingThreads still 1 after stuck-job fix",
+           "NumRenderingThreads=1" in bleed_src)
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3246,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_stuck_job_no_crop_route()
         gc.collect()
 
         all_passed = print_report()
