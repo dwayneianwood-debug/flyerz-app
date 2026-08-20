@@ -640,6 +640,12 @@ def section_6_no_crop_path():
                corrected is not None and os.path.exists(str(corrected)),
                f"Path: {corrected}")
 
+        record("nocrop", "No-crop: crop_box populated in result (full-page)",
+               isinstance(result.get("crop_box"), list) and len(result.get("crop_box") or []) >= 4
+               and float((result.get("crop_box") or [0, 0, 0, 0])[2]) > 0
+               and float((result.get("crop_box") or [0, 0, 0, 0])[3]) > 0,
+               f"crop_box={result.get('crop_box')}")
+
         pre_bleed = result.get("preBleedPath")
         record("nocrop", "No-crop: preBleedPath returned",
                pre_bleed is not None and os.path.exists(str(pre_bleed)),
@@ -1415,6 +1421,79 @@ def section_12_phase4_pro_proof():
             pass
 
 
+def section_24_glitchy_stuck_nocrop_cropbox():
+    """Regression: missing crop_box must not leave Glitchy stuck in PROCESSING."""
+    print(f"\n{BOLD}Section 24: Glitchy Unstick + No-Crop crop_box{RESET}")
+    print(f"{'─'*60}")
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+
+    crop_box_py = os.path.join(server_dir, "crop_box.py")
+    record("glitchy_stuck", "crop_box.py helper exists", os.path.exists(crop_box_py))
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, crop_box_py],
+            capture_output=True, text=True, timeout=30, cwd=server_dir,
+        )
+        record("glitchy_stuck", "crop_box.py unit tests pass",
+               proc.returncode == 0,
+               proc.stderr[-400:] if proc.returncode != 0 else "OK")
+    except Exception as e:
+        record("glitchy_stuck", "crop_box.py unit tests pass", False, str(e))
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(server_dir, "glitchy_cursor_agent.py")],
+            capture_output=True, text=True, timeout=30, cwd=server_dir,
+        )
+        record("glitchy_stuck", "glitchy_cursor_agent.py unit tests pass",
+               proc.returncode == 0,
+               proc.stderr[-400:] if proc.returncode != 0 else "OK")
+    except Exception as e:
+        record("glitchy_stuck", "glitchy_cursor_agent.py unit tests pass", False, str(e))
+
+    glitchy_path = os.path.join(root, "client", "src", "components", "glitchy-widget.tsx")
+    jd_path = os.path.join(root, "client", "src", "pages", "job-details.tsx")
+    upload_path = os.path.join(root, "client", "src", "components", "file-upload.tsx")
+    routes_path = os.path.join(server_dir, "routes.ts")
+    shared_crop = os.path.join(root, "shared", "crop-box.ts")
+
+    with open(glitchy_path, encoding="utf-8") as f:
+        glitchy_src = f.read()
+    with open(jd_path, encoding="utf-8") as f:
+        jd_src = f.read()
+    with open(upload_path, encoding="utf-8") as f:
+        upload_src = f.read()
+    with open(routes_path, encoding="utf-8") as f:
+        routes_src = f.read()
+    with open(shared_crop, encoding="utf-8") as f:
+        crop_ts = f.read()
+
+    record("glitchy_stuck", "Shared FULL_PAGE_CROP_NORMALIZED is 0,0,1,1",
+           "cropWidth: 1" in crop_ts and "cropHeight: 1" in crop_ts and "cropX: 0" in crop_ts)
+    record("glitchy_stuck", "No Crop Needed populates full-page crop_box in file-upload",
+           "FULL_PAGE_CROP_NORMALIZED" in upload_src and "isNoCrop" in upload_src)
+    record("glitchy_stuck", "sanitizeBleedOptions injects full-page crop via ensureFullPageCropBox",
+           "ensureFullPageCropBox" in routes_src)
+    record("glitchy_stuck", "spawnPreCompile always passes crop CLI args",
+           "force full-page when missing" in routes_src or "cropForCompile" in routes_src)
+    record("glitchy_stuck", "Glitchy unsticks PROCESSING when job completes (jobStatus)",
+           'jobStatus === "complete"' in glitchy_src and 'setProcessState("IDLE")' in glitchy_src)
+    record("glitchy_stuck", "Glitchy click during PROCESSING opens feedback (stuck escape hatch)",
+           'processState === "PROCESSING" || processState === "QUEUED"' in glitchy_src
+           and "setShowFeedback(true)" in glitchy_src)
+    record("glitchy_stuck", "Compile poller dispatches glitchy:compile-complete",
+           'glitchy:compile-complete' in jd_src and "data.state === \"COMPLETE\"" in jd_src)
+    record("glitchy_stuck", "Precompile compiling watchdog exists (MAX_COMPILING_POLLS)",
+           "MAX_COMPILING_POLLS" in jd_src)
+    record("glitchy_stuck", "Glitchy reports include crop_box / full_page_dimensions",
+           "full_page_dimensions" in glitchy_src and "crop_box" in glitchy_src)
+    record("glitchy_stuck", "Glitchy stays bottom-anchored",
+           "bottom: isVisible ? 0" in glitchy_src and 'transformOrigin: "bottom center"' in glitchy_src)
+
+
 def print_report():
     """Print final test report."""
     total = len(results)
@@ -1452,6 +1531,7 @@ def print_report():
         "prepress_struct": "25-Point Prepress Structural Assertions",
         "compile_pkg": "PDF Packaging — Flat Raster Compile",
         "print_enhance": "Smart Prepress Enhancer (Lanczos + Unsharp)",
+        "glitchy_stuck": "Glitchy Unstick + No-Crop crop_box",
     }
 
     for sec, counts in sections.items():
@@ -3077,6 +3157,9 @@ def main():
         section_5_gs_ram_law()
 
         section_6_no_crop_path()
+        gc.collect()
+
+        section_24_glitchy_stuck_nocrop_cropbox()
         gc.collect()
 
         section_7_performance_benchmark()
