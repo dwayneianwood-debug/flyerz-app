@@ -16,6 +16,12 @@ from typing import Any, Optional
 from unittest.mock import patch
 
 try:
+    from crop_box import ensure_full_page_crop_box
+except ImportError:  # pragma: no cover
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from crop_box import ensure_full_page_crop_box
+
+try:
     import requests
 except ImportError:  # pragma: no cover
     requests = None  # type: ignore
@@ -63,11 +69,8 @@ def ensure_cursor_rules(project_root: Optional[str] = None) -> str:
 
 
 def resolve_crop_box(crop_box: Any, page_state: Optional[dict]) -> Any:
-    """Populate full-page crop_box for No Crop routes when crop_box is missing."""
-    state = page_state or {}
-    if not crop_box and state.get("is_no_crop"):
-        return state.get("full_page_dimensions")
-    return crop_box
+    """Populate full-page crop_box when missing (No Crop / job page Document Closed safety)."""
+    return ensure_full_page_crop_box(crop_box, page_state)
 
 
 def build_agent_prompt(
@@ -247,6 +250,23 @@ class TestGlitchyAgentIntegration(unittest.TestCase):
         self.assertIn("[0, 0, 595, 842]", sent_text)
         self.assertIn("Artwork bleed offset does not look right", sent_text)
         self.assertIn(".cursor/rules/prepress.mdc", sent_text)
+
+    @patch("requests.post")
+    def test_missing_crop_on_job_page_gets_full_page_fallback(self, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"agent": {"id": "bc-stuck"}, "run": {"id": "r"}}
+        result = trigger_glitchy_background_fix(
+            user_feedback="its stuck",
+            crop_box=None,
+            gs_logs="",
+            page_state={"page": "/job/208", "jobId": 208, "href": "http://localhost:5000/job/208"},
+            api_key="cursor_test_key",
+            repo_url="https://github.com/acme/flyerz",
+        )
+        self.assertEqual(result["agent"]["id"], "bc-stuck")
+        sent_text = mock_post.call_args[1]["json"]["prompt"]["text"]
+        self.assertIn("[0.0, 0.0, 1.0, 1.0]", sent_text)
+        self.assertNotIn("Active crop_box: None", sent_text)
 
     def test_rejects_missing_api_key(self):
         with self.assertRaises(ValueError):
