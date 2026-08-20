@@ -309,6 +309,11 @@ export default function GlitchyWidget() {
         setChecklistPassOverride(false);
         setAchievementPhase(null);
         fetchChecklist();
+        if (d.jobStatus === "complete" || d.jobStatus === "failed") {
+          setProcessState((prev) => (prev === "PROCESSING" || prev === "QUEUED" ? "IDLE" : prev));
+          setProcessingMessage("");
+          setIsInteracting(false);
+        }
       } else {
         fetchChecklist();
       }
@@ -728,6 +733,17 @@ export default function GlitchyWidget() {
               ))}
             </ul>
           )}
+          {compileDownloadUrl && (
+            <a
+              href={compileDownloadUrl}
+              download="Print Ready Artwork.zip"
+              className="glitchy-download-btn"
+              data-testid="glitchy-download-btn"
+              onClick={(e) => e.stopPropagation()}
+            >
+              Download artwork
+            </a>
+          )}
           <p style={{ margin: "6px 0 0 0", fontSize: 8, color: "#888", textAlign: "center" }}>
             Click again to dismiss
           </p>
@@ -855,8 +871,10 @@ export default function GlitchyWidget() {
           box-shadow: 0 8px 25px rgba(0,0,0,0.3);
           text-align: center;
           position: relative;
-          max-width: 240px;
-          min-width: 140px;
+          max-width: min(280px, calc(100vw - 24px));
+          min-width: 180px;
+          width: max-content;
+          box-sizing: border-box;
         }
         .glitchy-chat-expanded {
           width: 330px;
@@ -888,15 +906,21 @@ export default function GlitchyWidget() {
           background-color: #e94560;
           color: white;
           text-decoration: none;
-          padding: 10px 20px;
+          padding: 10px 16px;
           border-radius: 8px;
           font-weight: 900;
-          font-size: 11px;
+          font-size: 10px;
           text-transform: uppercase;
-          letter-spacing: 1.5px;
+          letter-spacing: 0.6px;
           transition: background 0.2s ease, transform 0.1s ease;
-          display: inline-block;
-          margin-top: 4px;
+          display: block;
+          width: 100%;
+          box-sizing: border-box;
+          margin-top: 8px;
+          text-align: center;
+          white-space: nowrap;
+          word-break: keep-all;
+          overflow-wrap: normal;
         }
         .glitchy-download-btn:hover {
           background-color: #ff5277;
@@ -910,18 +934,22 @@ export default function GlitchyWidget() {
       `}</style>
       <div
         data-testid="glitchy-container"
+        className="glitchy-size-20"
         style={{
           position: "fixed",
           bottom: isVisible ? 0 : -100,
           right: wanderingRef.current ? undefined : 50,
           left: wanderingRef.current ? posX : undefined,
-          width: 120,
+          width: "auto",
+          minWidth: 64,
+          maxWidth: "min(280px, calc(100vw - 16px))",
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
           overflow: "visible",
           zIndex: 9999,
           fontFamily: "sans-serif",
+          transformOrigin: "bottom center",
           transition: "bottom 0.5s ease-in-out, left 2s linear",
         }}
       >

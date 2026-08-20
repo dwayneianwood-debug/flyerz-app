@@ -265,7 +265,7 @@ export default function JobDetails() {
   useEffect(() => {
     if (job?.status === "processing") {
       window.dispatchEvent(
-        new CustomEvent("glitchy:audit-sync", { detail: { overallPassed: false } }),
+        new CustomEvent("glitchy:audit-sync", { detail: { overallPassed: false, jobStatus: "processing" } }),
       );
     }
   }, [job?.status]);
@@ -273,6 +273,11 @@ export default function JobDetails() {
   /** Background process failures (batch/async): Glitchy only — no duplicate toast. */
   useEffect(() => {
     if (!job || job.status !== "failed") return;
+    window.dispatchEvent(
+      new CustomEvent("glitchy:audit-sync", {
+        detail: { overallPassed: false, jobStatus: "failed" },
+      }),
+    );
     const payload = job.errorMessage ?? job.auditResults?.checks?.find(
       (c) => c.name === "Safe Zone Layout",
     )?.message;
@@ -286,7 +291,7 @@ export default function JobDetails() {
     if (job?.status !== "complete" || !job.auditResults) return;
     window.dispatchEvent(
       new CustomEvent("glitchy:audit-sync", {
-        detail: { overallPassed: job.auditResults.overallPassed === true },
+        detail: { overallPassed: job.auditResults.overallPassed === true, jobStatus: "complete" },
       }),
     );
   }, [job?.status, job?.auditResults?.overallPassed, job?.id]);
@@ -469,9 +474,26 @@ export default function JobDetails() {
           window.dispatchEvent(new CustomEvent("glitchy:ink-stain", { detail: { message: "Mixing the perfect ink colors..." } }));
         }
         if (data.state === "COMPLETE") {
-          setCompileDownloadUrl(data.downloadUrl || null);
+          const dlUrl = data.downloadUrl || `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+          setCompileDownloadUrl(dlUrl);
           setCompileState("COMPLETE");
           clearInterval(interval);
+          const methodLabel = BLEED_METHOD_LABELS[selectedBleedMethod as keyof typeof BLEED_METHOD_LABELS]?.label || selectedBleedMethod;
+          const audit = job.auditResults?.jobAudit;
+          const auditResults = job.auditResults as any;
+          window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
+            downloadUrl: dlUrl,
+            lensesDetected: audit?.lensesDetected ?? false,
+            lensesFlattened: audit?.lensesFlattened ?? false,
+            supersampled: audit?.supersampled ?? false,
+            aiEnhanced: audit?.aiEnhanced ?? false,
+            originalTic: audit?.originalTic ?? null,
+            finalTic: audit?.finalTic ?? null,
+            auditReport: auditResults?.compileAuditReport || null,
+            glitchyMessage: `Your artwork is compiled with ${methodLabel} bleed and ready for the press!`,
+            glitchyState: "triumphant",
+            selectedBleedMethod: methodLabel,
+          } }));
           await queryClient.invalidateQueries({ queryKey: ["job", job.id] });
         } else if (data.state === "FAILURE") {
           const errMsg = data.error || data.message || "Compilation failed";
@@ -486,7 +508,7 @@ export default function JobDetails() {
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [compileTaskId, job?.id]);
+  }, [compileTaskId, job?.id, selectedBleedMethod]);
 
   const handleCompilePressReady = async (strategyOverride?: string): Promise<boolean> => {
     if (!job) return false;
@@ -932,8 +954,8 @@ export default function JobDetails() {
 
   const computedPhase = 
     (isFailed || (!isComplete && !isProcessing && !isPending)) ? 1 :
-    (isComplete && hasFailedChecks && !autoFixApplied) ? 1 :
     (isComplete && isFastTrack && phase3Confirmed) ? 3 :
+    (isComplete && hasFailedChecks && !autoFixApplied) ? 1 :
     (isComplete && hasProof && !proofChecked) ? 2 :
     (isComplete && (!hasUserSelectedBleed || !preCompileReady || !phase3Confirmed)) ? 2 :
     isComplete ? 3 :
@@ -1064,7 +1086,8 @@ export default function JobDetails() {
           )}
         </AnimatePresence>
 
-        {currentPhase === 1 && !isProcessing && !isPending && !autoFixApplied && (
+        {!isFastTrack && (
+          currentPhase === 1 && !isProcessing && !isPending && !autoFixApplied ? (
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1159,6 +1182,7 @@ export default function JobDetails() {
               <PhaseChecklist checks={job.auditResults.checks} jobId={job.id} filename={job.filename} />
             )}
           </motion.div>
+          ) : null
         )}
 
         {isComplete && currentPhase === 2 && (

@@ -3037,6 +3037,100 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_glitchy_unstick_and_perimeter_scan():
+    """Job 208 stuck: Glitchy PROCESSING deadlock, wrapping download CTA, pre-bleed perimeter trap."""
+    import numpy as np
+    from smart_bleed import TARGET_DPI, _scan_bleed_perimeter
+
+    section = "glitchy_unstick"
+    print(f"\n{BOLD}{CYAN}  SECTION: Glitchy unstick + post-bleed perimeter scan{RESET}")
+
+    widget_path = os.path.join(os.path.dirname(__file__), "..", "client", "src", "components", "glitchy-widget.tsx")
+    job_path = os.path.join(os.path.dirname(__file__), "..", "client", "src", "pages", "job-details.tsx")
+    bleed_path = os.path.join(os.path.dirname(__file__), "smart_bleed.py")
+    with open(widget_path, "r", encoding="utf-8") as f:
+        widget_src = f.read()
+    with open(job_path, "r", encoding="utf-8") as f:
+        job_src = f.read()
+    with open(bleed_path, "r", encoding="utf-8") as f:
+        bleed_src = f.read()
+
+    record(section, "Glitchy unsticks PROCESSING when audit completes with failures",
+           'd.jobStatus === "complete"' in widget_src and 'prev === "PROCESSING"' in widget_src,
+           "audit-sync overallPassed=false must leave PROCESSING so the cat is clickable")
+
+    record(section, "Glitchy download button is rendered (not CSS-only)",
+           'data-testid="glitchy-download-btn"' in widget_src and "compileDownloadUrl &&" in widget_src,
+           "Success bubble must include the download CTA")
+
+    record(section, "Glitchy download button does not wrap (white-space: nowrap)",
+           "white-space: nowrap" in widget_src and ".glitchy-download-btn" in widget_src,
+           "DOWNLOAD CTA must stay on one line")
+
+    record(section, "Glitchy bubble is not trapped in a 120px column",
+           "width: 120" not in widget_src and 'width: "auto"' in widget_src,
+           "Speech bubble parent must not force stacked button text")
+
+    record(section, "Glitchy stays 20% size and bottom-anchored",
+           "glitchy-size-20" in widget_src and "bottom: isVisible ? 0" in widget_src
+           and 'transformOrigin: "bottom center"' in widget_src
+           and "width: 32" in widget_src and "height: 32" in widget_src,
+           "Mascot remains 32px (20% of original) and pinned to the bottom")
+
+    record(section, "Compile poll dispatches glitchy:compile-complete on COMPLETE",
+           'data.state === "COMPLETE"' in job_src and "glitchy:compile-complete" in job_src,
+           "Fast Track / compile poll must unstick Glitchy PROCESSING")
+
+    record(section, "audit-sync includes jobStatus so processing vs complete can be distinguished",
+           'jobStatus: "complete"' in job_src and 'jobStatus: "processing"' in job_src
+           and 'jobStatus: "failed"' in job_src)
+
+    record(section, "LAW 3: {!isFastTrack && (} guard on Phase 1",
+           "{!isFastTrack && (" in job_src,
+           "Fast Track jobs must not snap back to Fix Everything")
+
+    record(section, "LAW 3: Fast Track phase is computed before hasFailedChecks",
+           job_src.find("(isComplete && isFastTrack && phase3Confirmed)")
+           < job_src.find("(isComplete && hasFailedChecks && !autoFixApplied)"),
+           "hasFailedChecks must not override One-Click Approve")
+
+    img_fn_start = bleed_src.find("def apply_smart_bleed_to_image(")
+    img_fn_end = bleed_src.find("\ndef apply_smart_bleed_to_pdf(", img_fn_start) if img_fn_start >= 0 else -1
+    img_fn_body = bleed_src[img_fn_start:img_fn_end] if img_fn_start >= 0 and img_fn_end > img_fn_start else ""
+    scan_call = img_fn_body.find("checks.append(_scan_bleed_perimeter(bleed_img")
+    bleed_gen = img_fn_body.find("auto_resolve_safe_zone(")
+    record(section, "Bleed Perimeter Scan runs AFTER bleed extension on bleed_img",
+           scan_call > 0 and bleed_gen > 0 and scan_call > bleed_gen,
+           "Pre-bleed scan of trim-sized art always failed with 'image too small'")
+
+    record(section, "Failed Bleed Perimeter Scan is WARNING (does not block overallPassed)",
+           'check["severity"] = "WARNING"' in bleed_src or "\"severity\": \"WARNING\"" in bleed_src)
+
+    record(section, "LAW 1 unchanged: MaxBitmap=50000000 and NumRenderingThreads=1",
+           "MaxBitmap=50000000" in bleed_src and "NumRenderingThreads=1" in bleed_src)
+
+    # Trim-sized artwork (no existing bleed) must be diagnostic WARNING, not a Phase 1 trap.
+    trim_w = int(round(148 / 25.4 * TARGET_DPI))
+    trim_h = int(round(210 / 25.4 * TARGET_DPI))
+    too_small = np.full((trim_h, trim_w, 3), 40, dtype=np.uint8)
+    small_check = _scan_bleed_perimeter(too_small, {"targetWidth": 148, "targetHeight": 210})
+    record(section, "Trim-sized image perimeter scan is WARNING not a blocking fail",
+           small_check.get("name") == "Bleed Perimeter Scan"
+           and small_check.get("severity") == "WARNING"
+           and small_check.get("passed") is False,
+           small_check.get("message", "")[:80])
+
+    # After 5mm bleed halo there is a scannable perimeter with content.
+    halo = 59  # ~5mm at 300 DPI
+    bled = np.full((trim_h + 2 * halo, trim_w + 2 * halo, 3), 40, dtype=np.uint8)
+    bled_check = _scan_bleed_perimeter(bled, {"targetWidth": 148, "targetHeight": 210})
+    record(section, "Post-bleed image with 5mm halo passes perimeter scan",
+           bled_check.get("passed") is True,
+           bled_check.get("message", "")[:80])
+
+    gc.collect()
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3231,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_glitchy_unstick_and_perimeter_scan()
         gc.collect()
 
         all_passed = print_report()

@@ -7270,6 +7270,84 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
     }
 
 
+def _scan_bleed_perimeter(img: np.ndarray, bleed_opts: dict = None) -> dict:
+    """Post-bleed diagnostic: 5mm halo around the center-anchored trim must contain artwork.
+
+    Runs AFTER bleed extension (checks_guide: verify the bleed zone, not the pre-bleed trim).
+    Artwork sized to trim has no pre-bleed halo — that must not fail overallPassed (Law 3).
+    Empty-strip / no-content results are WARNING so they never trap Phase 1.
+    """
+    scan_h, scan_w = img.shape[:2]
+    tw_mm = float(bleed_opts.get("targetWidth", 148)) if bleed_opts else 148.0
+    th_mm = float(bleed_opts.get("targetHeight", 210)) if bleed_opts else 210.0
+    scan_dpi = max(TARGET_DPI, 150)
+    trim_w_px = int(round(tw_mm / 25.4 * scan_dpi))
+    trim_h_px = int(round(th_mm / 25.4 * scan_dpi))
+    trim_w_px = min(trim_w_px, scan_w)
+    trim_h_px = min(trim_h_px, scan_h)
+    trim_x0 = max(0, (scan_w - trim_w_px) // 2)
+    trim_y0 = max(0, (scan_h - trim_h_px) // 2)
+    trim_x1 = trim_x0 + trim_w_px
+    trim_y1 = trim_y0 + trim_h_px
+    perimeter_mm = 5.0
+    perimeter_px = max(1, int(round(perimeter_mm / 25.4 * scan_dpi)))
+    outer_x0 = max(0, trim_x0 - perimeter_px)
+    outer_y0 = max(0, trim_y0 - perimeter_px)
+    outer_x1 = min(scan_w, trim_x1 + perimeter_px)
+    outer_y1 = min(scan_h, trim_y1 + perimeter_px)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+    strips = []
+    if outer_y0 < trim_y0:
+        strips.append(gray[outer_y0:trim_y0, outer_x0:outer_x1])
+    if trim_y1 < outer_y1:
+        strips.append(gray[trim_y1:outer_y1, outer_x0:outer_x1])
+    if outer_x0 < trim_x0:
+        strips.append(gray[trim_y0:trim_y1, outer_x0:trim_x0])
+    if trim_x1 < outer_x1:
+        strips.append(gray[trim_y0:trim_y1, trim_x1:outer_x1])
+    peri_mean = 0.0
+    peri_std = 0.0
+    non_white_ratio = 0.0
+    if strips:
+        perimeter_data = np.concatenate([s.flatten() for s in strips])
+        peri_std = float(np.std(perimeter_data))
+        peri_mean = float(np.mean(perimeter_data))
+        is_white_border = peri_mean > 240 and peri_std < 10
+        non_white_ratio = float(np.mean(perimeter_data < 240))
+        has_pixels = non_white_ratio > 0.15
+        perimeter_passed = has_pixels and not is_white_border
+        message = (
+            f"Center-anchored trim box ({tw_mm}×{th_mm}mm) — 5mm perimeter "
+            f"{'has continuous content' if perimeter_passed else 'needs bleed extension'}."
+        )
+        sys.stderr.write(
+            f"[SCANNER] Center-out trim scan: trim=({trim_x0},{trim_y0})-({trim_x1},{trim_y1}), "
+            f"perimeter={perimeter_px}px, mean={peri_mean:.1f}, std={peri_std:.1f}, "
+            f"non_white={non_white_ratio:.2%}, passed={perimeter_passed}, white_border={is_white_border}\n"
+        )
+    else:
+        perimeter_passed = False
+        message = "Could not scan perimeter — image too small for target size."
+        sys.stderr.write(
+            f"[SCANNER] Center-out trim scan: no halo (image {scan_w}x{scan_h}px vs trim "
+            f"{trim_w_px}x{trim_h_px}px). Diagnostic only — not a Phase 1 blocker.\n"
+        )
+    check = {
+        "name": "Bleed Perimeter Scan",
+        "passed": perimeter_passed,
+        "message": message,
+        "autoFixed": False,
+        "details": (
+            f"Trim box centered at image. Scanned {perimeter_px}px ({perimeter_mm}mm) outside trim edges. "
+            f"Mean luminance: {peri_mean:.1f}, Std: {peri_std:.1f}, Non-white: {non_white_ratio:.0%}. "
+            f"Content detected: {'yes' if perimeter_passed else 'no'}. Ignoring outer crop marks/white space."
+        ),
+    }
+    if not perimeter_passed:
+        check["severity"] = "WARNING"
+    return check
+
+
 def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: dict = None) -> dict:
     import gc
     _prof_total_t0 = time.time()
@@ -7505,70 +7583,6 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         "details": ai_detail if ai_detail else "No enhancement required"
     })
 
-    _prof_trim_scan_t0 = time.time()
-    try:
-        scan_h, scan_w = img.shape[:2]
-        tw_mm = float(bleed_opts.get("targetWidth", 148)) if bleed_opts else 148.0
-        th_mm = float(bleed_opts.get("targetHeight", 210)) if bleed_opts else 210.0
-        scan_dpi = max(TARGET_DPI, 150)
-        trim_w_px = int(round(tw_mm / 25.4 * scan_dpi))
-        trim_h_px = int(round(th_mm / 25.4 * scan_dpi))
-        trim_w_px = min(trim_w_px, scan_w)
-        trim_h_px = min(trim_h_px, scan_h)
-        trim_x0 = max(0, (scan_w - trim_w_px) // 2)
-        trim_y0 = max(0, (scan_h - trim_h_px) // 2)
-        trim_x1 = trim_x0 + trim_w_px
-        trim_y1 = trim_y0 + trim_h_px
-        perimeter_mm = 5.0
-        perimeter_px = max(1, int(round(perimeter_mm / 25.4 * scan_dpi)))
-        outer_x0 = max(0, trim_x0 - perimeter_px)
-        outer_y0 = max(0, trim_y0 - perimeter_px)
-        outer_x1 = min(scan_w, trim_x1 + perimeter_px)
-        outer_y1 = min(scan_h, trim_y1 + perimeter_px)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
-        strips = []
-        if outer_y0 < trim_y0:
-            strips.append(gray[outer_y0:trim_y0, outer_x0:outer_x1])
-        if trim_y1 < outer_y1:
-            strips.append(gray[trim_y1:outer_y1, outer_x0:outer_x1])
-        if outer_x0 < trim_x0:
-            strips.append(gray[trim_y0:trim_y1, outer_x0:trim_x0])
-        if trim_x1 < outer_x1:
-            strips.append(gray[trim_y0:trim_y1, trim_x1:outer_x1])
-        if strips:
-            perimeter_data = np.concatenate([s.flatten() for s in strips])
-            peri_std = float(np.std(perimeter_data))
-            peri_mean = float(np.mean(perimeter_data))
-            is_white_border = peri_mean > 240 and peri_std < 10
-            non_white_ratio = float(np.mean(perimeter_data < 240))
-            has_pixels = non_white_ratio > 0.15
-            perimeter_passed = has_pixels and not is_white_border
-            sys.stderr.write(f"[SCANNER] Center-out trim scan: trim=({trim_x0},{trim_y0})-({trim_x1},{trim_y1}), "
-                             f"perimeter={perimeter_px}px, mean={peri_mean:.1f}, std={peri_std:.1f}, "
-                             f"non_white={non_white_ratio:.2%}, passed={perimeter_passed}, white_border={is_white_border}\n")
-        else:
-            perimeter_passed = False
-            peri_mean = 0
-            peri_std = 0
-            non_white_ratio = 0
-        checks.append({
-            "name": "Bleed Perimeter Scan",
-            "passed": perimeter_passed,
-            "message": f"Center-anchored trim box ({tw_mm}×{th_mm}mm) — 5mm perimeter {'has continuous content' if perimeter_passed else 'needs bleed extension'}." if strips else "Could not scan perimeter — image too small for target size.",
-            "autoFixed": False,
-            "details": f"Trim box centered at image. Scanned {perimeter_px}px ({perimeter_mm}mm) outside trim edges. Mean luminance: {peri_mean:.1f}, Std: {peri_std:.1f}, Non-white: {non_white_ratio:.0%}. Content detected: {'yes' if perimeter_passed else 'no'}. Ignoring outer crop marks/white space."
-        })
-    except Exception as e:
-        sys.stderr.write(f"[SCANNER] Center-out trim scan failed: {e}\n")
-        checks.append({
-            "name": "Bleed Perimeter Scan",
-            "passed": False,
-            "message": "Perimeter scan could not be completed.",
-            "autoFixed": False,
-            "details": str(e)
-        })
-    sys.stderr.write(f"PROFILE: Center-out Trim Scan took {(time.time() - _prof_trim_scan_t0)*1000:.1f}ms\n")
-
     pre_bleed_path = os.path.splitext(output_path)[0] + "_prebleed.png"
     try:
         cv2.imwrite(pre_bleed_path, img)
@@ -7592,6 +7606,21 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         new_h, new_w = h, w
         heal_meta = {}
     sys.stderr.write(f"PROFILE: Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
+
+    _prof_trim_scan_t0 = time.time()
+    try:
+        checks.append(_scan_bleed_perimeter(bleed_img, bleed_opts))
+    except Exception as e:
+        sys.stderr.write(f"[SCANNER] Center-out trim scan failed: {e}\n")
+        checks.append({
+            "name": "Bleed Perimeter Scan",
+            "passed": False,
+            "severity": "WARNING",
+            "message": "Perimeter scan could not be completed.",
+            "autoFixed": False,
+            "details": str(e),
+        })
+    sys.stderr.write(f"PROFILE: Center-out Trim Scan took {(time.time() - _prof_trim_scan_t0)*1000:.1f}ms\n")
 
     checks.append({
         "name": f"{FINAL_BLEED_MM:.0f}mm True Outward Bleed",
