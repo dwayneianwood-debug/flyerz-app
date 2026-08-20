@@ -242,6 +242,8 @@ export default function JobDetails() {
             window.dispatchEvent(new CustomEvent("glitchy:queue-update", {
               detail: { position: data.position }
             }));
+          } else {
+            window.dispatchEvent(new CustomEvent("glitchy:progress"));
           }
         } catch {}
       }, 3000);
@@ -253,6 +255,7 @@ export default function JobDetails() {
       window.dispatchEvent(new CustomEvent("glitchy:queue-dequeued"));
       const interval = setInterval(() => {
         setProgress(p => Math.min(p + Math.random() * 15, 95));
+        window.dispatchEvent(new CustomEvent("glitchy:progress"));
       }, 500);
       return () => clearInterval(interval);
     } else if (job?.status === "complete" || job?.status === "failed") {
@@ -273,20 +276,34 @@ export default function JobDetails() {
   /** Background process failures (batch/async): Glitchy only — no duplicate toast. */
   useEffect(() => {
     if (!job || job.status !== "failed") return;
+    if (layoutGlitchyDispatchedForJobRef.current === job.id) return;
+    layoutGlitchyDispatchedForJobRef.current = job.id;
     const payload = job.errorMessage ?? job.auditResults?.checks?.find(
       (c) => c.name === "Safe Zone Layout",
     )?.message;
-    if (!isSafeZoneLayoutError(payload)) return;
-    if (layoutGlitchyDispatchedForJobRef.current === job.id) return;
-    layoutGlitchyDispatchedForJobRef.current = job.id;
-    handleSafeZoneLayoutProcessingError(payload);
+    if (isSafeZoneLayoutError(payload)) {
+      handleSafeZoneLayoutProcessingError(payload);
+      return;
+    }
+    const failedMsg = typeof job.errorMessage === "string" && job.errorMessage.trim()
+      ? job.errorMessage
+      : "Processing failed. Click me to continue.";
+    window.dispatchEvent(new CustomEvent("glitchy:job-failed", {
+      detail: { message: failedMsg },
+    }));
   }, [job?.id, job?.status, job?.errorMessage, job?.auditResults?.checks]);
 
   useEffect(() => {
     if (job?.status !== "complete" || !job.auditResults) return;
+    const passed = job.auditResults.overallPassed === true;
     window.dispatchEvent(
       new CustomEvent("glitchy:audit-sync", {
-        detail: { overallPassed: job.auditResults.overallPassed === true },
+        detail: { overallPassed: passed, jobStatus: "complete" },
+      }),
+    );
+    window.dispatchEvent(
+      new CustomEvent("glitchy:job-complete", {
+        detail: { overallPassed: passed },
       }),
     );
   }, [job?.status, job?.auditResults?.overallPassed, job?.id]);
@@ -465,6 +482,7 @@ export default function JobDetails() {
         setCompileState(data.state);
         const msg = data.message || "";
         setCompileMessage(msg);
+        window.dispatchEvent(new CustomEvent("glitchy:progress", { detail: { message: msg } }));
         if (msg && (msg.includes("Converting") || msg.includes("CMYK") || msg.includes("Neutralizing") || msg.includes("Trapping") || msg.includes("trap"))) {
           window.dispatchEvent(new CustomEvent("glitchy:ink-stain", { detail: { message: "Mixing the perfect ink colors..." } }));
         }
@@ -473,6 +491,22 @@ export default function JobDetails() {
           setCompileState("COMPLETE");
           clearInterval(interval);
           await queryClient.invalidateQueries({ queryKey: ["job", job.id] });
+          const methodLabel = BLEED_METHOD_LABELS[selectedBleedMethod as keyof typeof BLEED_METHOD_LABELS]?.label || selectedBleedMethod;
+          const audit = job.auditResults?.jobAudit;
+          const auditResults = job.auditResults as any;
+          window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
+            downloadUrl: data.downloadUrl || null,
+            lensesDetected: audit?.lensesDetected ?? false,
+            lensesFlattened: audit?.lensesFlattened ?? false,
+            supersampled: audit?.supersampled ?? false,
+            aiEnhanced: audit?.aiEnhanced ?? false,
+            originalTic: audit?.originalTic ?? null,
+            finalTic: audit?.finalTic ?? null,
+            auditReport: auditResults?.compileAuditReport || null,
+            glitchyMessage: `Your artwork is compiled with ${methodLabel} bleed and ready for the press!`,
+            glitchyState: "triumphant",
+            selectedBleedMethod: methodLabel,
+          } }));
         } else if (data.state === "FAILURE") {
           const errMsg = data.error || data.message || "Compilation failed";
           setCompileError(errMsg);
@@ -486,7 +520,7 @@ export default function JobDetails() {
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [compileTaskId, job?.id]);
+  }, [compileTaskId, job?.id, selectedBleedMethod]);
 
   const handleCompilePressReady = async (strategyOverride?: string): Promise<boolean> => {
     if (!job) return false;

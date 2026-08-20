@@ -249,6 +249,20 @@ def gate_6_no_crop_safety():
           "full_page_crop" in bleed_src or "NO_CROP_FULL_PAGE" in bleed_src or "auto_crop_mockup_bounding_box" in bleed_src,
           "No-crop path must initialize a valid bounding box")
 
+    fu_path = os.path.join(os.path.dirname(SERVER_DIR), "client", "src", "components", "file-upload.tsx")
+    crop_ui_path = os.path.join(os.path.dirname(SERVER_DIR), "client", "src", "pages", "manual-crop.tsx")
+    fu_src = ""
+    crop_ui_src = ""
+    if os.path.exists(fu_path):
+        with open(fu_path) as f:
+            fu_src = f.read()
+    if os.path.exists(crop_ui_path):
+        with open(crop_ui_path) as f:
+            crop_ui_src = f.read()
+    check("G6.5", "No Crop Needed UI populates FULL_PAGE_CROP_BOX",
+          "FULL_PAGE_CROP_BOX" in fu_src and "FULL_PAGE_CROP_BOX" in crop_ui_src,
+          "No Crop Needed must write full-page crop_box (0,0,1,1) to prevent Document Closed")
+
     check("G6.3", "original_input_path preserved through pipeline",
           "original_input_path = input_path" in bleed_src,
           "Must capture original input before emergency/flatten rewrites")

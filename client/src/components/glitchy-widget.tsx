@@ -128,6 +128,9 @@ interface PreflightItem {
 
 type ProcessState = "IDLE" | "PROCESSING" | "QUEUED" | "SUCCESS" | "ERROR";
 
+/** If a busy state never receives a complete/error/heartbeat, unstick so Glitchy is not frozen. */
+const GLITCHY_BUSY_WATCHDOG_MS = 120000;
+
 const GLITCHY_SUPPRESS_CROPBOX_ERR = "cropbox not in mediabox";
 
 function textContainsCropBoxMediaBoxUiNoise(text: string): boolean {
@@ -163,6 +166,7 @@ export default function GlitchyWidget() {
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const idleRef = useRef(0);
   const wanderingRef = useRef(false);
+  const busyHeartbeatRef = useRef(0);
 
   function getJobIdFromUrl(): number | null {
     const match = window.location.pathname.match(/\/job\/(\d+)/);
@@ -266,6 +270,19 @@ export default function GlitchyWidget() {
       const d = (e as CustomEvent).detail || {};
       if (d.overallPassed === true) {
         setChecklistPassOverride(true);
+        setCatMode("head");
+        setUiVisible(true);
+        setPosX(15);
+        wanderingRef.current = false;
+        idleRef.current = 0;
+        setChatBoxVisible(false);
+        setIdleBubbleReady(false);
+        setProcessState("SUCCESS");
+        setProcessingMessage("I finished checking your artwork and applied the print fixes it needed!");
+        setAchievementPhase("ask");
+        setCompileErrorMsg("");
+        setHappyHop(true);
+        setTimeout(() => setHappyHop(false), 3000);
         const jobId = getJobIdFromUrl();
         const items: PreflightItem[] = [];
         if (jobId) {
@@ -291,24 +308,16 @@ export default function GlitchyWidget() {
         if (items.length === 0) {
           items.push({ label: "Artwork audited and prepared for print", done: true });
         }
-        setCatMode("head");
-        setUiVisible(true);
-        setPosX(15);
-        wanderingRef.current = false;
-        idleRef.current = 0;
-        setChatBoxVisible(false);
-        setIdleBubbleReady(false);
-        setProcessState("SUCCESS");
-        setProcessingMessage("I finished checking your artwork and applied the print fixes it needed!");
         setPreflightItems(items);
-        setAchievementPhase("ask");
-        setCompileErrorMsg("");
-        setHappyHop(true);
-        setTimeout(() => setHappyHop(false), 3000);
       } else if (d.overallPassed === false) {
         setChecklistPassOverride(false);
         setAchievementPhase(null);
         fetchChecklist();
+        if (d.jobStatus === "complete") {
+          setProcessState("IDLE");
+          setProcessingMessage("");
+          setHappyHop(false);
+        }
       } else {
         fetchChecklist();
       }
@@ -341,6 +350,7 @@ export default function GlitchyWidget() {
 
     const handleCompileStart = (e: Event) => {
       const detail = (e as CustomEvent).detail || {};
+      busyHeartbeatRef.current = Date.now();
       resetGlitchy();
       setProcessState("PROCESSING");
       setProcessingMessage(detail.message || "Processing...");
@@ -444,6 +454,7 @@ export default function GlitchyWidget() {
 
     const handleBleedSwitch = (e: Event) => {
       const detail = (e as CustomEvent).detail || {};
+      busyHeartbeatRef.current = Date.now();
       resetGlitchy();
       setProcessState("PROCESSING");
       setProcessingMessage(detail.message || "Switching bleed strategy...");
@@ -486,6 +497,7 @@ export default function GlitchyWidget() {
 
     const handleQueueUpdate = (e: Event) => {
       const detail = (e as CustomEvent).detail || {};
+      busyHeartbeatRef.current = Date.now();
       if (detail.position && detail.position > 0) {
         setProcessState("QUEUED");
         setProcessingMessage(`You are #${detail.position} in line. The press room is busy — I'll start on your file as soon as a slot opens up!`);
@@ -496,13 +508,45 @@ export default function GlitchyWidget() {
     };
 
     const handleQueueDequeued = () => {
+      busyHeartbeatRef.current = Date.now();
       setProcessState("PROCESSING");
       setProcessingMessage("Your turn! Processing your artwork now...");
       setAchievementPhase(null);
     };
 
+    const handleJobComplete = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      if (detail.overallPassed === true) {
+        return;
+      }
+      resetGlitchy();
+      setProcessState("IDLE");
+      setProcessingMessage("");
+      setPreflightItems([]);
+      setCompileDownloadUrl(null);
+      setCompileErrorMsg("");
+      setHappyHop(false);
+      setAchievementPhase(null);
+    };
+
+    const handleJobFailed = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      resetGlitchy();
+      setProcessState("ERROR");
+      setCompileErrorMsg(detail.message || "Processing failed. Click me to continue.");
+      setPreflightItems([]);
+      setCompileDownloadUrl(null);
+      setHappyHop(false);
+      setAchievementPhase(null);
+    };
+
+    const handleProgressHeartbeat = () => {
+      busyHeartbeatRef.current = Date.now();
+    };
+
     const handleInkStain = (e: Event) => {
       const detail = (e as CustomEvent).detail || {};
+      busyHeartbeatRef.current = Date.now();
       setInkStainActive(true);
       if (detail.message) {
         setProcessingMessage(detail.message);
@@ -532,6 +576,9 @@ export default function GlitchyWidget() {
     window.addEventListener("glitchy:bleed-switch-done", handleBleedSwitchDone);
     window.addEventListener("glitchy:download-error", handleDownloadError);
     window.addEventListener("glitchy:job-reset", handleJobReset);
+    window.addEventListener("glitchy:job-complete", handleJobComplete);
+    window.addEventListener("glitchy:job-failed", handleJobFailed);
+    window.addEventListener("glitchy:progress", handleProgressHeartbeat);
     return () => {
       window.removeEventListener("glitchy:compile-start", handleCompileStart);
       window.removeEventListener("glitchy:compile-complete", handleCompileComplete);
@@ -544,8 +591,25 @@ export default function GlitchyWidget() {
       window.removeEventListener("glitchy:queue-update", handleQueueUpdate);
       window.removeEventListener("glitchy:queue-dequeued", handleQueueDequeued);
       window.removeEventListener("glitchy:ink-stain", handleInkStain);
+      window.removeEventListener("glitchy:job-complete", handleJobComplete);
+      window.removeEventListener("glitchy:job-failed", handleJobFailed);
+      window.removeEventListener("glitchy:progress", handleProgressHeartbeat);
     };
   }, []);
+
+  useEffect(() => {
+    const busy = processState === "PROCESSING" || processState === "QUEUED";
+    if (!busy) return;
+    busyHeartbeatRef.current = Date.now();
+    const interval = setInterval(() => {
+      if (Date.now() - busyHeartbeatRef.current < GLITCHY_BUSY_WATCHDOG_MS) return;
+      setProcessState("ERROR");
+      setCompileErrorMsg("I got stuck waiting. Click me to continue — you can retry from the job page.");
+      setAchievementPhase(null);
+      setHappyHop(false);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [processState]);
 
   function handleClick() {
     if (processState === "SUCCESS" && achievementPhase === "ask") {
@@ -564,7 +628,14 @@ export default function GlitchyWidget() {
       setIsInteracting(false);
       return;
     }
-    if (processState === "PROCESSING") return;
+    if (processState === "PROCESSING" || processState === "QUEUED") {
+      setProcessState("IDLE");
+      setProcessingMessage("");
+      setIdleBubbleReady(false);
+      setAchievementPhase(null);
+      idleRef.current = 0;
+      return;
+    }
 
     if (catMode !== "head") {
       idleRef.current = 0;
@@ -641,6 +712,10 @@ export default function GlitchyWidget() {
           page: window.location.pathname,
           jobId,
           href: window.location.href,
+          glitchyProcessState: processState,
+          catMode,
+          processingMessage,
+          compileErrorMsg,
         },
       }),
     });
@@ -910,12 +985,14 @@ export default function GlitchyWidget() {
       `}</style>
       <div
         data-testid="glitchy-container"
+        data-glitchy-state={processState}
         style={{
           position: "fixed",
           bottom: isVisible ? 0 : -100,
           right: wanderingRef.current ? undefined : 50,
           left: wanderingRef.current ? posX : undefined,
           width: 120,
+          transformOrigin: "bottom center",
           display: "flex",
           flexDirection: "column",
           alignItems: "center",

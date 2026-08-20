@@ -1452,6 +1452,7 @@ def print_report():
         "prepress_struct": "25-Point Prepress Structural Assertions",
         "compile_pkg": "PDF Packaging — Flat Raster Compile",
         "print_enhance": "Smart Prepress Enhancer (Lanczos + Unsharp)",
+        "glitchy_unstick": "Glitchy Unstick (busy-state deadlock)",
     }
 
     for sec, counts in sections.items():
@@ -3037,6 +3038,66 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_glitchy_unstick():
+    """Glitchy must never remain frozen in PROCESSING/QUEUED after the job page settles."""
+    print(f"\n{BOLD}{CYAN}Section 27: Glitchy Unstick (busy-state deadlock){RESET}")
+    print(f"{'─'*60}")
+    section = "glitchy_unstick"
+    base = os.path.join(os.path.dirname(__file__), "..")
+
+    glitchy_path = os.path.join(base, "client", "src", "components", "glitchy-widget.tsx")
+    jd_path = os.path.join(base, "client", "src", "pages", "job-details.tsx")
+    fu_path = os.path.join(base, "client", "src", "components", "file-upload.tsx")
+    crop_path = os.path.join(base, "client", "src", "pages", "manual-crop.tsx")
+
+    with open(glitchy_path, encoding="utf-8") as f:
+        glitchy_src = f.read()
+    with open(jd_path, encoding="utf-8") as f:
+        jd_src = f.read()
+    with open(fu_path, encoding="utf-8") as f:
+        fu_src = f.read()
+    with open(crop_path, encoding="utf-8") as f:
+        crop_src = f.read()
+
+    record(section, "Watchdog constant GLITCHY_BUSY_WATCHDOG_MS present",
+           "GLITCHY_BUSY_WATCHDOG_MS" in glitchy_src)
+    record(section, "Watchdog cap is 120s (not infinite PROCESSING)",
+           "GLITCHY_BUSY_WATCHDOG_MS = 120000" in glitchy_src)
+    record(section, "Glitchy listens for glitchy:job-complete",
+           'addEventListener("glitchy:job-complete"' in glitchy_src)
+    record(section, "Glitchy listens for glitchy:job-failed",
+           'addEventListener("glitchy:job-failed"' in glitchy_src)
+    record(section, "Glitchy listens for glitchy:progress heartbeat",
+           'addEventListener("glitchy:progress"' in glitchy_src)
+    record(section, "Click dismisses PROCESSING/QUEUED instead of ignoring input",
+           'processState === "PROCESSING" || processState === "QUEUED"' in glitchy_src
+           and 'if (processState === "PROCESSING") return;' not in glitchy_src)
+    record(section, "audit-sync with jobStatus complete exits PROCESSING",
+           'd.jobStatus === "complete"' in glitchy_src)
+    record(section, "Stuck watchdog message is user-dismissable",
+           "I got stuck waiting" in glitchy_src)
+    record(section, "Glitchy stays bottom-anchored (bottom: 0 when visible)",
+           "bottom: isVisible ? 0 : -100" in glitchy_src)
+    record(section, "Glitchy transform origin is bottom (20% size stays docked)",
+           'transformOrigin: "bottom center"' in glitchy_src)
+
+    record(section, "Job page dispatches glitchy:job-complete on success",
+           'glitchy:job-complete' in jd_src and 'jobStatus: "complete"' in jd_src)
+    record(section, "Job page dispatches glitchy:job-failed on non-layout failure",
+           'glitchy:job-failed' in jd_src)
+    record(section, "Compile-status COMPLETE dispatches glitchy:compile-complete",
+           'data.state === "COMPLETE"' in jd_src and 'glitchy:compile-complete' in jd_src)
+    record(section, "Processing poll heartbeats glitchy:progress",
+           'glitchy:progress' in jd_src)
+
+    record(section, "FULL_PAGE_CROP_BOX exported for No Crop Needed",
+           "FULL_PAGE_CROP_BOX" in crop_src and "cropWidth: 1" in crop_src)
+    record(section, "No Crop Needed button populates full-page crop_box",
+           "FULL_PAGE_CROP_BOX" in fu_src and "button-skip-crop" in fu_src)
+    record(section, "Full-page crop skips client-side pixel crop (PDF/image handoff)",
+           "isFullPageCropBox" in fu_src and "NO_CROP_FULL_PAGE" in fu_src)
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3198,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_glitchy_unstick()
         gc.collect()
 
         all_passed = print_report()

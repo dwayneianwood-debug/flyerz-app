@@ -53,6 +53,22 @@ export interface CropCoordinates {
   cropHeight: number;
 }
 
+/** Full-page crop_box (0–1 fractions) for the No Crop Needed route. */
+export const FULL_PAGE_CROP_BOX: CropCoordinates = {
+  cropX: 0,
+  cropY: 0,
+  cropWidth: 1,
+  cropHeight: 1,
+};
+
+export function isFullPageCropBox(crop: CropCoordinates | null | undefined): boolean {
+  return !!crop
+    && crop.cropX === 0
+    && crop.cropY === 0
+    && crop.cropWidth === 1
+    && crop.cropHeight === 1;
+}
+
 export function ManualCropEmbedded({ onCropApply, sourceImageUrl, aspectRatio }: { onCropApply?: (coords: CropCoordinates) => void; sourceImageUrl?: string; aspectRatio?: number } = {}) {
   return <ManualCrop embedded onCropApply={onCropApply} sourceImageUrl={sourceImageUrl} aspectRatio={aspectRatio} />;
 }

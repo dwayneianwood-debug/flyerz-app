@@ -14,7 +14,7 @@ import { twMerge } from "tailwind-merge";
 import { useToast } from "@/hooks/use-toast";
 import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
-import { ManualCropEmbedded, type CropCoordinates } from "@/pages/manual-crop";
+import { ManualCropEmbedded, FULL_PAGE_CROP_BOX, isFullPageCropBox, type CropCoordinates } from "@/pages/manual-crop";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
 
@@ -661,7 +661,7 @@ export function FileUpload() {
       const ext = stagedFile.name.split('.').pop()?.toLowerCase() || '';
       const isImage = ['png', 'jpg', 'jpeg'].includes(ext);
 
-      if (pendingCropCoords && isImage) {
+      if (pendingCropCoords && isImage && !isFullPageCropBox(pendingCropCoords)) {
         console.log(`[UPLOAD] Client-side crop: cropping ${stagedFile.name} in browser before upload`);
         setIsCropping(true);
         try {
@@ -685,7 +685,11 @@ export function FileUpload() {
         (uploadBleedOptions as any).cropY = pendingCropCoords.cropY;
         (uploadBleedOptions as any).cropWidth = pendingCropCoords.cropWidth;
         (uploadBleedOptions as any).cropHeight = pendingCropCoords.cropHeight;
-        console.log(`[UPLOAD] PDF crop coords attached: x=${pendingCropCoords.cropX.toFixed(4)}, y=${pendingCropCoords.cropY.toFixed(4)}, w=${pendingCropCoords.cropWidth.toFixed(4)}, h=${pendingCropCoords.cropHeight.toFixed(4)}`);
+        if (isFullPageCropBox(pendingCropCoords)) {
+          console.log(`[UPLOAD] NO_CROP_FULL_PAGE: crop_box = (0,0) 1×1 (full-page fractions) — Document Closed / bounds safety`);
+        } else {
+          console.log(`[UPLOAD] PDF crop coords attached: x=${pendingCropCoords.cropX.toFixed(4)}, y=${pendingCropCoords.cropY.toFixed(4)}, w=${pendingCropCoords.cropWidth.toFixed(4)}, h=${pendingCropCoords.cropHeight.toFixed(4)}`);
+        }
       } else {
         console.log(`[UPLOAD] No crop data — full artwork will be used`);
       }
@@ -1146,7 +1150,7 @@ export function FileUpload() {
                 <Shield className="w-3.5 h-3.5 text-green-600 dark:text-green-400 shrink-0" />
                 <span className="text-xs font-medium text-green-700 dark:text-green-400">Bleed preserved — original dimensions will pass through without rescaling</span>
                 <button
-                  onClick={() => setPreserveBleed(false)}
+                  onClick={() => { setPreserveBleed(false); if (isFullPageCropBox(pendingCropCoords)) setPendingCropCoords(null); }}
                   className="text-xs text-amber-600 dark:text-amber-400 hover:underline font-medium shrink-0 ml-auto"
                   data-testid="button-undo-preserve-bleed"
                 >
@@ -1166,7 +1170,7 @@ export function FileUpload() {
                 Crop artwork
               </Button>
               <Button
-                onClick={() => { setPendingCropCoords(null); setPreserveBleed(true); }}
+                onClick={() => { setPendingCropCoords({ ...FULL_PAGE_CROP_BOX }); setPreserveBleed(true); }}
                 variant={xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') ? "default" : "ghost"}
                 className={cn("flex-1 gap-2", xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') && "bg-green-600 hover:bg-green-700 text-white")}
                 data-testid="button-skip-crop"
@@ -1182,7 +1186,7 @@ export function FileUpload() {
                 <span className="text-sm font-semibold text-foreground truncate" data-testid="text-staged-filename-stage3">{stagedFile.name}</span>
                 <span className="text-xs text-muted-foreground ml-auto shrink-0">{(stagedFile.size / 1024 / 1024).toFixed(1)} MB</span>
               </div>
-              {pendingCropCoords && (
+              {pendingCropCoords && !isFullPageCropBox(pendingCropCoords) && (
                 <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/25 rounded-lg px-3 py-2 mb-2" data-testid="indicator-crop-active-stage3">
                   <CheckCircle2 className="w-3.5 h-3.5 text-green-600 shrink-0" />
                   <span className="text-xs font-medium text-green-700 dark:text-green-400">Crop active: {Math.round(pendingCropCoords.cropWidth * 100)}% × {Math.round(pendingCropCoords.cropHeight * 100)}% of original</span>

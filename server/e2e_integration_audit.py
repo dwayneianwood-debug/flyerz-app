@@ -783,6 +783,24 @@ def audit_5_frontend_ux():
     record("5. Frontend & UX", "glitchy:ink-stain dispatched on compile polling",
            "glitchy:ink-stain" in jd_src)
 
+    print(f"\n{BOLD}  5I — Glitchy unstick: no infinite PROCESSING deadlock{RESET}")
+    record("5. Frontend & UX", "Glitchy busy watchdog (GLITCHY_BUSY_WATCHDOG_MS)",
+           "GLITCHY_BUSY_WATCHDOG_MS" in glitchy_src)
+    record("5. Frontend & UX", "Glitchy listens for glitchy:job-complete",
+           "glitchy:job-complete" in glitchy_src)
+    record("5. Frontend & UX", "Job page dispatches glitchy:job-complete",
+           "glitchy:job-complete" in jd_src)
+    record("5. Frontend & UX", "Compile COMPLETE dispatches glitchy:compile-complete",
+           "glitchy:compile-complete" in jd_src)
+    record("5. Frontend & UX", "Click does not ignore PROCESSING forever",
+           'if (processState === "PROCESSING") return;' not in glitchy_src)
+
+    fu_path = os.path.join(base, "client", "src", "components", "file-upload.tsx")
+    with open(fu_path) as f:
+        fu_src = f.read()
+    record("5. Frontend & UX", "No Crop Needed populates FULL_PAGE_CROP_BOX",
+           "FULL_PAGE_CROP_BOX" in fu_src)
+
 
 # ============================================================
 # MAIN
