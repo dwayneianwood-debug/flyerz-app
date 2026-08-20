@@ -1,0 +1,11 @@
+.cache
+uploads
+.git
+dist
+node_modules/.vite
+node_modules/.cache
+.local
+/dev/shm
+fai_temp_processing
+*.tar.gz
+attached_assets

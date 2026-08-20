@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en" style="background-color: #1a1a2e;">
+<head>
+  <meta charset="utf-8"/>
+  <title>Flyerz — Artwork Intelligence Job Report</title>
+  <style>
+    @page { size: A4 portrait; margin: 15mm; }
+    html {
+      background-color: #1a1a2e;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      white-space: normal;
+    }
+    body {
+      font-family: Helvetica, Arial, "Segoe UI", sans-serif;
+      background-color: #1a1a2e;
+      color: #f1f5f9;
+      font-size: 14pt;
+      line-height: 1.5;
+      margin: 0 auto;
+      padding: 0;
+      max-width: 190mm;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      word-break: break-word;
+      white-space: normal;
+      box-sizing: border-box;
+    }
+    .pdf-outer-table {
+      width: 100%;
+      max-width: 190mm;
+      margin: 0 auto;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    .pdf-outer-table td { vertical-align: top; word-wrap: break-word; white-space: normal; }
+    #pdf-wrapper {
+      max-width: 190mm;
+      margin: 0 auto;
+      padding: 14pt 12pt 18pt 12pt;
+      background-color: #1a1a2e;
+      color: #f1f5f9;
+      border: 1pt solid #334155;
+      border-radius: 6pt;
+      page-break-inside: avoid;
+    }
+    h1 {
+      color: #e6e6fa;
+      font-size: 22pt;
+      font-weight: 900;
+      margin: 0 0 10pt 0;
+      line-height: 1.35;
+    }
+    h2 {
+      color: #38bdf8;
+      font-size: 16pt;
+      font-weight: bold;
+      margin: 16pt 0 10pt 0;
+      border-bottom: 1pt solid #334155;
+      padding-bottom: 4pt;
+      line-height: 1.35;
+    }
+    p { margin: 0 0 12pt 0; font-size: 14pt; line-height: 1.5; }
+    .meta { color: #94a3b8; font-size: 11pt; margin-bottom: 12pt; }
+    .banner-pass {
+      background-color: rgba(74, 222, 128, 0.12);
+      border: 1pt solid rgba(74, 222, 128, 0.45);
+      color: #86efac;
+      padding: 10pt 12pt;
+      border-radius: 6pt;
+      margin-bottom: 12pt;
+      font-weight: bold;
+      page-break-inside: avoid;
+    }
+    .banner-fail {
+      background-color: rgba(248, 113, 113, 0.12);
+      border: 1pt solid rgba(248, 113, 113, 0.45);
+      color: #fca5a5;
+      padding: 10pt 12pt;
+      border-radius: 6pt;
+      margin-bottom: 12pt;
+      font-weight: bold;
+      page-break-inside: avoid;
+    }
+    .auto-heal {
+      page-break-inside: avoid;
+      border: 2pt solid #00cc88;
+      background-color: #052e16;
+      color: #ecfdf5;
+      padding: 10pt 12pt;
+      margin: 12pt 0;
+      border-radius: 6pt;
+      font-size: 12pt;
+      line-height: 1.5;
+    }
+    .spec-grid {
+      background-color: #16213e;
+      border: 1pt solid #334155;
+      padding: 10pt 12pt;
+      margin-bottom: 12pt;
+      border-radius: 6pt;
+      font-size: 12pt;
+      color: #b8c1ec;
+      page-break-inside: avoid;
+    }
+    .spec-grid strong { color: #e6e6fa; }
+    .check-card {
+      background-color: #16213e;
+      border: 1pt solid #334155;
+      border-left: 4pt solid #64748b;
+      padding: 10pt 12pt;
+      margin: 0 0 12pt 0;
+      border-radius: 0 6pt 6pt 0;
+      page-break-inside: avoid;
+    }
+    .check-card.pass { border-left-color: #22c55e; }
+    .check-card.fail { border-left-color: #ef4444; }
+    .check-card.fix { border-left-color: #fbbf24; }
+    .check-title { font-weight: bold; color: #f8fafc; font-size: 13pt; margin-bottom: 6pt; }
+    .badge {
+      display: inline-block;
+      font-size: 9pt;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 0.5pt;
+      padding: 2pt 6pt;
+      border-radius: 4pt;
+      margin-right: 6pt;
+    }
+    .badge-pass { background: rgba(34, 197, 94, 0.2); color: #86efac; }
+    .badge-fail { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+    .badge-fix { background: rgba(251, 191, 36, 0.2); color: #fcd34d; }
+    .msg { color: #cbd5e1; margin: 6pt 0 0 0; font-size: 13pt; }
+    .details { color: #94a3b8; margin: 8pt 0 0 0; font-size: 11pt; white-space: pre-wrap; }
+    .empty { color: #94a3b8; font-style: italic; font-size: 13pt; }
+    .muted { color: #64748b; font-size: 11pt; }
+  </style>
+</head>
+<body style="margin:0;background-color:#1a1a2e;">
+<table class="pdf-outer-table" cellspacing="0" cellpadding="0"><tr><td>
+<div id="pdf-wrapper">
+
+  <h1>Artwork Intelligence Job Report</h1>
+  <p class="meta">Job #{{ job_id }} · {{ filename }} · {{ generated_at }}{% if job_status %} · Status: {{ job_status }}{% endif %}</p>
+
+  {% if overall_passed %}
+  <div class="banner-pass">Overall result: PASSED · Auto-fixes applied: {{ fixes_applied }}</div>
+  {% else %}
+  <div class="banner-fail">Overall result: NEEDS ATTENTION · Auto-fixes applied: {{ fixes_applied }}</div>
+  {% endif %}
+
+  {% if auto_heal and auto_heal.applied %}
+  <div class="auto-heal">
+    <strong>Auto-Heal (Shrink &amp; Re-Bleed)</strong><br/>
+    Trim micro-shrunk {% if auto_heal.shrinkPxPerSide %}{{ auto_heal.shrinkPxPerSide }}{% else %}30{% endif %} px/side;
+    bleed effective <strong>{{ auto_heal.bleedPxEffective }}</strong> px (base {{ auto_heal.bleedPxBase }} px);
+    strategy <strong>{% if auto_heal.bleedStrategy %}{{ auto_heal.bleedStrategy }}{% else %}auto{% endif %}</strong>.
+  </div>
+  {% endif %}
+
+  {% if artwork_size %}
+  <div class="spec-grid">
+    <strong>Artwork &amp; bleed</strong><br/>
+    Trim: {{ artwork_size.width_mm | round(2) }} × {{ artwork_size.height_mm | round(2) }} mm ·
+    Bleed present: {% if artwork_size.has_bleed %}yes{% else %}no{% endif %}
+    {% if artwork_size.bleed_mm %}
+    · Top {{ artwork_size.bleed_mm.top | round(1) }} / Bottom {{ artwork_size.bleed_mm.bottom | round(1) }} /
+    Left {{ artwork_size.bleed_mm.left | round(1) }} / Right {{ artwork_size.bleed_mm.right | round(1) }} mm
+    {% endif %}
+    <br/>
+    Document: {{ artwork_size.document_width_mm | round(2) }} × {{ artwork_size.document_height_mm | round(2) }} mm
+  </div>
+  {% endif %}
+
+  {% if original_dpi is not none %}
+  <p class="muted">Detected / reported DPI reference: {{ original_dpi }}{% if ai_enhanced %} · AI enhancement applied{% endif %}</p>
+  {% endif %}
+
+  {% if right_safety or critical_safe_zone is not none %}
+  <p class="muted">
+    {% if right_safety %}Right-edge safety: {{ right_safety }}{% endif %}
+    {% if critical_safe_zone is not none %} · Critical safe zone flag: {{ critical_safe_zone }}{% endif %}
+  </p>
+  {% endif %}
+
+  <h2>Channel results (this job)</h2>
+
+  {% if checks and checks|length > 0 %}
+    {% for check in checks %}
+    <div class="check-card {% if check.passed %}pass{% elif check.autoFixed %}fix{% else %}fail{% endif %}">
+      <div class="check-title">
+        {% if check.passed %}
+          <span class="badge badge-pass">Passed</span>
+        {% elif check.autoFixed %}
+          <span class="badge badge-fix">Auto-fixed</span>
+        {% else %}
+          <span class="badge badge-fail">Attention</span>
+        {% endif %}
+        {{ check.name }}
+        {% if check.severity %}<span class="muted"> · {{ check.severity }}</span>{% endif %}
+      </div>
+      <p class="msg">{{ check.message }}</p>
+      {% if check.details %}
+      <p class="details">{{ check.details }}</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="empty">No intelligence channel rows were recorded for this job yet. Open this report again after processing completes.</p>
+  {% endif %}
+
+  <p class="muted" style="margin-top:16pt;text-align:center;">© Flyerz.co.za Artwork Intelligence — job telemetry export</p>
+
+</div>
+</td></tr></table>
+</body>
+</html>

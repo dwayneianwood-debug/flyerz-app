@@ -1,0 +1,27 @@
+---
+description: Immutable development rules for prepress, memory safety, and layer integrity
+globs: "**/*"
+alwaysApply: true
+---
+# IMMUTABLE DEVELOPMENT RULES
+
+## 1. Memory Safety (8GB Replit Limit)
+- NEVER remove or weaken Ghostscript memory leashes.
+- `BufferSpace` and `MaxBitmap` MUST strictly remain capped at 50MB (`50000000`).
+- `NumRenderingThreads` MUST remain set to 1.
+
+## 2. Prepress Precision & Parameters
+- Bleed: Always use a 1-pixel sampling radius for Edge Replication/Pixel-Drift calculations.
+- DPI: All outputs must have 300 DPI metadata forcefully injected via PIL, PyMuPDF, and Ghostscript (`-dHWResolution=300`).
+- Color Intent: Preserve Rich Black using `-dBlackPtComp=1`, `KPreserve=2`, and Relative Colorimetric rendering intent.
+
+## 3. Layer Integrity
+- Final PDF outputs MUST be flattened to exactly one single image layer per page.
+- Purge all "Ghost Layers" or original vector elements prior to final compilation.
+
+## 4. "No Crop" Route Handling
+- The "No Crop Needed" route MUST bypass the UI while correctly populating the backend `crop_box` data structure (full-page dimensions) to prevent "Document Closed" errors.
+
+## 5. Zero Regression Policy
+- Every new feature or bug fix MUST include a corresponding automated unit/integration test.
+- Before completing or proposing any changes, verify that all existing regression tests pass successfully.

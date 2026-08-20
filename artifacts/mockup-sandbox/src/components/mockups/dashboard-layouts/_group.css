@@ -1,0 +1,40 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Outfit:wght@100..900&display=swap');
+
+:root {
+  --font-sans: 'DM Sans', sans-serif;
+  --font-display: 'Outfit', sans-serif;
+
+  --background: 220 20% 97%;
+  --foreground: 220 40% 13%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 220 40% 13%;
+  --card-border: 216 20% 90%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 220 40% 13%;
+
+  --primary: 214 98% 50%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 220 40% 13%;
+  --secondary-foreground: 210 40% 98%;
+
+  --muted: 216 20% 95%;
+  --muted-foreground: 216 15% 46%;
+
+  --accent: 9 100% 50%;
+  --accent-foreground: 0 0% 100%;
+
+  --warning: 54 100% 50%;
+  --warning-foreground: 220 40% 13%;
+
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 216 20% 90%;
+  --input: 216 20% 90%;
+  --ring: 214 98% 50%;
+
+  --radius: 0.75rem;
+}

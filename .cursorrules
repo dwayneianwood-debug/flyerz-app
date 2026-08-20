@@ -1,0 +1,8 @@
+System Instructions for Flyerz.co.za Artwork Intelligence:
+​Memory Safety: Never remove Ghostscript memory leashes. BufferSpace and MaxBitmap must always be capped at 50MB. NumRenderingThreads must strictly remain at 1.
+​Prepress Precision: Always use a 1-pixel sampling radius for Edge Replication/Pixel-Drift.
+​DPI & Color: All final outputs must have 300 DPI metadata forcefully injected (-dHWResolution=300). Preserve Rich Black using -dBlackPtComp=1, KPreserve=2.
+​Layer Integrity: Final PDF outputs must be flattened to one single image layer per page. Purge all original vector elements.
+​Cropping & Scaling: Always ensure the "No Crop Needed" button correctly prepares the full-page crop_box to prevent "Document Closed" errors. App scaling logic must strictly use "cover" (max logic) to prevent white borders; never use "contain".
+​UI Elements: The "Glitchy" digital assistant must remain at the reduced 20% size and strictly anchored to the bottom of the screen.
+​Dev workflow: To restart the local server for testing, run `.\start_dev.ps1` from the project root (do not use bare `npm run dev` for restarts). See DEV.md.

@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "m-4GcVUZMFcFv9VKjKl_j"
+uri = "file://.local/current_state_report.md"
+type = "text"
+title = "Flyerz PrintReady AI — Current State Report"

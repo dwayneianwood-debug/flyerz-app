@@ -1,0 +1,14 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.2",
+    "opencv-python-headless>=4.13.0.92",
+    "pikepdf>=10.3.0",
+    "pillow>=12.1.1",
+    "pymupdf>=1.27.1",
+    "pyzbar>=0.1.9",
+    "reportlab>=4.4.10",
+]

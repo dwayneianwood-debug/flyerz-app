@@ -1,0 +1,60 @@
+modules = ["web", "python-3.11", "nodejs-22", "postgresql-16"]
+run = "npm run dev"
+hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
+
+[nix]
+channel = "stable-24_05"
+packages = ["freetype", "ghostscript", "glib", "glibcLocales", "gumbo", "harfbuzz", "jbig2dec", "lcms2", "libGL", "libimagequant", "libjpeg", "libjpeg_turbo", "libtiff", "libwebp", "libxcrypt", "llvmPackages.openmp", "mupdf", "openjpeg", "patchelf", "qpdf", "swig", "tcl", "tk", "vulkan-loader", "xcbuild", "xorg.libX11", "zbar", "zlib", "zip"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 5555
+externalPort = 3001
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
+
+[[ports]]
+localPort = 23636
+externalPort = 3000
+
+[env]
+PORT = "5000"
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["npm", "run", "start"]
+publicDir = "dist/public"
+build = ["npm", "run", "build"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000

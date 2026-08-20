@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<!--
+  System Intelligence PDF — must match client/src/pages/dashboard-rules.tsx (dark console).
+  Legacy long-form checklist blocks are intentionally NOT rendered here.
+-->
+<html lang="en" style="background-color: #1a1a2e;">
+<head>
+  <meta charset="utf-8"/>
+  <title>Flyerz — System Intelligence</title>
+  <style>
+    /* Print-first: strict A4 column width so PDF engines do not shrink-to-fit */
+    @page { size: A4 portrait; margin: 15mm; }
+    html {
+      background-color: #1a1a2e;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      white-space: normal;
+    }
+    body {
+      font-family: Helvetica, Arial, "Segoe UI", sans-serif;
+      background-color: #1a1a2e;
+      color: #f1f5f9;
+      font-size: 14pt;
+      line-height: 1.5;
+      margin: 0 auto;
+      padding: 0;
+      max-width: 190mm;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      word-break: break-word;
+      white-space: normal;
+      box-sizing: border-box;
+    }
+    .pdf-outer-table {
+      width: 100%;
+      max-width: 190mm;
+      margin: 0 auto;
+      border-collapse: collapse;
+      table-layout: fixed;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      white-space: normal;
+    }
+    .pdf-outer-table td {
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      white-space: normal;
+      vertical-align: top;
+    }
+    #pdf-wrapper.audit-shell,
+    #pdf-wrapper.audit-shell * {
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      white-space: normal;
+    }
+    p {
+      margin: 0 0 12pt 0;
+      line-height: 1.5;
+      font-size: 14pt;
+      word-wrap: break-word;
+      white-space: normal;
+    }
+    ul, ol { margin: 0 0 12pt 0; padding-left: 18pt; }
+    li { margin: 0 0 12pt 0; line-height: 1.5; }
+    h1 {
+      color: #e6e6fa;
+      font-size: 24pt;
+      font-weight: 900;
+      margin: 0 0 12pt 0;
+      line-height: 1.5;
+      letter-spacing: 0.2pt;
+    }
+    h2 {
+      color: #38bdf8;
+      font-size: 18pt;
+      font-weight: bold;
+      margin: 0 0 12pt 0;
+      line-height: 1.5;
+    }
+    h3 {
+      color: #4ade80;
+      font-size: 14pt;
+      font-weight: bold;
+      margin: 0 0 12pt 0;
+      line-height: 1.5;
+    }
+    #pdf-wrapper.audit-shell {
+      max-width: 190mm;
+      margin: 0 auto;
+      padding: 18pt 14pt 22pt 14pt;
+      background-color: #1a1a2e;
+      color: #f1f5f9;
+      border-radius: 7pt;
+      border: 1pt solid #334155;
+    }
+    .tag {
+      color: #4ade80;
+      font-size: 10pt;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 2pt;
+      margin: 0 0 12pt 0;
+    }
+    .intro { color: #b8c1ec; margin-bottom: 12pt; font-size: 14pt; line-height: 1.5; }
+    .rule-row { width: 100%; border-collapse: collapse; margin: 6pt 0 12pt 0; table-layout: fixed; }
+    .rule-row td { height: 3pt; font-size: 1pt; line-height: 1pt; }
+    .rb { background-color: #0474fc; width: 33%; }
+    .rg { background-color: #00cc88; width: 34%; }
+    .rr { background-color: #ff2500; width: 33%; }
+    .legend {
+      page-break-inside: avoid;
+      background-color: #16213e;
+      border: 1pt solid #334155;
+      padding: 10pt 12pt;
+      font-size: 11pt;
+      line-height: 1.5;
+      color: #94a3b8;
+      margin-bottom: 12pt;
+      border-radius: 6pt;
+    }
+    .phase-card {
+      page-break-inside: avoid;
+      background-color: #16213e;
+      border: 1pt solid #334155;
+      border-left: 4pt solid #0474fc;
+      padding: 12pt 12pt 12pt 10pt;
+      margin: 12pt 0;
+      border-radius: 0 6pt 6pt 0;
+    }
+    .phase-card.p1 { border-left-color: #4ade80; }
+    .phase-card.p2 { border-left-color: #38bdf8; }
+    .phase-card.p3 { border-left-color: #00cc88; }
+    .phase-head { width: 100%; border-collapse: collapse; margin-bottom: 8pt; }
+    .glyph-td {
+      width: 22pt;
+      text-align: center;
+      vertical-align: middle;
+      font-size: 14pt;
+      font-weight: bold;
+      border-radius: 6pt;
+      border: 1pt solid #334155;
+      line-height: 1.2;
+    }
+    .phase-chip {
+      width: 28pt;
+      height: 26pt;
+      text-align: center;
+      vertical-align: middle;
+      font-size: 10pt;
+      font-weight: bold;
+      border-radius: 6pt;
+      border: 1pt solid #334155;
+    }
+    .phase-title { color: #e6e6fa; font-size: 14pt; font-weight: bold; margin: 0; padding-left: 8pt; line-height: 1.5; }
+    .phase-card ul { margin: 0 0 12pt 0; padding-left: 18pt; color: #b8c1ec; }
+    .phase-card li { margin: 0 0 12pt 0; line-height: 1.5; }
+    .cpu { color: #64748b; font-size: 10pt; margin-right: 4pt; }
+    .orchestrator {
+      page-break-inside: avoid;
+      background-color: #0f172a;
+      border: 1pt solid #38bdf8;
+      padding: 12pt;
+      margin: 12pt 0;
+      border-radius: 6pt;
+    }
+    .orchestrator h2 {
+      color: #38bdf8;
+      font-size: 18pt;
+      margin: 0 0 12pt 0;
+      font-weight: bold;
+      line-height: 1.5;
+    }
+    .orchestrator p { color: #cbd5e1; font-size: 14pt; margin: 0 0 12pt 0; line-height: 1.5; }
+    .orchestrator strong { color: #4ade80; }
+    .diagram {
+      page-break-inside: avoid;
+      border: 1pt solid rgba(255,255,255,0.1);
+      background-color: #16213e;
+      padding: 12pt;
+      margin: 12pt 0;
+      border-radius: 8pt;
+    }
+    .diagram h3 {
+      color: #4ade80;
+      font-size: 14pt;
+      font-weight: bold;
+      margin: 0 0 12pt 0;
+      line-height: 1.5;
+      text-transform: uppercase;
+      letter-spacing: 1pt;
+    }
+    .flow { color: #8891b0; font-size: 14pt; margin-bottom: 12pt; line-height: 1.5; }
+    .row { width: 100%; border-collapse: collapse; margin-top: 4pt; }
+    .row td { vertical-align: top; padding: 8pt; font-size: 14pt; line-height: 1.5; }
+    .before { border: 1pt solid rgba(248,113,113,0.45); background-color: #2a1a24; }
+    .after { border: 1pt solid rgba(74,222,128,0.45); background-color: #0f2840; }
+    .arrow { width: 10%; text-align: center; color: #38bdf8; font-size: 16pt; padding-top: 12pt; line-height: 1.5; }
+    .mid-cap { font-size: 9pt; color: #64748b; text-transform: uppercase; letter-spacing: 1.5pt; margin-top: 4pt; line-height: 1.5; }
+    .auto-heal {
+      page-break-inside: avoid;
+      border: 2pt solid #00cc88;
+      background-color: #052e16;
+      color: #ecfdf5;
+      padding: 10pt 12pt;
+      margin: 12pt 0;
+      border-radius: 6pt;
+      font-size: 14pt;
+      line-height: 1.5;
+    }
+    .auto-heal strong { color: #4ade80; font-size: 14pt; }
+    .jobline { font-size: 11pt; color: #64748b; margin: 0 0 12pt 0; line-height: 1.5; }
+    h2.section {
+      color: #00cc88;
+      font-size: 18pt;
+      margin: 18pt 0 12pt 0;
+      border-bottom: 1pt solid #334155;
+      padding-bottom: 4pt;
+      font-weight: bold;
+      line-height: 1.5;
+    }
+    .ch-table { width: 100%; border-collapse: collapse; margin: 6pt 0 12pt 0; font-size: 11pt; line-height: 1.5; table-layout: fixed; word-wrap: break-word; }
+    .ch-table th {
+      text-align: left;
+      color: #94a3b8;
+      font-weight: bold;
+      border-bottom: 1pt solid #334155;
+      padding: 6pt 8pt;
+      background-color: #16213e;
+    }
+    .ch-table td { border-bottom: 1pt solid #1e293b; padding: 5pt 8pt; color: #b8c1ec; }
+    .ch-table .cn { color: #00cc88; font-weight: bold; width: 42pt; vertical-align: top; }
+    .ch-table .cname { color: #f8fafc; }
+    .engine {
+      page-break-inside: avoid;
+      background-color: #0f172a;
+      border: 1pt solid #334155;
+      padding: 8pt 10pt;
+      font-size: 10pt;
+      line-height: 1.5;
+      color: #94a3b8;
+      margin: 10pt 0;
+      border-radius: 5pt;
+    }
+    .engine strong { color: #38bdf8; }
+    .foot { margin-top: 12pt; text-align: center; font-size: 10pt; color: #64748b; line-height: 1.5; }
+    code { font-size: 10pt; color: #7dd3fc; background-color: #0f172a; padding: 1pt 4pt; border-radius: 2pt; }
+  </style>
+</head>
+<body style="margin:0;background-color:#1a1a2e;">
+<table class="pdf-outer-table" cellspacing="0" cellpadding="0" style="background-color:#1a1a2e;"><tr><td style="background-color:#1a1a2e;">
+<div id="pdf-wrapper" class="audit-shell">
+
+  <p class="tag">{{ dash.panel_tag }}</p>
+  <h1>{{ dash.panel_title }}</h1>
+  <table class="rule-row"><tr>
+    <td class="rb"></td><td class="rg"></td><td class="rr"></td>
+  </tr></table>
+  <p class="intro">{{ dash.panel_intro | safe }}</p>
+
+  <div class="legend">
+    <strong>Legend</strong> — Passed: channel clear ·
+    <strong>Auto-Heal</strong> / Auto-fixed: automation wrote a safe state (includes <strong>Shrink &amp; Re-Bleed</strong> 30 px/side micro-shrink + elevated bleed) ·
+    <strong>System Radar</strong>: edge / safe-zone signals only (no silent rescale) ·
+    Attention: live telemetry gate only (no operator patch list) · Failed: operator gate
+  </div>
+
+  {% if job_id %}
+  <p class="jobline"><strong>Personalized report</strong> — Job #{{ job_id }} · {{ filename }} · {{ generated_at }}</p>
+  {% else %}
+  <p class="jobline">System Intelligence reference · {{ generated_at }}</p>
+  {% endif %}
+
+  {% if auto_heal and auto_heal.applied %}
+  <div class="auto-heal">
+    <strong>Auto-Heal Event — Shrink &amp; Re-Bleed</strong><br/>
+    System Radar flagged safe-zone pressure. Trim plane micro-shrunk
+    <strong>{% if auto_heal.shrinkPxPerSide %}{{ auto_heal.shrinkPxPerSide }}{% else %}30{% endif %} px/side</strong>
+    ({{ (auto_heal.shrinkPxPerSide or 30) * 2 }} px/axis via INTER_AREA); bleed effective
+    <strong>{{ auto_heal.bleedPxEffective }}</strong> px (base {{ auto_heal.bleedPxBase }} px); strategy
+    <strong>{% if auto_heal.bleedStrategy %}{{ auto_heal.bleedStrategy }}{% else %}auto{% endif %}</strong>.
+    {% if auto_heal.safeZoneWarnings is defined and auto_heal.safeZoneWarnings is not none %}
+    <br/><span style="color:#94a3b8;font-size:11pt;line-height:1.5;">System Radar:
+      {% if auto_heal.safeZoneWarnings is sequence and auto_heal.safeZoneWarnings is not string %}
+        {{ auto_heal.safeZoneWarnings | join('; ') }}
+      {% else %}
+        {{ auto_heal.safeZoneWarnings }}
+      {% endif %}
+    </span>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Phase 1–3: character-for-character sync with client/src/pages/dashboard-rules.tsx PHASES -->
+  <div class="phase-card p1">
+    <table class="phase-head"><tr>
+      <td class="glyph-td" style="color:#4ade80;border-color:rgba(74,222,128,0.35);background-color:rgba(74,222,128,0.12);">S</td>
+      <td class="phase-chip" style="border-color:#4ade80;color:#4ade80;background-color:rgba(74,222,128,0.12);">P1</td>
+      <td><p class="phase-title">Phase 1: The Non-Destructive Core</p></td>
+    </tr></table>
+    <ul>
+      <li><span class="cpu">◇</span> Zero-destructive sizing: we never squash artwork on independent X/Y axes. Cover scaling + centre crop preserves a 1:1 pixel fidelity discipline on the trim plate.</li>
+      <li><span class="cpu">◇</span> 50 MB memory leash: uncompressed arrays above the production cap fail fast with ArtworkMemoryLimitError so the press queue never inherits silent downscales.</li>
+      <li><span class="cpu">◇</span> Vector preservation: bad PDF geometry is repaired by redefining MediaBox / CropBox / TrimBox in PyMuPDF—no opportunistic rasterize-to-fix shortcut.</li>
+    </ul>
+  </div>
+
+  <div class="phase-card p2">
+    <table class="phase-head"><tr>
+      <td class="glyph-td" style="color:#38bdf8;border-color:rgba(56,189,248,0.35);background-color:rgba(56,189,248,0.12);">R</td>
+      <td class="phase-chip" style="border-color:#38bdf8;color:#38bdf8;background-color:rgba(56,189,248,0.12);">P2</td>
+      <td><p class="phase-title">Phase 2: Safe Zone Intelligence</p></td>
+    </tr></table>
+    <ul>
+      <li><span class="cpu">◇</span> Shrink &amp; Re-Bleed auto-heal: validate_safe_zone() watches the inner 3.0 mm strips; violations trigger auto_resolve_safe_zone() from img_bgr.copy(), 30 px/side INTER_AREA shrink, +30 px bleed budget, then your chosen strategy (including AI Outpaint).</li>
+      <li><span class="cpu">◇</span> Canny radar: 30 px outer bands run high-frequency edge-density scoring to spotlight typography and logo energy before trimming.</li>
+    </ul>
+  </div>
+
+  <div class="phase-card p3">
+    <table class="phase-head"><tr>
+      <td class="glyph-td" style="color:#00cc88;border-color:rgba(0,204,136,0.35);background-color:rgba(0,204,136,0.12);">D</td>
+      <td class="phase-chip" style="border-color:#00cc88;color:#00cc88;background-color:rgba(0,204,136,0.12);">P3</td>
+      <td><p class="phase-title">Phase 3: Smart Bleed Engine</p></td>
+    </tr></table>
+    <ul>
+      <li><span class="cpu">◇</span> AI Outpaint (Melt): Content-Aware Abstraction reflects edge pixels, Gaussian-melts the seam, feathers alpha, and seeds litho-grain so extensions read like real stock.</li>
+      <li><span class="cpu">◇</span> Pixel-Drift uses a 1-pixel sampling radius on stretch / edge-replication paths—no backward glyphs, no kaleidoscope halos.</li>
+    </ul>
+  </div>
+
+  <!-- Hardcoded Safe Zone + Shrink & Re-Bleed orchestrator (smart_bleed.py) -->
+  <div class="orchestrator">
+    <h2>Safe Zone Intelligence — Shrink &amp; Re-Bleed orchestrator</h2>
+    <p style="color:#fca5a5;font-size:14pt;line-height:1.5;margin-bottom:12pt;"><strong>Superseded:</strong> legacy white-background “25-point check guide” PDF safe-zone copy.</p>
+    <p style="color:#86efac;font-size:14pt;line-height:1.5;margin-bottom:12pt;"><strong>Active (System Intelligence):</strong> <strong>System Radar</strong> + <strong>Shrink &amp; Re-Bleed Auto-Heal</strong> — 30 px/side micro-shrink (INTER_AREA) + elevated bleed — only.</p>
+    <p><strong>System Radar</strong> runs <strong>validate_safe_zone()</strong> on the trim BGR plane: inner <strong>{{ engine.safe_zone_mm }} mm</strong> strips (px from runtime DPI), median-adaptive threshold, <strong>MORPH_OPEN 3×3</strong>, closest-foreground distance per edge, <strong>Canny</strong> 30 px outer-band edge-density scoring. Right-edge text inside the critical strip escalates to CRITICAL so guillotine shear is visible before RIP.</p>
+    <p><strong>Auto-Heal</strong> runs <strong>auto_resolve_safe_zone()</strong> on <strong>img_bgr.copy()</strong> only: on violation, <strong>bleedPxEffective = base + {{ engine.bleed_boost_px_on_violation }}</strong>, <strong>cv2.resize</strong> to <strong>(W−{{ engine.shrink_total_per_axis_px }})×(H−{{ engine.shrink_total_per_axis_px }})</strong> with <strong>{{ engine.resize }}</strong> (30 px/side), then the bleed engine re-runs so litho keeps a full halo. Non-violation path keeps canvas size and base bleed px.</p>
+  </div>
+
+  <div class="diagram">
+    <h3>{{ dash.diagram_heading }}</h3>
+    <p class="flow">{{ dash.diagram_flow }}</p>
+    <table class="row">
+      <tr>
+        <td class="before" style="width:42%;">
+          <strong style="color:#fca5a5;">{{ dash.diagram_before_title }}</strong><br/>
+          <span style="color:#b8c1ec;">{{ dash.diagram_before_body }}</span>
+        </td>
+        <td class="arrow">→<div class="mid-cap">{{ dash.diagram_mid_label }}</div></td>
+        <td class="after" style="width:42%;">
+          <strong style="color:#4ade80;">{{ dash.diagram_after_title }}</strong><br/>
+          <span style="color:#b8c1ec;">{{ dash.diagram_after_body }}</span>
+        </td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="engine">
+    <strong>Lockstep</strong> (smart_bleed.py): <strong>{{ engine.validate }}</strong> · <strong>{{ engine.resolve }}</strong> ·
+    <strong>{{ engine.work_buffer }}</strong>
+  </div>
+
+  <h2 class="section">Phase 1 — Non-Destructive Core · channel index</h2>
+  <table class="ch-table">
+    <tr><th>#</th><th>Intelligence channel</th></tr>
+    {% for ch in checks %}{% if ch.phase == 1 %}
+    <tr><td class="cn">#{{ ch.num }}</td><td class="cname">{{ ch.name }}</td></tr>
+    {% endif %}{% endfor %}
+  </table>
+
+  <h2 class="section">Phase 2 — Safe Zone Intelligence · channel index</h2>
+  <table class="ch-table">
+    <tr><th>#</th><th>Intelligence channel</th></tr>
+    {% for ch in checks %}{% if ch.phase == 2 %}
+    <tr><td class="cn">#{{ ch.num }}</td><td class="cname">{{ ch.name }}</td></tr>
+    {% endif %}{% endfor %}
+  </table>
+
+  <h2 class="section">Phase 3 — Smart Bleed Engine · channel index</h2>
+  <table class="ch-table">
+    <tr><th>#</th><th>Intelligence channel</th></tr>
+    {% for ch in checks %}{% if ch.phase == 3 %}
+    <tr><td class="cn">#{{ ch.num }}</td><td class="cname">{{ ch.name }}</td></tr>
+    {% endif %}{% endfor %}
+  </table>
+
+  <p class="foot">© Flyerz.co.za Artwork Intelligence — {{ dash.footer_note }}</p>
+
+</div>
+</td></tr></table>
+</body>
+</html>

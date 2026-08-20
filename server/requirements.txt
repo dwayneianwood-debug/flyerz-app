@@ -1,0 +1,14 @@
+# Flyerz prepress / Python stack (install: pip install -r server/requirements.txt)
+# Ghostscript (gs / gswin64c) must be installed separately on Windows and on PATH.
+
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+PyMuPDF>=1.23.0
+pikepdf>=8.0.0
+Pillow>=10.0.0
+reportlab>=4.0.0
+jinja2>=3.1.0
+xhtml2pdf>=0.2.15
+python-dotenv>=1.0.0
+requests>=2.31.0
+google-genai>=2.0.0
