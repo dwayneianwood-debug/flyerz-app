@@ -101,6 +101,7 @@ def _publish_zip_bytes(zip_bytes: bytes, final_zip_path: str) -> None:
         raise
 
 # API strings matching Node `select-bleed-method`; any other value routes to auto clean-bleed
+# CLI strategy_map: "ai_outpaint" → BLEED_STRATEGY_AI_OUTPAINT (proxy inpaint in smart_bleed).
 FORCED_BLEED_API_KEYS = frozenset({
     "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint",
 })
@@ -407,7 +408,7 @@ def raster_mount_rect_from_px(width_px: int, height_px: int, dpi: float = FINAL_
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Target-first compile builds pages at press_target_media_rect already;      ║
+# ║  LAST geometry pass: target-first compile already built press_target pages; ║
 # ║  _enforce_final_mediabox only verifies geometry — identity copy, no relabel. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 def _enforce_final_mediabox(
