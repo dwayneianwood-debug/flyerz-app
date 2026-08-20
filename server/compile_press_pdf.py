@@ -92,8 +92,11 @@ def _publish_zip_bytes(zip_bytes: bytes, final_zip_path: str) -> None:
         raise
 
 # API strings matching Node `select-bleed-method`; any other value routes to auto clean-bleed
+BLEED_STRATEGY_AI_OUTPAINT = "ai_outpaint"
+BLEED_STRATEGY_COLOR_BORDER = "colorBorder"
 FORCED_BLEED_API_KEYS = frozenset({
-    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint", "colorBorder",
+    "bgExtract", "stretch", "mirror", "replicate", "upscale",
+    BLEED_STRATEGY_AI_OUTPAINT, BLEED_STRATEGY_COLOR_BORDER,
 })
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
