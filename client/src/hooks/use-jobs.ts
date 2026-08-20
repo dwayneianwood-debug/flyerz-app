@@ -78,7 +78,7 @@ export function useJob(id: number) {
     // Poll every 2 seconds if the job is still processing or pending
     refetchInterval: (query) => {
       const status = query.state?.data?.status;
-      if (status === "pending" || status === "processing") {
+      if (status === "pending" || status === "processing" || (status as string) === "queued") {
         return 2000;
       }
       return false;
