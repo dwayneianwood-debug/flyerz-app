@@ -93,7 +93,7 @@ def _publish_zip_bytes(zip_bytes: bytes, final_zip_path: str) -> None:
 
 # API strings matching Node `select-bleed-method`; any other value routes to auto clean-bleed
 FORCED_BLEED_API_KEYS = frozenset({
-    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint",
+    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint", "colorBorder",
 })
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1153,6 +1153,7 @@ def main():
     parser.add_argument("--input", required=True, help="Path to corrected artwork")
     parser.add_argument("--output", required=True, help="Output press-ready PDF path")
     parser.add_argument("--strategy", default="auto", help="Bleed strategy to apply")
+    parser.add_argument("--bleed-color", default="#FFFFFF", help="Solid hex colour for colorBorder bleed (RGB)")
     parser.add_argument("--color-space", default="cmyk", help="Target color space (cmyk or rgb)")
     parser.add_argument("--trim-w", type=float, default=148, help="Trim width in mm")
     parser.add_argument("--trim-h", type=float, default=210, help="Trim height in mm")
@@ -1365,6 +1366,7 @@ def main():
                 target_bleed_px=target_bleed_px,
                 bleed_strategy=bleed_api_strategy,
                 dpi=float(dpi),
+                border_color=args.bleed_color if bleed_api_strategy == "colorBorder" else None,
             )
             sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
 
@@ -1665,6 +1667,7 @@ def main():
                                 target_bleed_px=target_bleed_px_pdf,
                                 bleed_strategy=bleed_api_pdf,
                                 dpi=float(render_dpi),
+                                border_color=args.bleed_color if bleed_api_pdf == "colorBorder" else None,
                             )
                             del img_bgr
             
@@ -2389,6 +2392,7 @@ def main():
             "replicate": "Edge Replicate",
             "upscale": "Upscale",
             "ai_outpaint": "AI Outpaint (proxy inpaint)",
+            "colorBorder": "Colour Border",
             "auto": "Auto-Detect",
         }
         strategy_label = strategy_labels.get(args.strategy, args.strategy)

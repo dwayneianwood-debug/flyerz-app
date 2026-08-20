@@ -117,6 +117,10 @@ const BLEED_METHOD_LABELS = {
     description:
       "Fast proxy inpainting extends bleed colors softly; your 300 DPI artwork stays pixel-perfect in the center.",
   },
+  colorBorder: {
+    label: "Colour Border",
+    description: "Adds a solid colour pad as 5mm bleed. Artwork stays full size — pick any colour.",
+  },
 } as const;
 
 export default function JobDetails() {
@@ -147,6 +151,8 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [bleedBorderColor, setBleedBorderColor] = useState<string>("#FFFFFF");
+  const bleedColorDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bleedMethodLoading, setBleedMethodLoading] = useState(false);
   const [compileTaskId, setCompileTaskId] = useState<string | null>(null);
   const [compileState, setCompileState] = useState<string | null>(null);
@@ -359,6 +365,14 @@ export default function JobDetails() {
   }, [job?.auditResults?.selectedBleedMethod]);
 
   useEffect(() => {
+    const saved = bleedOptsObjectFromAudit(job?.auditResults as any).bleedBorderColor;
+    if (typeof saved === "string" && /^#?[0-9A-Fa-f]{6}$/.test(saved.trim())) {
+      const hex = saved.trim().startsWith("#") ? saved.trim() : `#${saved.trim()}`;
+      setBleedBorderColor(hex.toUpperCase());
+    }
+  }, [job?.id, job?.auditResults]);
+
+  useEffect(() => {
     const ai = (job?.auditResults as any)?.aiEnhancements;
     if (ai) {
       if (ai.denoise?.enabled) setAiDenoise(true);
@@ -530,6 +544,7 @@ export default function JobDetails() {
         cropData: cropPayload,
         targetSize: { width: trimW, height: trimH },
         autoShifter: autoShifterEnabled,
+        ...(strategy === "colorBorder" ? { bleedBorderColor } : {}),
       });
       const data = await res.json();
       setCompileTaskId(data.taskId);
@@ -685,7 +700,7 @@ export default function JobDetails() {
     }
   };
 
-  const handleBleedMethodSelect = async (method: string, forceRecompile = false) => {
+  const handleBleedMethodSelect = async (method: string, forceRecompile = false, borderColorOverride?: string) => {
     if (!job || bleedMethodLoading) return;
     if (!forceRecompile && method === selectedBleedMethod) return;
 
@@ -698,11 +713,18 @@ export default function JobDetails() {
       detail: { method, message: `Switching bleed to ${methodLabel}...` }
     }));
 
+    const colorToSend = method === "colorBorder"
+      ? (borderColorOverride || bleedBorderColor || "#FFFFFF")
+      : undefined;
+
     try {
       const res = await fetch(`/api/jobs/${job.id}/select-bleed-method`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ method }),
+        body: JSON.stringify({
+          method,
+          ...(colorToSend ? { bleedBorderColor: colorToSend } : {}),
+        }),
       });
 
       const data = await res.json();
@@ -1409,6 +1431,14 @@ export default function JobDetails() {
                         selected={selectedBleedMethod}
                         onSelect={handleBleedMethodSelect}
                         loading={bleedMethodLoading}
+                        borderColor={bleedBorderColor}
+                        onBorderColorChange={(hex) => {
+                          setBleedBorderColor(hex);
+                          if (bleedColorDebounceRef.current) clearTimeout(bleedColorDebounceRef.current);
+                          bleedColorDebounceRef.current = setTimeout(() => {
+                            handleBleedMethodSelect("colorBorder", true, hex);
+                          }, 400);
+                        }}
                       />
                     </div>
                   )}
@@ -2800,18 +2830,21 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, borderColor = "#FFFFFF", onBorderColorChange }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
   selected: string;
   onSelect: (method: string) => void;
   loading: boolean;
+  borderColor?: string;
+  onBorderColorChange?: (hex: string) => void;
 }) {
   /** Always list every registered strategy; variant paths may be partial if generation skipped a tile. */
   const methods = [...BLEED_STRATEGY_IDS];
   const activeMethod = selected === "auto" ? recommended : selected;
   const activeInfo = activeMethod ? BLEED_METHOD_LABELS[activeMethod as keyof typeof BLEED_METHOD_LABELS] : null;
+  const colorPresets = ["#FFFFFF", "#000000", "#F5F5F5", "#1A1A1A", "#C41E3A"];
 
   if (methods.length === 0) return null;
 
@@ -2851,12 +2884,45 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             {activeInfo.description}
           </p>
         )}
+        {activeMethod === "colorBorder" && (
+          <div className="rounded-lg border border-border/50 bg-white/60 dark:bg-background/40 p-3 space-y-2" data-testid="section-color-border-picker">
+            <div className="flex items-center gap-2">
+              <Palette className="w-3.5 h-3.5 text-primary" />
+              <span className="text-xs font-semibold text-foreground">Bleed colour</span>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {colorPresets.map((hex) => (
+                <button
+                  key={hex}
+                  type="button"
+                  onClick={() => onBorderColorChange?.(hex)}
+                  disabled={loading}
+                  title={hex}
+                  className={`w-7 h-7 rounded-full border-2 transition-all ${borderColor.toUpperCase() === hex ? "border-primary scale-110" : "border-border/60"}`}
+                  style={{ backgroundColor: hex }}
+                  data-testid={`button-bleed-color-${hex.replace("#", "")}`}
+                />
+              ))}
+              <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+                <input
+                  type="color"
+                  value={/^#[0-9A-Fa-f]{6}$/.test(borderColor) ? borderColor : "#FFFFFF"}
+                  onChange={(e) => onBorderColorChange?.(e.target.value.toUpperCase())}
+                  disabled={loading}
+                  className="w-8 h-8 p-0 border border-border/60 rounded cursor-pointer bg-transparent"
+                  data-testid="input-bleed-border-color"
+                />
+                <span data-testid="text-bleed-border-color">{borderColor}</span>
+              </label>
+            </div>
+          </div>
+        )}
         {activeMethod && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
             <div className="aspect-[16/9]">
               {variants[activeMethod] ? (
               <img
-                src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
+                src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}?c=${encodeURIComponent(borderColor)}`}
                 alt={activeInfo?.label || activeMethod}
                 className="w-full h-full object-contain"
                 data-testid={`img-bleed-variant-${activeMethod}`}

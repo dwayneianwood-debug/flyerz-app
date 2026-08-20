@@ -99,9 +99,10 @@ export interface AuditResults {
     replicate?: string;
     upscale?: string;
     ai_outpaint?: string;
+    colorBorder?: string;
   };
-  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint";
-  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "auto";
+  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colorBorder";
+  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colorBorder" | "auto";
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;
@@ -164,6 +165,7 @@ export const BLEED_STRATEGY_IDS = [
   "replicate",
   "upscale",
   "ai_outpaint",
+  "colorBorder",
 ] as const;
 
 export type BleedStrategyId = (typeof BLEED_STRATEGY_IDS)[number];
@@ -232,6 +234,8 @@ export interface BleedOptions {
   enableGutterCollisionCheck: boolean;
   enableWhiteEdgeRisk: boolean;
   enablePdfxCompliance: boolean;
+  /** Hex RGB used when selectedBleedMethod is colorBorder (solid colour pad as bleed). */
+  bleedBorderColor?: string;
 }
 
 export const defaultBleedOptions: BleedOptions = {

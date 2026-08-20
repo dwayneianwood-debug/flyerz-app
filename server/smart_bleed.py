@@ -3567,11 +3567,122 @@ BLEED_STRATEGY_UPSCALE = "upscale"
 BLEED_STRATEGY_AI_OUTPAINT = "ai_outpaint"
 BLEED_STRATEGY_GRADIENT_EXTRAPOLATE = "gradient_extrapolate"
 BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
+BLEED_STRATEGY_COLOR_BORDER = "colorBorder"
+DEFAULT_COLOR_BORDER_HEX = "#FFFFFF"
 
 # Frequency-separated edge replication: thick strip for grain vs low-frequency color split
 FREQ_SEP_STRIP_DEPTH = 4
 FREQ_SEP_GAUSSIAN_KSIZE = (3, 3)
 FREQ_SEP_GAUSSIAN_SIGMA = 1.0
+
+
+def parse_bleed_border_color_bgr(value) -> np.ndarray:
+    """Parse a user colour (hex RGB, rgb(), name, or 3-tuple RGB) to uint8 BGR. Default white."""
+    if isinstance(value, np.ndarray) and value.size >= 3:
+        return np.clip(np.round(value.reshape(-1)[:3].astype(np.float32)), 0, 255).astype(np.uint8)
+    if value is None or value == "":
+        return np.array([255, 255, 255], dtype=np.uint8)
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        r, g, b = [int(round(float(value[i]))) for i in range(3)]
+        return np.array(
+            [int(np.clip(b, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(r, 0, 255))],
+            dtype=np.uint8,
+        )
+    s = str(value).strip()
+    sl = s.lower().replace("_", "").replace("-", "").replace(" ", "")
+    if sl in ("white", "default"):
+        return np.array([255, 255, 255], dtype=np.uint8)
+    if sl in ("black",):
+        return np.array([0, 0, 0], dtype=np.uint8)
+    if sl.startswith("rgb"):
+        digits = []
+        num = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            elif num:
+                digits.append(int(num))
+                num = ""
+        if num:
+            digits.append(int(num))
+        if len(digits) >= 3:
+            r, g, b = digits[0], digits[1], digits[2]
+            return np.array(
+                [int(np.clip(b, 0, 255)), int(np.clip(g, 0, 255)), int(np.clip(r, 0, 255))],
+                dtype=np.uint8,
+            )
+    hexpart = s[1:] if s.startswith("#") else s
+    if len(hexpart) == 3 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+        hexpart = "".join(c * 2 for c in hexpart)
+    if len(hexpart) == 6 and all(c in "0123456789abcdefABCDEF" for c in hexpart):
+        r = int(hexpart[0:2], 16)
+        g = int(hexpart[2:4], 16)
+        b = int(hexpart[4:6], 16)
+        return np.array([b, g, r], dtype=np.uint8)
+    return np.array([255, 255, 255], dtype=np.uint8)
+
+
+def apply_color_border_bleed(
+    img: np.ndarray,
+    bleed_px: int,
+    color=None,
+    dpi: float = 300.0,
+) -> np.ndarray:
+    """
+    Solid colour pad as litho bleed. Trim artwork stays 100% scale and is not sampled,
+    stretched, or textured — the bleed slab is a constant BORDER_CONSTANT fill.
+    """
+    _ = dpi  # signature kept for callers; fill is resolution-independent
+    if img is None or img.size == 0 or bleed_px <= 0:
+        return img
+    fill = parse_bleed_border_color_bgr(color)
+    b_v, g_v, r_v = int(fill[0]), int(fill[1]), int(fill[2])
+    bd = int(bleed_px)
+
+    if img.ndim == 2:
+        gval = int(round(0.114 * b_v + 0.587 * g_v + 0.299 * r_v))
+        return cv2.copyMakeBorder(img, bd, bd, bd, bd, cv2.BORDER_CONSTANT, value=int(gval))
+
+    if img.ndim == 3 and img.shape[2] == 4:
+        bgr = np.ascontiguousarray(img[:, :, :3])
+        alpha = img[:, :, 3]
+        ext_bgr = cv2.copyMakeBorder(
+            bgr, bd, bd, bd, bd, cv2.BORDER_CONSTANT, value=(b_v, g_v, r_v)
+        )
+        ext_a = cv2.copyMakeBorder(alpha, bd, bd, bd, bd, cv2.BORDER_CONSTANT, value=255)
+        return cv2.merge([ext_bgr[:, :, 0], ext_bgr[:, :, 1], ext_bgr[:, :, 2], ext_a])
+
+    work = _pixel_drift_work_to_bgr_u8(img) if img.ndim == 3 else np.ascontiguousarray(img)
+    return cv2.copyMakeBorder(work, bd, bd, bd, bd, cv2.BORDER_CONSTANT, value=(b_v, g_v, r_v))
+
+
+def rewrite_color_border_variant_file(
+    src_path: str,
+    dest_path: str,
+    color,
+    dpi: float = 300.0,
+    bleed_mm: float | None = None,
+) -> dict:
+    """Rebuild a colorBorder preview PNG from a pre-bleed raster (used when the user picks a colour)."""
+    if not src_path or not os.path.exists(src_path):
+        return {"success": False, "error": f"Source missing: {src_path}"}
+    img = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
+    if img is None or img.size == 0:
+        return {"success": False, "error": f"Could not read {src_path}"}
+    dpi_f = float(dpi) if dpi and dpi > 0 else 300.0
+    mm = float(bleed_mm) if bleed_mm and bleed_mm > 0 else float(BLEED_TARGET_MM)
+    bleed_px = max(1, int(round((mm / 25.4) * dpi_f)))
+    out = apply_color_border_bleed(img, bleed_px, color, dpi_f)
+    if not cv2.imwrite(dest_path, out):
+        return {"success": False, "error": f"Failed to write {dest_path}"}
+    try:
+        from PIL import Image as PILImage
+
+        with PILImage.open(dest_path) as im:
+            im.save(dest_path, dpi=(300, 300))
+    except Exception:
+        pass
+    return {"success": True, "path": dest_path, "bleed_px": bleed_px}
 
 
 def _median_edge_bgr_u8(bgr: np.ndarray) -> np.ndarray:
@@ -7033,7 +7144,8 @@ def composite_ghost_frame_pullback(
 
 
 def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
-                           bleed_strategy: str = "auto", dpi: float = 300.0):
+                           bleed_strategy: str = "auto", dpi: float = 300.0,
+                           border_color=None):
     """
     Unified bleed entry: strict geometric safe-zone clamp (SAFE_ZONE_MM vs trim), INTER_CUBIC resize,
     centered full-trim canvas with BORDER_REPLICATE margins; then validate_safe_zone; Elastic Anchor
@@ -7089,6 +7201,10 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         "gradientextrapolate": BLEED_STRATEGY_GRADIENT_EXTRAPOLATE,
         "frequencyseparated": BLEED_STRATEGY_FREQUENCY_SEPARATED,
         "freqsep": BLEED_STRATEGY_FREQUENCY_SEPARATED,
+        "colorborder": BLEED_STRATEGY_COLOR_BORDER,
+        "colourborder": BLEED_STRATEGY_COLOR_BORDER,
+        "solidborder": BLEED_STRATEGY_COLOR_BORDER,
+        "colorpad": BLEED_STRATEGY_COLOR_BORDER,
     }
 
     h, w = work.shape[:2]
@@ -7125,12 +7241,22 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         return out, meta
 
     internal = strategy_map_lc[api_key]
-    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f)
-    out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
+    out = _apply_forced_strategy_bleed(
+        work, internal, bleed_px_use, dpi_f, border_color=border_color
+    )
+    # Colour-border bleed must stay a flat solid pad — do not overlay paper grain.
+    if internal != BLEED_STRATEGY_COLOR_BORDER:
+        out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
     return out, meta
 
 
-def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0) -> np.ndarray:
+def _apply_forced_strategy_bleed(
+    img: np.ndarray,
+    strategy: str,
+    bleed_px: int,
+    dpi: float = 300.0,
+    border_color=None,
+) -> np.ndarray:
     orig_h, orig_w = img.shape[:2]
 
     def _bleed_tic_if_match(out_img: np.ndarray) -> np.ndarray:
@@ -7151,6 +7277,14 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             "cv2.inpaint INPAINT_NS (border mask; strip/tile when large)\n"
         )
         return _bleed_tic_if_match(_apply_ai_outpaint_bleed(img, bleed_px))
+
+    if strategy == BLEED_STRATEGY_COLOR_BORDER:
+        fill = parse_bleed_border_color_bgr(border_color)
+        sys.stderr.write(
+            f"[BLEED][ROUTING] colorBorder → apply_color_border_bleed "
+            f"(BORDER_CONSTANT BGR={fill.tolist()}; trim 100% scale, no grain)\n"
+        )
+        return _bleed_tic_if_match(apply_color_border_bleed(img, bleed_px, fill, dpi))
 
     if strategy == BLEED_STRATEGY_REPLICATE:
         sys.stderr.write(
@@ -7235,6 +7369,7 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         (BLEED_STRATEGY_BG_EXTRACT, "bgextract"),
         (BLEED_STRATEGY_UPSCALE, "upscale"),
         (BLEED_STRATEGY_AI_OUTPAINT, "ai_outpaint"),
+        (BLEED_STRATEGY_COLOR_BORDER, "colorborder"),
     ]
     api_for_suffix = {
         "stretch": "stretch",
@@ -7245,18 +7380,28 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         "bgextract": "bgExtract",
         "upscale": "upscale",
         "ai_outpaint": "ai_outpaint",
+        "colorborder": "colorBorder",
     }
     for _strategy_internal, suffix in all_strategies:
         try:
+            extra = {}
+            if _strategy_internal == BLEED_STRATEGY_COLOR_BORDER:
+                extra["border_color"] = DEFAULT_COLOR_BORDER_HEX
             variant_img, _heal_meta = auto_resolve_safe_zone(
                 cropped.copy(),
                 target_bleed_px=extend_px,
                 bleed_strategy=api_for_suffix[suffix],
                 dpi=actual_dpi,
+                **extra,
             )
             variant_path = f"{output_base}_variant_{suffix}{ext}"
             cv2.imwrite(variant_path, variant_img)
-            key = "bgExtract" if suffix == "bgextract" else suffix
+            if suffix == "bgextract":
+                key = "bgExtract"
+            elif suffix == "colorborder":
+                key = "colorBorder"
+            else:
+                key = suffix
             variant_paths[key] = variant_path
             print(f"[BLEED] Generated variant: {suffix} -> {variant_path}")
         except Exception as e:
@@ -8960,6 +9105,7 @@ DEFAULT_BLEED_OPTIONS = {
     "enableGutterCollisionCheck": True,
     "enableWhiteEdgeRisk": True,
     "enablePdfxCompliance": True,
+    "bleedBorderColor": "#FFFFFF",
 }
 
 
@@ -8985,6 +9131,21 @@ def _attach_proof(result: dict):
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--rewrite-color-border":
+        if len(sys.argv) < 5:
+            print(json.dumps({
+                "success": False,
+                "error": "Usage: smart_bleed.py --rewrite-color-border <src> <dest> <hex> [dpi]",
+            }))
+            sys.exit(1)
+        src_path = sys.argv[2]
+        dest_path = sys.argv[3]
+        color = sys.argv[4]
+        dpi = float(sys.argv[5]) if len(sys.argv) > 5 else 300.0
+        result = rewrite_color_border_variant_file(src_path, dest_path, color, dpi)
+        print(json.dumps(result))
+        sys.exit(0 if result.get("success") else 1)
+
     if len(sys.argv) < 5:
         print(json.dumps({"error": "Usage: smart_bleed.py <input_path> <output_path> <file_type> <result_file> [bleed_options_json]"}))
         sys.exit(1)

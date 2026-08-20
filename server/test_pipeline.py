@@ -543,6 +543,14 @@ def section_4_architecture_compliance():
            '"ai_outpaint"' in compile_src and "BLEED_STRATEGY_AI_OUTPAINT" in compile_src,
            "compile_press_pdf must wire CLI strategy ai_outpaint")
 
+    record("arch", "LAW: BLEED_STRATEGY_COLOR_BORDER (solid colour pad) defined in smart_bleed",
+           "BLEED_STRATEGY_COLOR_BORDER" in bleed_src and "apply_color_border_bleed" in bleed_src,
+           "smart_bleed must expose colorBorder pipeline")
+
+    record("arch", "LAW: compile_press_pdf maps colorBorder in FORCED_BLEED_API_KEYS",
+           '"colorBorder"' in compile_src and "--bleed-color" in compile_src,
+           "compile_press_pdf must wire CLI strategy colorBorder and --bleed-color")
+
 
 def section_5_gs_ram_law():
     """Verify Ghostscript RAM cap is not violated in any file."""
@@ -2581,9 +2589,9 @@ def section_20_auto_resolve_safe_zone_orchestrator():
     old_fit_scale = sb._safe_zone_trim_fit_scale
     calls = []
 
-    def spy_apply(img_in, strat, bleed_px, dpi=300.0):
+    def spy_apply(img_in, strat, bleed_px, dpi=300.0, border_color=None, **kwargs):
         calls.append(((img_in.shape[1], img_in.shape[0]), strat, bleed_px))
-        return old_apply(img_in, strat, bleed_px, dpi)
+        return old_apply(img_in, strat, bleed_px, dpi, border_color=border_color, **kwargs)
 
     try:
         sb._apply_forced_strategy_bleed = spy_apply
@@ -3037,6 +3045,96 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_color_border_bleed():
+    """Colour-border bleed: solid pad, trim unchanged, hex parse, no grain overlay."""
+    import numpy as np
+    import smart_bleed as sb
+    from smart_bleed import (
+        BLEED_STRATEGY_COLOR_BORDER,
+        apply_color_border_bleed,
+        parse_bleed_border_color_bgr,
+        auto_resolve_safe_zone,
+    )
+
+    section = "color_border"
+    print(f"\n{BOLD}{CYAN}  SECTION: Colour-border bleed option{RESET}")
+
+    red_rgb_hex = parse_bleed_border_color_bgr("#FF0000")
+    record(section, "parse hex #FF0000 → BGR [0,0,255]",
+           np.array_equal(red_rgb_hex, np.array([0, 0, 255], dtype=np.uint8)),
+           f"got {red_rgb_hex.tolist()}")
+
+    black = parse_bleed_border_color_bgr("black")
+    record(section, "parse name 'black' → BGR zeros",
+           np.array_equal(black, np.array([0, 0, 0], dtype=np.uint8)),
+           f"got {black.tolist()}")
+
+    rgb_tuple = parse_bleed_border_color_bgr((10, 20, 30))
+    record(section, "parse RGB tuple (10,20,30) → BGR [30,20,10]",
+           np.array_equal(rgb_tuple, np.array([30, 20, 10], dtype=np.uint8)),
+           f"got {rgb_tuple.tolist()}")
+
+    h, w, bp = 80, 60, 7
+    art = np.zeros((h, w, 3), dtype=np.uint8)
+    art[:, :] = (40, 80, 200)  # BGR
+    fill = np.array([15, 220, 40], dtype=np.uint8)  # BGR (ndarray, not RGB tuple)
+    out = apply_color_border_bleed(art, bp, fill, dpi=300.0)
+    shape_ok = out.shape == (h + 2 * bp, w + 2 * bp, 3)
+    record(section, "apply_color_border_bleed expands canvas by 2×bleed_px",
+           shape_ok, f"shape={out.shape}")
+
+    trim = out[bp:bp + h, bp:bp + w]
+    trim_ok = np.array_equal(trim, art)
+    record(section, "Trim interior is byte-identical to original artwork",
+           trim_ok, "center crop vs source")
+
+    corner = out[0, 0]
+    edge_mid = out[0, bp + w // 2]
+    fill_ok = np.array_equal(corner, np.array(fill, dtype=np.uint8)) and np.array_equal(
+        edge_mid, np.array(fill, dtype=np.uint8)
+    )
+    record(section, "Bleed slab is solid user colour (corners + edge)",
+           fill_ok, f"corner={corner.tolist()} edge={edge_mid.tolist()}")
+
+    old_validate = sb.validate_safe_zone
+    old_shrink = sb._pre_bleed_safe_zone_uniform_shrink
+    try:
+        sb.validate_safe_zone = lambda *a, **k: {
+            "passed": True, "warnings": [], "criticalSafeZone": False, "message": "ok",
+        }
+        sb._pre_bleed_safe_zone_uniform_shrink = lambda img, dpi: (img, {"shrinkApplied": False})
+        orch, meta = auto_resolve_safe_zone(
+            art.copy(), target_bleed_px=bp, bleed_strategy="colorBorder",
+            dpi=300.0, border_color="#00FF00",
+        )
+        orch_h, orch_w = orch.shape[:2]
+        orch_size_ok = orch_h == h + 2 * bp and orch_w == w + 2 * bp
+        record(section, "auto_resolve_safe_zone colorBorder keeps 5mm envelope size",
+               orch_size_ok, f"out={orch_w}x{orch_h} meta={meta.get('bleedStrategy')}")
+
+        # Green hex #00FF00 → BGR (0, 255, 0). Grain overlay would perturb a corner pixel.
+        orch_corner = orch[0, 0]
+        expected_green = np.array([0, 255, 0], dtype=np.uint8)
+        grain_skipped = np.array_equal(orch_corner, expected_green)
+        record(section, "colorBorder skips bleed-zone paper grain (flat fill)",
+               grain_skipped, f"corner={orch_corner.tolist()}")
+        record(section, "BLEED_STRATEGY_COLOR_BORDER id is colorBorder",
+               BLEED_STRATEGY_COLOR_BORDER == "colorBorder",
+               BLEED_STRATEGY_COLOR_BORDER)
+    finally:
+        sb.validate_safe_zone = old_validate
+        sb._pre_bleed_safe_zone_uniform_shrink = old_shrink
+
+    schema_path = os.path.join(os.path.dirname(__file__), "..", "shared", "schema.ts")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema_src = f.read()
+    record(section, "shared/schema.ts registers colorBorder strategy id",
+           '"colorBorder"' in schema_src and "BLEED_STRATEGY_IDS" in schema_src,
+           "schema BLEED_STRATEGY_IDS")
+
+    gc.collect()
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3235,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_color_border_bleed()
         gc.collect()
 
         all_passed = print_report()

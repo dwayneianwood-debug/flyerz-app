@@ -143,6 +143,10 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--creep-mm", String(precompileCreepMm),
   ];
 
+  if (strategy === "colorBorder") {
+    args.push("--bleed-color", sanitizeBleedBorderColor(savedOpts?.bleedBorderColor));
+  }
+
   if (savedOpts?.cropX != null && savedOpts?.cropY != null &&
       savedOpts?.cropWidth != null && savedOpts?.cropHeight != null) {
     args.push(
@@ -415,6 +419,15 @@ function readTargetMmFromForm(body: any): { targetWidth?: number; targetHeight?:
   return out;
 }
 
+function sanitizeBleedBorderColor(raw: unknown): string {
+  const s = String(raw ?? "").trim();
+  const hex = s.startsWith("#") ? s.slice(1) : s;
+  if (/^[0-9A-Fa-f]{6}$/.test(hex)) {
+    return `#${hex.toUpperCase()}`;
+  }
+  return "#FFFFFF";
+}
+
 function sanitizeBleedOptions(parsed: any) {
   if (!parsed || typeof parsed !== 'object') return undefined;
   const result: any = {
@@ -448,6 +461,13 @@ function sanitizeBleedOptions(parsed: any) {
     enableWhiteEdgeRisk: parsed.enableWhiteEdgeRisk !== false,
     enablePdfxCompliance: parsed.enablePdfxCompliance !== false,
   };
+
+  const borderHex = parsed.bleedBorderColor != null && String(parsed.bleedBorderColor).trim() !== ""
+    ? sanitizeBleedBorderColor(parsed.bleedBorderColor)
+    : "";
+  if (borderHex) {
+    result.bleedBorderColor = borderHex;
+  }
 
   if (parsed.clientOptimized) {
     result.clientOptimized = true;
@@ -1491,7 +1511,7 @@ export async function registerRoutes(
       const ext = path.extname(variantPath).toLowerCase();
       const mimeMap: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf" };
       res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
-      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Cache-Control", method === "colorBorder" ? "no-store" : "public, max-age=3600");
       const { createReadStream } = await import("fs");
       createReadStream(variantPath).pipe(res);
     } catch (error) {
@@ -1526,14 +1546,55 @@ export async function registerRoutes(
       const previousStrategy = auditResults.selectedBleedMethod || "auto";
       console.log(`TRACER: [Checkpoint A] select-bleed-method: job=${jobId} previousStrategy="${previousStrategy}" → newStrategy="${method}"`);
 
+      const selectSavedOpts = coerceSavedBleedOptionsFromDb((auditResults as any)?.savedBleedOptions);
+      const incomingColor = req.body?.bleedBorderColor;
+      if (method === "colorBorder") {
+        selectSavedOpts.bleedBorderColor = sanitizeBleedBorderColor(incomingColor);
+      }
+
       const updatedResults: AuditResults = {
         ...auditResults,
         selectedBleedMethod: method as AuditResults["selectedBleedMethod"],
+        savedBleedOptions: selectSavedOpts,
       };
+
+      if (method === "colorBorder") {
+        const existingVariant = (updatedResults.bleedVariants as any)?.colorBorder;
+        const preBleedForVariant = (updatedResults as any).preBleedPath;
+        const SMART_BLEED_SCRIPT = path.join(process.cwd(), "server", "smart_bleed.py");
+        const rewriteSrc = (preBleedForVariant && isPathSafe(preBleedForVariant) && fsSync.existsSync(preBleedForVariant))
+          ? preBleedForVariant
+          : "";
+        const rewriteDest = (existingVariant && isPathSafe(existingVariant))
+          ? existingVariant
+          : (preBleedForVariant ? `${String(preBleedForVariant).replace(/\.[^.]+$/, "")}_variant_colorborder.png` : "");
+        if (rewriteSrc && rewriteDest) {
+          try {
+            const rewrite = spawnSync(PYTHON_BIN, [
+              SMART_BLEED_SCRIPT,
+              "--rewrite-color-border",
+              rewriteSrc,
+              rewriteDest,
+              selectSavedOpts.bleedBorderColor,
+              "300",
+            ], { cwd: process.cwd(), env: PYTHON_ENV, timeout: 20000, encoding: "utf8" });
+            if (rewrite.status === 0) {
+              updatedResults.bleedVariants = {
+                ...(updatedResults.bleedVariants || {}),
+                colorBorder: rewriteDest,
+              };
+              console.log(`[FAI] colorBorder variant rewritten: ${rewriteDest} colour=${selectSavedOpts.bleedBorderColor}`);
+            } else {
+              console.warn(`[FAI] colorBorder variant rewrite failed: ${rewrite.stderr || rewrite.stdout}`);
+            }
+          } catch (rewriteErr) {
+            console.warn("[FAI] colorBorder variant rewrite error:", rewriteErr);
+          }
+        }
+      }
 
       await storage.updateJob(jobId, { auditResults: updatedResults });
 
-      const selectSavedOpts = coerceSavedBleedOptionsFromDb((auditResults as any)?.savedBleedOptions);
       const selectHasCrop = !!(selectSavedOpts?.cropWidth && selectSavedOpts?.cropHeight);
       const preBleedPath = (updatedResults as any).preBleedPath;
       let artworkPath = selectHasCrop ? job.originalPath : (preBleedPath || job.originalPath);
@@ -1545,11 +1606,12 @@ export async function registerRoutes(
       }
       console.log(`DEBUG: select-bleed-method Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${selectHasCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
 
+      const jobForCompile = { ...job, auditResults: updatedResults };
       if (artworkPath && job.status === "complete") {
         try {
           await fs.access(artworkPath);
           console.log(`TRACER: [Checkpoint B] spawnPreCompile: job=${jobId} strategy="${method}" artworkPath="${artworkPath}"`);
-          spawnPreCompile(jobId, artworkPath, method, job);
+          spawnPreCompile(jobId, artworkPath, method, jobForCompile);
         } catch (e) {
           console.log(`[FAI] Pre-compile skipped for job ${jobId}: artwork not accessible`);
         }
@@ -2015,6 +2077,16 @@ export async function registerRoutes(
         ...cropArgs,
         ...(autoShifter ? ["--auto-shifter", "2.0"] : []),
       ];
+
+      if (effectiveStrategy === "colorBorder") {
+        const bodyColor = req.body?.bleedBorderColor;
+        const colorHex = sanitizeBleedBorderColor(
+          bodyColor != null && String(bodyColor).trim() !== ""
+            ? bodyColor
+            : compileSavedOpts?.bleedBorderColor
+        );
+        args.push("--bleed-color", colorHex);
+      }
 
       if (job.originalPath && job.originalPath !== artworkPath) {
         args.push("--original-path", job.originalPath);

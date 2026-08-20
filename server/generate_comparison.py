@@ -12,6 +12,8 @@ BLEED_METHOD_LABELS = {
     "mirror": "Mirror + Cross-Fade",
     "replicate": "Edge Replication",
     "upscale": "Upscale",
+    "ai_outpaint": "AI Outpaint",
+    "colorBorder": "Colour Border",
 }
 
 def render_pdf_page_to_image(pdf_path: str, max_dim: int = 1200) -> PILImage.Image:
