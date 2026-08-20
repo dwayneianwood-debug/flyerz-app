@@ -29,6 +29,7 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -265,7 +266,7 @@ export default function JobDetails() {
   useEffect(() => {
     if (job?.status === "processing") {
       window.dispatchEvent(
-        new CustomEvent("glitchy:audit-sync", { detail: { overallPassed: false } }),
+        new CustomEvent("glitchy:audit-sync", { detail: { overallPassed: false, jobStatus: "processing" } }),
       );
     }
   }, [job?.status]);
@@ -273,6 +274,9 @@ export default function JobDetails() {
   /** Background process failures (batch/async): Glitchy only — no duplicate toast. */
   useEffect(() => {
     if (!job || job.status !== "failed") return;
+    window.dispatchEvent(
+      new CustomEvent("glitchy:audit-sync", { detail: { overallPassed: false, jobStatus: "failed" } }),
+    );
     const payload = job.errorMessage ?? job.auditResults?.checks?.find(
       (c) => c.name === "Safe Zone Layout",
     )?.message;
@@ -286,7 +290,10 @@ export default function JobDetails() {
     if (job?.status !== "complete" || !job.auditResults) return;
     window.dispatchEvent(
       new CustomEvent("glitchy:audit-sync", {
-        detail: { overallPassed: job.auditResults.overallPassed === true },
+        detail: {
+          overallPassed: job.auditResults.overallPassed === true,
+          jobStatus: "complete",
+        },
       }),
     );
   }, [job?.status, job?.auditResults?.overallPassed, job?.id]);
@@ -396,25 +403,43 @@ export default function JobDetails() {
   }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
 
   const noneCountRef = useRef(0);
+  const compilingCountRef = useRef(0);
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
     if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
+    compilingCountRef.current = 0;
     const MAX_NONE_POLLS = 8;
+    const MAX_COMPILING_POLLS = 90;
+    const methodLabel = selectedBleedMethod;
+    const dispatchCompileComplete = (downloadUrl: string, extra: Record<string, unknown> = {}) => {
+      window.dispatchEvent(new CustomEvent("glitchy:compile-complete", {
+        detail: {
+          downloadUrl,
+          glitchyMessage: extra.glitchyMessage || extra.message || "Your artwork is compiled and ready for the press!",
+          glitchyState: extra.glitchyState || "triumphant",
+          selectedBleedMethod: methodLabel,
+          auditReport: extra.auditReport || null,
+        },
+      }));
+    };
     const poll = async () => {
       try {
         const res = await fetch(`/api/jobs/${job.id}/precompile-status?strategy=${encodeURIComponent(selectedBleedMethod)}`);
         const data = await res.json();
         if (cancelled) return;
         if (data.state === "ready") {
+          const dlUrl = `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
           setPreCompileState("ready");
           setPreCompileMessage(data.message || "");
           setCompileState("COMPLETE");
-          setCompileDownloadUrl(`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`);
+          setCompileDownloadUrl(dlUrl);
           queryClient.invalidateQueries({ queryKey: ["job", job.id] });
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
+          dispatchCompileComplete(dlUrl, data);
           cancelled = true;
         } else if (data.state === "failed") {
           setPreCompileState("failed");
@@ -423,21 +448,37 @@ export default function JobDetails() {
           setCompileError(data.error || data.message || "Pre-compilation failed");
           window.dispatchEvent(new CustomEvent("glitchy:compile-error", { detail: { message: data.error || "Compilation failed" } }));
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
           cancelled = true;
         } else if (data.state === "none") {
           noneCountRef.current++;
+          compilingCountRef.current = 0;
           if (noneCountRef.current >= MAX_NONE_POLLS) {
+            const dlUrl = `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
             setPreCompileState("ready");
             setPreCompileMessage("Artwork ready for download.");
             setCompileState("COMPLETE");
-            setCompileDownloadUrl(`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`);
+            setCompileDownloadUrl(dlUrl);
             noneCountRef.current = 0;
+            dispatchCompileComplete(dlUrl, { message: "Artwork ready for download." });
             cancelled = true;
           }
         } else if (data.state === "compiling") {
-          setPreCompileState("compiling");
-          setPreCompileMessage(data.message || "");
+          compilingCountRef.current++;
           noneCountRef.current = 0;
+          if (compilingCountRef.current >= MAX_COMPILING_POLLS) {
+            setPreCompileState("failed");
+            setPreCompileMessage("Compilation is taking too long.");
+            setCompileState("FAILURE");
+            setCompileError("Compilation is taking too long. Please try again.");
+            window.dispatchEvent(new CustomEvent("glitchy:compile-error", {
+              detail: { message: "This is taking too long — click me if you're stuck." },
+            }));
+            cancelled = true;
+          } else {
+            setPreCompileState("compiling");
+            setPreCompileMessage(data.message || "");
+          }
         }
       } catch {}
     };
@@ -473,6 +514,15 @@ export default function JobDetails() {
           setCompileState("COMPLETE");
           clearInterval(interval);
           await queryClient.invalidateQueries({ queryKey: ["job", job.id] });
+          window.dispatchEvent(new CustomEvent("glitchy:compile-complete", {
+            detail: {
+              downloadUrl: data.downloadUrl || null,
+              glitchyMessage: data.glitchy_message || data.message || "Your artwork is compiled and ready for the press!",
+              glitchyState: data.glitchy_state || "triumphant",
+              auditReport: data.auditReport || null,
+              selectedBleedMethod,
+            },
+          }));
         } else if (data.state === "FAILURE") {
           const errMsg = data.error || data.message || "Compilation failed";
           setCompileError(errMsg);
@@ -486,7 +536,7 @@ export default function JobDetails() {
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [compileTaskId, job?.id]);
+  }, [compileTaskId, job?.id, selectedBleedMethod]);
 
   const handleCompilePressReady = async (strategyOverride?: string): Promise<boolean> => {
     if (!job) return false;
@@ -512,13 +562,11 @@ export default function JobDetails() {
       const colorProfile = oo.colorProfile || "cmyk";
 
       const savedCrop = oo;
-      const cropPayload = (savedCrop?.cropX != null && savedCrop?.cropWidth > 0) ? {
-        cropX: savedCrop.cropX,
-        cropY: savedCrop.cropY,
-        cropWidth: savedCrop.cropWidth,
-        cropHeight: savedCrop.cropHeight,
-      } : undefined;
-      console.log(`[COMPILE] Proceed to Download handoff: hasCrop=${!!cropPayload}, trimSize=${trimW}×${trimH}mm, strategy=${strategy}${cropPayload ? `, crop=(${cropPayload.cropX},${cropPayload.cropY}) ${cropPayload.cropWidth}×${cropPayload.cropHeight}` : ''}`);
+      const cropPayload = ensureFullPageCropBox(
+        (hasValidCropBox(savedCrop) ? savedCrop : { ...savedCrop, isNoCrop: true }),
+        { force: true },
+      );
+      console.log(`[COMPILE] Proceed to Download handoff: hasCrop=${hasValidCropBox(savedCrop)}, trimSize=${trimW}×${trimH}mm, strategy=${strategy}, crop=(${cropPayload.cropX},${cropPayload.cropY}) ${cropPayload.cropWidth}×${cropPayload.cropHeight}`);
 
       const res = await apiRequest("POST", `/api/jobs/${job.id}/compile-print-pdf`, {
         selectedStrategy: strategy,

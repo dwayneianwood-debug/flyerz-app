@@ -249,6 +249,11 @@ def gate_6_no_crop_safety():
           "full_page_crop" in bleed_src or "NO_CROP_FULL_PAGE" in bleed_src or "auto_crop_mockup_bounding_box" in bleed_src,
           "No-crop path must initialize a valid bounding box")
 
+    crop_box_path = os.path.join(SERVER_DIR, "crop_box.py")
+    check("G6.5", "crop_box.py helper exists for No Crop full-page fallback",
+          os.path.exists(crop_box_path),
+          "server/crop_box.py must provide ensure_full_page_crop_box")
+
     check("G6.3", "original_input_path preserved through pipeline",
           "original_input_path = input_path" in bleed_src,
           "Must capture original input before emergency/flatten rewrites")

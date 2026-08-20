@@ -309,6 +309,10 @@ export default function GlitchyWidget() {
         setChecklistPassOverride(false);
         setAchievementPhase(null);
         fetchChecklist();
+        if (d.jobStatus === "complete" || d.jobStatus === "failed") {
+          setProcessState("IDLE");
+          setProcessingMessage("");
+        }
       } else {
         fetchChecklist();
       }
@@ -564,7 +568,16 @@ export default function GlitchyWidget() {
       setIsInteracting(false);
       return;
     }
-    if (processState === "PROCESSING") return;
+    if (processState === "PROCESSING" || processState === "QUEUED") {
+      setProcessState("IDLE");
+      setProcessingMessage("");
+      setIsInteracting(true);
+      idleRef.current = 0;
+      setChatBoxVisible(true);
+      setShowFeedback(true);
+      fetchChecklist();
+      return;
+    }
 
     if (catMode !== "head") {
       idleRef.current = 0;
@@ -637,10 +650,15 @@ export default function GlitchyWidget() {
         page: window.location.pathname,
         timestamp: new Date().toLocaleString(),
         jobId,
+        crop_box: [0, 0, 1, 1],
+        is_no_crop: true,
+        full_page_dimensions: [0, 0, 1, 1],
         page_state: {
           page: window.location.pathname,
           jobId,
           href: window.location.href,
+          is_no_crop: true,
+          full_page_dimensions: [0, 0, 1, 1],
         },
       }),
     });
@@ -922,6 +940,7 @@ export default function GlitchyWidget() {
           overflow: "visible",
           zIndex: 9999,
           fontFamily: "sans-serif",
+          transformOrigin: "bottom center",
           transition: "bottom 0.5s ease-in-out, left 2s linear",
         }}
       >
