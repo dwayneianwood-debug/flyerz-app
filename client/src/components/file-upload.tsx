@@ -17,6 +17,7 @@ import { defaultBleedOptions } from "@shared/schema";
 import { ManualCropEmbedded, type CropCoordinates } from "@/pages/manual-crop";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
+import { FULL_PAGE_CROP_BOX, isFullPageCropBox } from "@/lib/full-page-crop";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -661,7 +662,7 @@ export function FileUpload() {
       const ext = stagedFile.name.split('.').pop()?.toLowerCase() || '';
       const isImage = ['png', 'jpg', 'jpeg'].includes(ext);
 
-      if (pendingCropCoords && isImage) {
+      if (pendingCropCoords && isImage && !isFullPageCropBox(pendingCropCoords)) {
         console.log(`[UPLOAD] Client-side crop: cropping ${stagedFile.name} in browser before upload`);
         setIsCropping(true);
         try {
@@ -685,9 +686,21 @@ export function FileUpload() {
         (uploadBleedOptions as any).cropY = pendingCropCoords.cropY;
         (uploadBleedOptions as any).cropWidth = pendingCropCoords.cropWidth;
         (uploadBleedOptions as any).cropHeight = pendingCropCoords.cropHeight;
-        console.log(`[UPLOAD] PDF crop coords attached: x=${pendingCropCoords.cropX.toFixed(4)}, y=${pendingCropCoords.cropY.toFixed(4)}, w=${pendingCropCoords.cropWidth.toFixed(4)}, h=${pendingCropCoords.cropHeight.toFixed(4)}`);
+        if (isFullPageCropBox(pendingCropCoords)) {
+          (uploadBleedOptions as any).is_no_crop = true;
+          console.log(`[UPLOAD] NO_CROP_FULL_PAGE: crop_box = full page (0,0,1,1) — raster-first handoff`);
+        } else {
+          console.log(`[UPLOAD] PDF crop coords attached: x=${pendingCropCoords.cropX.toFixed(4)}, y=${pendingCropCoords.cropY.toFixed(4)}, w=${pendingCropCoords.cropWidth.toFixed(4)}, h=${pendingCropCoords.cropHeight.toFixed(4)}`);
+        }
       } else {
-        console.log(`[UPLOAD] No crop data — full artwork will be used`);
+        // No Crop Needed / submit-as-is: always populate a full-page crop_box so
+        // PyMuPDF never sees a missing box (Document Closed / hung job page).
+        (uploadBleedOptions as any).cropX = FULL_PAGE_CROP_BOX.cropX;
+        (uploadBleedOptions as any).cropY = FULL_PAGE_CROP_BOX.cropY;
+        (uploadBleedOptions as any).cropWidth = FULL_PAGE_CROP_BOX.cropWidth;
+        (uploadBleedOptions as any).cropHeight = FULL_PAGE_CROP_BOX.cropHeight;
+        (uploadBleedOptions as any).is_no_crop = true;
+        console.log(`[UPLOAD] NO_CROP_FULL_PAGE: crop_box = full page (0,0,1,1) — raster-first handoff`);
       }
 
       if (preserveBleed) {
@@ -1061,7 +1074,7 @@ export function FileUpload() {
       {wizardStage >= 3 && stagedFile && (
         <div ref={stage3Ref}>
 
-        {pendingCropCoords && (
+        {pendingCropCoords && !isFullPageCropBox(pendingCropCoords) && (
           <Card className="p-3 mb-3 border-green-500/30 bg-green-500/5 glass-card tech-corners" data-testid="panel-crop-handoff-summary">
             <div className="flex items-center gap-2">
               <Scissors className="w-4 h-4 text-green-600 dark:text-green-400 shrink-0" />
@@ -1166,7 +1179,10 @@ export function FileUpload() {
                 Crop artwork
               </Button>
               <Button
-                onClick={() => { setPendingCropCoords(null); setPreserveBleed(true); }}
+                onClick={() => {
+                  setPendingCropCoords(FULL_PAGE_CROP_BOX);
+                  setPreserveBleed(true);
+                }}
                 variant={xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') ? "default" : "ghost"}
                 className={cn("flex-1 gap-2", xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') && "bg-green-600 hover:bg-green-700 text-white")}
                 data-testid="button-skip-crop"
@@ -1182,7 +1198,7 @@ export function FileUpload() {
                 <span className="text-sm font-semibold text-foreground truncate" data-testid="text-staged-filename-stage3">{stagedFile.name}</span>
                 <span className="text-xs text-muted-foreground ml-auto shrink-0">{(stagedFile.size / 1024 / 1024).toFixed(1)} MB</span>
               </div>
-              {pendingCropCoords && (
+              {pendingCropCoords && !isFullPageCropBox(pendingCropCoords) && (
                 <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/25 rounded-lg px-3 py-2 mb-2" data-testid="indicator-crop-active-stage3">
                   <CheckCircle2 className="w-3.5 h-3.5 text-green-600 shrink-0" />
                   <span className="text-xs font-medium text-green-700 dark:text-green-400">Crop active: {Math.round(pendingCropCoords.cropWidth * 100)}% × {Math.round(pendingCropCoords.cropHeight * 100)}% of original</span>

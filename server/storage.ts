@@ -152,6 +152,26 @@ export function coerceSavedBleedOptionsFromDb(raw: unknown): Record<string, any>
   return { ...o, targetWidth: tw, targetHeight: th };
 }
 
+/** True when crop_box is the No Crop Needed full-page box (0,0,1,1) or is_no_crop. */
+export function isFullPageNoCrop(opts: Record<string, any> | null | undefined): boolean {
+  if (!opts) return false;
+  if (opts.is_no_crop === true) return true;
+  const cx = Number(opts.cropX);
+  const cy = Number(opts.cropY);
+  const cw = Number(opts.cropWidth);
+  const ch = Number(opts.cropHeight);
+  return cx === 0 && cy === 0 && cw === 1 && ch === 1;
+}
+
+/** User-drawn crop only — full-page no-crop must not be treated as a mockup-killer crop. */
+export function isManualCropActive(opts: Record<string, any> | null | undefined): boolean {
+  if (!opts) return false;
+  if (isFullPageNoCrop(opts)) return false;
+  const cw = Number(opts.cropWidth);
+  const ch = Number(opts.cropHeight);
+  return opts.cropX != null && opts.cropY != null && Number.isFinite(cw) && cw > 0 && Number.isFinite(ch) && ch > 0;
+}
+
 function parseAuditResultsColumn(raw: unknown): FileJobResponse["auditResults"] {
   const text = auditColumnToString(raw);
   if (text == null || text === "") return null;

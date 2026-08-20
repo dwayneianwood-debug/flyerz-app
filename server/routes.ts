@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
+import { storage, coerceSavedBleedOptionsFromDb, isManualCropActive } from "./storage";
 import { api, buildUrl } from "@shared/routes";
 import type { AuditCheck, AuditResults } from "@shared/schema";
 import {
@@ -104,7 +104,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
 
   const auditResults = job.auditResults as AuditResults | null;
   const savedOptsDebug = coerceSavedBleedOptionsFromDb((auditResults as any)?.savedBleedOptions);
-  const hasCropDebug = savedOptsDebug?.cropX != null;
+  const hasCropDebug = isManualCropActive(savedOptsDebug);
   console.log(`[FAI] spawnPreCompile job=${jobId} strategy=${strategy} artworkPath=${artworkPath} hasCrop=${hasCropDebug} cropCoords=${hasCropDebug ? `(${savedOptsDebug.cropX},${savedOptsDebug.cropY}) ${savedOptsDebug.cropWidth}x${savedOptsDebug.cropHeight}` : 'none'}`);
   console.log(`TRACER: [Checkpoint B2] spawnPreCompile INSIDE: job=${jobId} strategy="${strategy}" dbSelectedBleedMethod="${auditResults?.selectedBleedMethod || 'none'}" recommended="${auditResults?.recommendedBleedMethod || 'none'}"`);
 
@@ -143,8 +143,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--creep-mm", String(precompileCreepMm),
   ];
 
-  if (savedOpts?.cropX != null && savedOpts?.cropY != null &&
-      savedOpts?.cropWidth != null && savedOpts?.cropHeight != null) {
+  if (isManualCropActive(savedOpts)) {
     args.push(
       "--crop-x", String(savedOpts.cropX),
       "--crop-y", String(savedOpts.cropY),
@@ -196,6 +195,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     entry.state = "failed";
     entry.error = "Pre-compilation timed out";
     updateTask(task.taskId, { state: "FAILURE", message: "Pre-compilation timed out after 180 seconds" });
+    if (entry.resolveDone) entry.resolveDone();
   }, COMPILE_TIMEOUT_MS);
 
   let pollInterval: ReturnType<typeof setInterval> | null = setInterval(() => {
@@ -457,6 +457,10 @@ function sanitizeBleedOptions(parsed: any) {
   if (parsed.preserveBleed) {
     result.preserveBleed = true;
     console.log(`[FAI] preserveBleed=true — scale_fill bypass requested`);
+  }
+
+  if (parsed.is_no_crop === true) {
+    result.is_no_crop = true;
   }
 
   if (parsed.cropX != null && parsed.cropY != null &&
@@ -883,7 +887,7 @@ export async function registerRoutes(
         console.log(`[FAI] Mockup Killer crop: (${req.body.cropX},${req.body.cropY}) ${req.body.cropWidth}x${req.body.cropHeight}`);
       }
 
-      const finalCropActive = (bleedOptions as any)?.cropX != null && (bleedOptions as any)?.cropWidth > 0;
+      const finalCropActive = isManualCropActive(bleedOptions as any);
       bleedOptions = sanitizeBleedOptions(coerceSavedBleedOptionsFromDb(bleedOptions ?? {}));
       console.log(`[FAI] processFile handoff job=${jobId}: hasCrop=${finalCropActive}${finalCropActive ? `, crop=(${(bleedOptions as any)?.cropX},${(bleedOptions as any)?.cropY}) ${(bleedOptions as any)?.cropWidth}x${(bleedOptions as any)?.cropHeight}` : ''}, targetSize=${(bleedOptions as any)?.targetWidth || '?'}x${(bleedOptions as any)?.targetHeight || '?'}mm`);
 
@@ -1534,7 +1538,7 @@ export async function registerRoutes(
       await storage.updateJob(jobId, { auditResults: updatedResults });
 
       const selectSavedOpts = coerceSavedBleedOptionsFromDb((auditResults as any)?.savedBleedOptions);
-      const selectHasCrop = !!(selectSavedOpts?.cropWidth && selectSavedOpts?.cropHeight);
+      const selectHasCrop = isManualCropActive(selectSavedOpts);
       const preBleedPath = (updatedResults as any).preBleedPath;
       let artworkPath = selectHasCrop ? job.originalPath : (preBleedPath || job.originalPath);
       if (preBleedPath && !selectHasCrop) {
@@ -1942,8 +1946,8 @@ export async function registerRoutes(
         cropWidth: Number(rawCrop.cropWidth) || 0,
         cropHeight: Number(rawCrop.cropHeight) || 0,
       } : null;
-      const requestHasCrop = !!(requestCrop && isFinite(requestCrop.cropWidth) && requestCrop.cropWidth > 0 && isFinite(requestCrop.cropHeight) && requestCrop.cropHeight > 0);
-      const dbHasCrop = !!(compileSavedOpts?.cropWidth && compileSavedOpts?.cropHeight);
+      const requestHasCrop = !!(requestCrop && isManualCropActive(requestCrop));
+      const dbHasCrop = isManualCropActive(compileSavedOpts);
       const hasCrop = requestHasCrop || dbHasCrop;
 
       const cropSource = requestHasCrop ? requestCrop : (dbHasCrop ? compileSavedOpts : null);

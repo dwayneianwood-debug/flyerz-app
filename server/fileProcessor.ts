@@ -1,4 +1,4 @@
-import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
+import { storage, coerceSavedBleedOptionsFromDb, isManualCropActive } from "./storage";
 import type { AuditResults, AuditCheck, BleedOptions, JobAudit } from "@shared/schema";
 import path from "path";
 import fs from "fs/promises";
@@ -47,7 +47,7 @@ async function acquireSlot(jobId: number): Promise<void> {
     return;
   }
 
-  await storage.updateJob(jobId, { status: "queued" as any });
+  await storage.updateJob(jobId, { status: "queued" });
   const queuePos = jobQueue.length + 1;
   console.log(`[FAI][Queue] Job ${jobId} queued at position #${queuePos} (${activeJobs}/${MAX_CONCURRENT_JOBS} active)`);
 
@@ -538,8 +538,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         }
       }
       let inputForBleed = path.extname(originalPath) ? originalPath : originalWithExt;
-      const hasCropCoords =
-        effectiveBleed && (effectiveBleed as any).cropX != null && (effectiveBleed as any).cropWidth > 0;
+      const hasCropCoords = isManualCropActive(effectiveBleed as any);
 
       console.time("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       let result!: ReturnType<typeof runPythonBleed>;

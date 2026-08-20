@@ -29,6 +29,7 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { isFullPageCropBox } from "@/lib/full-page-crop";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -242,6 +243,9 @@ export default function JobDetails() {
             window.dispatchEvent(new CustomEvent("glitchy:queue-update", {
               detail: { position: data.position }
             }));
+          } else {
+            // Slot opened — refetch job so the page leaves the queued spinner.
+            queryClient.invalidateQueries({ queryKey: ["job", jobId] });
           }
         } catch {}
       }, 3000);
@@ -396,13 +400,16 @@ export default function JobDetails() {
   }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
 
   const noneCountRef = useRef(0);
+  const compilingCountRef = useRef(0);
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
     if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
+    compilingCountRef.current = 0;
     const MAX_NONE_POLLS = 8;
+    const MAX_COMPILING_POLLS = 90; // 180s at 2s interval — matches COMPILE_TIMEOUT_MS
     const poll = async () => {
       try {
         const res = await fetch(`/api/jobs/${job.id}/precompile-status?strategy=${encodeURIComponent(selectedBleedMethod)}`);
@@ -415,6 +422,7 @@ export default function JobDetails() {
           setCompileDownloadUrl(`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`);
           queryClient.invalidateQueries({ queryKey: ["job", job.id] });
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
           cancelled = true;
         } else if (data.state === "failed") {
           setPreCompileState("failed");
@@ -423,9 +431,11 @@ export default function JobDetails() {
           setCompileError(data.error || data.message || "Pre-compilation failed");
           window.dispatchEvent(new CustomEvent("glitchy:compile-error", { detail: { message: data.error || "Compilation failed" } }));
           noneCountRef.current = 0;
+          compilingCountRef.current = 0;
           cancelled = true;
         } else if (data.state === "none") {
           noneCountRef.current++;
+          compilingCountRef.current = 0;
           if (noneCountRef.current >= MAX_NONE_POLLS) {
             setPreCompileState("ready");
             setPreCompileMessage("Artwork ready for download.");
@@ -438,6 +448,16 @@ export default function JobDetails() {
           setPreCompileState("compiling");
           setPreCompileMessage(data.message || "");
           noneCountRef.current = 0;
+          compilingCountRef.current++;
+          if (compilingCountRef.current >= MAX_COMPILING_POLLS) {
+            setPreCompileState("failed");
+            setPreCompileMessage("Compilation is taking too long. Please retry.");
+            setCompileState("FAILURE");
+            setCompileError("Compilation timed out. Please try again.");
+            window.dispatchEvent(new CustomEvent("glitchy:compile-error", { detail: { message: "Compilation timed out. Please try again." } }));
+            compilingCountRef.current = 0;
+            cancelled = true;
+          }
         }
       } catch {}
     };
@@ -512,7 +532,7 @@ export default function JobDetails() {
       const colorProfile = oo.colorProfile || "cmyk";
 
       const savedCrop = oo;
-      const cropPayload = (savedCrop?.cropX != null && savedCrop?.cropWidth > 0) ? {
+      const cropPayload = (savedCrop?.cropX != null && savedCrop?.cropWidth > 0 && !isFullPageCropBox(savedCrop)) ? {
         cropX: savedCrop.cropX,
         cropY: savedCrop.cropY,
         cropWidth: savedCrop.cropWidth,
@@ -1110,7 +1130,7 @@ export default function JobDetails() {
                       targetWidth: trimW,
                       targetHeight: trimH,
                     };
-                    const hasCropData = opts.cropX != null && opts.cropWidth > 0;
+                    const hasCropData = opts.cropX != null && opts.cropWidth > 0 && !isFullPageCropBox(opts);
                     console.log(`[PHASE2] Fix Everything handoff: hasCrop=${hasCropData}, targetSize=${opts.targetWidth}×${opts.targetHeight}mm${hasCropData ? `, crop=(${opts.cropX?.toFixed?.(4)},${opts.cropY?.toFixed?.(4)}) ${opts.cropWidth?.toFixed?.(4)}×${opts.cropHeight?.toFixed?.(4)}` : ''}`);
                     setAutoFixApplied(true);
                     processJob.mutate({ id: job.id, bleedOptions: opts }, {

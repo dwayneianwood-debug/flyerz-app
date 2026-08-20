@@ -53,7 +53,7 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json();
 }
 
-export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "failed") {
+export function useJobs(statusFilter?: "pending" | "queued" | "processing" | "complete" | "failed") {
   return useQuery({
     queryKey: ["jobs", statusFilter],
     queryFn: async () => {
@@ -67,6 +67,10 @@ export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "
   });
 }
 
+export function jobStatusNeedsPolling(status: string | undefined | null): boolean {
+  return status === "pending" || status === "processing" || status === "queued";
+}
+
 export function useJob(id: number) {
   return useQuery({
     queryKey: ["job", id],
@@ -75,10 +79,10 @@ export function useJob(id: number) {
       const res = await fetch(url, { credentials: "include" });
       return handleResponse<FileJobResponse>(res);
     },
-    // Poll every 2 seconds if the job is still processing or pending
+    // Poll every 2 seconds while the job is still in the pipeline (including queued)
     refetchInterval: (query) => {
       const status = query.state?.data?.status;
-      if (status === "pending" || status === "processing") {
+      if (jobStatusNeedsPolling(status as string | undefined)) {
         return 2000;
       }
       return false;

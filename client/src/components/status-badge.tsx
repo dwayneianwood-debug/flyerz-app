@@ -23,6 +23,13 @@ export function StatusBadge({ status, className, overallPassed }: StatusBadgePro
           Pending
         </Badge>
       );
+    case "queued":
+      return (
+        <Badge variant="outline" className={cn("bg-amber-500/15 text-amber-700 font-medium py-1 px-3 border-amber-500/20", className)} data-testid="badge-queued">
+          <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+          Queued
+        </Badge>
+      );
     case "processing":
       return (
         <Badge variant="secondary" className={cn("bg-primary/10 text-primary hover:bg-primary/20 font-medium py-1 px-3 border-transparent shadow-none", className)}>

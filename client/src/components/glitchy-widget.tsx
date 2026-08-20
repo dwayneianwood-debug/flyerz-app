@@ -128,6 +128,9 @@ interface PreflightItem {
 
 type ProcessState = "IDLE" | "PROCESSING" | "QUEUED" | "SUCCESS" | "ERROR";
 
+/** If Glitchy stays PROCESSING/QUEUED past the backend 180s job timeout, unstick the UI. */
+const GLITCHY_STUCK_WATCHDOG_MS = 210_000;
+
 const GLITCHY_SUPPRESS_CROPBOX_ERR = "cropbox not in mediabox";
 
 function textContainsCropBoxMediaBoxUiNoise(text: string): boolean {
@@ -308,6 +311,16 @@ export default function GlitchyWidget() {
       } else if (d.overallPassed === false) {
         setChecklistPassOverride(false);
         setAchievementPhase(null);
+        setHappyHop(false);
+        setCompileDownloadUrl(null);
+        setCompileErrorMsg("");
+        // Job finished (issues remain). Never leave Glitchy locked in PROCESSING/QUEUED.
+        setProcessState("IDLE");
+        setProcessingMessage("");
+        setCatMode("head");
+        setUiVisible(true);
+        wanderingRef.current = false;
+        idleRef.current = 0;
         fetchChecklist();
       } else {
         fetchChecklist();
@@ -547,6 +560,19 @@ export default function GlitchyWidget() {
     };
   }, []);
 
+  useEffect(() => {
+    if (processState !== "PROCESSING" && processState !== "QUEUED") return;
+    const watchdog = window.setTimeout(() => {
+      setProcessState("ERROR");
+      setCompileErrorMsg(
+        "This is taking longer than expected. You can keep waiting, retry, or send feedback.",
+      );
+      setAchievementPhase(null);
+      setHappyHop(false);
+    }, GLITCHY_STUCK_WATCHDOG_MS);
+    return () => window.clearTimeout(watchdog);
+  }, [processState]);
+
   function handleClick() {
     if (processState === "SUCCESS" && achievementPhase === "ask") {
       setAchievementPhase("reveal");
@@ -564,7 +590,25 @@ export default function GlitchyWidget() {
       setIsInteracting(false);
       return;
     }
-    if (processState === "PROCESSING") return;
+    // PROCESSING/QUEUED used to ignore clicks, which made Glitchy feel "stuck".
+    // Always allow opening chat/feedback so the user is never locked out.
+    if (processState === "PROCESSING" || processState === "QUEUED") {
+      setCatMode("head");
+      setUiVisible(true);
+      wanderingRef.current = false;
+      setIsInteracting(true);
+      idleRef.current = 0;
+      setChatBoxVisible((v) => {
+        if (v) {
+          setIsInteracting(false);
+          setShowFeedback(false);
+          return false;
+        }
+        fetchChecklist();
+        return true;
+      });
+      return;
+    }
 
     if (catMode !== "head") {
       idleRef.current = 0;

@@ -5929,6 +5929,22 @@ def _auto_crop_false_margins(img: np.ndarray, std_threshold: float = 2.5) -> tup
     return cropped, True
 
 
+def _is_no_crop_full_page(bleed_opts) -> bool:
+    """True when the UI sent the No Crop Needed full-page crop_box (0,0,1,1)."""
+    if not bleed_opts:
+        return False
+    if bleed_opts.get("is_no_crop"):
+        return True
+    try:
+        cx = float(bleed_opts.get("cropX"))
+        cy = float(bleed_opts.get("cropY"))
+        cw = float(bleed_opts.get("cropWidth"))
+        ch = float(bleed_opts.get("cropHeight"))
+    except (TypeError, ValueError):
+        return False
+    return cx == 0.0 and cy == 0.0 and cw == 1.0 and ch == 1.0
+
+
 def auto_crop_mockup_bounding_box(img: np.ndarray, area_ratio_min: float = 0.40,
                                    area_ratio_max: float = 0.95,
                                    rect_tolerance: float = 0.02) -> tuple:
@@ -7357,7 +7373,11 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
     except (TypeError, ValueError):
         has_manual_crop = False
 
-    if has_manual_crop:
+    if _is_no_crop_full_page(bleed_opts):
+        has_manual_crop = False
+        h_nc, w_nc = img.shape[:2]
+        sys.stderr.write(f"[FAI] NO_CROP_FULL_PAGE: Using full image as crop_box ({w_nc}x{h_nc}px). Raster-first handoff active.\n")
+    elif has_manual_crop:
         raw_cx, raw_cy = float(manual_crop_x), float(manual_crop_y)
         raw_cw, raw_ch = float(manual_crop_w), float(manual_crop_h)
         if raw_cx <= 1.0 and raw_cy <= 1.0 and raw_cw <= 1.0 and raw_ch <= 1.0:
@@ -7811,6 +7831,8 @@ def process_page_worker(page_data: dict) -> dict:
             for v in [manual_crop_x, manual_crop_y, manual_crop_w, manual_crop_h]
         ) and float(manual_crop_w) > 0 and float(manual_crop_h) > 0
     except (TypeError, ValueError):
+        has_manual_crop = False
+    if _is_no_crop_full_page(bleed_opts):
         has_manual_crop = False
     if has_manual_crop:
         ph, pw = img_bgr.shape[:2]

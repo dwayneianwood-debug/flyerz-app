@@ -248,6 +248,14 @@ class TestGlitchyAgentIntegration(unittest.TestCase):
         self.assertIn("Artwork bleed offset does not look right", sent_text)
         self.assertIn(".cursor/rules/prepress.mdc", sent_text)
 
+    def test_resolve_crop_box_no_crop_route(self):
+        self.assertEqual(
+            resolve_crop_box(None, {"is_no_crop": True, "full_page_dimensions": [0, 0, 595, 842]}),
+            [0, 0, 595, 842],
+        )
+        self.assertEqual(resolve_crop_box([10, 10, 100, 100], {"is_no_crop": True}), [10, 10, 100, 100])
+        self.assertIsNone(resolve_crop_box(None, {"page": "/job/208"}))
+
     def test_rejects_missing_api_key(self):
         with self.assertRaises(ValueError):
             trigger_glitchy_background_fix(

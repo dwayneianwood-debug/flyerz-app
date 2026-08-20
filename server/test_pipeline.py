@@ -1452,6 +1452,7 @@ def print_report():
         "prepress_struct": "25-Point Prepress Structural Assertions",
         "compile_pkg": "PDF Packaging — Flat Raster Compile",
         "print_enhance": "Smart Prepress Enhancer (Lanczos + Unsharp)",
+        "glitchy_stuck": "Glitchy Job-Page Unstick",
     }
 
     for sec, counts in sections.items():
@@ -3037,6 +3038,31 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_glitchy_job_page_unstick():
+    """Glitchy 'its stuck' on /job/:id — queued poll, no-crop crop_box, PROCESSING lock."""
+    print(f"\n{BOLD}{CYAN}Section 27: Glitchy Job-Page Unstick{RESET}")
+    print(f"{'─'*60}")
+    import unittest
+    from test_glitchy_stuck import TestGlitchyStuckFixes
+
+    loader = unittest.defaultTestLoader
+    for name in loader.getTestCaseNames(TestGlitchyStuckFixes):
+        case = TestGlitchyStuckFixes(name)
+        result = unittest.TestResult()
+        case.run(result)
+        if result.wasSuccessful() and result.testsRun > 0:
+            record("glitchy_stuck", name, True)
+        else:
+            detail = ""
+            if result.failures:
+                detail = result.failures[0][1][-400:]
+            elif result.errors:
+                detail = result.errors[0][1][-400:]
+            elif result.testsRun == 0:
+                detail = "test did not run"
+            record("glitchy_stuck", name, False, detail)
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3163,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_glitchy_job_page_unstick()
         gc.collect()
 
         all_passed = print_report()
