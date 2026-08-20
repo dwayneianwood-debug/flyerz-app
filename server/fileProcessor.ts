@@ -7,6 +7,7 @@ import { spawnSync } from "child_process";
 import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
+import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
 
 const MAX_CONCURRENT_JOBS = 3;
 let activeJobs = 0;
@@ -538,14 +539,14 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         }
       }
       let inputForBleed = path.extname(originalPath) ? originalPath : originalWithExt;
-      const hasCropCoords =
-        effectiveBleed && (effectiveBleed as any).cropX != null && (effectiveBleed as any).cropWidth > 0;
+      const hasCropCoords = hasValidCropBox(effectiveBleed as any);
+      const skipPreResize = hasCropCoords || isNoCropRoute(effectiveBleed as any);
 
       console.time("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       let result!: ReturnType<typeof runPythonBleed>;
       try {
       if (
-        !hasCropCoords &&
+        !skipPreResize &&
         effectiveBleed?.targetWidth &&
         effectiveBleed?.targetHeight &&
         effectiveBleed.targetWidth > 0 &&
@@ -564,8 +565,8 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
           effectiveBleed.targetHeight,
         );
         inputForBleed = resizedPath;
-      } else if (hasCropCoords) {
-        console.log(`[FAI] Manual crop active — skipping pre-resize, crop+scale will happen in bleed/compile pipeline`);
+      } else if (hasCropCoords || isNoCropRoute(effectiveBleed as any)) {
+        console.log(`[FAI] Manual crop / No Crop Needed — skipping pre-resize, crop+scale will happen in bleed/compile pipeline`);
       }
 
       const outputPath = path.join(dir, `processed_${jobId}_${basename}${ext}`);
@@ -598,6 +599,18 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       originalTic = result.originalTic;
       finalTic = result.finalTic;
       preBleedPath = result.preBleedPath;
+
+      if (Array.isArray((result as any).crop_box) && (result as any).crop_box.length >= 4) {
+        (effectiveBleed as any).cropBoxPx = (result as any).crop_box;
+        if (!hasValidCropBox(effectiveBleed as any)) {
+          (effectiveBleed as any).cropX = 0;
+          (effectiveBleed as any).cropY = 0;
+          (effectiveBleed as any).cropWidth = 1;
+          (effectiveBleed as any).cropHeight = 1;
+          (effectiveBleed as any).isNoCrop = true;
+          console.log(`[FAI] Persisted NO_CROP full-page crop_box from pipeline: ${(result as any).crop_box}`);
+        }
+      }
 
       if (result.correctedPath) {
         try {

@@ -14,6 +14,7 @@ import { twMerge } from "tailwind-merge";
 import { useToast } from "@/hooks/use-toast";
 import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
+import { FULL_PAGE_CROP_NORMALIZED } from "@shared/crop-box";
 import { ManualCropEmbedded, type CropCoordinates } from "@/pages/manual-crop";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
@@ -661,7 +662,7 @@ export function FileUpload() {
       const ext = stagedFile.name.split('.').pop()?.toLowerCase() || '';
       const isImage = ['png', 'jpg', 'jpeg'].includes(ext);
 
-      if (pendingCropCoords && isImage) {
+      if (pendingCropCoords && isImage && !preserveBleed) {
         console.log(`[UPLOAD] Client-side crop: cropping ${stagedFile.name} in browser before upload`);
         setIsCropping(true);
         try {
@@ -692,7 +693,14 @@ export function FileUpload() {
 
       if (preserveBleed) {
         (uploadBleedOptions as any).preserveBleed = true;
-        console.log(`[UPLOAD] preserveBleed=true — bypassing scale_fill, preserving original bleed`);
+        (uploadBleedOptions as any).isNoCrop = true;
+        if (!(uploadBleedOptions as any).cropWidth) {
+          (uploadBleedOptions as any).cropX = FULL_PAGE_CROP_NORMALIZED.cropX;
+          (uploadBleedOptions as any).cropY = FULL_PAGE_CROP_NORMALIZED.cropY;
+          (uploadBleedOptions as any).cropWidth = FULL_PAGE_CROP_NORMALIZED.cropWidth;
+          (uploadBleedOptions as any).cropHeight = FULL_PAGE_CROP_NORMALIZED.cropHeight;
+        }
+        console.log(`[UPLOAD] preserveBleed=true — full-page crop_box populated, bypassing scale_fill`);
       }
 
       if (isImage && uploadBleedOptions.targetWidth && uploadBleedOptions.targetHeight && !preserveBleed) {
@@ -1166,7 +1174,15 @@ export function FileUpload() {
                 Crop artwork
               </Button>
               <Button
-                onClick={() => { setPendingCropCoords(null); setPreserveBleed(true); }}
+                onClick={() => {
+                  setPendingCropCoords({
+                    cropX: FULL_PAGE_CROP_NORMALIZED.cropX,
+                    cropY: FULL_PAGE_CROP_NORMALIZED.cropY,
+                    cropWidth: FULL_PAGE_CROP_NORMALIZED.cropWidth,
+                    cropHeight: FULL_PAGE_CROP_NORMALIZED.cropHeight,
+                  });
+                  setPreserveBleed(true);
+                }}
                 variant={xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') ? "default" : "ghost"}
                 className={cn("flex-1 gap-2", xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') && "bg-green-600 hover:bg-green-700 text-white")}
                 data-testid="button-skip-crop"

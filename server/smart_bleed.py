@@ -7345,6 +7345,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
 
     _prof_crop_t0 = time.time()
     mock_radar = None
+    full_page_crop_box = [0, 0, int(w), int(h)]
     manual_crop_x = bleed_opts.get("cropX") if bleed_opts else None
     manual_crop_y = bleed_opts.get("cropY") if bleed_opts else None
     manual_crop_w = bleed_opts.get("cropWidth") if bleed_opts else None
@@ -7375,6 +7376,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         ch_crop = max(1, min(ch_crop, h - cy))
         img = img[cy:cy + ch_crop, cx:cx + cw]
         h, w = img.shape[:2]
+        full_page_crop_box = [int(cx), int(cy), int(cw), int(ch_crop)]
         sys.stderr.write(f"[FAI] Manual crop applied: ({cx},{cy}) {cw}x{ch_crop} -> {w}x{h}\n")
         checks.append({
             "name": "Manual Crop (Mockup Killer)",
@@ -7387,6 +7389,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         img, _, mock_radar = auto_crop_mockup_bounding_box(img)
         h_nc, w_nc = img.shape[:2]
         sys.stderr.write(f"[FAI] NO_CROP_FULL_PAGE: Using full image as crop_box ({w_nc}x{h_nc}px). Raster-first handoff active.\n")
+        full_page_crop_box = [0, 0, int(w_nc), int(h_nc)]
         if mock_radar:
             sys.stderr.write(f"[FAI] {mock_radar}\n")
 
@@ -7739,6 +7742,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         "originalTic": 0,
         "finalTic": 0,
         "autoHealEvent": auto_heal_event,
+        "crop_box": full_page_crop_box,
     }
     if variant_result.get("paths"):
         result["bleedVariants"] = variant_result["paths"]
@@ -8878,6 +8882,16 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
         "lensesFlattened": lenses_flattened,
         "originalTic": neutralization_result.get("maxOriginalTic", 0),
         "finalTic": neutralization_result.get("maxFinalTic", 0),
+        "crop_box": (
+            [
+                float(bleed_opts.get("cropX", 0)),
+                float(bleed_opts.get("cropY", 0)),
+                float(bleed_opts.get("cropWidth", 1)),
+                float(bleed_opts.get("cropHeight", 1)),
+            ]
+            if bleed_opts and bleed_opts.get("cropWidth") and float(bleed_opts.get("cropWidth") or 0) > 0
+            else [0.0, 0.0, 1.0, 1.0]
+        ),
     }
     if any_critical_safe_zone:
         result["criticalSafeZone"] = True

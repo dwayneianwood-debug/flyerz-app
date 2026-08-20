@@ -27,6 +27,7 @@ import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { spawn } from "child_process";
+import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 
 const EXEC_TIMEOUT_MS = 60_000;
 const COMPILE_TIMEOUT_MS = 180_000;
@@ -122,6 +123,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
   const savedOpts = coerceSavedBleedOptionsFromDb(auditResults?.savedBleedOptions);
   const trimW = savedOpts.targetWidth || 148;
   const trimH = savedOpts.targetHeight || 210;
+  const cropForCompile = ensureFullPageCropBox(savedOpts, { force: true });
 
   // Booklet gutter creep shifts the raster in PDF pt space (white strip on the left). Single-page flyer compile must keep creep at 0.
   const precompileCreepMm = 0;
@@ -143,15 +145,13 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--creep-mm", String(precompileCreepMm),
   ];
 
-  if (savedOpts?.cropX != null && savedOpts?.cropY != null &&
-      savedOpts?.cropWidth != null && savedOpts?.cropHeight != null) {
-    args.push(
-      "--crop-x", String(savedOpts.cropX),
-      "--crop-y", String(savedOpts.cropY),
-      "--crop-w", String(savedOpts.cropWidth),
-      "--crop-h", String(savedOpts.cropHeight)
-    );
-  }
+  args.push(
+    "--crop-x", String(cropForCompile.cropX),
+    "--crop-y", String(cropForCompile.cropY),
+    "--crop-w", String(cropForCompile.cropWidth),
+    "--crop-h", String(cropForCompile.cropHeight),
+  );
+  console.log(`[FAI] spawnPreCompile crop_box=(${cropForCompile.cropX},${cropForCompile.cropY}) ${cropForCompile.cropWidth}x${cropForCompile.cropHeight} (force full-page when missing)`);
 
   console.log(`TRACER: [Checkpoint C] Spawning compile subprocess for job ${jobId} — args: ${JSON.stringify(args)}`);
   if (job.originalPath && job.originalPath !== artworkPath) {
@@ -459,6 +459,10 @@ function sanitizeBleedOptions(parsed: any) {
     console.log(`[FAI] preserveBleed=true — scale_fill bypass requested`);
   }
 
+  if (parsed.isNoCrop === true || parsed.is_no_crop === true) {
+    result.isNoCrop = true;
+  }
+
   if (parsed.cropX != null && parsed.cropY != null &&
       parsed.cropWidth != null && parsed.cropHeight != null) {
     const cx = Number(parsed.cropX);
@@ -472,6 +476,16 @@ function sanitizeBleedOptions(parsed: any) {
       result.cropHeight = ch;
       console.log(`[FAI] sanitizeBleedOptions: Crop coords preserved: (${cx},${cy}) ${cw}x${ch}`);
     }
+  }
+
+  const withCrop = ensureFullPageCropBox(result);
+  if (withCrop.cropWidth != null && result.cropWidth == null) {
+    result.cropX = withCrop.cropX;
+    result.cropY = withCrop.cropY;
+    result.cropWidth = withCrop.cropWidth;
+    result.cropHeight = withCrop.cropHeight;
+    if (withCrop.isNoCrop) result.isNoCrop = true;
+    console.log(`[FAI] sanitizeBleedOptions: No Crop Needed — full-page crop_box (${result.cropX},${result.cropY}) ${result.cropWidth}x${result.cropHeight}`);
   }
 
   return result;
@@ -1534,7 +1548,7 @@ export async function registerRoutes(
       await storage.updateJob(jobId, { auditResults: updatedResults });
 
       const selectSavedOpts = coerceSavedBleedOptionsFromDb((auditResults as any)?.savedBleedOptions);
-      const selectHasCrop = !!(selectSavedOpts?.cropWidth && selectSavedOpts?.cropHeight);
+      const selectHasCrop = hasValidCropBox(selectSavedOpts) && !selectSavedOpts.isNoCrop && !selectSavedOpts.preserveBleed;
       const preBleedPath = (updatedResults as any).preBleedPath;
       let artworkPath = selectHasCrop ? job.originalPath : (preBleedPath || job.originalPath);
       if (preBleedPath && !selectHasCrop) {
@@ -1943,19 +1957,21 @@ export async function registerRoutes(
         cropHeight: Number(rawCrop.cropHeight) || 0,
       } : null;
       const requestHasCrop = !!(requestCrop && isFinite(requestCrop.cropWidth) && requestCrop.cropWidth > 0 && isFinite(requestCrop.cropHeight) && requestCrop.cropHeight > 0);
-      const dbHasCrop = !!(compileSavedOpts?.cropWidth && compileSavedOpts?.cropHeight);
-      const hasCrop = requestHasCrop || dbHasCrop;
+      const dbHasCrop = hasValidCropBox(compileSavedOpts);
+      const isSyntheticNoCrop = !!(compileSavedOpts?.isNoCrop || compileSavedOpts?.preserveBleed);
+      const hasManualCrop = (requestHasCrop || dbHasCrop) && !isSyntheticNoCrop;
 
-      const cropSource = requestHasCrop ? requestCrop : (dbHasCrop ? compileSavedOpts : null);
+      const cropSource = ensureFullPageCropBox(
+        (requestHasCrop ? requestCrop : compileSavedOpts) || {},
+        { force: true },
+      );
 
-      console.log(`[FAI] compile-print-pdf crop resolution: requestHasCrop=${requestHasCrop} dbHasCrop=${dbHasCrop} hasCrop=${hasCrop} source=${requestHasCrop ? 'POST_BODY' : dbHasCrop ? 'DB' : 'NONE'}`);
-      if (hasCrop && cropSource) {
-        console.log(`[FAI] Crop values: x=${cropSource.cropX}, y=${cropSource.cropY}, w=${cropSource.cropWidth}, h=${cropSource.cropHeight}`);
-      }
+      console.log(`[FAI] compile-print-pdf crop resolution: requestHasCrop=${requestHasCrop} dbHasCrop=${dbHasCrop} hasManualCrop=${hasManualCrop} isNoCrop=${isSyntheticNoCrop} source=${requestHasCrop ? 'POST_BODY' : dbHasCrop ? 'DB' : 'FULL_PAGE'}`);
+      console.log(`[FAI] Crop values: x=${cropSource.cropX}, y=${cropSource.cropY}, w=${cropSource.cropWidth}, h=${cropSource.cropHeight}`);
 
       const preBleedPath = (auditResults as any)?.preBleedPath;
-      let artworkPath = hasCrop ? job.originalPath : (preBleedPath || job.originalPath);
-      if (preBleedPath && !hasCrop) {
+      let artworkPath = hasManualCrop ? job.originalPath : (preBleedPath || job.originalPath);
+      if (preBleedPath && !hasManualCrop) {
         try { await fs.access(preBleedPath); } catch {
           console.log(`[FAI] compile-print-pdf: preBleedPath missing (${preBleedPath}), falling back to originalPath`);
           artworkPath = job.originalPath;
@@ -1968,16 +1984,16 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Artwork file not found on disk" });
       }
 
-      console.log(`DEBUG: Compiling PDF for Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${hasCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
+      console.log(`DEBUG: Compiling PDF for Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${hasManualCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
 
       const effectiveStrategy = selectedStrategy;
 
-      const cropArgs = (hasCrop && cropSource) ? [
+      const cropArgs = [
         "--crop-x", String(cropSource.cropX || 0),
         "--crop-y", String(cropSource.cropY || 0),
         "--crop-w", String(cropSource.cropWidth),
-        "--crop-h", String(cropSource.cropHeight)
-      ] : [];
+        "--crop-h", String(cropSource.cropHeight),
+      ];
 
       console.log(`TRACER: [Checkpoint C] compile-print-pdf: job=${jobId} requestBody.selectedStrategy="${selectedStrategy}" effectiveStrategy="${effectiveStrategy}" dbSelectedBleedMethod="${auditResults?.selectedBleedMethod || 'none'}"`);
       console.log(`[FAI] Compile strategy: direct="${effectiveStrategy}" (no DB fallback)`);
