@@ -18,7 +18,6 @@ import {
   generateHealthReport,
   getQueueStatus,
   getJobQueuePosition,
-  isSafeZoneLayoutRejectionMessage,
 } from "./fileProcessor";
 import { execSync, spawnSync } from "child_process";
 import fsSync from "fs";
@@ -459,6 +458,22 @@ function sanitizeBleedOptions(parsed: any) {
     console.log(`[FAI] preserveBleed=true — scale_fill bypass requested`);
   }
 
+  // No Crop Needed: persist full-page crop_box metadata WITHOUT cropX/W/H so
+  // compile still uses preBleedPath (hasCrop stays false) and avoids Document Closed.
+  const noCropFlag = parsed.isNoCrop === true || parsed.is_no_crop === true;
+  if (noCropFlag) {
+    result.isNoCrop = true;
+    result.is_no_crop = true;
+  }
+  if (Array.isArray(parsed.crop_box) && parsed.crop_box.length === 4) {
+    const box = parsed.crop_box.map((n: unknown) => Number(n));
+    if (box.every((n: number) => Number.isFinite(n))) {
+      result.crop_box = box;
+    }
+  } else if (noCropFlag && !result.crop_box) {
+    result.crop_box = [0, 0, 1, 1];
+  }
+
   if (parsed.cropX != null && parsed.cropY != null &&
       parsed.cropWidth != null && parsed.cropHeight != null) {
     const cx = Number(parsed.cropX);
@@ -845,7 +860,7 @@ export async function registerRoutes(
         return res.status(404).json({ message: 'Job not found' });
       }
 
-      if (job.status === 'processing') {
+      if (job.status === 'processing' || (job.status as string) === 'queued') {
         return res.status(400).json({ message: 'Job is already being processed' });
       }
 
@@ -885,28 +900,26 @@ export async function registerRoutes(
 
       const finalCropActive = (bleedOptions as any)?.cropX != null && (bleedOptions as any)?.cropWidth > 0;
       bleedOptions = sanitizeBleedOptions(coerceSavedBleedOptionsFromDb(bleedOptions ?? {}));
-      console.log(`[FAI] processFile handoff job=${jobId}: hasCrop=${finalCropActive}${finalCropActive ? `, crop=(${(bleedOptions as any)?.cropX},${(bleedOptions as any)?.cropY}) ${(bleedOptions as any)?.cropWidth}x${(bleedOptions as any)?.cropHeight}` : ''}, targetSize=${(bleedOptions as any)?.targetWidth || '?'}x${(bleedOptions as any)?.targetHeight || '?'}mm`);
+      if (!finalCropActive && (bleedOptions as any)?.isNoCrop) {
+        (bleedOptions as any).crop_box = (bleedOptions as any).crop_box || [0, 0, 1, 1];
+      }
+      console.log(`[FAI] processFile handoff job=${jobId}: hasCrop=${finalCropActive}${finalCropActive ? `, crop=(${(bleedOptions as any)?.cropX},${(bleedOptions as any)?.cropY}) ${(bleedOptions as any)?.cropWidth}x${(bleedOptions as any)?.cropHeight}` : ''}, isNoCrop=${!!(bleedOptions as any)?.isNoCrop}, targetSize=${(bleedOptions as any)?.targetWidth || '?'}x${(bleedOptions as any)?.targetHeight || '?'}mm`);
 
-      try {
-        await processFile(jobId, true, bleedOptions);
-      } catch (error: any) {
+      // Fire-and-forget so the job page can poll queued/processing instead of hanging
+      // the HTTP request (progress stuck at 95% / "its stuck").
+      await storage.updateJob(jobId, { status: 'processing', errorMessage: null as any });
+      processFile(jobId, true, bleedOptions).catch((error: Error) => {
         console.error(`Error processing job ${jobId}:`, error);
         const msg = error instanceof Error ? error.message : String(error);
-        const layoutRejection = isSafeZoneLayoutRejectionMessage(msg);
-        await storage.updateJob(jobId, {
+        storage.updateJob(jobId, {
           status: 'failed',
           errorMessage: msg,
           completedAt: new Date(),
         });
-        return res.status(layoutRejection ? 422 : 500).json({
-          success: false,
-          message: msg || 'Processing failed',
-          jobId: jobId,
-        });
-      }
+      });
 
       res.json({
-        message: 'Processing complete',
+        message: 'Processing started',
         jobId: jobId,
       });
     } catch (error) {
@@ -3236,6 +3249,19 @@ print(f'{w},{h}')
           response = "Hold on! I don't see proper bleed. Your edges might get cut off during trimming! 📏";
         } else if (warnings.includes("wrong_color")) {
           response = "Careful! The colors aren't in CMYK yet. They might shift when printed! 🎨";
+        }
+      } else if (msg.includes("stuck") || msg.includes("frozen") || msg.includes("hang") || msg.includes("not moving")) {
+        const st = artworkState?.status;
+        if (st === "queued") {
+          response = "You're in the press-room queue — I haven't started the file yet. Stay on this page and I'll pick it up as soon as a slot opens. ⏳";
+        } else if (st === "processing" || st === "pending") {
+          response = "Still working on your file! Fonts, colours, and bleed can take a minute. If this spinner doesn't move for a few minutes, hit retry. 🔧";
+        } else if (st === "failed") {
+          response = "The last pass failed. Use Retry & Fix Automatically and I'll try again. 🔁";
+        } else if (st === "complete") {
+          response = "The file is processed — if the download button is grey, confirm the bleed preview (and Before & After) then wait for 'Proceed to Download'. ✨";
+        } else {
+          response = "If the page looks frozen, stay on this job — I'll keep polling the queue. You can also send me a report with what's on screen. 🐾";
         }
       } else if (msg.includes("hello") || msg.includes("hi") || msg.includes("hey")) {
         response = "Hiya! I'm Glitchy, your tiny print-shop assistant! ✨";

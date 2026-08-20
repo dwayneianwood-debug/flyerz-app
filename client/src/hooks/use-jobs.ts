@@ -75,10 +75,11 @@ export function useJob(id: number) {
       const res = await fetch(url, { credentials: "include" });
       return handleResponse<FileJobResponse>(res);
     },
-    // Poll every 2 seconds if the job is still processing or pending
+    // Poll while the job is in-flight. "queued" must be included — otherwise
+    // staleTime: Infinity freezes the job page on "Queued..." forever.
     refetchInterval: (query) => {
-      const status = query.state?.data?.status;
-      if (status === "pending" || status === "processing") {
+      const status = query.state?.data?.status as string | undefined;
+      if (status === "pending" || status === "processing" || status === "queued") {
         return 2000;
       }
       return false;

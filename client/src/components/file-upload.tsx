@@ -688,10 +688,16 @@ export function FileUpload() {
         console.log(`[UPLOAD] PDF crop coords attached: x=${pendingCropCoords.cropX.toFixed(4)}, y=${pendingCropCoords.cropY.toFixed(4)}, w=${pendingCropCoords.cropWidth.toFixed(4)}, h=${pendingCropCoords.cropHeight.toFixed(4)}`);
       } else {
         console.log(`[UPLOAD] No crop data — full artwork will be used`);
+        (uploadBleedOptions as any).isNoCrop = true;
+        (uploadBleedOptions as any).is_no_crop = true;
+        (uploadBleedOptions as any).crop_box = [0, 0, 1, 1];
       }
 
       if (preserveBleed) {
         (uploadBleedOptions as any).preserveBleed = true;
+        (uploadBleedOptions as any).isNoCrop = true;
+        (uploadBleedOptions as any).is_no_crop = true;
+        (uploadBleedOptions as any).crop_box = (uploadBleedOptions as any).crop_box || [0, 0, 1, 1];
         console.log(`[UPLOAD] preserveBleed=true — bypassing scale_fill, preserving original bleed`);
       }
 
@@ -1166,7 +1172,10 @@ export function FileUpload() {
                 Crop artwork
               </Button>
               <Button
-                onClick={() => { setPendingCropCoords(null); setPreserveBleed(true); }}
+                onClick={() => {
+                  setPendingCropCoords(null);
+                  setPreserveBleed(true);
+                }}
                 variant={xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') ? "default" : "ghost"}
                 className={cn("flex-1 gap-2", xrayAnalysis && (xrayAnalysis.scenario === 'true-bleed' || xrayAnalysis.scenario === 'partial-bleed') && "bg-green-600 hover:bg-green-700 text-white")}
                 data-testid="button-skip-crop"

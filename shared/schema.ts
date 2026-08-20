@@ -28,7 +28,7 @@ export const insertFileJobSchema = createInsertSchema(fileJobs).omit({
 // === EXPLICIT API CONTRACT TYPES ===
 
 // Job status type
-export type JobStatus = "pending" | "processing" | "complete" | "failed";
+export type JobStatus = "pending" | "processing" | "queued" | "complete" | "failed";
 
 // File types supported
 export type FileType = "pdf" | "jpg" | "png" | "docx" | "pptx";

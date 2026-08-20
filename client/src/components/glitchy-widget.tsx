@@ -629,6 +629,27 @@ export default function GlitchyWidget() {
     const text = feedbackRef.current?.value;
     if (!text) return;
     const jobId = getJobIdFromUrl();
+    let crop_box: number[] | null = null;
+    const page_state: Record<string, unknown> = {
+      page: window.location.pathname,
+      jobId,
+      href: window.location.href,
+    };
+    if (jobId) {
+      try {
+        const jr = await fetch(`/api/jobs/${jobId}`);
+        const jd = await jr.json();
+        const opts = jd?.auditResults?.savedBleedOptions || {};
+        const hasCrop = Number(opts.cropWidth) > 0 && Number(opts.cropHeight) > 0;
+        page_state.status = jd?.status;
+        page_state.errorMessage = jd?.errorMessage || null;
+        page_state.is_no_crop = !!(opts.isNoCrop || opts.is_no_crop || opts.preserveBleed) && !hasCrop;
+        page_state.full_page_dimensions = Array.isArray(opts.crop_box) ? opts.crop_box : [0, 0, 1, 1];
+        crop_box = hasCrop
+          ? [Number(opts.cropX) || 0, Number(opts.cropY) || 0, Number(opts.cropWidth), Number(opts.cropHeight)]
+          : (page_state.full_page_dimensions as number[]);
+      } catch { /* report still saves without job extras */ }
+    }
     await fetch("/api/glitchy-report", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -637,11 +658,10 @@ export default function GlitchyWidget() {
         page: window.location.pathname,
         timestamp: new Date().toLocaleString(),
         jobId,
-        page_state: {
-          page: window.location.pathname,
-          jobId,
-          href: window.location.href,
-        },
+        crop_box,
+        is_no_crop: page_state.is_no_crop === true,
+        full_page_dimensions: page_state.full_page_dimensions || [0, 0, 1, 1],
+        page_state,
       }),
     });
     setSubmitted(true);

@@ -177,6 +177,8 @@ export default function JobDetails() {
   const [aiEnhanceMessages, setAiEnhanceMessages] = useState<Record<string, string>>({});
   const [prepressOverlay, setPrepressOverlay] = useState<{ type: string; label: string } | null>(null);
   const [prepressSpinnerActive, setPrepressSpinnerActive] = useState(false);
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
+  const [waitTooLong, setWaitTooLong] = useState(false);
   const [guillotineOpen, setGuillotineOpen] = useState(false);
   const [reviewTab, setReviewTab] = useState<"review" | "tools">("review");
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
@@ -239,14 +241,18 @@ export default function JobDetails() {
           const res = await fetch(`/api/jobs/${jobId}/queue-position`);
           const data = await res.json();
           if (data.queued && data.position > 0) {
+            setQueuePosition(data.position);
             window.dispatchEvent(new CustomEvent("glitchy:queue-update", {
               detail: { position: data.position }
             }));
+          } else {
+            setQueuePosition(null);
+            queryClient.invalidateQueries({ queryKey: ["job", jobId] });
           }
         } catch {}
       }, 3000);
       window.dispatchEvent(new CustomEvent("glitchy:queue-update", {
-        detail: { position: 1 }
+        detail: { position: queuePosition || 1 }
       }));
       return () => clearInterval(pollQueue);
     } else if (job?.status === "processing") {
@@ -257,9 +263,27 @@ export default function JobDetails() {
       return () => clearInterval(interval);
     } else if (job?.status === "complete" || job?.status === "failed") {
       setProgress(100);
+      setQueuePosition(null);
+      setWaitTooLong(false);
     } else {
       setProgress(0);
     }
+  }, [job?.status]);
+
+  useEffect(() => {
+    if (job?.status === "failed") {
+      setAutoFixApplied(false);
+    }
+  }, [job?.status]);
+
+  useEffect(() => {
+    const inFlight = job?.status === "processing" || job?.status === "pending" || (job?.status as string) === "queued";
+    if (!inFlight) {
+      setWaitTooLong(false);
+      return;
+    }
+    const t = setTimeout(() => setWaitTooLong(true), 180_000);
+    return () => clearTimeout(t);
   }, [job?.status]);
 
   useEffect(() => {
@@ -396,13 +420,16 @@ export default function JobDetails() {
   }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
 
   const noneCountRef = useRef(0);
+  const compilingCountRef = useRef(0);
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
     if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
+    compilingCountRef.current = 0;
     const MAX_NONE_POLLS = 8;
+    const MAX_COMPILING_POLLS = 90;
     const poll = async () => {
       try {
         const res = await fetch(`/api/jobs/${job.id}/precompile-status?strategy=${encodeURIComponent(selectedBleedMethod)}`);
@@ -438,6 +465,15 @@ export default function JobDetails() {
           setPreCompileState("compiling");
           setPreCompileMessage(data.message || "");
           noneCountRef.current = 0;
+          compilingCountRef.current++;
+          if (compilingCountRef.current >= MAX_COMPILING_POLLS) {
+            setPreCompileState("failed");
+            setPreCompileMessage("Pre-compilation is taking too long. Please retry.");
+            setCompileState("FAILURE");
+            setCompileError("Pre-compilation timed out. Please retry.");
+            compilingCountRef.current = 0;
+            cancelled = true;
+          }
         }
       } catch {}
     };
@@ -931,7 +967,8 @@ export default function JobDetails() {
   })();
 
   const computedPhase = 
-    (isFailed || (!isComplete && !isProcessing && !isPending)) ? 1 :
+    (isQueued || isProcessing || isPending) ? 0 :
+    (isFailed || (!isComplete && !isProcessing && !isPending && !isQueued)) ? 1 :
     (isComplete && hasFailedChecks && !autoFixApplied) ? 1 :
     (isComplete && isFastTrack && phase3Confirmed) ? 3 :
     (isComplete && hasProof && !proofChecked) ? 2 :
@@ -1047,9 +1084,16 @@ export default function JobDetails() {
                 </h2>
                 <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto" data-testid="text-processing-description">
                   {isQueued
-                    ? "The press room is busy. Your file is in line and will be processed as soon as a slot opens."
+                    ? (queuePosition
+                        ? `The press room is busy. You are #${queuePosition} in line and will be processed as soon as a slot opens.`
+                        : "The press room is busy. Your file is in line and will be processed as soon as a slot opens.")
                     : "We're checking fonts, colors, bleeds, and more. This usually takes a few seconds."}
                 </p>
+                {waitTooLong && (
+                  <p className="text-xs text-amber-700 dark:text-amber-400 mb-4" data-testid="text-processing-watchdog">
+                    This is taking longer than usual. Hang tight — or refresh if the page looks frozen.
+                  </p>
+                )}
                 {!isQueued && (
                   <div className="max-w-xs mx-auto">
                     <div className="flex justify-between text-xs font-medium mb-1 text-primary">
@@ -1064,7 +1108,7 @@ export default function JobDetails() {
           )}
         </AnimatePresence>
 
-        {currentPhase === 1 && !isProcessing && !isPending && !autoFixApplied && (
+        {currentPhase === 1 && !isProcessing && !isPending && !isQueued && !autoFixApplied && (
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1111,7 +1155,12 @@ export default function JobDetails() {
                       targetHeight: trimH,
                     };
                     const hasCropData = opts.cropX != null && opts.cropWidth > 0;
-                    console.log(`[PHASE2] Fix Everything handoff: hasCrop=${hasCropData}, targetSize=${opts.targetWidth}×${opts.targetHeight}mm${hasCropData ? `, crop=(${opts.cropX?.toFixed?.(4)},${opts.cropY?.toFixed?.(4)}) ${opts.cropWidth?.toFixed?.(4)}×${opts.cropHeight?.toFixed?.(4)}` : ''}`);
+                    if (!hasCropData) {
+                      opts.isNoCrop = true;
+                      opts.is_no_crop = true;
+                      opts.crop_box = Array.isArray(opts.crop_box) ? opts.crop_box : [0, 0, 1, 1];
+                    }
+                    console.log(`[PHASE2] Fix Everything handoff: hasCrop=${hasCropData}, targetSize=${opts.targetWidth}×${opts.targetHeight}mm${hasCropData ? `, crop=(${opts.cropX?.toFixed?.(4)},${opts.cropY?.toFixed?.(4)}) ${opts.cropWidth?.toFixed?.(4)}×${opts.cropHeight?.toFixed?.(4)}` : ', isNoCrop=true'}`);
                     setAutoFixApplied(true);
                     processJob.mutate({ id: job.id, bleedOptions: opts }, {
                       onSuccess: () => {
@@ -1123,6 +1172,7 @@ export default function JobDetails() {
                         setBleedPreviewError(null);
                       },
                       onError: (err: unknown) => {
+                        setAutoFixApplied(false);
                         if (handleSafeZoneLayoutProcessingError(err)) {
                           return;
                         }

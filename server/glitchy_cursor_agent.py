@@ -62,11 +62,23 @@ def ensure_cursor_rules(project_root: Optional[str] = None) -> str:
     return rule_path
 
 
+FULL_PAGE_CROP_BOX = [0, 0, 1, 1]
+
+
 def resolve_crop_box(crop_box: Any, page_state: Optional[dict]) -> Any:
     """Populate full-page crop_box for No Crop routes when crop_box is missing."""
     state = page_state or {}
-    if not crop_box and state.get("is_no_crop"):
-        return state.get("full_page_dimensions")
+    if crop_box:
+        return crop_box
+    if (
+        state.get("is_no_crop")
+        or state.get("isNoCrop")
+        or state.get("preserveBleed")
+    ):
+        return state.get("full_page_dimensions") or FULL_PAGE_CROP_BOX
+    page = str(state.get("page") or "")
+    if page.startswith("/job/"):
+        return state.get("full_page_dimensions") or FULL_PAGE_CROP_BOX
     return crop_box
 
 
@@ -247,6 +259,14 @@ class TestGlitchyAgentIntegration(unittest.TestCase):
         self.assertIn("[0, 0, 595, 842]", sent_text)
         self.assertIn("Artwork bleed offset does not look right", sent_text)
         self.assertIn(".cursor/rules/prepress.mdc", sent_text)
+
+    def test_job_page_missing_crop_box_uses_full_page(self):
+        page_state = {"page": "/job/208", "jobId": 208, "href": "http://localhost:5000/job/208"}
+        box = resolve_crop_box(None, page_state)
+        self.assertEqual(box, FULL_PAGE_CROP_BOX)
+        prompt = build_agent_prompt("its stuck", crop_box=None, page_state=page_state)
+        self.assertIn("[0, 0, 1, 1]", prompt)
+        self.assertIn("its stuck", prompt)
 
     def test_rejects_missing_api_key(self):
         with self.assertRaises(ValueError):

@@ -1452,6 +1452,7 @@ def print_report():
         "prepress_struct": "25-Point Prepress Structural Assertions",
         "compile_pkg": "PDF Packaging — Flat Raster Compile",
         "print_enhance": "Smart Prepress Enhancer (Lanczos + Unsharp)",
+        "job_stuck": "Job Page Stuck Recovery (queued poll / no-crop)",
     }
 
     for sec, counts in sections.items():
@@ -3037,6 +3038,80 @@ def section_26_frequency_separated_bleed():
     gc.collect()
 
 
+def section_27_job_page_stuck_recovery():
+    """Glitchy 'its stuck' on /job/:id — polling, no-crop crop_box, fire-and-forget process."""
+    print(f"\n{BOLD}Section 27: Job Page Stuck Recovery{RESET}")
+    print(f"{'─'*60}")
+    root = os.path.join(os.path.dirname(__file__), "..")
+
+    def _read(rel):
+        path = os.path.join(root, rel)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    jobs_src = _read("client/src/hooks/use-jobs.ts")
+    jd_src = _read("client/src/pages/job-details.tsx")
+    routes_src = _read("server/routes.ts")
+    upload_src = _read("client/src/components/file-upload.tsx")
+    glitchy_src = _read("client/src/components/glitchy-widget.tsx")
+    agent_src = _read("server/glitchy_cursor_agent.py")
+
+    record("job_stuck", "useJob polls queued status (not just pending/processing)",
+           'status === "queued"' in jobs_src and "refetchInterval" in jobs_src,
+           "Queued jobs must keep polling or the job page freezes")
+
+    record("job_stuck", "Phase 1 hidden while job is queued",
+           "!isQueued" in jd_src and "currentPhase === 1" in jd_src,
+           "Queued jobs must not render Fix Everything / issues panel")
+
+    record("job_stuck", "computedPhase treats queued as in-flight (not Phase 1)",
+           "isQueued || isProcessing || isPending" in jd_src,
+           "Queued status must not be classified as 'issues need attention'")
+
+    record("job_stuck", "autoFixApplied resets on processing failure",
+           'job?.status === "failed"' in jd_src and "setAutoFixApplied(false)" in jd_src,
+           "Failed jobs must re-show Retry or the page looks stuck")
+
+    record("job_stuck", "Queue-position poller invalidates job query when dequeued",
+           'queryClient.invalidateQueries({ queryKey: ["job", jobId] })' in jd_src
+           or 'queryClient.invalidateQueries({ queryKey: ["job", jobId] })' in jd_src.replace(" ", ""),
+           "Must refetch job after leaving the queue")
+
+    record("job_stuck", "Precompile compiling has a poll ceiling (not infinite spinner)",
+           "MAX_COMPILING_POLLS" in jd_src and "compilingCountRef" in jd_src,
+           "Preparing artwork... must time out so the user can retry")
+
+    record("job_stuck", "Process endpoint is fire-and-forget (does not await processFile)",
+           "processFile(jobId, true, bleedOptions).catch(" in routes_src
+           and "await processFile(jobId, true, bleedOptions)" not in routes_src,
+           "Blocking process HTTP hangs the job page at 95%")
+
+    record("job_stuck", "sanitizeBleedOptions persists isNoCrop + full-page crop_box",
+           "isNoCrop" in routes_src and "crop_box = [0, 0, 1, 1]" in routes_src,
+           "No Crop Needed must populate backend crop_box without fake cropX/W")
+
+    record("job_stuck", "Upload No Crop path sends isNoCrop full-page crop_box",
+           "isNoCrop = true" in upload_src and "crop_box = [0, 0, 1, 1]" in upload_src,
+           "Skip-crop upload must attach full-page crop_box metadata")
+
+    record("job_stuck", "Glitchy report includes crop_box / is_no_crop from job",
+           "crop_box" in glitchy_src and "is_no_crop" in glitchy_src and "full_page_dimensions" in glitchy_src,
+           "Stuck reports must include crop_box so No Crop routes are identifiable")
+
+    record("job_stuck", "Glitchy chat answers stuck/frozen on the job page",
+           'msg.includes("stuck")' in routes_src,
+           "Users who say 'its stuck' should get a status-aware reply")
+
+    record("job_stuck", "fileProcessor stamps full-page crop_box when no crop coords",
+           "isNoCrop = true" in _read("server/fileProcessor.ts")
+           and "crop_box = (effectiveBleed as any).crop_box || [0, 0, 1, 1]" in _read("server/fileProcessor.ts"),
+           "No-crop process must persist full-page crop_box on savedBleedOptions")
+
+    record("job_stuck", "Agent resolve_crop_box fills full page for /job pages",
+           "FULL_PAGE_CROP_BOX" in agent_src and 'page.startswith("/job/")' in agent_src,
+           "Missing crop_box on a job page must default to full-page [0,0,1,1]")
+
+
 def main():
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}{CYAN}  FLYERZ ANTI-REGRESSION PIPELINE TEST{RESET}")
@@ -3137,6 +3212,9 @@ def main():
         gc.collect()
 
         section_26_frequency_separated_bleed()
+        gc.collect()
+
+        section_27_job_page_stuck_recovery()
         gc.collect()
 
         all_passed = print_report()

@@ -541,6 +541,12 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       const hasCropCoords =
         effectiveBleed && (effectiveBleed as any).cropX != null && (effectiveBleed as any).cropWidth > 0;
 
+      if (!hasCropCoords) {
+        (effectiveBleed as any).isNoCrop = true;
+        (effectiveBleed as any).is_no_crop = true;
+        (effectiveBleed as any).crop_box = (effectiveBleed as any).crop_box || [0, 0, 1, 1];
+      }
+
       console.time("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       let result!: ReturnType<typeof runPythonBleed>;
       try {
