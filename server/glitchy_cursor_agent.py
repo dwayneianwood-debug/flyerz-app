@@ -101,9 +101,17 @@ def build_v1_payload(
     prompt_text: str,
     repo_url: str,
     starting_ref: str = "main",
-    auto_create_pr: bool = True,
+    auto_create_pr: bool = False,
+    work_on_current_branch: bool = True,
 ) -> dict:
-    """Cloud Agents API v1 create-agent body (repos[], not legacy source{})."""
+    """Cloud Agents API v1 create-agent body (repos[], not legacy source{}).
+
+    Glitchy Cloud Agent runs commit and push fixes straight to the starting
+    branch (default: main) with no Pull Request or Draft:
+    - workOnCurrentBranch=True makes Cursor push commits directly to
+      repos[0].startingRef instead of an auto-generated `cursor/...` branch.
+    - autoCreatePR=False stops Cursor from opening a PR/Draft when the run ends.
+    """
     return {
         "prompt": {"text": prompt_text},
         "repos": [
@@ -112,6 +120,7 @@ def build_v1_payload(
                 "startingRef": starting_ref,
             }
         ],
+        "workOnCurrentBranch": work_on_current_branch,
         "autoCreatePR": auto_create_pr,
         "name": "Glitchy prepress fix",
         "mode": "agent",
@@ -219,6 +228,30 @@ class TestGlitchyAgentIntegration(unittest.TestCase):
         self.assertIn("repos", payload)
         self.assertNotIn("source", payload)
         self.assertEqual(payload["repos"][0]["url"], "https://github.com/acme/flyerz")
+        self.assertEqual(payload["repos"][0]["startingRef"], "main")
+
+    def test_payload_pushes_to_main_without_pr(self):
+        """Glitchy runs must commit directly to main with no PR/Draft."""
+        payload = build_v1_payload("fix bleed", "https://github.com/acme/flyerz")
+        self.assertIs(payload["autoCreatePR"], False)
+        self.assertIs(payload["workOnCurrentBranch"], True)
+        self.assertEqual(payload["repos"][0]["startingRef"], "main")
+        # The v1 API rejects an explicit branchName; direct push is driven by
+        # workOnCurrentBranch pushing to startingRef instead.
+        self.assertNotIn("branchName", payload)
+
+    def test_trigger_defaults_push_to_main_without_pr(self):
+        """End-to-end default payload (dry run) targets main directly, no PR."""
+        result = trigger_glitchy_background_fix(
+            user_feedback="bleed looks off",
+            api_key="cursor_test_key",
+            repo_url="https://github.com/acme/flyerz",
+            starting_ref="main",
+            dry_run=True,
+        )
+        payload = result["payload"]
+        self.assertIs(payload["autoCreatePR"], False)
+        self.assertIs(payload["workOnCurrentBranch"], True)
         self.assertEqual(payload["repos"][0]["startingRef"], "main")
 
     @patch("requests.post")
