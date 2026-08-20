@@ -10,6 +10,7 @@
     "build": "tsx script/build.ts",
     "start": "cross-env NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
+    "test:worker": "tsx --test server/glitchyWorker.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

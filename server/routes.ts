@@ -26,6 +26,7 @@ import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
+import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 
@@ -3111,6 +3112,25 @@ print(f'{w},{h}')
       },
     };
     if (!payload.user_feedback) return;
+
+    // Autonomous mode: route feedback through the guarded worker (dedupe +
+    // rate cap + concurrency cap + queue cap). Disabled unless GLITCHY_AUTORUN=1,
+    // so the direct fire-and-forget spawn below remains the default behavior.
+    if (process.env.GLITCHY_AUTORUN === "1") {
+      const outcome = getGlitchyWorker(GLITCHY_CURSOR_AGENT_SCRIPT, PYTHON_BIN).enqueue({
+        userFeedback: payload.user_feedback,
+        jobId: report.jobId ?? (payload.page_state as any)?.jobId ?? null,
+        cropBox: payload.crop_box,
+        gsLogs: payload.gs_logs,
+        pageState: payload.page_state,
+      });
+      if (!outcome.accepted) {
+        console.log(
+          `[Glitchy] autorun enqueue skipped (${outcome.reason}); pending=${outcome.pending} inFlight=${outcome.inFlight}`,
+        );
+      }
+      return;
+    }
 
     try {
       const child = spawn(
