@@ -1493,6 +1493,12 @@ def section_24_glitchy_stuck_nocrop_cropbox():
     record("glitchy_stuck", "Glitchy stays bottom-anchored",
            "bottom: isVisible ? 0" in glitchy_src and 'transformOrigin: "bottom center"' in glitchy_src)
 
+    jobs_hook = os.path.join(root, "client", "src", "hooks", "use-jobs.ts")
+    with open(jobs_hook, encoding="utf-8") as f:
+        jobs_src = f.read()
+    record("glitchy_stuck", "useJob keeps polling while status is queued",
+           '"queued"' in jobs_src and "refetchInterval" in jobs_src)
+
 
 def print_report():
     """Print final test report."""
