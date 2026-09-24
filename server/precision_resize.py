@@ -14,6 +14,7 @@ Process Flow:
   5. Return print-ready file with ResizeAudit
 """
 
+from artwork_types import is_vector_type
 import sys
 import json
 import os
@@ -577,7 +578,7 @@ def main():
     result_file = sys.argv[7]
 
     try:
-        if file_type == "pdf":
+        if is_vector_type(file_type):
             result = process_pdf(input_path, output_path, target_w_mm, target_h_mm, uniform)
         elif file_type in ("jpg", "jpeg", "png"):
             result = resize_image(input_path, output_path, target_w_mm, target_h_mm, uniform)

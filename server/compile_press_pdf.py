@@ -19,6 +19,7 @@ import shutil
 import time
 import math
 
+from artwork_types import input_kind
 from fai_temp_utils import init_fai_temp_dir, is_scratch_temp_file
 FAI_TEMP_DIR = init_fai_temp_dir()
 
@@ -1318,8 +1319,9 @@ def main():
             sys.stderr.write(f"[COMPILE] Using original (un-bled) file: {input_path}\n")
 
         file_ext = os.path.splitext(input_path)[1].lower()
-        is_pdf = file_ext == ".pdf"
-        is_image = file_ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp")
+        kind = input_kind(file_ext)
+        is_pdf = kind == "pdf"
+        is_image = kind == "image"
 
         compile_stats = {
             "total_spans": 0,

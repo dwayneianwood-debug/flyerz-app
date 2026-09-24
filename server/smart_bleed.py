@@ -38,6 +38,8 @@ import cv2
 cv2.setNumThreads(4)
 import numpy as np
 import fitz  # PyMuPDF
+from artwork_types import is_vector_extension, is_vector_type
+from vector_resolution import minimum_placed_dpi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -465,24 +467,9 @@ def detect_dpi_from_image(img_path: str) -> float:
 def get_original_pdf_dpi(pdf_path: str) -> int:
     try:
         doc = fitz.open(pdf_path)
-        min_dpi = 999
-        found_image = False
-
-        for page in doc:
-            img_info = page.get_image_info(xrefs=True)
-            for info in img_info:
-                width_pts = info['bbox'][2] - info['bbox'][0]
-                height_pts = info['bbox'][3] - info['bbox'][1]
-
-                if width_pts > 0 and height_pts > 0:
-                    dpi_x = (info['width'] / width_pts) * 72
-                    dpi_y = (info['height'] / height_pts) * 72
-                    current_dpi = min(dpi_x, dpi_y)
-                    min_dpi = min(min_dpi, current_dpi)
-                    found_image = True
-
+        dpi = minimum_placed_dpi(doc)
         doc.close()
-        return int(min_dpi) if found_image else 300
+        return 300 if dpi is None else int(round(dpi))
     except Exception:
         return 300
 
@@ -490,7 +477,7 @@ def get_original_pdf_dpi(pdf_path: str) -> int:
 def get_effective_asset_dpi(file_path: str, target_width_mm: float = 148, target_height_mm: float = 210) -> int:
     ext = os.path.splitext(file_path)[1].lower()
 
-    if ext == '.pdf':
+    if is_vector_extension(ext):
         return get_original_pdf_dpi(file_path)
     else:
         try:
@@ -649,7 +636,7 @@ def standardize_input(input_path: str, dpi: int = 300) -> tuple:
     temp_tiff = None
 
     try:
-        if ext == ".pdf":
+        if is_vector_extension(ext):
             scan = detect_rgb_alpha_emergency(input_path)
             complexity = check_pdf_complexity(input_path)
 
@@ -1518,7 +1505,7 @@ def generate_signoff_comparison(original_path: str, corrected_path: str,
             return images
 
         ext = os.path.splitext(original_path)[1].lower()
-        is_pdf = ext == ".pdf" or (file_type and file_type.lower() == "pdf")
+        is_pdf = is_vector_extension(ext) or is_vector_type(file_type or "")
         if is_pdf:
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=2) as _ex:
@@ -1620,7 +1607,7 @@ def generate_bleed_report_proof(original_path: str, fixed_path: str, output_png_
 
         def _load_as_bgr(fpath):
             ext = os.path.splitext(fpath)[1].lower()
-            if ext == ".pdf":
+            if is_vector_extension(ext):
                 doc = fitz.open(fpath)
                 page = doc[0]
                 zoom = 150 / 72.0
@@ -1702,7 +1689,7 @@ def _get_pdf_page_dimensions_mm(file_path: str) -> list:
     dims = []
     ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext == ".pdf":
+        if is_vector_extension(ext):
             doc = fitz.open(file_path)
             for page in doc:
                 w_mm = page.rect.width * 25.4 / 72.0
@@ -9067,7 +9054,7 @@ def main():
             })
             _attach_proof(result)
 
-        elif file_type == "pdf":
+        elif is_vector_type(file_type):
             result = apply_smart_bleed_to_pdf(input_path, output_path, bleed_opts)
 
         elif file_type in ("jpg", "jpeg", "png"):

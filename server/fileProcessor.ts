@@ -8,6 +8,13 @@ import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
+import { isPrintToolType } from "@shared/artwork-types";
+import {
+  auditIllustratorFile,
+  extractIllustratorPage,
+  isIllustratorType,
+  prepareIllustratorFile,
+} from "./illustratorIntake";
 
 const MAX_CONCURRENT_JOBS = 3;
 let activeJobs = 0;
@@ -525,10 +532,17 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       }),
     } as BleedOptions;
 
-    if (["pdf", "jpg", "jpeg", "png"].includes(fileType)) {
+    const illustrator = isIllustratorType(fileType) || isIllustratorType(filename);
+    if (illustrator) {
+      prepareIllustratorFile(originalPath, filename);
+    }
+
+    if (isPrintToolType(fileType) || illustrator) {
       const dir = path.dirname(originalPath);
-      const ext = path.extname(filename).toLowerCase();
-      const basename = path.basename(filename, ext);
+      const sourceExt = path.extname(filename).toLowerCase();
+      const ext = illustrator ? ".pdf" : sourceExt;
+      const basename = path.basename(filename, sourceExt || ext);
+      const pipelineType = illustrator ? "pdf" : (fileType === "jpeg" ? "jpg" : fileType);
 
       const originalWithExt = path.join(dir, `original_${jobId}_${basename}${ext}`);
       if (!path.extname(originalPath)) {
@@ -539,6 +553,28 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         }
       }
       let inputForBleed = path.extname(originalPath) ? originalPath : originalWithExt;
+      const selectedArtboard = Number((effectiveBleed as any)?.selectedPage);
+      if (illustrator && Number.isInteger(selectedArtboard) && selectedArtboard >= 0) {
+        const singlePage = path.join(dir, `original_${jobId}_${basename}_artboard${selectedArtboard + 1}.pdf`);
+        extractIllustratorPage(inputForBleed, singlePage, selectedArtboard);
+        inputForBleed = singlePage;
+        console.log(`[FAI] Illustrator artboard ${selectedArtboard + 1} selected for job ${jobId}`);
+      }
+      let illustratorChecks: AuditCheck[] = [];
+      if (illustrator) {
+        try {
+          illustratorChecks = auditIllustratorFile(inputForBleed).map((check) => ({
+            name: check.name,
+            passed: !!check.passed,
+            message: check.message || "",
+            autoFixed: false,
+            details: check.details || "",
+            severity: check.severity,
+          }));
+        } catch (auditErr) {
+          console.warn(`[FAI] Illustrator audit skipped for job ${jobId}:`, auditErr);
+        }
+      }
       const hasCropCoords = hasValidCropBox(effectiveBleed as any);
       const skipPreResize = hasCropCoords || isNoCropRoute(effectiveBleed as any);
 
@@ -560,7 +596,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         await runPythonResize(
           inputForBleed,
           resizedPath,
-          fileType === "jpeg" ? "jpg" : fileType,
+          pipelineType,
           effectiveBleed.targetWidth,
           effectiveBleed.targetHeight,
         );
@@ -571,12 +607,18 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
 
       const outputPath = path.join(dir, `processed_${jobId}_${basename}${ext}`);
 
-      result = await runPythonBleed(inputForBleed, outputPath, fileType, effectiveBleed);
+      result = await runPythonBleed(inputForBleed, outputPath, pipelineType, effectiveBleed);
       bleedPythonResult = result;
       } finally {
         console.timeEnd("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       }
       checks = result.checks || [];
+      if (illustratorChecks.length > 0) {
+        const seen = new Set(checks.map((check) => check.name));
+        for (const extra of illustratorChecks) {
+          if (!seen.has(extra.name)) checks.push(extra);
+        }
+      }
       proofPath = result.proofPath;
       proofPaths = result.proofPaths;
       proofPageCount = result.proofPageCount;
@@ -633,7 +675,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
           passed: false,
           message: `File type '${fileType}' is not supported.`,
           autoFixed: false,
-          details: "Supported types: PDF, JPG, PNG, DOCX, PPTX",
+          details: "Supported types: PDF, AI, EPS, JPG, PNG, DOCX, PPTX",
         },
       ];
     }

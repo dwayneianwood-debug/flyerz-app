@@ -12,7 +12,7 @@ export const fileJobs = sqliteTable("file_jobs", {
   uploadedAt: integer("uploaded_at", { mode: "timestamp_ms" }).$defaultFn(() => new Date()).notNull(),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   fileSize: integer("file_size").notNull(),
-  fileType: text("file_type").notNull(), // pdf, jpg, png, docx, pptx
+  fileType: text("file_type").notNull(), // pdf, jpg, png, docx, pptx, ai, eps
   // SQLite has no native JSONB; store JSON as text via Drizzle's JSON mode.
   auditResults: text("audit_results", { mode: "json" }).$type<Record<string, any> | null>(),
   errorMessage: text("error_message"),
@@ -31,7 +31,7 @@ export const insertFileJobSchema = createInsertSchema(fileJobs).omit({
 export type JobStatus = "pending" | "processing" | "complete" | "failed";
 
 // File types supported
-export type FileType = "pdf" | "jpg" | "png" | "docx" | "pptx";
+export type FileType = "pdf" | "jpg" | "png" | "docx" | "pptx" | "ai" | "eps";
 
 // Individual audit check result
 export interface AuditCheck {
@@ -88,6 +88,10 @@ export interface AuditResults {
     document_height_mm: number;
   };
   savedBleedOptions?: Record<string, any>;
+  /** Illustrator/EPS intake: artboard count after the file is read as a PDF. */
+  pageCount?: number;
+  /** Original container when an .ai or .eps file was normalised onto the PDF pipeline. */
+  sourceFormat?: "ai" | "eps";
   originalDpi?: number;
   showLowDpiWarning?: boolean;
   aiEnhanced?: boolean;

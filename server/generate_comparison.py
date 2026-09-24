@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from artwork_types import is_vector_extension
 import argparse
 import sys
 import os
@@ -44,7 +45,7 @@ def load_image(file_path: str, max_dim: int = 1200) -> PILImage.Image:
     if not file_path or not os.path.exists(file_path):
         return None
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf" or (not ext and _detect_is_pdf(file_path)):
+    if is_vector_extension(ext) or (not ext and _detect_is_pdf(file_path)):
         return render_pdf_page_to_image(file_path, max_dim)
     try:
         img = PILImage.open(file_path).convert("RGB")
