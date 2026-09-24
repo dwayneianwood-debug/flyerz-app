@@ -93,8 +93,19 @@ def _publish_zip_bytes(zip_bytes: bytes, final_zip_path: str) -> None:
 
 # API strings matching Node `select-bleed-method`; any other value routes to auto clean-bleed
 FORCED_BLEED_API_KEYS = frozenset({
-    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint",
+    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint", "colourBorder",
 })
+
+
+def _border_cmyk_arg(args) -> tuple:
+    def _pct(value) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(100.0, number))
+
+    return (_pct(args.border_c), _pct(args.border_m), _pct(args.border_y), _pct(args.border_k))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1169,6 +1180,11 @@ def main():
     parser.add_argument("--crop-w", type=float, default=-1, help="Manual crop width (pixels)")
     parser.add_argument("--crop-h", type=float, default=-1, help="Manual crop height (pixels)")
     parser.add_argument("--creep-mm", type=float, default=0, help="Creep/gutter margin shift in mm for folded booklets (0 = disabled)")
+    parser.add_argument("--border-c", type=float, default=0, help="Colour-border cyan percent")
+    parser.add_argument("--border-m", type=float, default=0, help="Colour-border magenta percent")
+    parser.add_argument("--border-y", type=float, default=0, help="Colour-border yellow percent")
+    parser.add_argument("--border-k", type=float, default=0, help="Colour-border black percent")
+    parser.add_argument("--border-label", default="White", help="Colour-border display name")
     parser.add_argument("--auto-shifter", type=float, default=0, help="Auto-Shifter scale-down percentage to pull content into safe zone (0 = disabled)")
     args = parser.parse_args()
 
@@ -1365,6 +1381,7 @@ def main():
                 target_bleed_px=target_bleed_px,
                 bleed_strategy=bleed_api_strategy,
                 dpi=float(dpi),
+                border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
             )
             sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
 
@@ -1665,6 +1682,7 @@ def main():
                                 target_bleed_px=target_bleed_px_pdf,
                                 bleed_strategy=bleed_api_pdf,
                                 dpi=float(render_dpi),
+                                border_cmyk=_border_cmyk_arg(args) if bleed_api_pdf == "colourBorder" else None,
                             )
                             del img_bgr
             
@@ -2357,6 +2375,25 @@ def main():
             except Exception as oi_err:
                 sys.stderr.write(f"[COMPILE] OutputIntent embedding failed (non-fatal): {oi_err}\n")
 
+        if args.strategy == "colourBorder":
+            try:
+                from colour_border import stamp_cmyk_bleed
+
+                stamp_cmyk_bleed(
+                    args.output,
+                    _border_cmyk_arg(args),
+                    float(args.trim_w),
+                    float(args.trim_h),
+                    PRESS_DEFAULT_BLEED_MM,
+                )
+                sys.stderr.write(
+                    f"[COMPILE] Colour border stamped onto CMYK bleed "
+                    f"C{args.border_c:g} M{args.border_m:g} Y{args.border_y:g} K{args.border_k:g}\n"
+                )
+            except Exception as border_err:
+                sys.stderr.write(f"[COMPILE] Colour border CMYK stamp failed: {border_err}\n")
+                raise
+
         output_size = os.path.getsize(args.output)
         sys.stderr.write(f"[COMPILE] Press-ready PDF complete: {args.output} ({output_size} bytes)\n")
 
@@ -2389,10 +2426,20 @@ def main():
             "replicate": "Edge Replicate",
             "upscale": "Upscale",
             "ai_outpaint": "AI Outpaint (proxy inpaint)",
+            "colourBorder": "Colour Border",
             "auto": "Auto-Detect",
         }
         strategy_label = strategy_labels.get(args.strategy, args.strategy)
-        geo_action = f"Generated litho-standard 5mm bleed using {strategy_label} strategy at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
+        if args.strategy == "colourBorder":
+            bc, bm, by, bk = _border_cmyk_arg(args)
+            geo_action = (
+                f"Generated litho-standard 5mm solid colour border ({args.border_label}, "
+                f"C{bc:g} M{bm:g} Y{by:g} K{bk:g}) at {render_dpi} DPI. "
+                f"Artwork kept at trim size with no mirror or stretch. "
+                f"TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
+            )
+        else:
+            geo_action = f"Generated litho-standard 5mm bleed using {strategy_label} strategy at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
 
         if compile_stats["lenses_flattened"]:
             res_action = f"Flattened complex live transparencies (lenses) and locked resolution to {render_dpi} DPI."

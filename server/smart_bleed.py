@@ -3565,6 +3565,7 @@ BLEED_STRATEGY_MIRROR = "mirror"
 BLEED_STRATEGY_REPLICATE = "replicate"
 BLEED_STRATEGY_UPSCALE = "upscale"
 BLEED_STRATEGY_AI_OUTPAINT = "ai_outpaint"
+BLEED_STRATEGY_COLOUR_BORDER = "colourBorder"
 BLEED_STRATEGY_GRADIENT_EXTRAPOLATE = "gradient_extrapolate"
 BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
 
@@ -7033,7 +7034,8 @@ def composite_ghost_frame_pullback(
 
 
 def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
-                           bleed_strategy: str = "auto", dpi: float = 300.0):
+                           bleed_strategy: str = "auto", dpi: float = 300.0,
+                           border_cmyk: tuple | None = None):
     """
     Unified bleed entry: strict geometric safe-zone clamp (SAFE_ZONE_MM vs trim), INTER_CUBIC resize,
     centered full-trim canvas with BORDER_REPLICATE margins; then validate_safe_zone; Elastic Anchor
@@ -7085,6 +7087,7 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         "replicate": BLEED_STRATEGY_REPLICATE,
         "upscale": BLEED_STRATEGY_UPSCALE,
         "ai_outpaint": BLEED_STRATEGY_AI_OUTPAINT,
+        "colourborder": BLEED_STRATEGY_COLOUR_BORDER,
         "gradient": BLEED_STRATEGY_GRADIENT_EXTRAPOLATE,
         "gradientextrapolate": BLEED_STRATEGY_GRADIENT_EXTRAPOLATE,
         "frequencyseparated": BLEED_STRATEGY_FREQUENCY_SEPARATED,
@@ -7125,12 +7128,15 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         return out, meta
 
     internal = strategy_map_lc[api_key]
-    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f)
+    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk)
+    if internal == BLEED_STRATEGY_COLOUR_BORDER:
+        meta["colourBorder"] = True
+        return out, meta
     out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
     return out, meta
 
 
-def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0) -> np.ndarray:
+def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0, border_cmyk: tuple | None = None) -> np.ndarray:
     orig_h, orig_w = img.shape[:2]
 
     def _bleed_tic_if_match(out_img: np.ndarray) -> np.ndarray:
@@ -7188,6 +7194,16 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             mirror_blend_bleed_expand(img, bleed_px, bleed_px, bleed_px, bleed_px, dpi)
         )
 
+    if strategy == BLEED_STRATEGY_COLOUR_BORDER:
+        from colour_border import apply_colour_border_bgr
+
+        ink = border_cmyk if border_cmyk is not None else (0.0, 0.0, 0.0, 0.0)
+        sys.stderr.write(
+            f"[BLEED][ROUTING] colourBorder → solid CMYK border "
+            f"C{ink[0]} M{ink[1]} Y{ink[2]} K{ink[3]} ({bleed_px}px, trim copied)\n"
+        )
+        return _bleed_tic_if_match(apply_colour_border_bgr(img, bleed_px, ink))
+
     if strategy == BLEED_STRATEGY_UPSCALE:
         sys.stderr.write(
             "[BLEED][ROUTING] upscale → _apply_smart_upscale_bleed "
@@ -7235,6 +7251,7 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         (BLEED_STRATEGY_BG_EXTRACT, "bgextract"),
         (BLEED_STRATEGY_UPSCALE, "upscale"),
         (BLEED_STRATEGY_AI_OUTPAINT, "ai_outpaint"),
+        (BLEED_STRATEGY_COLOUR_BORDER, "colourBorder"),
     ]
     api_for_suffix = {
         "stretch": "stretch",
@@ -7245,6 +7262,7 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         "bgextract": "bgExtract",
         "upscale": "upscale",
         "ai_outpaint": "ai_outpaint",
+        "colourBorder": "colourBorder",
     }
     for _strategy_internal, suffix in all_strategies:
         try:

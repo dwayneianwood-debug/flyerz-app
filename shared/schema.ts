@@ -99,9 +99,12 @@ export interface AuditResults {
     replicate?: string;
     upscale?: string;
     ai_outpaint?: string;
+    colourBorder?: string;
   };
   recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint";
-  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "auto";
+  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
+  /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */
+  colourBorder?: { c: number; m: number; y: number; k: number; label?: string; source?: string };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;
@@ -164,6 +167,7 @@ export const BLEED_STRATEGY_IDS = [
   "replicate",
   "upscale",
   "ai_outpaint",
+  "colourBorder",
 ] as const;
 
 export type BleedStrategyId = (typeof BLEED_STRATEGY_IDS)[number];

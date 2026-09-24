@@ -29,6 +29,12 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { ColourBorderPicker } from "@/components/colour-border-picker";
+import {
+  type ColourBorderChoice,
+  loadColourBorderChoice,
+  saveColourBorderChoice,
+} from "@/lib/colour-border";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
@@ -118,6 +124,10 @@ const BLEED_METHOD_LABELS = {
     description:
       "Fast proxy inpainting extends bleed colors softly; your 300 DPI artwork stays pixel-perfect in the center.",
   },
+  colourBorder: {
+    label: "Colour Border",
+    description: "Keeps the artwork at trim size and fills the bleed with a solid colour you choose.",
+  },
 } as const;
 
 export default function JobDetails() {
@@ -148,6 +158,10 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [colourBorder, setColourBorder] = useState<ColourBorderChoice>(() => loadColourBorderChoice());
+  const colourBorderRef = useRef(colourBorder);
+  colourBorderRef.current = colourBorder;
+  const colourSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bleedMethodLoading, setBleedMethodLoading] = useState(false);
   const [compileTaskId, setCompileTaskId] = useState<string | null>(null);
   const [compileState, setCompileState] = useState<string | null>(null);
@@ -747,10 +761,21 @@ export default function JobDetails() {
     }));
 
     try {
+      const border = colourBorderRef.current;
       const res = await fetch(`/api/jobs/${job.id}/select-bleed-method`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ method }),
+        body: JSON.stringify({
+          method,
+          colourBorder: method === "colourBorder" ? {
+            c: border.c,
+            m: border.m,
+            y: border.y,
+            k: border.k,
+            label: border.label,
+            source: border.source,
+          } : undefined,
+        }),
       });
 
       const data = await res.json();
@@ -830,6 +855,66 @@ export default function JobDetails() {
       setBleedPreviewLoading(false);
     }
   };
+
+  const handleColourBorderChange = async (next: ColourBorderChoice) => {
+    let choice = next;
+    if (next.source === "edge" && job) {
+      try {
+        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0`);
+        const data = await res.json();
+        if (res.ok && data.success) {
+          choice = {
+            source: "edge",
+            presetId: "edge",
+            label: "Match artwork edge",
+            c: Number(data.c) || 0,
+            m: Number(data.m) || 0,
+            y: Number(data.y) || 0,
+            k: Number(data.k) || 0,
+            r: Number(data.r) || 0,
+            g: Number(data.g) || 0,
+            b: Number(data.b) || 0,
+          };
+        }
+      } catch {
+        toast({ title: "Could not sample the edge", description: "Try another colour.", variant: "destructive" });
+      }
+    }
+    setColourBorder(choice);
+    colourBorderRef.current = choice;
+    saveColourBorderChoice(choice);
+    if (selectedBleedMethod !== "colourBorder" || !job) return;
+    if (colourSaveTimer.current) clearTimeout(colourSaveTimer.current);
+    const jobId = job.id;
+    colourSaveTimer.current = setTimeout(() => {
+      const latest = colourBorderRef.current;
+      void fetch(`/api/jobs/${jobId}/select-bleed-method`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          method: "colourBorder",
+          colourBorder: {
+            c: latest.c,
+            m: latest.m,
+            y: latest.y,
+            k: latest.k,
+            label: latest.label,
+            source: latest.source,
+          },
+        }),
+      });
+    }, 400);
+  };
+
+  const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
+    ? {
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`,
+        trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
+        trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
+        bleedMm: 5,
+      }
+    : null;
 
   const handleTextClearupStartOcr = async () => {
     if (!job || textClearupBusy) return;
@@ -1457,6 +1542,8 @@ export default function JobDetails() {
                         selected={selectedBleedMethod}
                         onSelect={handleBleedMethodSelect}
                         loading={bleedMethodLoading}
+                        colourBorder={colourBorder}
+                        onColourBorderChange={handleColourBorderChange}
                       />
                     </div>
                   )}
@@ -1489,6 +1576,7 @@ export default function JobDetails() {
                       currentBleedPage={currentBleedPage}
                       loadBleedPreview={loadBleedPreview}
                       enhancementLoading={aiEnhanceLoading}
+                      colourBorderPreview={colourBorderPreview}
                     />
                   </div>
                   <div className="px-4 sm:px-5 pb-4 sm:pb-5">
@@ -2479,7 +2567,7 @@ export default function JobDetails() {
 
 
 
-function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading }: {
+function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading, colourBorderPreview }: {
   bleedPreview: BleedPreviewData | null;
   bleedPreviewLoading: boolean;
   bleedPreviewError: string | null;
@@ -2488,7 +2576,50 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
   currentBleedPage: BleedPreviewPage | undefined;
   loadBleedPreview: () => void;
   enhancementLoading?: string | null;
+  colourBorderPreview?: { url: string; trimW: number; trimH: number; bleedMm: number } | null;
 }) {
+  if (colourBorderPreview) {
+    return (
+      <div className="space-y-3" data-testid="section-colour-border-preview">
+        <div className="relative bg-gray-900 rounded-xl border-2 border-red-500/30 overflow-hidden" data-testid="bleed-preview-image-container">
+          <img
+            src={colourBorderPreview.url}
+            alt="Colour border bleed preview"
+            className="w-full h-auto max-h-[500px] object-contain"
+            data-testid="img-colour-border-preview"
+          />
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Trim Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-trim-size">
+              {colourBorderPreview.trimW} × {colourBorderPreview.trimH}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Total Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-total-size">
+              {colourBorderPreview.trimW + colourBorderPreview.bleedMm * 2} × {colourBorderPreview.trimH + colourBorderPreview.bleedMm * 2}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Bleed</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-bleed-amount">
+              {colourBorderPreview.bleedMm}mm
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] text-muted-foreground justify-center">
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-0.5 bg-red-500 inline-block rounded"></span> Cut line
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-2 inline-block rounded border border-black/10" style={{ backgroundColor: "currentColor" }}></span> Colour border
+          </span>
+        </div>
+      </div>
+    );
+  }
   if (bleedPreviewLoading) {
     return (
       <div className="flex flex-col items-center gap-3 py-8">
@@ -2848,13 +2979,15 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
   selected: string;
   onSelect: (method: string) => void;
   loading: boolean;
+  colourBorder: ColourBorderChoice;
+  onColourBorderChange: (next: ColourBorderChoice) => void;
 }) {
   /** Always list every registered strategy; variant paths may be partial if generation skipped a tile. */
   const methods = [...BLEED_STRATEGY_IDS];
@@ -2899,10 +3032,20 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             {activeInfo.description}
           </p>
         )}
+        {activeMethod === "colourBorder" && (
+          <ColourBorderPicker value={colourBorder} onChange={onColourBorderChange} disabled={loading} />
+        )}
         {activeMethod && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
             <div className="aspect-[16/9]">
-              {variants[activeMethod] ? (
+              {activeMethod === "colourBorder" ? (
+              <img
+                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`}
+                alt="Colour border preview"
+                className="w-full h-full object-contain"
+                data-testid="img-bleed-variant-colourBorder"
+              />
+              ) : variants[activeMethod] ? (
               <img
                 src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
                 alt={activeInfo?.label || activeMethod}

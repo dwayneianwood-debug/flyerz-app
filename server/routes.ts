@@ -101,6 +101,24 @@ function nukeRamDisk() {
   } catch {}
 }
 
+function colourBorderCliArgs(strategy: string, audit: any): string[] {
+  if (strategy !== "colourBorder") return [];
+  const border = audit?.colourBorder || {};
+  const pct = (value: unknown) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "0";
+    return String(Math.min(100, Math.max(0, number)));
+  };
+  const label = String(border.label || "White").replace(/[\r\n]/g, " ").slice(0, 80);
+  return [
+    "--border-c", pct(border.c),
+    "--border-m", pct(border.m),
+    "--border-y", pct(border.y),
+    "--border-k", pct(border.k),
+    "--border-label", label,
+  ];
+}
+
 function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, job: any) {
   cancelPreCompile(jobId);
   nukeRamDisk();
@@ -145,6 +163,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--report-path", reportPath,
     "--base-name", baseName,
     "--creep-mm", String(precompileCreepMm),
+    ...colourBorderCliArgs(strategy, auditResults),
   ];
 
   args.push(
@@ -1362,6 +1381,78 @@ export async function registerRoutes(
     }
   });
 
+  const COLOUR_BORDER_SCRIPT = path.join(process.cwd(), "server", "colour_border.py");
+
+  app.get('/api/jobs/:id/colour-border-preview', async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const source = job.originalPath || job.correctedPath;
+      if (!source) return res.status(404).json({ message: "Artwork not available" });
+      try {
+        await fs.access(source);
+      } catch {
+        return res.status(404).json({ message: "Artwork file not found" });
+      }
+      const saved = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
+      const trimW = Number(saved.targetWidth) > 0 ? Number(saved.targetWidth) : 148;
+      const trimH = Number(saved.targetHeight) > 0 ? Number(saved.targetHeight) : 210;
+      const bleedMm = 5;
+      const lines = req.query.lines === "0" ? false : true;
+      const sampleEdge = req.query.edge === "1";
+      const crop = (!saved.isNoCrop && !saved.preserveBleed && saved.cropWidth > 0 && saved.cropHeight > 0)
+        ? [Number(saved.cropX) || 0, Number(saved.cropY) || 0, Number(saved.cropWidth), Number(saved.cropHeight)]
+        : null;
+      const previewFilename = `colour_border_${jobId}_${Date.now()}.png`;
+      const previewPath = path.join(uploadDir, previewFilename);
+      const options = {
+        src: source,
+        dest: previewPath,
+        trimW,
+        trimH,
+        bleedMm,
+        c: Number(req.query.c) || 0,
+        m: Number(req.query.m) || 0,
+        y: Number(req.query.y) || 0,
+        k: Number(req.query.k) || 0,
+        lines,
+        page: Number(req.query.page) || 1,
+        crop,
+        sampleEdge,
+      };
+      const previewProc = spawnSync(PYTHON_BIN, [COLOUR_BORDER_SCRIPT, "preview", JSON.stringify(options)], {
+        cwd: process.cwd(),
+        env: PYTHON_ENV,
+        encoding: "utf8",
+        timeout: EXEC_TIMEOUT_MS,
+      });
+      if (previewProc.status !== 0) {
+        const detail = (previewProc.stderr || previewProc.stdout || "").slice(-400);
+        throw new Error(detail || "Colour border preview failed");
+      }
+      const previewLine = (previewProc.stdout || "").trim().split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
+      const info = previewLine ? JSON.parse(previewLine) : null;
+      if (!info?.success) {
+        return res.status(400).json({ message: info?.error || "Could not build the colour border preview" });
+      }
+      if (req.query.format === "json") {
+        return res.json({ ...info, url: `/api/jobs/${jobId}/bleed-preview-image/${previewFilename}` });
+      }
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Colour-C", String(info.c));
+      res.setHeader("X-Colour-M", String(info.m));
+      res.setHeader("X-Colour-Y", String(info.y));
+      res.setHeader("X-Colour-K", String(info.k));
+      const { createReadStream } = await import("fs");
+      createReadStream(previewPath).pipe(res);
+    } catch (error) {
+      console.error("[FAI] Colour border preview failed:", error);
+      res.status(500).json({ message: error instanceof Error ? error.message : "Could not build the colour border preview" });
+    }
+  });
+
   // Generate bleed preview with trim/cut lines
   const BLEED_PREVIEW_SCRIPT = path.join(process.cwd(), "server", "bleed_preview.py");
 
@@ -1519,7 +1610,7 @@ export async function registerRoutes(
   app.post('/api/jobs/:id/select-bleed-method', async (req, res) => {
     try {
       const jobId = Number(req.params.id);
-      const { method } = req.body;
+      const { method, colourBorder } = req.body;
       const validMethods = [...BLEED_METHOD_POST_VALUES];
       if (!method || !(validMethods as readonly string[]).includes(method)) {
         return res.status(400).json({ message: `Invalid method: ${method}` });
@@ -1546,6 +1637,20 @@ export async function registerRoutes(
         ...auditResults,
         selectedBleedMethod: method as AuditResults["selectedBleedMethod"],
       };
+      if (method === "colourBorder" && colourBorder && typeof colourBorder === "object") {
+        const pct = (value: unknown) => {
+          const number = Number(value);
+          return Number.isFinite(number) ? Math.min(100, Math.max(0, number)) : 0;
+        };
+        updatedResults.colourBorder = {
+          c: pct(colourBorder.c),
+          m: pct(colourBorder.m),
+          y: pct(colourBorder.y),
+          k: pct(colourBorder.k),
+          label: String(colourBorder.label || "White").slice(0, 80),
+          source: String(colourBorder.source || "preset").slice(0, 20),
+        };
+      }
 
       await storage.updateJob(jobId, { auditResults: updatedResults });
 
@@ -1565,7 +1670,7 @@ export async function registerRoutes(
         try {
           await fs.access(artworkPath);
           console.log(`TRACER: [Checkpoint B] spawnPreCompile: job=${jobId} strategy="${method}" artworkPath="${artworkPath}"`);
-          spawnPreCompile(jobId, artworkPath, method, job);
+          spawnPreCompile(jobId, artworkPath, method, { ...job, auditResults: updatedResults });
         } catch (e) {
           console.log(`[FAI] Pre-compile skipped for job ${jobId}: artwork not accessible`);
         }
@@ -2032,6 +2137,7 @@ export async function registerRoutes(
         "--creep-mm", String(creepMm),
         ...cropArgs,
         ...(autoShifter ? ["--auto-shifter", "2.0"] : []),
+        ...colourBorderCliArgs(effectiveStrategy, auditResults),
       ];
 
       if (job.originalPath && job.originalPath !== artworkPath) {
