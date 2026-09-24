@@ -113,7 +113,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                         </div>
                         <div>
                           <p className="text-sm font-semibold text-foreground leading-tight">Manual Crop</p>
-                          <p className="text-[11px] text-muted-foreground">Draw or type exact crop dimensions</p>
+                          <p className="text-[11px] text-muted-foreground">Crop any size, save PDF or JPG</p>
                         </div>
                       </div>
                     </Link>

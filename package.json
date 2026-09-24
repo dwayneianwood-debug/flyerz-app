@@ -12,6 +12,7 @@
     "check": "tsc",
     "test:worker": "tsx --test server/glitchyWorker.test.ts",
     "test:artwork-preview": "tsx --test client/src/components/artwork-thumbnail.test.tsx",
+    "test:pure-crop": "tsx --test server/pureCrop.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

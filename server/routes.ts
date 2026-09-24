@@ -29,6 +29,7 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { registerPureCropRoutes } from "./pureCropRoutes";
 
 const EXEC_TIMEOUT_MS = 60_000;
 const COMPILE_TIMEOUT_MS = 180_000;
@@ -3495,6 +3496,8 @@ print(f'{w},{h}')
   }
 
   await seedDatabase();
+
+  registerPureCropRoutes(app);
 
   return httpServer;
 }
