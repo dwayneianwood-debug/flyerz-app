@@ -1107,6 +1107,14 @@ if __name__ == "__main__":
             float(options.get("trim_h_mm", 210)),
             float(options.get("bleed_mm", 5)),
         )
+    elif action == "ai_artwork_assess":
+        from ai_artwork import plan_artwork
+        result = plan_artwork(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+            options,
+        )
     else:
         result = {"error": f"Unknown action: {action}"}
         sys.exit(1)

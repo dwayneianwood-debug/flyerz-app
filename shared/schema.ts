@@ -101,7 +101,7 @@ export interface AuditResults {
     ai_outpaint?: string;
     colourBorder?: string;
   };
-  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint";
+  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder";
   selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
   /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */
   colourBorder?: { c: number; m: number; y: number; k: number; label?: string; source?: string };
@@ -118,6 +118,30 @@ export interface AuditResults {
     effectiveDpi?: number;
     enhancedDpi?: number;
     kind?: string;
+  };
+  /** Auto defaults for likely AI-generated images. Every field is overridable. */
+  aiArtwork?: {
+    detected?: boolean;
+    reasons?: string[];
+    mismatch?: boolean;
+    fit?: "crop" | "extend" | "border" | "none";
+    offset?: number;
+    bleed?: string;
+    bleedOverridden?: boolean;
+    edge?: { c: number; m: number; y: number; k: number };
+    enhance?: boolean;
+    enhanceOverridden?: boolean;
+    effectiveDpi?: number;
+    bright?: boolean;
+    brightMessage?: string;
+    textStatus?: "warning" | "clear" | "unavailable";
+    textWarnings?: Array<{ word: string; suggestion?: string }>;
+    textMessage?: string;
+    applied?: string[];
+    note?: string;
+    blocked?: boolean;
+    srcW?: number;
+    srcH?: number;
   };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;

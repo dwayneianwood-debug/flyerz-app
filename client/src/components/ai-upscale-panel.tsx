@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CheckCircle2, Loader2, Sparkles } from "lucide-react";
 
 export const AI_UPSCALE_EXPLANATION = "Make blurry or low-resolution artwork crisp and clear.";
@@ -178,14 +178,22 @@ interface AiUpscalePanelProps {
   trimWidthMm: number;
   trimHeightMm: number;
   onApplied?: () => void;
+  /** When AI artwork is under 300 DPI, turn enhancement on and accept it. The switch still works. */
+  autoStart?: boolean;
+  onEnhanceChoice?: (accepted: boolean) => void;
 }
 
-export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied }: AiUpscalePanelProps) {
+export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied, autoStart = false, onEnhanceChoice }: AiUpscalePanelProps) {
   const [enabled, setEnabled] = useState(false);
   const [phase, setPhase] = useState<AiUpscalePhase>("idle");
   const [assess, setAssess] = useState<AiUpscaleAssess | null>(null);
   const [preview, setPreview] = useState<AiUpscalePreview | null>(null);
   const [slider, setSlider] = useState(55);
+  const userTouched = useRef(false);
+  const autoStarted = useRef(false);
+  const autoAccepted = useRef(false);
+  const onEnhanceChoiceRef = useRef(onEnhanceChoice);
+  onEnhanceChoiceRef.current = onEnhanceChoice;
 
   useEffect(() => {
     let cancel = false;
@@ -211,6 +219,10 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied }: 
             provider: data.saved.provider,
             message: data.saved.message,
           });
+        } else if (data.saved && data.saved.accepted === false && !data.saved.note) {
+          setEnabled(false);
+          setPhase("kept");
+          userTouched.current = true;
         }
       })
       .catch(() => {});
@@ -227,7 +239,8 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied }: 
     });
   };
 
-  const onToggle = async (next: boolean) => {
+  const onToggle = async (next: boolean, fromAuto = false) => {
+    if (!fromAuto) userTouched.current = true;
     if (!next) {
       setEnabled(false);
       setPhase("idle");
@@ -270,9 +283,35 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied }: 
     }
   };
 
+  useEffect(() => {
+    if (!autoStart || userTouched.current || autoStarted.current) return;
+    if (!assess || assess.eligible === false) return;
+    if (phase !== "idle") return;
+    autoStarted.current = true;
+    void onToggle(true, true);
+  }, [autoStart, assess, phase]);
+
+  useEffect(() => {
+    if (!autoStarted.current || userTouched.current || autoAccepted.current) return;
+    if (phase !== "ready") return;
+    autoAccepted.current = true;
+    void (async () => {
+      try {
+        await saveDecision(true);
+        await onEnhanceChoiceRef.current?.(true);
+        setPhase("accepted");
+        onApplied?.();
+      } catch {
+        setPhase("fallback");
+      }
+    })();
+  }, [phase]);
+
   const onAccept = async () => {
+    userTouched.current = true;
     try {
       await saveDecision(true);
+      await onEnhanceChoiceRef.current?.(true);
       setPhase("accepted");
       onApplied?.();
     } catch {
@@ -282,8 +321,10 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied }: 
   };
 
   const onKeep = async () => {
+    userTouched.current = true;
     try {
       await saveDecision(false);
+      await onEnhanceChoiceRef.current?.(false);
       setPhase("kept");
       onApplied?.();
     } catch {

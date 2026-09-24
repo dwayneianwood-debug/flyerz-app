@@ -101,6 +101,30 @@ function nukeRamDisk() {
   } catch {}
 }
 
+function aiArtworkCliArgs(audit: any): string[] {
+  const art = audit?.aiArtwork;
+  if (!art?.detected) return [];
+  const requested = String(art.fit || "crop");
+  const fit = art.mismatch && ["crop", "extend", "border"].includes(requested) ? requested : "none";
+  const offset = Number(art.offset);
+  const note = String(art.note || "AI-generated artwork detected.").replace(/[\r\n]/g, " ").slice(0, 700);
+  const edge = art.edge || {};
+  const pct = (value: unknown) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "0";
+    return String(Math.min(100, Math.max(0, number)));
+  };
+  return [
+    "--ai-artwork-fit", fit,
+    "--ai-artwork-offset", String(Number.isFinite(offset) ? Math.min(1, Math.max(0, offset)) : 0.5),
+    "--ai-artwork-note", note,
+    "--ai-fit-c", pct(edge.c),
+    "--ai-fit-m", pct(edge.m),
+    "--ai-fit-y", pct(edge.y),
+    "--ai-fit-k", pct(edge.k),
+  ];
+}
+
 function aiUpscaleCliArgs(audit: any): string[] {
   const saved = audit?.aiUpscale;
   if (!saved?.accepted) return [];
@@ -176,6 +200,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--creep-mm", String(precompileCreepMm),
     ...colourBorderCliArgs(strategy, auditResults),
     ...aiUpscaleCliArgs(auditResults),
+    ...aiArtworkCliArgs(auditResults),
   ];
 
   args.push(
@@ -2054,6 +2079,176 @@ export async function registerRoutes(
     }
   });
 
+  const slimArtworkPlan = (parsed: any, flags: { enhanceOverridden?: boolean; bleedOverridden?: boolean } = {}) => ({
+    detected: !!parsed?.detected,
+    reasons: Array.isArray(parsed?.reasons) ? parsed.reasons : [],
+    mismatch: !!parsed?.mismatch,
+    fit: parsed?.fit || "none",
+    offset: Number.isFinite(Number(parsed?.offset)) ? Number(parsed.offset) : 0.5,
+    bleed: parsed?.bleed || "mirror",
+    bleedOverridden: !!flags.bleedOverridden,
+    edge: parsed?.edge || { c: 0, m: 0, y: 0, k: 0 },
+    enhance: !!parsed?.enhance,
+    enhanceOverridden: !!flags.enhanceOverridden,
+    effectiveDpi: parsed?.effective_dpi ?? parsed?.effectiveDpi ?? null,
+    bright: !!parsed?.bright,
+    brightMessage: parsed?.bright_message || parsed?.brightMessage || "",
+    textStatus: parsed?.text_status || parsed?.textStatus || "unavailable",
+    textWarnings: parsed?.text_warnings || parsed?.textWarnings || [],
+    textMessage: parsed?.text_message || parsed?.textMessage || "",
+    applied: Array.isArray(parsed?.applied) ? parsed.applied : [],
+    note: parsed?.note || "",
+    blocked: false,
+    srcW: parsed?.src_w || parsed?.srcW || 0,
+    srcH: parsed?.src_h || parsed?.srcH || 0,
+    crop: parsed?.crop || null,
+  });
+
+  app.get("/api/jobs/:id/ai-artwork/assess", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const ext = artworkPath ? path.extname(artworkPath).toLowerCase() : "";
+      const fileType = String(job.fileType || "").toLowerCase();
+      const imageExt = [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"].includes(ext);
+      const imageType = ["png", "jpg", "jpeg", "webp", "tif", "tiff"].includes(fileType);
+      if (!artworkPath || (!imageExt && !imageType)) {
+        return res.json({ success: true, detected: false, blocked: false });
+      }
+      const saved = audit.aiArtwork || null;
+      const options: Record<string, unknown> = {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        screen_preview: path.join(uploadDir, `ai-artwork-${jobId}-screen.png`),
+        print_preview: path.join(uploadDir, `ai-artwork-${jobId}-print.png`),
+        source_preview: path.join(uploadDir, `ai-artwork-${jobId}-source.png`),
+      };
+      if (saved?.detected) {
+        if (saved.fit) options.fit = saved.fit;
+        if (saved.offset != null) options.offset = saved.offset;
+        if (saved.bleed) options.bleed = saved.bleed;
+        options.use_given_enhance = true;
+        options.enhance = !!saved.enhance;
+        if (saved.textMessage) {
+          options.reuse_text = {
+            text_status: saved.textStatus,
+            text_warnings: saved.textWarnings || [],
+            text_message: saved.textMessage,
+          };
+        }
+      }
+      const parsed = await runUpscaleScript("ai_artwork_assess", artworkPath, options);
+      const plan = slimArtworkPlan(parsed, {
+        enhanceOverridden: !!saved?.enhanceOverridden,
+        bleedOverridden: !!saved?.bleedOverridden,
+      });
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        ...plan,
+        saved: !!saved?.detected,
+        trimW,
+        trimH,
+        sourceUrl: `/api/jobs/${jobId}/ai-artwork/image?which=source`,
+        screenUrl: `/api/jobs/${jobId}/ai-artwork/image?which=screen`,
+        printUrl: `/api/jobs/${jobId}/ai-artwork/image?which=print`,
+      });
+    } catch (error: any) {
+      console.error("[AI-ARTWORK] assess failed:", error?.message || error);
+      res.json({ success: true, detected: false, blocked: false });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-artwork/choice", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      if (!artworkPath) return res.json({ success: true, detected: false, blocked: false });
+      const prev = audit.aiArtwork || {};
+      const body = req.body || {};
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(body.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(body.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const fit = ["crop", "extend", "border", "none"].includes(body.fit) ? body.fit : (prev.fit || "crop");
+      const offset = body.offset != null ? Number(body.offset) : Number(prev.offset ?? 0.5);
+      const enhance = body.enhance != null ? body.enhance === true : !!prev.enhance;
+      const bleed = typeof body.bleed === "string" && body.bleed ? body.bleed : (prev.bleed || "mirror");
+      const enhanceOverridden = body.enhanceOverridden != null ? body.enhanceOverridden === true : !!prev.enhanceOverridden;
+      const bleedOverridden = body.bleedOverridden != null ? body.bleedOverridden === true : !!prev.bleedOverridden;
+      const textMessage = body.textMessage || prev.textMessage;
+      const options: Record<string, unknown> = {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        fit,
+        offset,
+        bleed,
+        use_given_enhance: true,
+        enhance,
+        screen_preview: path.join(uploadDir, `ai-artwork-${jobId}-screen.png`),
+        print_preview: path.join(uploadDir, `ai-artwork-${jobId}-print.png`),
+        source_preview: path.join(uploadDir, `ai-artwork-${jobId}-source.png`),
+      };
+      if (textMessage) {
+        options.reuse_text = {
+          text_status: body.textStatus || prev.textStatus,
+          text_warnings: body.textWarnings || prev.textWarnings || [],
+          text_message: textMessage,
+        };
+      }
+      const parsed = await runUpscaleScript("ai_artwork_assess", artworkPath, options);
+      if (!parsed?.detected) return res.json({ success: true, detected: false, blocked: false });
+      const plan = slimArtworkPlan(parsed, { enhanceOverridden, bleedOverridden });
+      const nextAudit: any = { ...audit, aiArtwork: plan };
+      if (!bleedOverridden && plan.bleed) {
+        nextAudit.recommendedBleedMethod = plan.bleed;
+      }
+      if (!bleedOverridden && plan.bleed === "colourBorder" && plan.edge) {
+        nextAudit.colourBorder = {
+          c: Number(plan.edge.c) || 0,
+          m: Number(plan.edge.m) || 0,
+          y: Number(plan.edge.y) || 0,
+          k: Number(plan.edge.k) || 0,
+          label: "Match artwork edge",
+          source: "edge",
+        };
+      }
+      await storage.updateJob(jobId, { auditResults: nextAudit });
+      res.json({
+        ...plan,
+        saved: true,
+        sourceUrl: `/api/jobs/${jobId}/ai-artwork/image?which=source`,
+        screenUrl: `/api/jobs/${jobId}/ai-artwork/image?which=screen`,
+        printUrl: `/api/jobs/${jobId}/ai-artwork/image?which=print`,
+      });
+    } catch (error) {
+      console.error("[AI-ARTWORK] choice failed:", error);
+      res.json({ success: true, detected: false, blocked: false });
+    }
+  });
+
+  app.get("/api/jobs/:id/ai-artwork/image", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const which = req.query.which === "print" ? "print" : req.query.which === "screen" ? "screen" : "source";
+      const filePath = path.join(uploadDir, `ai-artwork-${jobId}-${which}.png`);
+      if (!fsSync.existsSync(filePath)) return res.status(404).json({ message: "Preview not ready" });
+      res.setHeader("Cache-Control", "no-store");
+      res.type("png");
+      fsSync.createReadStream(filePath).pipe(res);
+    } catch (error) {
+      console.error("[AI-ARTWORK] image failed:", error);
+      res.status(404).json({ message: "Preview not ready" });
+    }
+  });
+
   // --- Optional Text Clear-up (OCR → edit → overlay). Unused = zero pipeline change. ---
   const resolveTextClearupArtwork = (job: any, auditResults: any): string | null => {
     const p = auditResults?.preBleedPath || job.correctedPath || job.originalPath;
@@ -2344,6 +2539,7 @@ export async function registerRoutes(
         ...(autoShifter ? ["--auto-shifter", "2.0"] : []),
         ...colourBorderCliArgs(effectiveStrategy, auditResults),
         ...aiUpscaleCliArgs(auditResults),
+        ...aiArtworkCliArgs(auditResults),
       ];
 
       if (job.originalPath && job.originalPath !== artworkPath) {

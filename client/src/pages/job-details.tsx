@@ -31,8 +31,10 @@ import {
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
+import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
 import {
   type ColourBorderChoice,
+  cmykToRgb,
   loadColourBorderChoice,
   saveColourBorderChoice,
 } from "@/lib/colour-border";
@@ -159,6 +161,8 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [autoEnhance, setAutoEnhance] = useState(false);
+  const [aiArtworkGate, setAiArtworkGate] = useState<{ ready: boolean; bleed?: string }>({ ready: false });
   const [colourBorder, setColourBorder] = useState<ColourBorderChoice>(() => loadColourBorderChoice());
   const colourBorderRef = useRef(colourBorder);
   colourBorderRef.current = colourBorder;
@@ -412,10 +416,12 @@ export default function JobDetails() {
     const variants = job.auditResults?.bleedVariants;
     const hasVariants = variants && Object.keys(variants).length > 0;
     if (hasVariants) return;
-    const recommended = job.auditResults?.recommendedBleedMethod || "mirror";
+    const canAssessArtwork = !!(job.auditResults && (job.correctedPath || job.originalPath));
+    if (canAssessArtwork && !aiArtworkGate.ready) return;
+    const recommended = aiArtworkGate.bleed || job.auditResults?.recommendedBleedMethod || "mirror";
     autoSelectTriggeredRef.current = true;
     handleBleedMethodSelect(recommended);
-  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
+  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, job?.correctedPath, job?.originalPath, selectedBleedMethod, aiArtworkGate]);
 
   const noneCountRef = useRef(0);
   const compilingCountRef = useRef(0);
@@ -1220,6 +1226,43 @@ export default function JobDetails() {
                 </p>
               </div>
 
+              {job.auditResults && (job.correctedPath || job.originalPath) && (
+                <div className="mb-6">
+                  <AiArtworkPanel
+                    jobId={job.id}
+                    trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                    trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                    onPlan={(plan: AiArtworkPlan) => {
+                      if (plan.bleed === "colourBorder" && plan.edge) {
+                        const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                        const choice: ColourBorderChoice = {
+                          source: "edge",
+                          presetId: "edge",
+                          label: "Match artwork edge",
+                          c: Number(plan.edge.c) || 0,
+                          m: Number(plan.edge.m) || 0,
+                          y: Number(plan.edge.y) || 0,
+                          k: Number(plan.edge.k) || 0,
+                          r: rgb.r,
+                          g: rgb.g,
+                          b: rgb.b,
+                        };
+                        colourBorderRef.current = choice;
+                        setColourBorder(choice);
+                        saveColourBorderChoice(choice);
+                      }
+                      setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                      setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                    }}
+                    onRefit={() => {
+                      if (selectedBleedMethod !== "auto") {
+                        void handleBleedMethodSelect(selectedBleedMethod, true);
+                      }
+                    }}
+                  />
+                </div>
+              )}
+
               {job.auditResults && job.auditResults.checks.some(c => !c.passed) && (
                 <div className="grid gap-3 sm:grid-cols-2 mb-6">
                   {job.auditResults.checks.filter(c => !c.passed).map((check, idx) => (
@@ -1534,7 +1577,43 @@ export default function JobDetails() {
                       </LazyCollapsibleContent>
                     </Collapsible>
                   )}
-                  {job.auditResults && job.correctedPath && (
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="px-4 sm:px-5 pt-4">
+                      <AiArtworkPanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        onPlan={(plan: AiArtworkPlan) => {
+                          if (plan.bleed === "colourBorder" && plan.edge) {
+                            const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                            const choice: ColourBorderChoice = {
+                              source: "edge",
+                              presetId: "edge",
+                              label: "Match artwork edge",
+                              c: Number(plan.edge.c) || 0,
+                              m: Number(plan.edge.m) || 0,
+                              y: Number(plan.edge.y) || 0,
+                              k: Number(plan.edge.k) || 0,
+                              r: rgb.r,
+                              g: rgb.g,
+                              b: rgb.b,
+                            };
+                            colourBorderRef.current = choice;
+                            setColourBorder(choice);
+                            saveColourBorderChoice(choice);
+                          }
+                          setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                          setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                        }}
+                        onRefit={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
                     <div className="p-4 sm:p-5 border-b border-border/30">
                       <BleedMethodSelector
                         jobId={job.id}
@@ -1548,12 +1627,25 @@ export default function JobDetails() {
                       />
                     </div>
                   )}
-                  {job.auditResults && job.correctedPath && (
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
                     <div className="px-4 sm:px-5 pb-5 border-b border-border/30">
                       <AiUpscalePanel
                         jobId={job.id}
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        autoStart={autoEnhance}
+                        onEnhanceChoice={async (accepted) => {
+                          setAutoEnhance(accepted);
+                          try {
+                            await fetch(`/api/jobs/${job.id}/ai-artwork/choice`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ enhance: accepted, enhanceOverridden: true }),
+                            });
+                          } catch {
+                            /* The print job still continues. */
+                          }
+                        }}
                         onApplied={() => {
                           if (selectedBleedMethod !== "auto") {
                             void handleBleedMethodSelect(selectedBleedMethod, true);

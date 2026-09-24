@@ -73,6 +73,45 @@ def _maybe_use_enhanced_raster(img, args, *, allow_pdf_page: bool = False):
     return loaded, True
 
 
+def _apply_ai_artwork_fit(img, args, already_enhanced: bool = False):
+    """Fit an AI image to the print aspect before cover-scale. Failures keep the raster."""
+    fit = (getattr(args, "ai_artwork_fit", "") or "").strip().lower()
+    if fit not in ("crop", "extend", "border"):
+        return img
+    try:
+        from ai_artwork import apply_artwork_fit, configured_expand
+
+        source = ""
+        expand_fn = None
+        if fit == "extend" and not already_enhanced:
+            source = getattr(args, "input", "") or ""
+            expand_fn = configured_expand
+        fitted, info = apply_artwork_fit(
+            img,
+            float(args.trim_w),
+            float(args.trim_h),
+            fit,
+            float(getattr(args, "ai_artwork_offset", 0.5) or 0.5),
+            (
+                float(getattr(args, "ai_fit_c", 0) or 0),
+                float(getattr(args, "ai_fit_m", 0) or 0),
+                float(getattr(args, "ai_fit_y", 0) or 0),
+                float(getattr(args, "ai_fit_k", 0) or 0),
+            ),
+            source_path=source,
+            expand_fn=expand_fn,
+        )
+        if fitted is None or getattr(fitted, "size", 0) == 0:
+            return img
+        sys.stderr.write(
+            f"[COMPILE] AI artwork fit '{fit}' → {fitted.shape[1]}x{fitted.shape[0]} ({info.get('expand')})\n"
+        )
+        return fitted
+    except Exception as exc:
+        sys.stderr.write(f"[COMPILE] AI artwork fit skipped: {exc}\n")
+        return img
+
+
 def _cover_scale_image_to_trim_px(img, target_w_px: int, target_h_px: int, *, log_label: str = "[COMPILE]"):
     """Delegates to smart_bleed.cover_scale_to_trim_px — single strict object-fit:cover implementation."""
     from smart_bleed import cover_scale_to_trim_px
@@ -1237,6 +1276,13 @@ def main():
     parser.add_argument("--border-label", default="White", help="Colour-border display name")
     parser.add_argument("--ai-upscale-path", default="", help="Accepted enhanced raster applied before bleed")
     parser.add_argument("--ai-upscale-note", default="", help="Health-report note when enhancement was accepted")
+    parser.add_argument("--ai-artwork-fit", default="", help="AI image aspect fit: crop, extend, border, or none")
+    parser.add_argument("--ai-artwork-offset", type=float, default=0.5, help="Crop-to-fit position from 0 to 1")
+    parser.add_argument("--ai-artwork-note", default="", help="Health-report note listing auto-applied AI artwork defaults")
+    parser.add_argument("--ai-fit-c", type=float, default=0, help="Aspect colour-border cyan percent")
+    parser.add_argument("--ai-fit-m", type=float, default=0, help="Aspect colour-border magenta percent")
+    parser.add_argument("--ai-fit-y", type=float, default=0, help="Aspect colour-border yellow percent")
+    parser.add_argument("--ai-fit-k", type=float, default=0, help="Aspect colour-border black percent")
     parser.add_argument("--auto-shifter", type=float, default=0, help="Auto-Shifter scale-down percentage to pull content into safe zone (0 = disabled)")
     args = parser.parse_args()
 
@@ -1402,6 +1448,7 @@ def main():
             if _ai_applied:
                 compile_stats["ai_upscale_applied"] = True
             img = _auto_trim_white_margins(img, white_thresh=250)
+            img = _apply_ai_artwork_fit(img, args, already_enhanced=_ai_applied)
 
             _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
 
@@ -2508,6 +2555,9 @@ def main():
             res_action = f"No live transparencies. Resolution locked to {render_dpi} DPI across {page_count} page(s)."
         if compile_stats.get("ai_upscale_applied") and (getattr(args, "ai_upscale_note", "") or "").strip():
             res_action = res_action + " " + args.ai_upscale_note.strip()
+        artwork_note = (getattr(args, "ai_artwork_note", "") or "").strip()
+        if artwork_note:
+            res_action = res_action + " " + artwork_note
 
         if compile_stats["hairlines_fixed"] > 0:
             hairline_action = f"Hairline strokes detected (below 0.25pt) and bulked to 0.3pt for press stability. {compile_stats['hairlines_fixed']} stroke(s) enforced."
