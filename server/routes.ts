@@ -415,6 +415,19 @@ function chosenTrimMm(source: { targetWidth?: number | null; targetHeight?: numb
   return undefined;
 }
 
+/** Size the customer sent. The A5 storage fallback is not a chosen print size. */
+export function customerTrimFromUploadBody(body: any): { width: number; height: number } | undefined {
+  const mm = readTargetMmFromForm(body);
+  let merged: Record<string, any> = { ...mm };
+  if (body?.bleedOptions) {
+    const parsed = parseJsonField(body.bleedOptions);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      merged = { ...parsed, ...mm };
+    }
+  }
+  return chosenTrimMm(merged);
+}
+
 function execQuickCheck(
   scriptPath: string,
   filePath: string,
@@ -706,6 +719,7 @@ export async function registerRoutes(
       });
 
       let bleedOptions: ReturnType<typeof sanitizeBleedOptions> | undefined;
+      let customerTrim: { width: number; height: number } | undefined;
       try {
         const mm = readTargetMmFromForm(req.body);
         let merged: Record<string, any> = {};
@@ -719,6 +733,7 @@ export async function registerRoutes(
         } else {
           merged = { ...mm };
         }
+        customerTrim = chosenTrimMm(merged);
         bleedOptions = sanitizeBleedOptions(coerceSavedBleedOptionsFromDb(merged));
       } catch (e) {
         console.warn('[FAI] Invalid bleedOptions JSON, using defaults', e);
@@ -738,7 +753,7 @@ export async function registerRoutes(
             QUICK_CHECK_SCRIPT,
             file.path,
             normalizedType,
-            chosenTrimMm(bleedOptions),
+            customerTrim,
           );
         }
       } catch (qcError: any) {
