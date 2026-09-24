@@ -16,6 +16,7 @@ import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
 import { FULL_PAGE_CROP_NORMALIZED } from "@shared/crop-box";
 import { ManualCropEmbedded, type CropCoordinates } from "@/pages/manual-crop";
+import { ArtworkThumbnail } from "@/components/artwork-thumbnail";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
 
@@ -864,18 +865,11 @@ export function FileUpload() {
         <div data-testid="panel-size-selection">
           <Card className="p-4 glass-card tech-corners mb-3" data-testid="panel-staged-preview">
             <div className="flex items-center gap-3">
-              {stagedPreviewUrl ? (
-                <img
-                  src={stagedPreviewUrl}
-                  alt="Artwork preview"
-                  className="w-16 h-16 object-contain rounded-lg border border-border/40 bg-muted/30 shrink-0"
-                  data-testid="img-staged-preview"
-                />
-              ) : (
-                <div className="w-16 h-16 rounded-lg border border-border/40 bg-muted/30 flex items-center justify-center shrink-0">
-                  <File className="w-8 h-8 text-primary/60" />
-                </div>
-              )}
+              <ArtworkThumbnail
+                previewUrl={stagedPreviewUrl}
+                fileName={stagedFile.name}
+                dimensionsMm={originalDims ? { w: originalDims.w, h: originalDims.h } : null}
+              />
               <div className="flex-1 min-w-0">
                 <span className="text-sm font-semibold text-foreground truncate block" data-testid="text-staged-filename">{stagedFile.name}</span>
                 <span className="text-xs text-muted-foreground">{(stagedFile.size / 1024 / 1024).toFixed(1)} MB</span>
