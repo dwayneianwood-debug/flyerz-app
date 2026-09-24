@@ -18,6 +18,7 @@
     "test:ai-artwork": "tsx --test server/aiArtwork.test.ts client/src/components/ai-artwork-panel.test.tsx",
     "test:quick-check": "tsx --test server/quickCheckRules.test.ts",
     "test:illustrator-intake": "tsx --test server/illustratorIntake.test.ts",
+    "test:load-env": "tsx --test server/loadEnv.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

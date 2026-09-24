@@ -1,3 +1,4 @@
+import "./loadEnv";
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
@@ -32,6 +33,7 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { pythonChildEnv } from "./pythonChildEnv";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import {
@@ -249,7 +251,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
 
   const child = spawn(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -348,19 +350,6 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
   return task.taskId;
 }
 
-const PYTHON_ENV: Record<string, string> = (() => {
-  const e: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    PYTHONUNBUFFERED: "1",
-    PYTHONIOENCODING: "utf-8",
-    PYTHONUTF8: "1",
-  };
-  if (!e.FAI_TEMP_DIR?.trim()) {
-    e.FAI_TEMP_DIR = getFlyerzTempRoot();
-  }
-  return e;
-})();
-
 /** Never send this healed-geometry artifact to the client / Glitchy */
 function stripCropBoxNotInMediaBoxFromChecks(checks: unknown[] | undefined): any[] {
   const needle = /cropbox\s+not\s+in\s+mediabox/i;
@@ -371,7 +360,7 @@ function stripCropBoxNotInMediaBoxFromChecks(checks: unknown[] | undefined): any
 function execPythonCapture(args: string[], label: string, timeoutMs: number = EXEC_TIMEOUT_MS): any {
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     encoding: "utf8",
     timeout: timeoutMs,
     maxBuffer: 50 * 1024 * 1024,
@@ -442,7 +431,7 @@ function execQuickCheck(
 
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     encoding: "utf8",
     timeout: EXEC_TIMEOUT_MS,
     maxBuffer: 50 * 1024 * 1024,
@@ -839,7 +828,7 @@ export async function registerRoutes(
         const child = spawn(PYTHON_BIN, [REMOVE_BG_SCRIPT, file.path, outputPath], {
           timeout: 60000,
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: PYTHON_ENV,
+          env: pythonChildEnv(),
         });
         let stdout = '';
         let stderr = '';
@@ -1370,7 +1359,7 @@ export async function registerRoutes(
                 const escapedOutput = proofBase.replace(/'/g, "'\\''");
                 execSync(
                   `${PYTHON_BIN} -c "import sys; sys.path.insert(0, 'server'); from smart_bleed import generate_visual_proof; generate_visual_proof('${escapedInput}', '${escapedOutput}')"`,
-                  { timeout: 30000, cwd: process.cwd(), env: PYTHON_ENV, stdio: ['pipe', 'pipe', 'inherit'] }
+                  { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), stdio: ['pipe', 'pipe', 'inherit'] }
                 );
 
                 try {
@@ -1566,7 +1555,7 @@ export async function registerRoutes(
       };
       const previewProc = spawnSync(PYTHON_BIN, [COLOUR_BORDER_SCRIPT, "preview", JSON.stringify(options)], {
         cwd: process.cwd(),
-        env: PYTHON_ENV,
+        env: pythonChildEnv(),
         encoding: "utf8",
         timeout: EXEC_TIMEOUT_MS,
       });
@@ -2016,7 +2005,7 @@ export async function registerRoutes(
     const { stdout } = await execFileAsync(
       PYTHON_BIN,
       [script, action, artworkPath, JSON.stringify(options || {})],
-      { timeout: 40000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024, env: PYTHON_ENV, cwd: process.cwd() },
+      { timeout: 40000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024, env: pythonChildEnv(), cwd: process.cwd() },
     );
     return parseUpscaleJson(stdout as string);
   };
@@ -2373,7 +2362,7 @@ export async function registerRoutes(
       timeout: action === "ocr" || action === "apply" ? 120000 : 90000,
       encoding: "utf-8",
       maxBuffer: 8 * 1024 * 1024,
-      env: PYTHON_ENV,
+      env: pythonChildEnv(),
       cwd: process.cwd(),
     });
     return JSON.parse((stdout as string).trim());
@@ -2654,7 +2643,7 @@ export async function registerRoutes(
 
       const child = spawn(PYTHON_BIN, args, {
         cwd: process.cwd(),
-        env: PYTHON_ENV,
+        env: pythonChildEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       });
 
@@ -3291,7 +3280,7 @@ else:
 print(f'{w},{h}')
 `, tmpInput, previewPath, ext], {
         cwd: process.cwd(),
-        env: PYTHON_ENV,
+        env: pythonChildEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       });
 

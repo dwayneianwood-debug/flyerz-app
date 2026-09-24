@@ -1,3 +1,4 @@
+import "./loadEnv";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import type { AuditResults, AuditCheck, BleedOptions, JobAudit } from "@shared/schema";
 import path from "path";
@@ -5,6 +6,7 @@ import fs from "fs/promises";
 import fsSync from "fs";
 import { spawnSync } from "child_process";
 import os from "os";
+import { pythonChildEnv } from "./pythonChildEnv";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
@@ -78,21 +80,6 @@ const REPORT_SCRIPT = path.join(process.cwd(), "server", "health_report.py");
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
 
 const EXEC_TIMEOUT_MS = 180_000;
-
-function pythonChildEnv(): Record<string, string> {
-  const base = {
-    ...(process.env as Record<string, string>),
-    PYTHONUNBUFFERED: "1",
-    PYTHONIOENCODING: "utf-8",
-    PYTHONUTF8: "1",
-  };
-  if (!base.FAI_TEMP_DIR?.trim()) {
-    base.FAI_TEMP_DIR = getFlyerzTempRoot();
-  }
-  return base;
-}
-
-const PYTHON_ENV: Record<string, string> = pythonChildEnv();
 
 function makeResultFile(prefix: string): string {
   const id = crypto.randomBytes(8).toString("hex");
@@ -201,7 +188,7 @@ function execPython(args: string[], label: string, resultFile: string, timeoutMs
     // A single-quoted shell string is for bash only; cmd.exe does not treat '...' as quoting.
     const proc = spawnSync(PYTHON_BIN, args, {
       cwd: process.cwd(),
-      env: PYTHON_ENV,
+      env: pythonChildEnv(),
       encoding: "utf8",
       timeout: timeoutMs,
       maxBuffer: 50 * 1024 * 1024,

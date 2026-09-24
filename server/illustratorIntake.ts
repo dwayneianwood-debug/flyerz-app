@@ -3,9 +3,10 @@
  * PDF-compatible .ai files stay as PDF bytes. PostScript .ai and .eps are
  * distilled by server/illustrator_intake.py before the normal PDF pipeline.
  */
+import "./loadEnv";
 import { spawnSync } from "child_process";
 import path from "path";
-import { getFlyerzTempRoot } from "./envPaths";
+import { pythonChildEnv } from "./pythonChildEnv";
 import {
   PRINT_TOOL_EXTENSIONS,
   UPLOAD_EXTENSIONS,
@@ -100,19 +101,6 @@ export function isAllowedPrintTool(filename: string, mimetype?: string | null): 
   return isAllowedUpload(filename, mimetype);
 }
 
-function pythonEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    PYTHONUNBUFFERED: "1",
-    PYTHONIOENCODING: "utf-8",
-    PYTHONUTF8: "1",
-  };
-  if (!env.FAI_TEMP_DIR?.trim()) {
-    env.FAI_TEMP_DIR = getFlyerzTempRoot();
-  }
-  return env;
-}
-
 function parseIntakeStdout(stdout: string): any | null {
   const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -129,7 +117,7 @@ function parseIntakeStdout(stdout: string): any | null {
 function runIntake(args: string[]): any {
   const proc = spawnSync(PYTHON_BIN, [SCRIPT, ...args], {
     cwd: process.cwd(),
-    env: pythonEnv(),
+    env: pythonChildEnv(),
     encoding: "utf8",
     timeout: 120_000,
     maxBuffer: 20 * 1024 * 1024,

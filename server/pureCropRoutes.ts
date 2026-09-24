@@ -1,9 +1,11 @@
+import "./loadEnv";
 import type { Express, Request, Response } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs/promises";
 import fsSync from "fs";
 import { spawn } from "child_process";
+import { pythonChildEnv } from "./pythonChildEnv";
 import crypto from "crypto";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
@@ -28,7 +30,7 @@ type PythonResult = { code: number | null; stdout: string; stderr: string };
 
 function runPython(args: string[]): Promise<PythonResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(PYTHON_BIN, args, { cwd: process.cwd() });
+    const child = spawn(PYTHON_BIN, args, { cwd: process.cwd(), env: pythonChildEnv() });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
