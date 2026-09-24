@@ -30,6 +30,7 @@ import {
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isIllustratorFile, isVectorArtwork } from "@/lib/accepted-artwork";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -1627,8 +1628,8 @@ export default function JobDetails() {
 
               {(() => {
                 const lowerName = job.filename?.toLowerCase() || "";
-                const isPdfFile = lowerName.endsWith(".pdf") || lowerName.endsWith(".ai") || lowerName.endsWith(".eps") || job.fileType === "ai" || job.fileType === "eps" || job.fileType === "pdf";
-                const vectorLabel = lowerName.endsWith(".ai") || lowerName.endsWith(".eps") || job.fileType === "ai" || job.fileType === "eps" ? "Illustrator file" : "PDF";
+                const isPdfFile = isVectorArtwork(lowerName) || isVectorArtwork(job.fileType || "");
+                const vectorLabel = isIllustratorFile(lowerName) || isIllustratorFile(job.fileType || "") ? "Illustrator file" : "PDF";
                 return (
                   <Collapsible open={openSections.prepress} onOpenChange={(open) => toggleSection("prepress", open)}>
                   <div className="mt-6 rounded-xl border-2 border-blue-500/20 bg-gradient-to-br from-blue-50/30 to-slate-50/20 dark:from-blue-500/5 dark:to-slate-500/5 overflow-hidden" data-testid="section-prepress-refinements">

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fitz
 
+from artwork_types import input_kind
 from illustrator_intake import (
     GS_BAND_BUFFER_SPACE,
     GS_BUFFER_SPACE,
@@ -207,6 +208,41 @@ class IllustratorIntakeTests(unittest.TestCase):
         self.assertEqual(report["pageCount"], 2)
         self.assertIn("illustrator_artboards", by_id)
         self.assertIn("page picker", by_id["illustrator_artboards"]["message"])
+
+        self.assertTrue(by_id["resolution"]["passed"])
+        self.assertEqual(by_id["resolution"]["message"], "Vector artwork, resolution independent")
+
+    def test_vector_pdf_and_placed_image_dpi(self):
+        self.assertEqual(input_kind(".ai"), "pdf")
+        self.assertEqual(input_kind(".eps"), "pdf")
+        self.assertEqual(input_kind(".pdf"), "pdf")
+        self.assertEqual(input_kind(".png"), "image")
+        self.assertEqual(input_kind(".exe"), "unsupported")
+
+        vector_path = self._write("vector.pdf", b"")
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=100)
+        page.insert_text((10, 50), "Vector only")
+        doc.save(vector_path)
+        doc.close()
+        vector = run_quick_check(vector_path, "pdf")
+        resolution = next(check for check in vector["checks"] if check["id"] == "resolution")
+        self.assertTrue(resolution["passed"])
+        self.assertEqual(resolution["message"], "Vector artwork, resolution independent")
+
+        placed_path = self._write("placed.pdf", b"")
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=200)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), 0)
+        pix.clear_with(255)
+        page.insert_image(fitz.Rect(10, 10, 82, 82), pixmap=pix)
+        doc.save(placed_path)
+        doc.close()
+        pix = None
+        placed = run_quick_check(placed_path, "pdf")
+        resolution = next(check for check in placed["checks"] if check["id"] == "resolution")
+        self.assertFalse(resolution["passed"])
+        self.assertEqual(resolution["message"], "Resolution too low: 10 DPI (minimum: 300 DPI)")
 
     def test_eps_converts_with_bounding_box_and_memory_leash(self):
         cmd = ghostscript_pdf_command("in.eps", "out.pdf", eps_crop=True)

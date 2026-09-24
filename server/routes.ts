@@ -29,6 +29,7 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import {
   IllustratorIntakeError,
   INVALID_UPLOAD_MESSAGE,
@@ -85,7 +86,7 @@ function cancelPreCompile(jobId: number) {
 
 function ensureExtensionPath(originalPath: string, filename: string, jobId: number): { inputPath: string; tempSymlink: string | null } {
   const existingExt = path.extname(originalPath).toLowerCase();
-  if (existingExt && [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"].includes(existingExt)) {
+  if (existingExt && isPassThroughExtension(existingExt)) {
     return { inputPath: originalPath, tempSymlink: null };
   }
   const filenameExt = path.extname(filename).toLowerCase() || ".png";
@@ -1254,9 +1255,9 @@ export async function registerRoutes(
           try {
             await fs.access(artworkFile);
             const ext = path.extname(artworkFile).toLowerCase();
-            if (['.png', '.jpg', '.jpeg'].includes(ext)) {
+            if (isRasterExtension(ext)) {
               proofPaths = [artworkFile];
-            } else if (ext === '.pdf') {
+            } else if (isVectorExtension(ext)) {
               const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + '_proof.png');
               try {
                 const escapedInput = artworkFile.replace(/'/g, "'\\''");

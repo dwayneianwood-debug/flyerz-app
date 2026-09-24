@@ -1,33 +1,57 @@
-/** File types the print pipeline accepts. Illustrator .ai and .eps join the PDF path. */
+/** Dropzone and labels. Extensions come from shared/artwork-types.json. */
 
-export const ARTWORK_DROPZONE_ACCEPT: Record<string, string[]> = {
-  "application/pdf": [".pdf", ".ai"],
-  "image/jpeg": [".jpg", ".jpeg"],
-  "image/png": [".png"],
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
-  "application/postscript": [".ai", ".eps"],
-  "application/illustrator": [".ai"],
-  "application/vnd.adobe.illustrator": [".ai"],
-  "image/x-eps": [".eps"],
-  "application/eps": [".eps"],
-  "application/octet-stream": [".ai", ".eps"],
+import {
+  ARTWORK_TYPE_LABEL,
+  PRINT_TOOL_ACCEPT,
+  PRINT_TOOL_TYPE_LABEL,
+  UPLOAD_EXTENSIONS,
+  isIllustratorFile,
+  isPrintToolExtension,
+  isVectorArtwork,
+} from "@shared/artwork-types";
+
+export {
+  ARTWORK_TYPE_LABEL,
+  PRINT_TOOL_ACCEPT,
+  PRINT_TOOL_TYPE_LABEL,
+  isIllustratorFile,
+  isVectorArtwork,
 };
 
-export const PRINT_TOOL_ACCEPT = ".pdf,.ai,.eps,.jpg,.jpeg,.png";
+const MIME_FOR_EXT: Record<string, string[]> = {
+  ".pdf": ["application/pdf"],
+  ".jpg": ["image/jpeg"],
+  ".jpeg": ["image/jpeg"],
+  ".png": ["image/png"],
+  ".docx": ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  ".pptx": ["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+  ".ai": ["application/pdf", "application/postscript", "application/illustrator", "application/vnd.adobe.illustrator"],
+  ".eps": ["application/postscript", "image/x-eps", "application/eps"],
+};
 
-export const ARTWORK_TYPE_LABEL = "PDF, AI, EPS, JPG, PNG, DOCX, PPTX";
-export const PRINT_TOOL_TYPE_LABEL = "PDF, AI, EPS, JPG, PNG";
+function addExtension(accept: Record<string, string[]>, mime: string, ext: string) {
+  const current = accept[mime] || [];
+  if (!current.includes(ext)) accept[mime] = [...current, ext];
+}
+
+export const ARTWORK_DROPZONE_ACCEPT: Record<string, string[]> = (() => {
+  const accept: Record<string, string[]> = {};
+  for (const ext of UPLOAD_EXTENSIONS) {
+    for (const mime of MIME_FOR_EXT[ext] || ["application/octet-stream"]) {
+      addExtension(accept, mime, ext);
+    }
+  }
+  addExtension(accept, "application/octet-stream", ".ai");
+  addExtension(accept, "application/octet-stream", ".eps");
+  return accept;
+})();
 
 export function fileExtension(name: string): string {
-  return name.split(".").pop()?.toLowerCase() || "";
+  const base = (name || "").split(/[/\\]/).pop() || "";
+  if (!base.includes(".")) return base.toLowerCase();
+  return base.split(".").pop()?.toLowerCase() || "";
 }
 
 export function isPrintToolFile(name: string): boolean {
-  return ["pdf", "jpg", "jpeg", "png", "ai", "eps"].includes(fileExtension(name));
-}
-
-export function isIllustratorFile(name: string): boolean {
-  const ext = fileExtension(name);
-  return ext === "ai" || ext === "eps";
+  return isPrintToolExtension(fileExtension(name));
 }

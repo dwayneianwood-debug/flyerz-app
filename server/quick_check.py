@@ -28,15 +28,17 @@ import fitz  # PyMuPDF
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pdf_geometry_sanitize import sanitize_pdf_geometry_inplace
 from illustrator_intake import illustrator_audit_checks
+from artwork_types import is_illustrator_type, is_vector_type
+from vector_resolution import placed_raster_samples
 
 
 def _pdf_like(file_type):
     """PDF, and Illustrator/EPS files that have already been normalised to PDF bytes."""
-    return (file_type or "").lower() in ("pdf", "ai", "eps")
+    return is_vector_type(file_type)
 
 
 def _illustrator_source(file_type):
-    return (file_type or "").lower() in ("ai", "eps")
+    return is_illustrator_type(file_type)
 
 
 def find_gs_binary():
@@ -457,35 +459,19 @@ def check_resolution(doc, img_bgr, dpi, file_type, input_path):
     dpi_sources = []
 
     if _pdf_like(file_type) and doc is not None:
-        page = doc[0]
-        images = page.get_images(full=True)
-        min_img_dpi = 999999
-
-        for img_info in images:
-            img_xref = img_info[0]
-            try:
-                base_img = doc.extract_image(img_xref)
-                if base_img:
-                    img_w = base_img.get("width", 0)
-                    img_h = base_img.get("height", 0)
-
-                    page_w_pt = page.rect.width
-                    page_h_pt = page.rect.height
-
-                    if page_w_pt > 0 and img_w > 0:
-                        img_dpi_x = img_w / (page_w_pt / 72)
-                        img_dpi_y = img_h / (page_h_pt / 72)
-                        img_dpi = min(img_dpi_x, img_dpi_y)
-                        min_img_dpi = min(min_img_dpi, img_dpi)
-                        dpi_sources.append(f"Embedded image: {img_w}x{img_h}px = ~{img_dpi:.0f} DPI")
-            except Exception:
-                pass
-
-        if min_img_dpi < 999999:
-            effective_dpi = min_img_dpi
-        else:
-            effective_dpi = 300
-            dpi_sources.append("Vector PDF — resolution independent (300+ DPI equivalent)")
+        samples = placed_raster_samples(doc)
+        if not samples:
+            result["passed"] = True
+            result["message"] = "Vector artwork, resolution independent"
+            result["details"] = "No placed raster images. Vector paths do not have a pixel resolution."
+            result["severity"] = "PASS"
+            return result
+        worst = min(samples, key=lambda sample: sample["dpi"])
+        effective_dpi = worst["dpi"]
+        dpi_sources.extend(
+            f"Placed image on page {sample['page']}: {sample['width']}x{sample['height']}px at ~{sample['dpi']:.0f} DPI"
+            for sample in samples
+        )
     else:
         metadata_dpi = detect_dpi_from_image(input_path)
         try:

@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { PRINT_TOOL_EXTENSIONS, UPLOAD_EXTENSIONS } from "@shared/artwork-types";
 import {
+  ALLOWED_UPLOAD_EXTENSIONS,
   INVALID_UPLOAD_MESSAGE,
+  PRINT_TOOL_EXTENSIONS as SERVER_PRINT_EXTENSIONS,
   PRINT_TOOL_REJECTION,
   isAllowedPrintTool,
   isAllowedUpload,
@@ -29,4 +32,8 @@ test("upload allow-list accepts Illustrator and EPS by extension and MIME", () =
   assert.match(INVALID_UPLOAD_MESSAGE, /AI/);
   assert.match(INVALID_UPLOAD_MESSAGE, /EPS/);
   assert.match(PRINT_TOOL_REJECTION, /AI/);
+  assert.ok(UPLOAD_EXTENSIONS.includes(".ai"));
+  assert.ok(UPLOAD_EXTENSIONS.includes(".eps"));
+  assert.deepEqual(ALLOWED_UPLOAD_EXTENSIONS, [...UPLOAD_EXTENSIONS]);
+  assert.deepEqual(SERVER_PRINT_EXTENSIONS, PRINT_TOOL_EXTENSIONS);
 });

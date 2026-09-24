@@ -8,6 +8,7 @@ import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
+import { isPrintToolType } from "@shared/artwork-types";
 import {
   auditIllustratorFile,
   extractIllustratorPage,
@@ -531,12 +532,12 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       }),
     } as BleedOptions;
 
-    const illustrator = isIllustratorType(fileType) || [".ai", ".eps"].includes(path.extname(filename).toLowerCase());
+    const illustrator = isIllustratorType(fileType) || isIllustratorType(filename);
     if (illustrator) {
       prepareIllustratorFile(originalPath, filename);
     }
 
-    if (["pdf", "jpg", "jpeg", "png", "ai", "eps"].includes(fileType) || illustrator) {
+    if (isPrintToolType(fileType) || illustrator) {
       const dir = path.dirname(originalPath);
       const sourceExt = path.extname(filename).toLowerCase();
       const ext = illustrator ? ".pdf" : sourceExt;

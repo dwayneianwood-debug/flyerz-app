@@ -6,6 +6,11 @@
 import { spawnSync } from "child_process";
 import path from "path";
 import { getFlyerzTempRoot } from "./envPaths";
+import {
+  PRINT_TOOL_EXTENSIONS,
+  UPLOAD_EXTENSIONS,
+  isIllustratorType as sharedIsIllustratorType,
+} from "@shared/artwork-types";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
 const SCRIPT = path.join(process.cwd(), "server", "illustrator_intake.py");
@@ -24,8 +29,8 @@ export class IllustratorIntakeError extends Error {
   }
 }
 
-export const ALLOWED_UPLOAD_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png", ".docx", ".pptx", ".ai", ".eps"];
-export const PRINT_TOOL_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png", ".ai", ".eps"];
+export const ALLOWED_UPLOAD_EXTENSIONS = [...UPLOAD_EXTENSIONS];
+export { PRINT_TOOL_EXTENSIONS };
 
 export const INVALID_UPLOAD_MESSAGE =
   "Invalid file type. Only PDF, JPG, PNG, DOCX, PPTX, AI, and EPS are allowed.";
@@ -78,8 +83,7 @@ export function isIllustratorName(filename: string): boolean {
 }
 
 export function isIllustratorType(fileType: string | null | undefined): boolean {
-  const t = (fileType || "").toLowerCase();
-  return t === "ai" || t === "eps";
+  return sharedIsIllustratorType(fileType || "");
 }
 
 export function isAllowedUpload(filename: string, mimetype?: string | null): boolean {
