@@ -12,6 +12,7 @@ Generates a high-resolution preview image of the corrected artwork showing:
 Output: PNG image ready for client review or download.
 """
 
+from artwork_types import is_vector_type
 import sys
 import json
 import os
@@ -429,7 +430,7 @@ if __name__ == "__main__":
     target_h = float(sys.argv[6]) if len(sys.argv) > 6 else 0
 
     try:
-        if file_type == "pdf":
+        if is_vector_type(file_type):
             result = generate_bleed_preview_pdf(input_path, output_path, bleed_mm,
                                                  target_width_mm=target_w, target_height_mm=target_h)
         else:

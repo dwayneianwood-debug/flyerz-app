@@ -8,6 +8,7 @@ import { useToast } from "@/hooks/use-toast";
 import { Maximize2, Upload, Download, AlertTriangle, Loader2, CheckCircle2, FileImage, Palette, Sparkles } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ResizeAudit } from "@shared/schema";
+import { PRINT_TOOL_ACCEPT, PRINT_TOOL_TYPE_LABEL, isPrintToolFile } from "@/lib/accepted-artwork";
 
 interface LogEntry {
   step: string;
@@ -100,14 +101,13 @@ export function PrecisionResizer() {
     setDragActive(false);
     const droppedFile = e.dataTransfer.files?.[0];
     if (droppedFile) {
-      const ext = droppedFile.name.split(".").pop()?.toLowerCase();
-      if (["pdf", "jpg", "jpeg", "png"].includes(ext || "")) {
+      if (isPrintToolFile(droppedFile.name)) {
         setFile(droppedFile);
         setResult(null);
       } else {
         toast({
           title: "Unsupported file",
-          description: "Only PDF, JPG, and PNG files can be resized.",
+          description: `Only ${PRINT_TOOL_TYPE_LABEL} files can be resized.`,
           variant: "destructive",
         });
       }
@@ -145,7 +145,7 @@ export function PrecisionResizer() {
           <input
             id="resize-file-input"
             type="file"
-            accept=".pdf,.jpg,.jpeg,.png"
+            accept={PRINT_TOOL_ACCEPT}
             onChange={handleFileSelect}
             className="hidden"
             data-testid="resize-file-input"
@@ -160,7 +160,7 @@ export function PrecisionResizer() {
             <div className="space-y-1">
               <Upload className="w-8 h-8 mx-auto text-muted-foreground/50" />
               <p className="text-sm text-muted-foreground">Drop a file here or click to select</p>
-              <p className="text-xs text-muted-foreground/60">PDF, JPG, PNG</p>
+              <p className="text-xs text-muted-foreground/60">{PRINT_TOOL_TYPE_LABEL}</p>
             </div>
           )}
         </div>

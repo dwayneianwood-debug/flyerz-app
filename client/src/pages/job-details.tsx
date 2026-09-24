@@ -30,6 +30,7 @@ import {
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isIllustratorFile, isVectorArtwork } from "@/lib/accepted-artwork";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -1626,7 +1627,9 @@ export default function JobDetails() {
               </Collapsible>
 
               {(() => {
-                const isPdfFile = job.filename?.toLowerCase().endsWith('.pdf');
+                const lowerName = job.filename?.toLowerCase() || "";
+                const isPdfFile = isVectorArtwork(lowerName) || isVectorArtwork(job.fileType || "");
+                const vectorLabel = isIllustratorFile(lowerName) || isIllustratorFile(job.fileType || "") ? "Illustrator file" : "PDF";
                 return (
                   <Collapsible open={openSections.prepress} onOpenChange={(open) => toggleSection("prepress", open)}>
                   <div className="mt-6 rounded-xl border-2 border-blue-500/20 bg-gradient-to-br from-blue-50/30 to-slate-50/20 dark:from-blue-500/5 dark:to-slate-500/5 overflow-hidden" data-testid="section-prepress-refinements">
@@ -1656,7 +1659,7 @@ export default function JobDetails() {
                           </div>
                           <p className="text-xs text-muted-foreground mt-0.5">Caps total ink coverage at 280% to prevent paper from getting too wet during litho printing.</p>
                           {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
+                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
                           )}
                           {aiEnhanceMessages.tac_limit && aiTacLimit && (
                             <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-tac-limit-status">{aiEnhanceMessages.tac_limit}</p>
@@ -1678,7 +1681,7 @@ export default function JobDetails() {
                           </div>
                           <p className="text-xs text-muted-foreground mt-0.5">Adds tiny overlap between colours so white gaps don't appear if the press is slightly off-register.</p>
                           {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
+                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
                           )}
                           {aiEnhanceMessages.trapping && aiTrapping && (
                             <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-trapping-status">{aiEnhanceMessages.trapping}</p>

@@ -27,6 +27,18 @@ import fitz  # PyMuPDF
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pdf_geometry_sanitize import sanitize_pdf_geometry_inplace
+from illustrator_intake import illustrator_audit_checks
+from artwork_types import is_illustrator_type, is_vector_type
+from vector_resolution import placed_raster_samples
+
+
+def _pdf_like(file_type):
+    """PDF, and Illustrator/EPS files that have already been normalised to PDF bytes."""
+    return is_vector_type(file_type)
+
+
+def _illustrator_source(file_type):
+    return is_illustrator_type(file_type)
 
 
 def find_gs_binary():
@@ -87,7 +99,7 @@ def detect_artwork_size(doc, img_bgr, dpi, file_type):
         "document_height_mm": 0,
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         doc_w = round(media.width * 25.4 / 72, 1)
@@ -196,7 +208,7 @@ def check_bleed(doc, img_bgr, dpi, file_type):
         "severity": "CRITICAL"
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         try:
@@ -229,12 +241,21 @@ def check_bleed(doc, img_bgr, dpi, file_type):
         else:
             w_mm = round(media.width * 25.4 / 72, 1)
             h_mm = round(media.height * 25.4 / 72, 1)
-            result["message"] = f"No TrimBox defined — cannot verify bleed. Document is {w_mm} x {h_mm}mm."
-            result["details"] = (
-                f"The PDF has no TrimBox set. This means the artwork boundary is unknown. "
-                f"For proper bleed: keep actual content at trim size, extend backgrounds {BLEED_TARGET_MM}mm outward, "
-                f"and center the artwork on the page."
-            )
+            if _illustrator_source(file_type):
+                result["message"] = (
+                    f"No TrimBox on the artboard — cannot verify bleed. Artboard is {w_mm} x {h_mm}mm."
+                )
+                result["details"] = (
+                    f"The artboard has no bleed. Extend the background {BLEED_TARGET_MM}mm beyond the artboard "
+                    f"on all sides in Illustrator (File > Document Setup > Bleed), then save again."
+                )
+            else:
+                result["message"] = f"No TrimBox defined — cannot verify bleed. Document is {w_mm} x {h_mm}mm."
+                result["details"] = (
+                    f"The PDF has no TrimBox set. This means the artwork boundary is unknown. "
+                    f"For proper bleed: keep actual content at trim size, extend backgrounds {BLEED_TARGET_MM}mm outward, "
+                    f"and center the artwork on the page."
+                )
     else:
         h, w = img_bgr.shape[:2]
         w_mm = _px_to_mm(w, dpi)
@@ -288,7 +309,7 @@ def check_cmyk(doc, file_type, input_path):
         "severity": "HIGH"
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         rgb_found = False
         cmyk_found = False
 
@@ -315,6 +336,14 @@ def check_cmyk(doc, file_type, input_path):
                     rgb_found = True
             except Exception:
                 pass
+
+            if _illustrator_source(file_type):
+                try:
+                    content = page.read_contents() or b""
+                except Exception:
+                    content = b""
+                if b" rg" in content or b"\nrg" in content or content.startswith(b"rg") or b" RG" in content or b"\nRG" in content:
+                    rgb_found = True
 
         if cmyk_found and not rgb_found:
             result["passed"] = True
@@ -358,7 +387,7 @@ def check_transparency(doc, file_type, input_path):
 
     issues = []
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         for page_num in range(len(doc)):
             page = doc[page_num]
             try:
@@ -429,36 +458,20 @@ def check_resolution(doc, img_bgr, dpi, file_type, input_path):
     effective_dpi = dpi
     dpi_sources = []
 
-    if file_type == "pdf" and doc is not None:
-        page = doc[0]
-        images = page.get_images(full=True)
-        min_img_dpi = 999999
-
-        for img_info in images:
-            img_xref = img_info[0]
-            try:
-                base_img = doc.extract_image(img_xref)
-                if base_img:
-                    img_w = base_img.get("width", 0)
-                    img_h = base_img.get("height", 0)
-
-                    page_w_pt = page.rect.width
-                    page_h_pt = page.rect.height
-
-                    if page_w_pt > 0 and img_w > 0:
-                        img_dpi_x = img_w / (page_w_pt / 72)
-                        img_dpi_y = img_h / (page_h_pt / 72)
-                        img_dpi = min(img_dpi_x, img_dpi_y)
-                        min_img_dpi = min(min_img_dpi, img_dpi)
-                        dpi_sources.append(f"Embedded image: {img_w}x{img_h}px = ~{img_dpi:.0f} DPI")
-            except Exception:
-                pass
-
-        if min_img_dpi < 999999:
-            effective_dpi = min_img_dpi
-        else:
-            effective_dpi = 300
-            dpi_sources.append("Vector PDF — resolution independent (300+ DPI equivalent)")
+    if _pdf_like(file_type) and doc is not None:
+        samples = placed_raster_samples(doc)
+        if not samples:
+            result["passed"] = True
+            result["message"] = "Vector artwork, resolution independent"
+            result["details"] = "No placed raster images. Vector paths do not have a pixel resolution."
+            result["severity"] = "PASS"
+            return result
+        worst = min(samples, key=lambda sample: sample["dpi"])
+        effective_dpi = worst["dpi"]
+        dpi_sources.extend(
+            f"Placed image on page {sample['page']}: {sample['width']}x{sample['height']}px at ~{sample['dpi']:.0f} DPI"
+            for sample in samples
+        )
     else:
         metadata_dpi = detect_dpi_from_image(input_path)
         try:
@@ -527,7 +540,7 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
     issues = []
     info = []
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         w_mm = round(media.width * 25.4 / 72, 1)
@@ -551,21 +564,22 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
         except Exception:
             pass
 
-        fonts = doc.get_page_fonts(0, full=True)
-        embedded_count = 0
-        not_embedded = []
-        for font in fonts:
-            font_name = font[3] if len(font) > 3 else "Unknown"
-            font_file = font[4] if len(font) > 4 else ""
-            if font_file:
-                embedded_count += 1
-            else:
-                not_embedded.append(font_name)
+        if not _illustrator_source(file_type):
+            fonts = doc.get_page_fonts(0, full=True)
+            embedded_count = 0
+            not_embedded = []
+            for font in fonts:
+                font_name = font[3] if len(font) > 3 else "Unknown"
+                font_file = font[4] if len(font) > 4 else ""
+                if font_file:
+                    embedded_count += 1
+                else:
+                    not_embedded.append(font_name)
 
-        if not_embedded:
-            issues.append(f"{len(not_embedded)} font(s) not embedded: {', '.join(not_embedded[:3])}")
-        elif fonts:
-            info.append(f"{embedded_count} font(s) embedded")
+            if not_embedded:
+                issues.append(f"{len(not_embedded)} font(s) not embedded: {', '.join(not_embedded[:3])}")
+            elif fonts:
+                info.append(f"{embedded_count} font(s) embedded")
 
         page_count = len(doc)
         if page_count > 1:
@@ -639,7 +653,7 @@ def run_quick_check(input_path, file_type):
     dpi = 300.0
 
     try:
-        if file_type == "pdf":
+        if _pdf_like(file_type):
             try:
                 if sanitize_pdf_geometry_inplace(input_path):
                     sys.stderr.write(
@@ -687,6 +701,15 @@ def run_quick_check(input_path, file_type):
             check_print_readiness(doc, img_bgr, dpi, file_type, input_path),
         ]
 
+        page_count = len(doc) if doc is not None else 1
+        if _illustrator_source(file_type) and doc is not None:
+            try:
+                with open(input_path, "rb") as raw_f:
+                    raw = raw_f.read()
+            except Exception:
+                raw = b""
+            checks.extend(illustrator_audit_checks(doc, raw, page_count))
+
         checks = strip_cropbox_not_in_mediabox_items(checks)
         all_passed = all(c["passed"] for c in checks)
 
@@ -696,6 +719,7 @@ def run_quick_check(input_path, file_type):
             "passCount": sum(1 for c in checks if c["passed"]),
             "failCount": sum(1 for c in checks if not c["passed"]),
             "artworkSize": artwork_size,
+            "pageCount": page_count,
         }
 
     except Exception as e:

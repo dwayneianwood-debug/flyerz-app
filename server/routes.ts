@@ -2,7 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import { api, buildUrl } from "@shared/routes";
-import type { AuditCheck, AuditResults } from "@shared/schema";
+import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
 import {
   BLEED_METHOD_POST_VALUES,
   BLEED_STRATEGY_IDS,
@@ -29,6 +29,18 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
+import {
+  IllustratorIntakeError,
+  INVALID_UPLOAD_MESSAGE,
+  PRINT_TOOL_REJECTION,
+  isAllowedPrintTool,
+  isAllowedUpload,
+  isIllustratorName,
+  isIllustratorType,
+  prepareIllustratorFile,
+  renderIllustratorPreview,
+} from "./illustratorIntake";
 
 const EXEC_TIMEOUT_MS = 60_000;
 const COMPILE_TIMEOUT_MS = 180_000;
@@ -74,7 +86,7 @@ function cancelPreCompile(jobId: number) {
 
 function ensureExtensionPath(originalPath: string, filename: string, jobId: number): { inputPath: string; tempSymlink: string | null } {
   const existingExt = path.extname(originalPath).toLowerCase();
-  if (existingExt && [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"].includes(existingExt)) {
+  if (existingExt && isPassThroughExtension(existingExt)) {
     return { inputPath: originalPath, tempSymlink: null };
   }
   const filenameExt = path.extname(filename).toLowerCase() || ".png";
@@ -464,6 +476,13 @@ function sanitizeBleedOptions(parsed: any) {
     result.isNoCrop = true;
   }
 
+  if (parsed.selectedPage != null && parsed.selectedPage !== "" && parsed.selectedPage !== "all") {
+    const selectedPage = Number(parsed.selectedPage);
+    if (Number.isInteger(selectedPage) && selectedPage >= 0 && selectedPage < 200) {
+      result.selectedPage = selectedPage;
+    }
+  }
+
   if (parsed.cropX != null && parsed.cropY != null &&
       parsed.cropWidth != null && parsed.cropHeight != null) {
     const cx = Number(parsed.cropX);
@@ -498,12 +517,10 @@ const upload = multer({
   dest: uploadDir,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['.pdf', '.jpg', '.jpeg', '.png', '.docx', '.pptx'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowedTypes.includes(ext)) {
+    if (isAllowedUpload(file.originalname, file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Only PDF, JPG, PNG, DOCX, and PPTX are allowed.'));
+      cb(new Error(INVALID_UPLOAD_MESSAGE));
     }
   }
 });
@@ -514,6 +531,26 @@ async function ensureUploadDir() {
   } catch {
     await fs.mkdir(uploadDir, { recursive: true });
   }
+}
+
+function normalizedUploadType(originalName: string): string {
+  const ext = path.extname(originalName).toLowerCase().replace(".", "");
+  return ext === "jpeg" ? "jpg" : ext;
+}
+
+function pipelineTypeFor(fileType: string): string {
+  if (isIllustratorType(fileType)) return "pdf";
+  return fileType === "jpeg" ? "jpg" : fileType;
+}
+
+/** PDF-compatible .ai stays as PDF bytes. PostScript .ai/.eps is distilled in place. */
+function ingestUploadedArtwork(file: Express.Multer.File): { fileType: string; pageCount?: number; kind?: string } {
+  const fileType = normalizedUploadType(file.originalname);
+  if (isIllustratorType(fileType)) {
+    const prepared = prepareIllustratorFile(file.path, file.originalname);
+    return { fileType, pageCount: prepared.pageCount, kind: prepared.kind };
+  }
+  return { fileType };
 }
 
 function isPathSafe(filePath: string): boolean {
@@ -575,14 +612,22 @@ export async function registerRoutes(
       }
 
       const file = req.file;
-      const fileType = path.extname(file.originalname).toLowerCase().replace('.', '') as any;
-      const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+      let ingested: ReturnType<typeof ingestUploadedArtwork>;
+      try {
+        ingested = ingestUploadedArtwork(file);
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+      const normalizedType = ingested.fileType;
 
       const job = await storage.createJob({
         filename: file.originalname,
         originalPath: file.path,
         fileSize: file.size,
-        fileType: normalizedType,
+        fileType: normalizedType as FileType,
       });
 
       let bleedOptions: ReturnType<typeof sanitizeBleedOptions> | undefined;
@@ -646,6 +691,8 @@ export async function registerRoutes(
         complianceReport: `Quick check completed. ${checks.filter(c => c.passed).length}/${checks.length} checks passed.`,
         artworkSize: quickCheckResult.artworkSize,
         savedBleedOptions: bleedOptions,
+        pageCount: quickCheckResult.pageCount ?? ingested.pageCount,
+        ...(isIllustratorType(normalizedType) ? { sourceFormat: normalizedType as "ai" | "eps" } : {}),
       };
 
       await storage.updateJob(job.id, {
@@ -762,8 +809,16 @@ export async function registerRoutes(
       }
 
       const file = req.file;
-      const fileType = path.extname(file.originalname).toLowerCase().replace('.', '');
-      const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+      let ingested: ReturnType<typeof ingestUploadedArtwork>;
+      try {
+        ingested = ingestUploadedArtwork(file);
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+      const normalizedType = ingested.fileType;
 
       // quick_check.py sanitizes PDF page boxes in-place before pre-flight telemetry
       const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
@@ -787,6 +842,8 @@ export async function registerRoutes(
         storedFilename: path.basename(file.path),
         originalFilename: file.originalname,
         fileType: normalizedType,
+        pageCount: result.pageCount ?? ingested.pageCount,
+        sourceFormat: isIllustratorType(normalizedType) ? normalizedType : undefined,
       });
     } catch (error: any) {
       console.error('[FAI] Quick check error:', error);
@@ -1198,9 +1255,9 @@ export async function registerRoutes(
           try {
             await fs.access(artworkFile);
             const ext = path.extname(artworkFile).toLowerCase();
-            if (['.png', '.jpg', '.jpeg'].includes(ext)) {
+            if (isRasterExtension(ext)) {
               proofPaths = [artworkFile];
-            } else if (ext === '.pdf') {
+            } else if (isVectorExtension(ext)) {
               const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + '_proof.png');
               try {
                 const escapedInput = artworkFile.replace(/'/g, "'\\''");
@@ -1387,7 +1444,7 @@ export async function registerRoutes(
       const validStrategies = [...BLEED_STRATEGY_QUERY_VALUES];
 
       let previewSourcePath = job.correctedPath!;
-      let previewFileType = job.fileType || 'pdf';
+      let previewFileType = pipelineTypeFor(job.fileType || 'pdf');
 
       if (strategy !== "auto" && (validStrategies as readonly string[]).includes(strategy)) {
         const variantPath = auditResults?.bleedVariants?.[strategy as keyof NonNullable<AuditResults["bleedVariants"]>];
@@ -2459,23 +2516,37 @@ export async function registerRoutes(
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      const fileType = ext.replace('.', '');
-      const allowedTypes = ['pdf', 'jpg', 'jpeg', 'png'];
-      if (!allowedTypes.includes(fileType)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files are supported for cropping.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: PRINT_TOOL_REJECTION });
+      }
+
+      let sourceFormat: "ai" | "eps" | undefined;
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          sourceFormat = toolType as "ai" | "eps";
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const previewFilename = `${Date.now()}_preview.png`;
       const previewPath = path.join(cropDir, previewFilename);
 
-      // Store original file reference for later crop
-      const origFilename = `${Date.now()}_${req.file.originalname}`;
+      const base = path.basename(req.file.originalname, ext);
+      const storedExt = sourceFormat ? ".pdf" : ext;
+      const origFilename = `${Date.now()}_${base}${storedExt}`;
       const origStorePath = path.join(cropDir, origFilename);
       await fs.rename(req.file.path, origStorePath);
 
       const result = execPythonCapture([
         CROP_SCRIPT, origStorePath, previewPath,
-        fileType === 'jpeg' ? 'jpg' : fileType, "preview"
+        toolType, "preview"
       ], "CropPreview");
 
       res.json({
@@ -2483,7 +2554,8 @@ export async function registerRoutes(
         originalFilename: req.file.originalname,
         storedFilename: origFilename,
         previewFilename,
-        fileType: fileType === 'jpeg' ? 'jpg' : fileType,
+        fileType: toolType,
+        sourceFormat,
       });
     } catch (error) {
       console.error('Error generating crop preview:', error);
@@ -2521,14 +2593,15 @@ export async function registerRoutes(
         return res.status(404).json({ message: 'Source file not found. Please re-upload.' });
       }
 
-      const ext = fileType === 'pdf' ? '.pdf' : fileType === 'png' ? '.png' : '.jpg';
+      const pipelineType = pipelineTypeFor(fileType);
+      const ext = pipelineType === 'pdf' ? '.pdf' : pipelineType === 'png' ? '.png' : '.jpg';
       const basename = path.basename(storedFilename, path.extname(storedFilename))
         .replace(/^\d+_/, '');
       const outputFilename = `${Date.now()}_${basename}_cropped${ext}`;
       const outputPath = path.join(cropDir, outputFilename);
 
       const result = execPythonCapture([
-        CROP_SCRIPT, inputPath, outputPath, fileType, "crop",
+        CROP_SCRIPT, inputPath, outputPath, pipelineType, "crop",
         String(x), String(y), String(w), String(h), String(scale)
       ], "CropExecute");
 
@@ -2573,6 +2646,26 @@ export async function registerRoutes(
       const ext = path.extname(req.file.originalname || "").toLowerCase();
       const previewFilename = `file_preview_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
       const previewPath = path.join(cropDir, previewFilename);
+
+      if (isIllustratorName(req.file.originalname || "")) {
+        try {
+          const prepared = prepareIllustratorFile(tmpInput, req.file.originalname);
+          const page = Math.max(0, parseInt(String(req.body?.page ?? "0"), 10) || 0);
+          const rendered = renderIllustratorPreview(prepared.outputPath || tmpInput, previewPath, page);
+          try { await fs.unlink(tmpInput); } catch {}
+          return res.json({
+            previewUrl: `/api/manual-crop/preview-image/${previewFilename}`,
+            width: rendered.width || 0,
+            height: rendered.height || 0,
+            pageCount: rendered.pageCount ?? prepared.pageCount,
+            page: rendered.page ?? page,
+          });
+        } catch (error) {
+          try { await fs.unlink(tmpInput); } catch {}
+          const message = error instanceof Error ? error.message : "Failed to preview Illustrator file";
+          return res.status(400).json({ message, code: error instanceof IllustratorIntakeError ? error.code : undefined });
+        }
+      }
 
       const py = spawn(PYTHON_BIN, ["-c", `
 import sys, os
@@ -2720,19 +2813,31 @@ print(f'{w},{h}')
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      const fileType = ext.replace('.', '');
-      const allowedTypes = ['pdf', 'jpg', 'jpeg', 'png'];
-      if (!allowedTypes.includes(fileType)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files can be resized.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: 'Only PDF, AI, EPS, JPG, and PNG files can be resized.' });
+      }
+
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const basename = path.basename(req.file.originalname, ext);
-      const outputFilename = `${basename}_resized_${targetWidth}x${targetHeight}mm${ext}`;
+      const outExt = toolType === "pdf" ? ".pdf" : ext;
+      const outputFilename = `${basename}_resized_${targetWidth}x${targetHeight}mm${outExt}`;
       const outputPath = path.join(resizeDir, `${Date.now()}_${outputFilename}`);
 
       const result = execPythonCapture([
         RESIZE_SCRIPT, req.file!.path, outputPath,
-        fileType === 'jpeg' ? 'jpg' : fileType,
+        toolType,
         String(targetWidth), String(targetHeight), uniform ? '1' : '0'
       ], "Resize");
 
@@ -2787,12 +2892,27 @@ print(f'{w},{h}')
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png'].includes(ext)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files are supported.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: PRINT_TOOL_REJECTION });
+      }
+
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const shrinkFactor = Math.max(0.50, Math.min(0.99, parseFloat(req.body.shrinkFactor) || 0.92));
-      const storedFilename = `${Date.now()}_${req.file.originalname}`;
+      const base = path.basename(req.file.originalname, ext);
+      const storedExt = toolType === "pdf" ? ".pdf" : ext;
+      const storedFilename = `${Date.now()}_${base}${storedExt}`;
       const storedPath = path.join(shrinkDir, storedFilename);
       await fs.rename(req.file.path, storedPath);
 
@@ -2804,7 +2924,7 @@ print(f'{w},{h}')
       res.json({
         ...result,
         storedFilename,
-        fileType: ext.replace('.', ''),
+        fileType: toolType,
         previewUrl: `/api/shrink/preview-image/${previewFilename}`,
       });
     } catch (error) {
@@ -2829,7 +2949,8 @@ print(f'{w},{h}')
         return res.status(404).json({ message: 'Source file not found. Please re-upload.' });
       }
 
-      const ext = fileType === 'pdf' ? '.pdf' : fileType === 'png' ? '.png' : '.jpg';
+      const pipelineType = pipelineTypeFor(String(fileType));
+      const ext = pipelineType === 'pdf' ? '.pdf' : pipelineType === 'png' ? '.png' : '.jpg';
       const basename = path.basename(storedFilename, path.extname(storedFilename))
         .replace(/^\d+_/, '');
       const outputFilename = `${Date.now()}_${basename}_safemargin${ext}`;
@@ -3373,14 +3494,35 @@ print(f'{w},{h}')
       }
 
       const jobIds: number[] = [];
+      const errors: { filename: string; message: string }[] = [];
       for (const file of files) {
-        const fileType = path.extname(file.originalname).toLowerCase().replace('.', '') as any;
-        const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+        let ingested: ReturnType<typeof ingestUploadedArtwork>;
+        try {
+          ingested = ingestUploadedArtwork(file);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Could not read this file.";
+          const fileType = normalizedUploadType(file.originalname) || "ai";
+          const job = await storage.createJob({
+            filename: file.originalname,
+            originalPath: file.path,
+            fileSize: file.size,
+            fileType: fileType as any,
+          });
+          await storage.updateJob(job.id, {
+            status: 'failed',
+            errorMessage: message,
+            completedAt: new Date(),
+          });
+          jobIds.push(job.id);
+          errors.push({ filename: file.originalname, message });
+          continue;
+        }
+        const normalizedType = ingested.fileType;
         const job = await storage.createJob({
           filename: file.originalname,
           originalPath: file.path,
           fileSize: file.size,
-          fileType: normalizedType,
+          fileType: normalizedType as FileType,
         });
         await storage.updateJob(job.id, { status: 'processing' });
         jobIds.push(job.id);
@@ -3394,7 +3536,7 @@ print(f'{w},{h}')
         });
       }
 
-      return res.status(201).json({ jobIds });
+      return res.status(201).json({ jobIds, errors });
     } catch (error: any) {
       console.error('[FAI] Batch upload error:', error);
       return res.status(500).json({ message: error.message || 'Batch upload failed' });
