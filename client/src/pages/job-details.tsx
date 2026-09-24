@@ -30,6 +30,7 @@ import {
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ColourBorderPicker } from "@/components/colour-border-picker";
+import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import {
   type ColourBorderChoice,
   loadColourBorderChoice,
@@ -1544,6 +1545,20 @@ export default function JobDetails() {
                         loading={bleedMethodLoading}
                         colourBorder={colourBorder}
                         onColourBorderChange={handleColourBorderChange}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && job.correctedPath && (
+                    <div className="px-4 sm:px-5 pb-5 border-b border-border/30">
+                      <AiUpscalePanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        onApplied={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
                       />
                     </div>
                   )}

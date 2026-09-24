@@ -101,6 +101,17 @@ function nukeRamDisk() {
   } catch {}
 }
 
+function aiUpscaleCliArgs(audit: any): string[] {
+  const saved = audit?.aiUpscale;
+  if (!saved?.accepted) return [];
+  const enhancedPath = typeof saved.enhancedPath === "string" ? saved.enhancedPath : "";
+  if (!enhancedPath || !fsSync.existsSync(enhancedPath)) return [];
+  const note = String(saved.note || "AI enhancement was applied before bleed.")
+    .replace(/[\r\n]/g, " ")
+    .slice(0, 500);
+  return ["--ai-upscale-path", enhancedPath, "--ai-upscale-note", note];
+}
+
 function colourBorderCliArgs(strategy: string, audit: any): string[] {
   if (strategy !== "colourBorder") return [];
   const border = audit?.colourBorder || {};
@@ -164,6 +175,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--base-name", baseName,
     "--creep-mm", String(precompileCreepMm),
     ...colourBorderCliArgs(strategy, auditResults),
+    ...aiUpscaleCliArgs(auditResults),
   ];
 
   args.push(
@@ -1849,6 +1861,199 @@ export async function registerRoutes(
     }
   });
 
+  const resolveUpscaleArtwork = (job: any, auditResults: any): string | null => {
+    const saved = coerceSavedBleedOptionsFromDb(auditResults?.savedBleedOptions);
+    const hasCrop = hasValidCropBox(saved) && !saved.isNoCrop && !saved.preserveBleed;
+    const preBleedPath = auditResults?.preBleedPath;
+    let artworkPath = hasCrop ? job.originalPath : (preBleedPath || job.originalPath);
+    if (!artworkPath || !fsSync.existsSync(artworkPath)) artworkPath = job.originalPath;
+    if (!artworkPath || !fsSync.existsSync(artworkPath)) return null;
+    return artworkPath;
+  };
+
+  const parseUpscaleJson = (stdout: string) => {
+    const lines = String(stdout || "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith("{"));
+    if (!lines.length) throw new Error("Upscale returned no JSON");
+    return JSON.parse(lines[lines.length - 1]);
+  };
+
+  const runUpscaleScript = async (action: string, artworkPath: string, options: Record<string, unknown>) => {
+    const { promisify } = await import("util");
+    const { execFile } = await import("child_process");
+    const execFileAsync = promisify(execFile);
+    const script = path.join(process.cwd(), "server", "ai_enhancements.py");
+    const { stdout } = await execFileAsync(
+      PYTHON_BIN,
+      [script, action, artworkPath, JSON.stringify(options || {})],
+      { timeout: 40000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024, env: PYTHON_ENV, cwd: process.cwd() },
+    );
+    return parseUpscaleJson(stdout as string);
+  };
+
+  app.get("/api/jobs/:id/ai-upscale/assess", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, auditResults);
+      const savedOpts = coerceSavedBleedOptionsFromDb(auditResults.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(savedOpts?.targetHeight) || 210;
+      if (!artworkPath) {
+        return res.json({
+          success: true,
+          eligible: false,
+          suggestion: false,
+          message: "Artwork is not ready to enhance yet.",
+          explanation: "Make blurry or low-resolution artwork crisp and clear.",
+          saved: auditResults.aiUpscale || null,
+        });
+      }
+      const parsed = await runUpscaleScript("ai_upscale_assess", artworkPath, {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        bleed_mm: 5,
+      });
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ ...parsed, saved: auditResults.aiUpscale || null, trimW, trimH });
+    } catch (error: any) {
+      console.error("[AI-UPSCALE] assess failed:", error?.message || error);
+      res.json({
+        success: true,
+        eligible: true,
+        suggestion: false,
+        message: "",
+        explanation: "Make blurry or low-resolution artwork crisp and clear.",
+        saved: null,
+      });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-upscale/preview", async (req, res) => {
+    const friendly = "The AI upscaler isn't available right now, so we'll keep your original artwork and continue.";
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as AuditResults;
+      const artworkPath = resolveUpscaleArtwork(job, auditResults);
+      if (!artworkPath) {
+        return res.json({ success: true, used_original: true, message: "Artwork is not ready, so the original will be used." });
+      }
+      const savedOpts = coerceSavedBleedOptionsFromDb((auditResults as any).savedBleedOptions);
+      const trimW = Number(req.body?.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.body?.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const fullPath = path.join(uploadDir, `ai-upscale-${jobId}-full.png`);
+      const beforePath = path.join(uploadDir, `ai-upscale-${jobId}-before.png`);
+      const afterPath = path.join(uploadDir, `ai-upscale-${jobId}-after.png`);
+      const parsed = await runUpscaleScript("ai_upscale", artworkPath, {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        bleed_mm: 5,
+        output_path: fullPath,
+        before_preview_path: beforePath,
+        after_preview_path: afterPath,
+      });
+      const previous = (auditResults as any).aiUpscale || {};
+      const usable = !!(parsed.success && parsed.enhanced_path && !parsed.used_original && fsSync.existsSync(fullPath));
+      const nextUpscale = usable
+        ? {
+            accepted: false,
+            provider: parsed.provider,
+            model: parsed.model,
+            version: parsed.version,
+            scale: parsed.scale,
+            enhancedPath: fullPath,
+            note: parsed.note,
+            message: parsed.message,
+            effectiveDpi: parsed.effective_dpi,
+            enhancedDpi: parsed.enhanced_dpi,
+            kind: parsed.kind,
+          }
+        : { ...previous, accepted: false, enhancedPath: undefined, note: "", message: parsed.message || friendly, provider: "original" };
+      await storage.updateJob(jobId, {
+        auditResults: { ...auditResults, aiUpscale: nextUpscale },
+      });
+      res.json({
+        success: true,
+        used_original: !usable,
+        provider: usable ? parsed.provider : "original",
+        basic: !!parsed.basic,
+        message: parsed.message || friendly,
+        effectiveDpi: parsed.effective_dpi ?? null,
+        enhancedDpi: parsed.enhanced_dpi ?? null,
+        scale: parsed.scale ?? null,
+        model: parsed.model || null,
+        version: parsed.version || null,
+        beforeUrl: usable ? `/api/jobs/${jobId}/ai-upscale/image?which=before&v=${Date.now()}` : null,
+        afterUrl: usable ? `/api/jobs/${jobId}/ai-upscale/image?which=after&v=${Date.now()}` : null,
+      });
+    } catch (error: any) {
+      const errMsg = String(error?.message || error);
+      const busy = /timed out|timeout|busy/i.test(errMsg);
+      console.error("[AI-UPSCALE] preview failed:", errMsg.slice(0, 300));
+      res.json({
+        success: true,
+        used_original: true,
+        provider: "original",
+        message: busy
+          ? "The AI upscaler is busy right now, so we'll keep your original artwork and continue."
+          : friendly,
+      });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-upscale/decision", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as AuditResults;
+      const accepted = req.body?.accepted === true;
+      const current = (auditResults as any).aiUpscale || {};
+      if (accepted && (!current.enhancedPath || !fsSync.existsSync(current.enhancedPath))) {
+        return res.json({
+          success: true,
+          accepted: false,
+          message: "There's no enhanced artwork to accept, so the original will be used.",
+        });
+      }
+      const aiUpscale = {
+        ...current,
+        accepted,
+        note: accepted ? (current.note || "AI enhancement was applied before bleed.") : "",
+      };
+      await storage.updateJob(jobId, { auditResults: { ...auditResults, aiUpscale } });
+      res.json({
+        success: true,
+        accepted,
+        provider: current.provider || null,
+        message: accepted
+          ? (current.message || "Enhanced artwork will be used.")
+          : "Keeping your original artwork.",
+      });
+    } catch (error) {
+      console.error("[AI-UPSCALE] decision failed:", error);
+      res.status(500).json({ message: "Couldn't save that choice. Your original artwork is still safe." });
+    }
+  });
+
+  app.get("/api/jobs/:id/ai-upscale/image", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const which = req.query.which === "after" ? "after" : "before";
+      const filePath = path.join(uploadDir, `ai-upscale-${jobId}-${which}.png`);
+      if (!fsSync.existsSync(filePath)) return res.status(404).json({ message: "Preview not ready" });
+      res.setHeader("Cache-Control", "no-store");
+      res.type("png");
+      fsSync.createReadStream(filePath).pipe(res);
+    } catch (error) {
+      console.error("[AI-UPSCALE] image failed:", error);
+      res.status(404).json({ message: "Preview not ready" });
+    }
+  });
+
   // --- Optional Text Clear-up (OCR → edit → overlay). Unused = zero pipeline change. ---
   const resolveTextClearupArtwork = (job: any, auditResults: any): string | null => {
     const p = auditResults?.preBleedPath || job.correctedPath || job.originalPath;
@@ -2138,6 +2343,7 @@ export async function registerRoutes(
         ...cropArgs,
         ...(autoShifter ? ["--auto-shifter", "2.0"] : []),
         ...colourBorderCliArgs(effectiveStrategy, auditResults),
+        ...aiUpscaleCliArgs(auditResults),
       ];
 
       if (job.originalPath && job.originalPath !== artworkPath) {

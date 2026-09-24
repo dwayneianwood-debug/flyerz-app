@@ -14,6 +14,7 @@
     "test:artwork-preview": "tsx --test client/src/components/artwork-thumbnail.test.tsx",
     "test:pure-crop": "tsx --test server/pureCrop.test.ts",
     "test:colour-border": "tsx --test server/colourBorder.test.ts client/src/components/colour-border-picker.test.tsx",
+    "test:ai-upscale": "tsx --test server/aiUpscale.test.ts client/src/components/ai-upscale-panel.test.tsx",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

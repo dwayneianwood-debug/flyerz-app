@@ -105,6 +105,20 @@ export interface AuditResults {
   selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
   /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */
   colourBorder?: { c: number; m: number; y: number; k: number; label?: string; source?: string };
+  /** Optional AI upscale accepted after the bleed choice. Applied to the artwork before bleed. */
+  aiUpscale?: {
+    accepted?: boolean;
+    provider?: "replicate" | "basic" | "stub" | "original";
+    model?: string;
+    version?: string;
+    scale?: number;
+    enhancedPath?: string;
+    note?: string;
+    message?: string;
+    effectiveDpi?: number;
+    enhancedDpi?: number;
+    kind?: string;
+  };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;
