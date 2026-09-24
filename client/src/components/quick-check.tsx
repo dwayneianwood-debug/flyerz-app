@@ -68,9 +68,15 @@ export function QuickCheck() {
   }, [result]);
 
   const quickCheckMutation = useMutation({
-    mutationFn: async (file: File) => {
+    mutationFn: async ({ file, widthMm, heightMm }: { file: File; widthMm: string; heightMm: string }) => {
       const formData = new FormData();
       formData.append("file", file);
+      const width = parseFloat(widthMm);
+      const height = parseFloat(heightMm);
+      if (width > 0 && height > 0) {
+        formData.append("targetWidthMm", String(width));
+        formData.append("targetHeightMm", String(height));
+      }
       const res = await fetch("/api/quick-check", {
         method: "POST",
         body: formData,
@@ -139,8 +145,8 @@ export function QuickCheck() {
     setFixingItems(new Set());
     setDetectedWidth(null);
     setDetectedHeight(null);
-    quickCheckMutation.mutate(file);
-  }, [quickCheckMutation, toast]);
+    quickCheckMutation.mutate({ file, widthMm: targetWidth, heightMm: targetHeight });
+  }, [quickCheckMutation, toast, targetWidth, targetHeight]);
 
   const { getRootProps, getInputProps, isDragActive, isDragReject } = useDropzone({
     onDrop,

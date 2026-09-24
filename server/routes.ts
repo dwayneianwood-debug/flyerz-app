@@ -19,6 +19,9 @@ import {
   getQueueStatus,
   getJobQueuePosition,
   isSafeZoneLayoutRejectionMessage,
+  buildOfficeQuickCheck,
+  clientSafeQuickCheckError,
+  isOfficeUpload,
 } from "./fileProcessor";
 import { execSync, spawnSync } from "child_process";
 import fsSync from "fs";
@@ -405,9 +408,24 @@ function execPythonCapture(args: string[], label: string, timeoutMs: number = EX
   }
 }
 
-function execQuickCheck(scriptPath: string, filePath: string, fileType: string): any {
+function chosenTrimMm(source: { targetWidth?: number | null; targetHeight?: number | null } | undefined): { width: number; height: number } | undefined {
+  const width = Number(source?.targetWidth);
+  const height = Number(source?.targetHeight);
+  if (width > 0 && height > 0) return { width, height };
+  return undefined;
+}
+
+function execQuickCheck(
+  scriptPath: string,
+  filePath: string,
+  fileType: string,
+  trimMm?: { width: number; height: number },
+): any {
   const resultFile = path.join(os.tmpdir(), `qc_${crypto.randomBytes(8).toString("hex")}.json`);
   const args = [scriptPath, filePath, fileType, resultFile];
+  if (trimMm && trimMm.width > 0 && trimMm.height > 0) {
+    args.push(String(trimMm.width), String(trimMm.height));
+  }
 
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
@@ -711,13 +729,22 @@ export async function registerRoutes(
 
       let quickCheckResult: any;
       try {
-        // quick_check.py runs PDF geometry sanitize (CropBox/MediaBox) on disk before the 5 checks
-        const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
-        quickCheckResult = await execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType);
+        if (isOfficeUpload(normalizedType)) {
+          quickCheckResult = buildOfficeQuickCheck(normalizedType);
+        } else {
+          // quick_check.py runs PDF geometry sanitize (CropBox/MediaBox) on disk before the 5 checks
+          const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
+          quickCheckResult = execQuickCheck(
+            QUICK_CHECK_SCRIPT,
+            file.path,
+            normalizedType,
+            chosenTrimMm(bleedOptions),
+          );
+        }
       } catch (qcError: any) {
         await storage.updateJob(job.id, {
           status: 'failed',
-          errorMessage: qcError.message || 'Quick check crashed',
+          errorMessage: clientSafeQuickCheckError(qcError.message || 'Quick check crashed', normalizedType),
           completedAt: new Date(),
         });
         return res.status(201).json({ jobId: job.id, filename: job.filename, status: 'failed' });
@@ -726,7 +753,7 @@ export async function registerRoutes(
       if (quickCheckResult.error) {
         await storage.updateJob(job.id, {
           status: 'failed',
-          errorMessage: quickCheckResult.error,
+          errorMessage: clientSafeQuickCheckError(quickCheckResult.error, normalizedType),
           completedAt: new Date(),
         });
         return res.status(201).json({ jobId: job.id, filename: job.filename, status: 'failed' });
@@ -876,13 +903,19 @@ export async function registerRoutes(
         throw error;
       }
       const normalizedType = ingested.fileType;
+      const trim = chosenTrimMm(readTargetMmFromForm(req.body));
 
-      // quick_check.py sanitizes PDF page boxes in-place before pre-flight telemetry
-      const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
-      const result = await execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType);
+      let result: any;
+      if (isOfficeUpload(normalizedType)) {
+        result = buildOfficeQuickCheck(normalizedType);
+      } else {
+        // quick_check.py sanitizes PDF page boxes in-place before pre-flight telemetry
+        const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
+        result = execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType, trim);
+      }
 
       if (result.error) {
-        return res.status(500).json({ message: result.error });
+        return res.status(500).json({ message: clientSafeQuickCheckError(result.error, normalizedType) });
       }
 
       if (result.checks) {
@@ -904,7 +937,8 @@ export async function registerRoutes(
       });
     } catch (error: any) {
       console.error('[FAI] Quick check error:', error);
-      res.status(500).json({ message: error.message || 'Quick check failed' });
+      const fileType = req.file ? normalizedUploadType(req.file.originalname) : "";
+      res.status(500).json({ message: clientSafeQuickCheckError(error.message || 'Quick check failed', fileType) });
     }
   });
 

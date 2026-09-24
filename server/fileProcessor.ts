@@ -291,14 +291,16 @@ function runPythonBleed(
   }
 }
 
-function auditOfficeFile(fileType: string): AuditCheck[] {
+export function auditOfficeFile(fileType: string): AuditCheck[] {
+  const kind = (fileType || "Office").toUpperCase();
   return [
     {
       name: "Office File Format",
       passed: false,
-      message: `${fileType.toUpperCase()} files are not ideal for litho printing.`,
+      message: `${kind} files are not ideal for litho printing. Please send a PDF or a picture (JPG or PNG).`,
       autoFixed: false,
       details: "Recommend converting to high-resolution PDF (400 DPI) with embedded fonts and CMYK color space.",
+      severity: "HIGH",
     },
     {
       name: "Color Space",
@@ -306,6 +308,7 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Office files use RGB color space — must be converted to CMYK.",
       autoFixed: false,
       details: "Export to PDF from your application and choose CMYK color space.",
+      severity: "HIGH",
     },
     {
       name: "Font Embedding",
@@ -313,6 +316,7 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Office files may not have embedded fonts.",
       autoFixed: false,
       details: "When exporting to PDF, enable 'Embed all fonts' option.",
+      severity: "HIGH",
     },
     {
       name: "5mm Smart Bleed",
@@ -320,8 +324,50 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Smart Bleed cannot be applied to Office files. Convert to PDF first.",
       autoFixed: false,
       details: "Upload as PDF or JPG/PNG to enable automatic Smart Bleed via pixel mirroring.",
+      severity: "HIGH",
     },
   ];
+}
+
+export function isOfficeUpload(fileType: string): boolean {
+  return fileType === "docx" || fileType === "pptx";
+}
+
+/** Never show a server path. Office files get the litho-ready explanation instead of a crash. */
+export function clientSafeQuickCheckError(message: string, fileType?: string): string {
+  if (isOfficeUpload(fileType || "")) {
+    return buildOfficeQuickCheck(fileType || "docx").checks[0].message;
+  }
+  let text = String(message || "Quick check failed");
+  text = text.replace(/[A-Za-z]:\\[^\s'"]+/g, "");
+  text = text.replace(/(?:\/(?:[\w.+@=-]+)){2,}/g, "");
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text || /cannot identify image file/i.test(message)) {
+    return "We couldn't read this file. Please send a PDF or a picture (JPG or PNG).";
+  }
+  return text;
+}
+
+/** Same office checklist, shaped like a quick-check result so the first screen can show it. */
+export function buildOfficeQuickCheck(fileType: string) {
+  const ids = ["office_format", "office_color", "office_fonts", "office_bleed"];
+  const checks = auditOfficeFile(fileType).map((check, index) => ({
+    id: ids[index] || `office_${index}`,
+    name: check.name,
+    passed: false,
+    message: check.message,
+    details: check.details || "",
+    fixType: "manual" as const,
+    severity: "HIGH",
+    autoFixed: false,
+  }));
+  return {
+    checks,
+    allPassed: false,
+    passCount: 0,
+    failCount: checks.length,
+    pageCount: 1,
+  };
 }
 
 export function generateHealthReport(

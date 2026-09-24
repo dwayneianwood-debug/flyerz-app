@@ -16,6 +16,8 @@
     "test:colour-border": "tsx --test server/colourBorder.test.ts client/src/components/colour-border-picker.test.tsx",
     "test:ai-upscale": "tsx --test server/aiUpscale.test.ts client/src/components/ai-upscale-panel.test.tsx",
     "test:ai-artwork": "tsx --test server/aiArtwork.test.ts client/src/components/ai-artwork-panel.test.tsx",
+    "test:quick-check": "tsx --test server/quickCheckRules.test.ts",
+    "test:illustrator-intake": "tsx --test server/illustratorIntake.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },
