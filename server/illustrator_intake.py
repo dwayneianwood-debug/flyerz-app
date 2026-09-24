@@ -30,7 +30,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fai_temp_utils import init_fai_temp_dir
 
 try:
-    import fitz
+    import contextlib
+    import io
+    _fitz_import_log = io.StringIO()
+    with contextlib.redirect_stdout(_fitz_import_log):
+        import fitz
 except ImportError:
     fitz = None
 

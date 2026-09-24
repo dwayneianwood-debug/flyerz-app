@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Intake tests for Adobe Illustrator .ai and .eps files."""
 
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -129,6 +131,20 @@ class IllustratorIntakeTests(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(data)
         return path
+
+    def test_cli_stdout_is_only_json(self):
+        path = self._write("campaign.ai", _pdf_compatible_ai_bytes())
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "illustrator_intake.py")
+        proc = subprocess.run(
+            [sys.executable, script, "prepare", path, ".ai"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["pageCount"], 2)
 
     def test_signature_not_extension(self):
         pdf_named_ai = self._write("flyer.ai", _pdf_compatible_ai_bytes())

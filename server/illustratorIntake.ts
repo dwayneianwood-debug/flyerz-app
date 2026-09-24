@@ -109,6 +109,19 @@ function pythonEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+function parseIntakeStdout(stdout: string): any | null {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith("{")) continue;
+    try {
+      return JSON.parse(lines[i]);
+    } catch {
+      /* A library warning can share stdout with the JSON result. */
+    }
+  }
+  return null;
+}
+
 function runIntake(args: string[]): any {
   const proc = spawnSync(PYTHON_BIN, [SCRIPT, ...args], {
     cwd: process.cwd(),
@@ -118,13 +131,7 @@ function runIntake(args: string[]): any {
     maxBuffer: 20 * 1024 * 1024,
   });
 
-  const stdout = (proc.stdout || "").trim();
-  let parsed: any = null;
-  try {
-    parsed = stdout ? JSON.parse(stdout) : null;
-  } catch {
-    parsed = null;
-  }
+  const parsed = parseIntakeStdout(proc.stdout || "");
 
   if (proc.error || proc.status !== 0 || !parsed || parsed.success === false) {
     const message = typeof parsed?.error === "string" && parsed.error.trim()
