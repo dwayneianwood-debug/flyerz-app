@@ -1188,7 +1188,7 @@ export async function registerRoutes(
         }
       }
 
-      res.download(reportPath!, `Flyerz.co.za Artwork Intellegence Proof and Report.pdf`);
+      res.download(reportPath!, `Flyerz.co.za Artwork Intelligence Proof and Report.pdf`);
     } catch (error) {
       console.error('Error downloading health report:', error);
       res.status(500).json({ message: 'Failed to download health report' });
@@ -3711,7 +3711,7 @@ print(f'{w},{h}')
             try {
               const reportBuffer = await fs.readFile(healthReportPath);
               attachments.push({
-                filename: "Flyerz.co.za Artwork Intellegence Proof and Report.pdf",
+                filename: "Flyerz.co.za Artwork Intelligence Proof and Report.pdf",
                 content: reportBuffer,
               });
             } catch (e) {
@@ -4153,26 +4153,6 @@ print(f'{w},{h}')
       if (!res.headersSent) {
         return res.status(500).json({ message: error.message || 'Batch download failed' });
       }
-    }
-  });
-
-  // Seed database with example jobs (for demo purposes)
-  app.get('/api/test-pdf/download', async (_req, res) => {
-    try {
-      const filePath = path.resolve('stress_test.pdf');
-      try {
-        await fs.access(filePath);
-      } catch {
-        const { execSync: exec } = await import('child_process');
-        exec(`${PYTHON_BIN} make_test.py`, { cwd: path.resolve('.'), timeout: 30000 });
-      }
-      await fs.access(filePath);
-      res.setHeader('Content-Disposition', 'attachment; filename="stress_test.pdf"');
-      res.setHeader('Content-Type', 'application/pdf');
-      const stream = fsSync.createReadStream(filePath);
-      stream.pipe(res);
-    } catch (err: any) {
-      res.status(500).json({ error: 'Failed to generate stress_test.pdf', details: err?.message });
     }
   });
 

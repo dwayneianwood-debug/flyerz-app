@@ -19,6 +19,7 @@
     "test:quick-check": "tsx --test server/quickCheckRules.test.ts",
     "test:illustrator-intake": "tsx --test server/illustratorIntake.test.ts",
     "test:load-env": "tsx --test server/loadEnv.test.ts",
+    "test:tidy-ups": "tsx --test server/tidyUps.test.ts client/src/lib/home-wizard-steps.test.ts client/src/lib/glitchy-placement.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

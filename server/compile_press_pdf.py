@@ -2739,7 +2739,7 @@ def main():
                 if report_for_zip and os.path.exists(report_for_zip):
                     with open(report_for_zip, "rb") as f:
                         zf.writestr(
-                            "Flyerz.co.za Artwork Intellegence Proof and Report.pdf",
+                            "Flyerz.co.za Artwork Intelligence Proof and Report.pdf",
                             f.read(),
                         )
 

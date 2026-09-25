@@ -249,7 +249,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 pb-24 sm:p-6 sm:pb-6 lg:p-8">
         {children}
       </main>
       
