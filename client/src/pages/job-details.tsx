@@ -29,7 +29,17 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { ColourBorderPicker } from "@/components/colour-border-picker";
+import { AiUpscalePanel } from "@/components/ai-upscale-panel";
+import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
+import {
+  type ColourBorderChoice,
+  cmykToRgb,
+  loadColourBorderChoice,
+  saveColourBorderChoice,
+} from "@/lib/colour-border";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isIllustratorFile, isVectorArtwork } from "@/lib/accepted-artwork";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -118,6 +128,10 @@ const BLEED_METHOD_LABELS = {
     description:
       "Fast proxy inpainting extends bleed colors softly; your 300 DPI artwork stays pixel-perfect in the center.",
   },
+  colourBorder: {
+    label: "Colour Border",
+    description: "Keeps the artwork at trim size and fills the bleed with a solid colour you choose.",
+  },
 } as const;
 
 export default function JobDetails() {
@@ -148,6 +162,12 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [autoEnhance, setAutoEnhance] = useState(false);
+  const [aiArtworkGate, setAiArtworkGate] = useState<{ ready: boolean; bleed?: string }>({ ready: false });
+  const [colourBorder, setColourBorder] = useState<ColourBorderChoice>(() => loadColourBorderChoice());
+  const colourBorderRef = useRef(colourBorder);
+  colourBorderRef.current = colourBorder;
+  const colourSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bleedMethodLoading, setBleedMethodLoading] = useState(false);
   const [compileTaskId, setCompileTaskId] = useState<string | null>(null);
   const [compileState, setCompileState] = useState<string | null>(null);
@@ -397,10 +417,12 @@ export default function JobDetails() {
     const variants = job.auditResults?.bleedVariants;
     const hasVariants = variants && Object.keys(variants).length > 0;
     if (hasVariants) return;
-    const recommended = job.auditResults?.recommendedBleedMethod || "mirror";
+    const canAssessArtwork = !!(job.auditResults && (job.correctedPath || job.originalPath));
+    if (canAssessArtwork && !aiArtworkGate.ready) return;
+    const recommended = aiArtworkGate.bleed || job.auditResults?.recommendedBleedMethod || "mirror";
     autoSelectTriggeredRef.current = true;
     handleBleedMethodSelect(recommended);
-  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
+  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, job?.correctedPath, job?.originalPath, selectedBleedMethod, aiArtworkGate]);
 
   const noneCountRef = useRef(0);
   const compilingCountRef = useRef(0);
@@ -747,10 +769,21 @@ export default function JobDetails() {
     }));
 
     try {
+      const border = colourBorderRef.current;
       const res = await fetch(`/api/jobs/${job.id}/select-bleed-method`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ method }),
+        body: JSON.stringify({
+          method,
+          colourBorder: method === "colourBorder" ? {
+            c: border.c,
+            m: border.m,
+            y: border.y,
+            k: border.k,
+            label: border.label,
+            source: border.source,
+          } : undefined,
+        }),
       });
 
       const data = await res.json();
@@ -830,6 +863,66 @@ export default function JobDetails() {
       setBleedPreviewLoading(false);
     }
   };
+
+  const handleColourBorderChange = async (next: ColourBorderChoice) => {
+    let choice = next;
+    if (next.source === "edge" && job) {
+      try {
+        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0`);
+        const data = await res.json();
+        if (res.ok && data.success) {
+          choice = {
+            source: "edge",
+            presetId: "edge",
+            label: "Match artwork edge",
+            c: Number(data.c) || 0,
+            m: Number(data.m) || 0,
+            y: Number(data.y) || 0,
+            k: Number(data.k) || 0,
+            r: Number(data.r) || 0,
+            g: Number(data.g) || 0,
+            b: Number(data.b) || 0,
+          };
+        }
+      } catch {
+        toast({ title: "Could not sample the edge", description: "Try another colour.", variant: "destructive" });
+      }
+    }
+    setColourBorder(choice);
+    colourBorderRef.current = choice;
+    saveColourBorderChoice(choice);
+    if (selectedBleedMethod !== "colourBorder" || !job) return;
+    if (colourSaveTimer.current) clearTimeout(colourSaveTimer.current);
+    const jobId = job.id;
+    colourSaveTimer.current = setTimeout(() => {
+      const latest = colourBorderRef.current;
+      void fetch(`/api/jobs/${jobId}/select-bleed-method`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          method: "colourBorder",
+          colourBorder: {
+            c: latest.c,
+            m: latest.m,
+            y: latest.y,
+            k: latest.k,
+            label: latest.label,
+            source: latest.source,
+          },
+        }),
+      });
+    }, 400);
+  };
+
+  const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
+    ? {
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`,
+        trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
+        trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
+        bleedMm: 5,
+      }
+    : null;
 
   const handleTextClearupStartOcr = async () => {
     if (!job || textClearupBusy) return;
@@ -1133,6 +1226,43 @@ export default function JobDetails() {
                     : "We found a few things that could cause problems during printing. Hit the button below and we'll fix everything automatically."}
                 </p>
               </div>
+
+              {job.auditResults && (job.correctedPath || job.originalPath) && (
+                <div className="mb-6">
+                  <AiArtworkPanel
+                    jobId={job.id}
+                    trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                    trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                    onPlan={(plan: AiArtworkPlan) => {
+                      if (plan.bleed === "colourBorder" && plan.edge) {
+                        const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                        const choice: ColourBorderChoice = {
+                          source: "edge",
+                          presetId: "edge",
+                          label: "Match artwork edge",
+                          c: Number(plan.edge.c) || 0,
+                          m: Number(plan.edge.m) || 0,
+                          y: Number(plan.edge.y) || 0,
+                          k: Number(plan.edge.k) || 0,
+                          r: rgb.r,
+                          g: rgb.g,
+                          b: rgb.b,
+                        };
+                        colourBorderRef.current = choice;
+                        setColourBorder(choice);
+                        saveColourBorderChoice(choice);
+                      }
+                      setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                      setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                    }}
+                    onRefit={() => {
+                      if (selectedBleedMethod !== "auto") {
+                        void handleBleedMethodSelect(selectedBleedMethod, true);
+                      }
+                    }}
+                  />
+                </div>
+              )}
 
               {job.auditResults && job.auditResults.checks.some(c => !c.passed) && (
                 <div className="grid gap-3 sm:grid-cols-2 mb-6">
@@ -1448,7 +1578,43 @@ export default function JobDetails() {
                       </LazyCollapsibleContent>
                     </Collapsible>
                   )}
-                  {job.auditResults && job.correctedPath && (
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="px-4 sm:px-5 pt-4">
+                      <AiArtworkPanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        onPlan={(plan: AiArtworkPlan) => {
+                          if (plan.bleed === "colourBorder" && plan.edge) {
+                            const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                            const choice: ColourBorderChoice = {
+                              source: "edge",
+                              presetId: "edge",
+                              label: "Match artwork edge",
+                              c: Number(plan.edge.c) || 0,
+                              m: Number(plan.edge.m) || 0,
+                              y: Number(plan.edge.y) || 0,
+                              k: Number(plan.edge.k) || 0,
+                              r: rgb.r,
+                              g: rgb.g,
+                              b: rgb.b,
+                            };
+                            colourBorderRef.current = choice;
+                            setColourBorder(choice);
+                            saveColourBorderChoice(choice);
+                          }
+                          setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                          setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                        }}
+                        onRefit={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
                     <div className="p-4 sm:p-5 border-b border-border/30">
                       <BleedMethodSelector
                         jobId={job.id}
@@ -1457,6 +1623,35 @@ export default function JobDetails() {
                         selected={selectedBleedMethod}
                         onSelect={handleBleedMethodSelect}
                         loading={bleedMethodLoading}
+                        colourBorder={colourBorder}
+                        onColourBorderChange={handleColourBorderChange}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="px-4 sm:px-5 pb-5 border-b border-border/30">
+                      <AiUpscalePanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        autoStart={autoEnhance}
+                        onEnhanceChoice={async (accepted) => {
+                          setAutoEnhance(accepted);
+                          try {
+                            await fetch(`/api/jobs/${job.id}/ai-artwork/choice`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ enhance: accepted, enhanceOverridden: true }),
+                            });
+                          } catch {
+                            /* The print job still continues. */
+                          }
+                        }}
+                        onApplied={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
                       />
                     </div>
                   )}
@@ -1489,6 +1684,7 @@ export default function JobDetails() {
                       currentBleedPage={currentBleedPage}
                       loadBleedPreview={loadBleedPreview}
                       enhancementLoading={aiEnhanceLoading}
+                      colourBorderPreview={colourBorderPreview}
                     />
                   </div>
                   <div className="px-4 sm:px-5 pb-4 sm:pb-5">
@@ -1626,7 +1822,9 @@ export default function JobDetails() {
               </Collapsible>
 
               {(() => {
-                const isPdfFile = job.filename?.toLowerCase().endsWith('.pdf');
+                const lowerName = job.filename?.toLowerCase() || "";
+                const isPdfFile = isVectorArtwork(lowerName) || isVectorArtwork(job.fileType || "");
+                const vectorLabel = isIllustratorFile(lowerName) || isIllustratorFile(job.fileType || "") ? "Illustrator file" : "PDF";
                 return (
                   <Collapsible open={openSections.prepress} onOpenChange={(open) => toggleSection("prepress", open)}>
                   <div className="mt-6 rounded-xl border-2 border-blue-500/20 bg-gradient-to-br from-blue-50/30 to-slate-50/20 dark:from-blue-500/5 dark:to-slate-500/5 overflow-hidden" data-testid="section-prepress-refinements">
@@ -1656,7 +1854,7 @@ export default function JobDetails() {
                           </div>
                           <p className="text-xs text-muted-foreground mt-0.5">Caps total ink coverage at 280% to prevent paper from getting too wet during litho printing.</p>
                           {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
+                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
                           )}
                           {aiEnhanceMessages.tac_limit && aiTacLimit && (
                             <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-tac-limit-status">{aiEnhanceMessages.tac_limit}</p>
@@ -1678,7 +1876,7 @@ export default function JobDetails() {
                           </div>
                           <p className="text-xs text-muted-foreground mt-0.5">Adds tiny overlap between colours so white gaps don't appear if the press is slightly off-register.</p>
                           {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
+                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
                           )}
                           {aiEnhanceMessages.trapping && aiTrapping && (
                             <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-trapping-status">{aiEnhanceMessages.trapping}</p>
@@ -2479,7 +2677,7 @@ export default function JobDetails() {
 
 
 
-function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading }: {
+function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading, colourBorderPreview }: {
   bleedPreview: BleedPreviewData | null;
   bleedPreviewLoading: boolean;
   bleedPreviewError: string | null;
@@ -2488,7 +2686,50 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
   currentBleedPage: BleedPreviewPage | undefined;
   loadBleedPreview: () => void;
   enhancementLoading?: string | null;
+  colourBorderPreview?: { url: string; trimW: number; trimH: number; bleedMm: number } | null;
 }) {
+  if (colourBorderPreview) {
+    return (
+      <div className="space-y-3" data-testid="section-colour-border-preview">
+        <div className="relative bg-gray-900 rounded-xl border-2 border-red-500/30 overflow-hidden" data-testid="bleed-preview-image-container">
+          <img
+            src={colourBorderPreview.url}
+            alt="Colour border bleed preview"
+            className="w-full h-auto max-h-[500px] object-contain"
+            data-testid="img-colour-border-preview"
+          />
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Trim Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-trim-size">
+              {colourBorderPreview.trimW} × {colourBorderPreview.trimH}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Total Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-total-size">
+              {colourBorderPreview.trimW + colourBorderPreview.bleedMm * 2} × {colourBorderPreview.trimH + colourBorderPreview.bleedMm * 2}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Bleed</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-bleed-amount">
+              {colourBorderPreview.bleedMm}mm
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] text-muted-foreground justify-center">
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-0.5 bg-red-500 inline-block rounded"></span> Cut line
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-2 inline-block rounded border border-black/10" style={{ backgroundColor: "currentColor" }}></span> Colour border
+          </span>
+        </div>
+      </div>
+    );
+  }
   if (bleedPreviewLoading) {
     return (
       <div className="flex flex-col items-center gap-3 py-8">
@@ -2848,13 +3089,15 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
   selected: string;
   onSelect: (method: string) => void;
   loading: boolean;
+  colourBorder: ColourBorderChoice;
+  onColourBorderChange: (next: ColourBorderChoice) => void;
 }) {
   /** Always list every registered strategy; variant paths may be partial if generation skipped a tile. */
   const methods = [...BLEED_STRATEGY_IDS];
@@ -2899,10 +3142,20 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             {activeInfo.description}
           </p>
         )}
+        {activeMethod === "colourBorder" && (
+          <ColourBorderPicker value={colourBorder} onChange={onColourBorderChange} disabled={loading} />
+        )}
         {activeMethod && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
             <div className="aspect-[16/9]">
-              {variants[activeMethod] ? (
+              {activeMethod === "colourBorder" ? (
+              <img
+                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`}
+                alt="Colour border preview"
+                className="w-full h-full object-contain"
+                data-testid="img-bleed-variant-colourBorder"
+              />
+              ) : variants[activeMethod] ? (
               <img
                 src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
                 alt={activeInfo?.label || activeMethod}

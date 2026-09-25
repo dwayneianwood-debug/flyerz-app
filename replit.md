@@ -1,7 +1,7 @@
 # Flyerz.co.za Artwork Intelligence
 
 ## Overview
-Flyerz.co.za Artwork Intelligence (FAI) is a full-stack application designed to automatically audit and correct PDF, JPG, PNG, DOCX, and PPTX files to meet professional litho-printing standards. Its primary purpose is to validate artwork against a comprehensive set of print rules and then apply automated fixes, ensuring files are print-ready. The project aims to provide a robust prepress automation suite that streamlines the printing workflow, reduces manual errors, and improves efficiency for print service providers and their clients. This leads to reduced manual errors, improved efficiency, and higher customer satisfaction in the printing industry.
+Flyerz.co.za Artwork Intelligence (FAI) is a full-stack application designed to automatically audit and correct PDF, AI, EPS, JPG, PNG, DOCX, and PPTX files to meet professional litho-printing standards. Its primary purpose is to validate artwork against a comprehensive set of print rules and then apply automated fixes, ensuring files are print-ready. The project aims to provide a robust prepress automation suite that streamlines the printing workflow, reduces manual errors, and improves efficiency for print service providers and their clients. This leads to reduced manual errors, improved efficiency, and higher customer satisfaction in the printing industry.
 
 ## User Preferences
 Not specified.

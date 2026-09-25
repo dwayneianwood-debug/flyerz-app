@@ -12,6 +12,7 @@ Usage:
   python3 server/safe_margin_shrink.py <input_path> preview  [shrink_factor]
 """
 
+from artwork_types import is_vector_extension
 import sys
 import json
 import os
@@ -85,7 +86,7 @@ def analyze_safe_zone_boundary_radar(rgb_np: np.ndarray, boundary_px: int = BOUN
 def _rgb_np_from_input(input_path: str):
     """RGB uint8 array and effective dpi hint for mm math in previews."""
     ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".pdf":
+    if is_vector_extension(ext):
         if not fitz:
             raise RuntimeError("PyMuPDF (fitz) not available for PDF radar")
         doc = fitz.open(input_path)
@@ -167,7 +168,7 @@ def generate_preview(input_path, preview_path, shrink_factor=0.92):
     _ = shrink_factor
     ext = os.path.splitext(input_path)[1].lower()
 
-    if ext == ".pdf":
+    if is_vector_extension(ext):
         if not fitz:
             return {"success": False, "error": "PyMuPDF not available"}
         rgb, dpi = _rgb_np_from_input(input_path)
@@ -243,7 +244,7 @@ def main():
         base = os.path.splitext(input_path)[0]
         preview_path = f"{base}_shrink_preview.png"
         result = generate_preview(input_path, preview_path, shrink_factor)
-    elif ext == ".pdf":
+    elif is_vector_extension(ext):
         result = shrink_pdf(input_path, output_path, shrink_factor)
     elif ext in (".jpg", ".jpeg", ".png"):
         result = shrink_image(input_path, output_path, shrink_factor)

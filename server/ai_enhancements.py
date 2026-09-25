@@ -133,9 +133,14 @@ def _to_data_uri(image_path: str) -> str:
 
 
 def _replicate_create_prediction(model_owner: str, model_name: str,
-                                  model_input: dict, token: str) -> dict:
-    url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
-    payload = json.dumps({"input": model_input}).encode("utf-8")
+                                  model_input: dict, token: str, version: str = "") -> dict:
+    if version:
+        url = f"{REPLICATE_API_URL}/predictions"
+        body = {"version": version, "input": model_input}
+    else:
+        url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
+        body = {"input": model_input}
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -195,7 +200,7 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
 
 
 def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
-                     model_input: dict) -> tuple:
+                     model_input: dict, version: str = "") -> tuple:
     token = _get_replicate_token()
     if not token:
         return None, "REPLICATE_API_TOKEN not configured — enhancement requires API access"
@@ -204,7 +209,7 @@ def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
 
     try:
         prediction = _replicate_create_prediction(
-            model_owner, model_name, model_input, token
+            model_owner, model_name, model_input, token, version=version
         )
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:200]
@@ -249,6 +254,7 @@ def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
         "sharpen_logos": "_sharpened.png",
         "background_remove": "_bg_removed.png",
         "expand_background": "_expanded.png",
+        "ai_upscale": "_upscaled.png",
     }
     try:
         out_path = _download_to_ramdisk(
@@ -1090,6 +1096,25 @@ if __name__ == "__main__":
         result = apply_identify_fonts(input_path)
     elif action == "test_design_style":
         result = apply_test_design_style(input_path)
+    elif action == "ai_upscale":
+        from ai_upscale import apply_ai_upscale
+        result = apply_ai_upscale(input_path, options)
+    elif action == "ai_upscale_assess":
+        from ai_upscale import assess_artwork
+        result = assess_artwork(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+            float(options.get("bleed_mm", 5)),
+        )
+    elif action == "ai_artwork_assess":
+        from ai_artwork import plan_artwork
+        result = plan_artwork(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+            options,
+        )
     else:
         result = {"error": f"Unknown action: {action}"}
         sys.exit(1)

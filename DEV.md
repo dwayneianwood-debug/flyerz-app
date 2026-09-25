@@ -13,7 +13,7 @@ This script:
 1. Stops anything listening on ports **3000**, **5000**, and **5173**.
 2. Force-stops **node**, **python** / **pythonw**, and Ghostscript CLI (**gswin64c** / **gswin32c**) so headless workers do not linger.
 3. Clears **`server/temp/`**, **`server/output/`**, **`dist/`**, and **`.next/`** (creates empty temp/output folders if missing).
-4. Runs **`npm run dev`**, which starts the **single** dev process used by this repo: Express (API) plus Vite in middleware mode (UI). There is no separate `python main.py` server for the web app; root `main.py` is a stub.
+4. Runs **`npm run dev`**, which starts the **single** dev process used by this repo: Express (API) plus Vite in middleware mode (UI). There is no separate Python web server.
 
 After it boots, open **http://localhost:5000/** unless `PORT` in `.env` overrides the port.
 

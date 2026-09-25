@@ -16,8 +16,10 @@ import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
 import { FULL_PAGE_CROP_NORMALIZED } from "@shared/crop-box";
 import { ManualCropEmbedded, type CropCoordinates } from "@/pages/manual-crop";
+import { ArtworkThumbnail } from "@/components/artwork-thumbnail";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
+import { ARTWORK_DROPZONE_ACCEPT, ARTWORK_TYPE_LABEL, isIllustratorFile } from "@/lib/accepted-artwork";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -449,6 +451,8 @@ export function FileUpload() {
   const [widthInput, setWidthInput] = useState("");
   const [batchJobs, setBatchJobs] = useState<BatchJob[]>([]);
   const [batchProcessing, setBatchProcessing] = useState(false);
+  const [artboardCount, setArtboardCount] = useState(0);
+  const [selectedArtboard, setSelectedArtboard] = useState<number | "all">("all");
   const batchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -553,6 +557,41 @@ export function FileUpload() {
     }
   }, []);
 
+  const loadStagedPreview = useCallback((file: File, page: number) => {
+    const illustrator = isIllustratorFile(file.name);
+    const webNativeImageTypes = ["image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp"];
+    if (webNativeImageTypes.includes(file.type)) {
+      setStagedPreviewUrl(URL.createObjectURL(file));
+      setArtboardCount(0);
+      return;
+    }
+    if (page === 0) setStagedPreviewUrl(null);
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("page", String(page));
+    fetch("/api/preview-pdf-page", { method: "POST", body: formData })
+      .then(async (response) => {
+        if (!response.ok) {
+          const err = await response.json().catch(() => null);
+          if (err?.message && illustrator) {
+            toast({
+              title: "Can't read this Illustrator file",
+              description: err.message,
+              variant: "destructive",
+            });
+          }
+          return null;
+        }
+        return response.json();
+      })
+      .then((data) => {
+        if (!data) return;
+        if (data.previewUrl) setStagedPreviewUrl(data.previewUrl);
+        if (illustrator) setArtboardCount(Number(data.pageCount) || 1);
+      })
+      .catch(() => {});
+  }, [toast]);
+
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     const oversized = acceptedFiles.filter(f => f.size > 50 * 1024 * 1024);
     if (oversized.length > 0) {
@@ -570,22 +609,9 @@ export function FileUpload() {
       handleFilePreview(file);
       setStagedFile(file);
       setBatchJobs([]);
-      const webNativeImageTypes = ["image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp"];
-      if (webNativeImageTypes.includes(file.type)) {
-        setStagedPreviewUrl(URL.createObjectURL(file));
-      } else {
-        setStagedPreviewUrl(null);
-        const formData = new FormData();
-        formData.append("file", file);
-        fetch("/api/preview-pdf-page", { method: "POST", body: formData })
-          .then(r => r.ok ? r.json() : null)
-          .then(data => {
-            if (data?.previewUrl) {
-              setStagedPreviewUrl(data.previewUrl);
-            }
-          })
-          .catch(() => {});
-      }
+      setSelectedArtboard("all");
+      setArtboardCount(0);
+      loadStagedPreview(file, 0);
       setPendingCropCoords(null);
       setShowCropTool(false);
       setPreserveBleed(false);
@@ -600,7 +626,7 @@ export function FileUpload() {
       setWizardStage(1);
       setBatchJobs(validFiles.map(f => ({ file: f, status: 'pending' as const })));
     }
-  }, [toast, handleFilePreview]);
+  }, [toast, handleFilePreview, loadStagedPreview]);
 
   const handleStartProcess = useCallback(async () => {
     if (batchJobs.length > 1) {
@@ -613,9 +639,19 @@ export function FileUpload() {
         }
         setBatchJobs(prev => prev.map(bj => ({ ...bj, status: 'uploading' as const })));
         const resp = await fetch('/api/batch-upload', { method: 'POST', body: formData });
-        if (!resp.ok) throw new Error('Batch upload failed');
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => null);
+          throw new Error(err?.message || 'Batch upload failed');
+        }
         const data = await resp.json();
         const jobIds: number[] = data.jobIds;
+        if (Array.isArray(data.errors) && data.errors.length > 0 && data.errors[0]?.message) {
+          toast({
+            title: "Some files need a re-save",
+            description: data.errors[0].message,
+            variant: "destructive",
+          });
+        }
         setBatchJobs(prev => prev.map((bj, i) => ({ ...bj, jobId: jobIds[i], status: 'processing' as const })));
         toast({ title: "Batch uploaded", description: `${jobIds.length} files are being analyzed...` });
 
@@ -656,7 +692,10 @@ export function FileUpload() {
       return;
     }
     try {
-      const uploadBleedOptions = { ...bleedOptions };
+      const uploadBleedOptions = { ...bleedOptions } as BleedOptions & { selectedPage?: number };
+      if (typeof selectedArtboard === "number") {
+        uploadBleedOptions.selectedPage = selectedArtboard;
+      }
       let fileToUpload: globalThis.File | Blob = stagedFile;
       let uploadFileName: string = stagedFile.name;
       const ext = stagedFile.name.split('.').pop()?.toLowerCase() || '';
@@ -787,7 +826,7 @@ export function FileUpload() {
         variant: "destructive",
       });
     }
-  }, [stagedFile, uploadJob, bleedOptions, setLocation, toast, batchJobs, pendingCropCoords, preserveBleed]);
+  }, [stagedFile, uploadJob, bleedOptions, setLocation, toast, batchJobs, pendingCropCoords, preserveBleed, selectedArtboard]);
 
 
   const handleClearStaged = useCallback(() => {
@@ -804,19 +843,25 @@ export function FileUpload() {
     setIsCropping(false);
     setIsOptimizing(false);
     setPreserveBleed(false);
+    setArtboardCount(0);
+    setSelectedArtboard("all");
     if (batchPollRef.current) { clearInterval(batchPollRef.current); batchPollRef.current = null; }
   }, [stagedPreviewUrl]);
 
   const { getRootProps, getInputProps, isDragActive, isDragReject } = useDropzone({
     onDrop,
     maxFiles: 20,
-    accept: {
-      'application/pdf': ['.pdf'],
-      'image/jpeg': ['.jpg', '.jpeg'],
-      'image/png': ['.png'],
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx']
-    }
+    accept: ARTWORK_DROPZONE_ACCEPT,
+    onDropRejected: (rejections) => {
+      const name = rejections[0]?.file?.name;
+      toast({
+        title: "File not supported",
+        description: name
+          ? `${name} isn't a file we can print. Use ${ARTWORK_TYPE_LABEL}.`
+          : `Use ${ARTWORK_TYPE_LABEL}.`,
+        variant: "destructive",
+      });
+    },
   });
 
   const hasSizeSet = !!(parseFloat(widthInput) > 0 && parseFloat(heightInput) > 0);
@@ -864,23 +909,49 @@ export function FileUpload() {
         <div data-testid="panel-size-selection">
           <Card className="p-4 glass-card tech-corners mb-3" data-testid="panel-staged-preview">
             <div className="flex items-center gap-3">
-              {stagedPreviewUrl ? (
-                <img
-                  src={stagedPreviewUrl}
-                  alt="Artwork preview"
-                  className="w-16 h-16 object-contain rounded-lg border border-border/40 bg-muted/30 shrink-0"
-                  data-testid="img-staged-preview"
-                />
-              ) : (
-                <div className="w-16 h-16 rounded-lg border border-border/40 bg-muted/30 flex items-center justify-center shrink-0">
-                  <File className="w-8 h-8 text-primary/60" />
-                </div>
-              )}
+              <ArtworkThumbnail
+                previewUrl={stagedPreviewUrl}
+                fileName={stagedFile.name}
+                dimensionsMm={originalDims ? { w: originalDims.w, h: originalDims.h } : null}
+              />
               <div className="flex-1 min-w-0">
                 <span className="text-sm font-semibold text-foreground truncate block" data-testid="text-staged-filename">{stagedFile.name}</span>
                 <span className="text-xs text-muted-foreground">{(stagedFile.size / 1024 / 1024).toFixed(1)} MB</span>
                 {originalDims && (
                   <span className="text-xs text-muted-foreground ml-2">• {originalDims.w} × {originalDims.h}mm @ 300 DPI</span>
+                )}
+                {artboardCount > 1 && (
+                  <div className="flex flex-wrap gap-1.5 mt-2" data-testid="artboard-picker">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={selectedArtboard === "all" ? "default" : "outline"}
+                      className="h-7 text-xs"
+                      onClick={() => {
+                        setSelectedArtboard("all");
+                        if (stagedFile) loadStagedPreview(stagedFile, 0);
+                      }}
+                      data-testid="button-artboard-all"
+                    >
+                      All artboards
+                    </Button>
+                    {Array.from({ length: artboardCount }, (_, index) => (
+                      <Button
+                        key={index}
+                        type="button"
+                        size="sm"
+                        variant={selectedArtboard === index ? "default" : "outline"}
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setSelectedArtboard(index);
+                          if (stagedFile) loadStagedPreview(stagedFile, index);
+                        }}
+                        data-testid={`button-artboard-${index + 1}`}
+                      >
+                        Artboard {index + 1}
+                      </Button>
+                    ))}
+                  </div>
                 )}
               </div>
               <Button
@@ -1314,14 +1385,17 @@ export function FileUpload() {
               </h3>
 
               <p className="text-xs text-muted-foreground max-w-[200px] font-medium" data-testid="text-upload-description">
-                PDF, JPG, PNG, DOCX, PPTX up to 50MB — drop multiple files for batch processing
+                {ARTWORK_TYPE_LABEL} up to 50MB — drop multiple files for batch processing
               </p>
 
-              <div className="mt-4 flex gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+              <div className="mt-4 flex flex-wrap justify-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
                 <span className="bg-muted px-1.5 py-0.5 rounded">PDF</span>
+                <span className="bg-muted px-1.5 py-0.5 rounded">AI</span>
+                <span className="bg-muted px-1.5 py-0.5 rounded">EPS</span>
                 <span className="bg-muted px-1.5 py-0.5 rounded">JPG</span>
                 <span className="bg-muted px-1.5 py-0.5 rounded">PNG</span>
                 <span className="bg-muted px-1.5 py-0.5 rounded">DOCX</span>
+                <span className="bg-muted px-1.5 py-0.5 rounded">PPTX</span>
               </div>
             </div>
           </div>

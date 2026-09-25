@@ -1,3 +1,4 @@
+import "./loadEnv";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -6,32 +7,6 @@ import os from "os";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
-
-/** Sync load project `.env` before any env-dependent constants (no dotenv dependency). */
-(() => {
-  try {
-    const envPath = path.join(process.cwd(), ".env");
-    if (!fs.existsSync(envPath)) return;
-    const raw = fs.readFileSync(envPath, "utf8");
-    for (const line of raw.split(/\r?\n/)) {
-      const t = line.trim();
-      if (!t || t.startsWith("#")) continue;
-      const eq = t.indexOf("=");
-      if (eq <= 0) continue;
-      const k = t.slice(0, eq).trim();
-      let v = t.slice(eq + 1).trim();
-      if (
-        (v.startsWith('"') && v.endsWith('"')) ||
-        (v.startsWith("'") && v.endsWith("'"))
-      ) {
-        v = v.slice(1, -1);
-      }
-      if (process.env[k] === undefined) process.env[k] = v;
-    }
-  } catch {
-    /* ignore malformed .env */
-  }
-})();
 
 let sighupCount = 0;
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");

@@ -1,14 +1,10 @@
 import { Layout } from "@/components/layout";
 import { FileUpload } from "@/components/file-upload";
+import { HOME_WIZARD_STEPS } from "@/lib/home-wizard-steps";
 import { motion } from "framer-motion";
-import { Ruler, Upload, Eye, Download } from "lucide-react";
+import { Crop, Ruler, Upload } from "lucide-react";
 
-const STEPS = [
-  { num: 1, label: "Set Size", icon: Ruler, color: "text-primary" },
-  { num: 2, label: "Upload & Fix", icon: Upload, color: "text-primary" },
-  { num: 3, label: "Review", icon: Eye, color: "text-muted-foreground" },
-  { num: 4, label: "Download", icon: Download, color: "text-muted-foreground" },
-];
+const STEP_ICONS = [Upload, Ruler, Crop];
 
 export default function Dashboard() {
   return (
@@ -26,15 +22,15 @@ export default function Dashboard() {
             <span className="gradient-text-animated">every single time.</span>
           </h1>
           <p className="text-base text-muted-foreground max-w-xl mx-auto font-medium" data-testid="text-hero-subtitle">
-            Choose your size, drop your file, and we handle the rest. Three steps to print-ready artwork.
+            Upload your artwork, choose the size, then crop and submit. Three steps to print-ready artwork.
           </p>
         </div>
 
         <div className="mb-8" data-testid="wizard-steps-preview">
           <div className="flex items-center justify-center gap-0 px-4 sm:px-16">
-            {STEPS.map((step, idx) => {
-              const StepIcon = step.icon;
-              const isActive = step.num <= 2;
+            {HOME_WIZARD_STEPS.map((step, idx) => {
+              const StepIcon = STEP_ICONS[idx] || Upload;
+              const isActive = step.num === 1;
               return (
                 <div key={step.num} className="flex items-center flex-1">
                   <div className="flex flex-col items-center flex-1">
@@ -50,14 +46,12 @@ export default function Dashboard() {
                     >
                       <StepIcon className="w-4 h-4" />
                     </motion.div>
-                    <span className={`text-[11px] font-semibold mt-1.5 ${isActive ? 'text-primary' : 'text-muted-foreground'}`}>
+                    <span className={`text-[11px] font-semibold mt-1.5 text-center ${isActive ? 'text-primary' : 'text-muted-foreground'}`}>
                       {step.label}
                     </span>
                   </div>
-                  {idx < STEPS.length - 1 && (
-                    <div className={`h-0.5 flex-1 mx-1 mt-[-16px] rounded-full ${
-                      idx < 1 ? 'bg-primary/40' : 'bg-border'
-                    }`} />
+                  {idx < HOME_WIZARD_STEPS.length - 1 && (
+                    <div className="h-0.5 flex-1 mx-1 mt-[-16px] rounded-full bg-border" />
                   )}
                 </div>
               );

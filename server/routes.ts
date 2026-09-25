@@ -1,8 +1,9 @@
+import "./loadEnv";
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import { api, buildUrl } from "@shared/routes";
-import type { AuditCheck, AuditResults } from "@shared/schema";
+import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
 import {
   BLEED_METHOD_POST_VALUES,
   BLEED_STRATEGY_IDS,
@@ -19,6 +20,9 @@ import {
   getQueueStatus,
   getJobQueuePosition,
   isSafeZoneLayoutRejectionMessage,
+  buildOfficeQuickCheck,
+  clientSafeQuickCheckError,
+  isOfficeUpload,
 } from "./fileProcessor";
 import { execSync, spawnSync } from "child_process";
 import fsSync from "fs";
@@ -29,6 +33,20 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { pythonChildEnv } from "./pythonChildEnv";
+import { registerPureCropRoutes } from "./pureCropRoutes";
+import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
+import {
+  IllustratorIntakeError,
+  INVALID_UPLOAD_MESSAGE,
+  PRINT_TOOL_REJECTION,
+  isAllowedPrintTool,
+  isAllowedUpload,
+  isIllustratorName,
+  isIllustratorType,
+  prepareIllustratorFile,
+  renderIllustratorPreview,
+} from "./illustratorIntake";
 
 const EXEC_TIMEOUT_MS = 60_000;
 const COMPILE_TIMEOUT_MS = 180_000;
@@ -74,7 +92,7 @@ function cancelPreCompile(jobId: number) {
 
 function ensureExtensionPath(originalPath: string, filename: string, jobId: number): { inputPath: string; tempSymlink: string | null } {
   const existingExt = path.extname(originalPath).toLowerCase();
-  if (existingExt && [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"].includes(existingExt)) {
+  if (existingExt && isPassThroughExtension(existingExt)) {
     return { inputPath: originalPath, tempSymlink: null };
   }
   const filenameExt = path.extname(filename).toLowerCase() || ".png";
@@ -98,6 +116,59 @@ function nukeRamDisk() {
   try {
     fsSync.mkdirSync(ramDir, { recursive: true });
   } catch {}
+}
+
+function aiArtworkCliArgs(audit: any): string[] {
+  const art = audit?.aiArtwork;
+  if (!art?.detected) return [];
+  const requested = String(art.fit || "crop");
+  const fit = art.mismatch && ["crop", "extend", "border"].includes(requested) ? requested : "none";
+  const offset = Number(art.offset);
+  const note = String(art.note || "AI-generated artwork detected.").replace(/[\r\n]/g, " ").slice(0, 700);
+  const edge = art.edge || {};
+  const pct = (value: unknown) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "0";
+    return String(Math.min(100, Math.max(0, number)));
+  };
+  return [
+    "--ai-artwork-fit", fit,
+    "--ai-artwork-offset", String(Number.isFinite(offset) ? Math.min(1, Math.max(0, offset)) : 0.5),
+    "--ai-artwork-note", note,
+    "--ai-fit-c", pct(edge.c),
+    "--ai-fit-m", pct(edge.m),
+    "--ai-fit-y", pct(edge.y),
+    "--ai-fit-k", pct(edge.k),
+  ];
+}
+
+function aiUpscaleCliArgs(audit: any): string[] {
+  const saved = audit?.aiUpscale;
+  if (!saved?.accepted) return [];
+  const enhancedPath = typeof saved.enhancedPath === "string" ? saved.enhancedPath : "";
+  if (!enhancedPath || !fsSync.existsSync(enhancedPath)) return [];
+  const note = String(saved.note || "AI enhancement was applied before bleed.")
+    .replace(/[\r\n]/g, " ")
+    .slice(0, 500);
+  return ["--ai-upscale-path", enhancedPath, "--ai-upscale-note", note];
+}
+
+function colourBorderCliArgs(strategy: string, audit: any): string[] {
+  if (strategy !== "colourBorder") return [];
+  const border = audit?.colourBorder || {};
+  const pct = (value: unknown) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "0";
+    return String(Math.min(100, Math.max(0, number)));
+  };
+  const label = String(border.label || "White").replace(/[\r\n]/g, " ").slice(0, 80);
+  return [
+    "--border-c", pct(border.c),
+    "--border-m", pct(border.m),
+    "--border-y", pct(border.y),
+    "--border-k", pct(border.k),
+    "--border-label", label,
+  ];
 }
 
 function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, job: any) {
@@ -144,6 +215,9 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--report-path", reportPath,
     "--base-name", baseName,
     "--creep-mm", String(precompileCreepMm),
+    ...colourBorderCliArgs(strategy, auditResults),
+    ...aiUpscaleCliArgs(auditResults),
+    ...aiArtworkCliArgs(auditResults),
   ];
 
   args.push(
@@ -177,7 +251,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
 
   const child = spawn(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -276,19 +350,6 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
   return task.taskId;
 }
 
-const PYTHON_ENV: Record<string, string> = (() => {
-  const e: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    PYTHONUNBUFFERED: "1",
-    PYTHONIOENCODING: "utf-8",
-    PYTHONUTF8: "1",
-  };
-  if (!e.FAI_TEMP_DIR?.trim()) {
-    e.FAI_TEMP_DIR = getFlyerzTempRoot();
-  }
-  return e;
-})();
-
 /** Never send this healed-geometry artifact to the client / Glitchy */
 function stripCropBoxNotInMediaBoxFromChecks(checks: unknown[] | undefined): any[] {
   const needle = /cropbox\s+not\s+in\s+mediabox/i;
@@ -299,7 +360,7 @@ function stripCropBoxNotInMediaBoxFromChecks(checks: unknown[] | undefined): any
 function execPythonCapture(args: string[], label: string, timeoutMs: number = EXEC_TIMEOUT_MS): any {
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     encoding: "utf8",
     timeout: timeoutMs,
     maxBuffer: 50 * 1024 * 1024,
@@ -336,13 +397,41 @@ function execPythonCapture(args: string[], label: string, timeoutMs: number = EX
   }
 }
 
-function execQuickCheck(scriptPath: string, filePath: string, fileType: string): any {
+function chosenTrimMm(source: { targetWidth?: number | null; targetHeight?: number | null } | undefined): { width: number; height: number } | undefined {
+  const width = Number(source?.targetWidth);
+  const height = Number(source?.targetHeight);
+  if (width > 0 && height > 0) return { width, height };
+  return undefined;
+}
+
+/** Size the customer sent. The A5 storage fallback is not a chosen print size. */
+export function customerTrimFromUploadBody(body: any): { width: number; height: number } | undefined {
+  const mm = readTargetMmFromForm(body);
+  let merged: Record<string, any> = { ...mm };
+  if (body?.bleedOptions) {
+    const parsed = parseJsonField(body.bleedOptions);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      merged = { ...parsed, ...mm };
+    }
+  }
+  return chosenTrimMm(merged);
+}
+
+function execQuickCheck(
+  scriptPath: string,
+  filePath: string,
+  fileType: string,
+  trimMm?: { width: number; height: number },
+): any {
   const resultFile = path.join(os.tmpdir(), `qc_${crypto.randomBytes(8).toString("hex")}.json`);
   const args = [scriptPath, filePath, fileType, resultFile];
+  if (trimMm && trimMm.width > 0 && trimMm.height > 0) {
+    args.push(String(trimMm.width), String(trimMm.height));
+  }
 
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: PYTHON_ENV,
+    env: pythonChildEnv(),
     encoding: "utf8",
     timeout: EXEC_TIMEOUT_MS,
     maxBuffer: 50 * 1024 * 1024,
@@ -464,6 +553,13 @@ function sanitizeBleedOptions(parsed: any) {
     result.isNoCrop = true;
   }
 
+  if (parsed.selectedPage != null && parsed.selectedPage !== "" && parsed.selectedPage !== "all") {
+    const selectedPage = Number(parsed.selectedPage);
+    if (Number.isInteger(selectedPage) && selectedPage >= 0 && selectedPage < 200) {
+      result.selectedPage = selectedPage;
+    }
+  }
+
   if (parsed.cropX != null && parsed.cropY != null &&
       parsed.cropWidth != null && parsed.cropHeight != null) {
     const cx = Number(parsed.cropX);
@@ -498,12 +594,10 @@ const upload = multer({
   dest: uploadDir,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['.pdf', '.jpg', '.jpeg', '.png', '.docx', '.pptx'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowedTypes.includes(ext)) {
+    if (isAllowedUpload(file.originalname, file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Only PDF, JPG, PNG, DOCX, and PPTX are allowed.'));
+      cb(new Error(INVALID_UPLOAD_MESSAGE));
     }
   }
 });
@@ -514,6 +608,26 @@ async function ensureUploadDir() {
   } catch {
     await fs.mkdir(uploadDir, { recursive: true });
   }
+}
+
+function normalizedUploadType(originalName: string): string {
+  const ext = path.extname(originalName).toLowerCase().replace(".", "");
+  return ext === "jpeg" ? "jpg" : ext;
+}
+
+function pipelineTypeFor(fileType: string): string {
+  if (isIllustratorType(fileType)) return "pdf";
+  return fileType === "jpeg" ? "jpg" : fileType;
+}
+
+/** PDF-compatible .ai stays as PDF bytes. PostScript .ai/.eps is distilled in place. */
+function ingestUploadedArtwork(file: Express.Multer.File): { fileType: string; pageCount?: number; kind?: string } {
+  const fileType = normalizedUploadType(file.originalname);
+  if (isIllustratorType(fileType)) {
+    const prepared = prepareIllustratorFile(file.path, file.originalname);
+    return { fileType, pageCount: prepared.pageCount, kind: prepared.kind };
+  }
+  return { fileType };
 }
 
 function isPathSafe(filePath: string): boolean {
@@ -575,17 +689,26 @@ export async function registerRoutes(
       }
 
       const file = req.file;
-      const fileType = path.extname(file.originalname).toLowerCase().replace('.', '') as any;
-      const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+      let ingested: ReturnType<typeof ingestUploadedArtwork>;
+      try {
+        ingested = ingestUploadedArtwork(file);
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+      const normalizedType = ingested.fileType;
 
       const job = await storage.createJob({
         filename: file.originalname,
         originalPath: file.path,
         fileSize: file.size,
-        fileType: normalizedType,
+        fileType: normalizedType as FileType,
       });
 
       let bleedOptions: ReturnType<typeof sanitizeBleedOptions> | undefined;
+      let customerTrim: { width: number; height: number } | undefined;
       try {
         const mm = readTargetMmFromForm(req.body);
         let merged: Record<string, any> = {};
@@ -599,6 +722,7 @@ export async function registerRoutes(
         } else {
           merged = { ...mm };
         }
+        customerTrim = chosenTrimMm(merged);
         bleedOptions = sanitizeBleedOptions(coerceSavedBleedOptionsFromDb(merged));
       } catch (e) {
         console.warn('[FAI] Invalid bleedOptions JSON, using defaults', e);
@@ -609,13 +733,22 @@ export async function registerRoutes(
 
       let quickCheckResult: any;
       try {
-        // quick_check.py runs PDF geometry sanitize (CropBox/MediaBox) on disk before the 5 checks
-        const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
-        quickCheckResult = await execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType);
+        if (isOfficeUpload(normalizedType)) {
+          quickCheckResult = buildOfficeQuickCheck(normalizedType);
+        } else {
+          // quick_check.py runs PDF geometry sanitize (CropBox/MediaBox) on disk before the 5 checks
+          const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
+          quickCheckResult = execQuickCheck(
+            QUICK_CHECK_SCRIPT,
+            file.path,
+            normalizedType,
+            customerTrim,
+          );
+        }
       } catch (qcError: any) {
         await storage.updateJob(job.id, {
           status: 'failed',
-          errorMessage: qcError.message || 'Quick check crashed',
+          errorMessage: clientSafeQuickCheckError(qcError.message || 'Quick check crashed', normalizedType),
           completedAt: new Date(),
         });
         return res.status(201).json({ jobId: job.id, filename: job.filename, status: 'failed' });
@@ -624,7 +757,7 @@ export async function registerRoutes(
       if (quickCheckResult.error) {
         await storage.updateJob(job.id, {
           status: 'failed',
-          errorMessage: quickCheckResult.error,
+          errorMessage: clientSafeQuickCheckError(quickCheckResult.error, normalizedType),
           completedAt: new Date(),
         });
         return res.status(201).json({ jobId: job.id, filename: job.filename, status: 'failed' });
@@ -646,6 +779,8 @@ export async function registerRoutes(
         complianceReport: `Quick check completed. ${checks.filter(c => c.passed).length}/${checks.length} checks passed.`,
         artworkSize: quickCheckResult.artworkSize,
         savedBleedOptions: bleedOptions,
+        pageCount: quickCheckResult.pageCount ?? ingested.pageCount,
+        ...(isIllustratorType(normalizedType) ? { sourceFormat: normalizedType as "ai" | "eps" } : {}),
       };
 
       await storage.updateJob(job.id, {
@@ -693,7 +828,7 @@ export async function registerRoutes(
         const child = spawn(PYTHON_BIN, [REMOVE_BG_SCRIPT, file.path, outputPath], {
           timeout: 60000,
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: PYTHON_ENV,
+          env: pythonChildEnv(),
         });
         let stdout = '';
         let stderr = '';
@@ -762,15 +897,29 @@ export async function registerRoutes(
       }
 
       const file = req.file;
-      const fileType = path.extname(file.originalname).toLowerCase().replace('.', '');
-      const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+      let ingested: ReturnType<typeof ingestUploadedArtwork>;
+      try {
+        ingested = ingestUploadedArtwork(file);
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
+      }
+      const normalizedType = ingested.fileType;
+      const trim = chosenTrimMm(readTargetMmFromForm(req.body));
 
-      // quick_check.py sanitizes PDF page boxes in-place before pre-flight telemetry
-      const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
-      const result = await execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType);
+      let result: any;
+      if (isOfficeUpload(normalizedType)) {
+        result = buildOfficeQuickCheck(normalizedType);
+      } else {
+        // quick_check.py sanitizes PDF page boxes in-place before pre-flight telemetry
+        const QUICK_CHECK_SCRIPT = path.join(process.cwd(), 'server', 'quick_check.py');
+        result = execQuickCheck(QUICK_CHECK_SCRIPT, file.path, normalizedType, trim);
+      }
 
       if (result.error) {
-        return res.status(500).json({ message: result.error });
+        return res.status(500).json({ message: clientSafeQuickCheckError(result.error, normalizedType) });
       }
 
       if (result.checks) {
@@ -787,10 +936,13 @@ export async function registerRoutes(
         storedFilename: path.basename(file.path),
         originalFilename: file.originalname,
         fileType: normalizedType,
+        pageCount: result.pageCount ?? ingested.pageCount,
+        sourceFormat: isIllustratorType(normalizedType) ? normalizedType : undefined,
       });
     } catch (error: any) {
       console.error('[FAI] Quick check error:', error);
-      res.status(500).json({ message: error.message || 'Quick check failed' });
+      const fileType = req.file ? normalizedUploadType(req.file.originalname) : "";
+      res.status(500).json({ message: clientSafeQuickCheckError(error.message || 'Quick check failed', fileType) });
     }
   });
 
@@ -1036,7 +1188,7 @@ export async function registerRoutes(
         }
       }
 
-      res.download(reportPath!, `Flyerz.co.za Artwork Intellegence Proof and Report.pdf`);
+      res.download(reportPath!, `Flyerz.co.za Artwork Intelligence Proof and Report.pdf`);
     } catch (error) {
       console.error('Error downloading health report:', error);
       res.status(500).json({ message: 'Failed to download health report' });
@@ -1198,16 +1350,16 @@ export async function registerRoutes(
           try {
             await fs.access(artworkFile);
             const ext = path.extname(artworkFile).toLowerCase();
-            if (['.png', '.jpg', '.jpeg'].includes(ext)) {
+            if (isRasterExtension(ext)) {
               proofPaths = [artworkFile];
-            } else if (ext === '.pdf') {
+            } else if (isVectorExtension(ext)) {
               const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + '_proof.png');
               try {
                 const escapedInput = artworkFile.replace(/'/g, "'\\''");
                 const escapedOutput = proofBase.replace(/'/g, "'\\''");
                 execSync(
                   `${PYTHON_BIN} -c "import sys; sys.path.insert(0, 'server'); from smart_bleed import generate_visual_proof; generate_visual_proof('${escapedInput}', '${escapedOutput}')"`,
-                  { timeout: 30000, cwd: process.cwd(), env: PYTHON_ENV, stdio: ['pipe', 'pipe', 'inherit'] }
+                  { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), stdio: ['pipe', 'pipe', 'inherit'] }
                 );
 
                 try {
@@ -1361,6 +1513,78 @@ export async function registerRoutes(
     }
   });
 
+  const COLOUR_BORDER_SCRIPT = path.join(process.cwd(), "server", "colour_border.py");
+
+  app.get('/api/jobs/:id/colour-border-preview', async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const source = job.originalPath || job.correctedPath;
+      if (!source) return res.status(404).json({ message: "Artwork not available" });
+      try {
+        await fs.access(source);
+      } catch {
+        return res.status(404).json({ message: "Artwork file not found" });
+      }
+      const saved = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
+      const trimW = Number(saved.targetWidth) > 0 ? Number(saved.targetWidth) : 148;
+      const trimH = Number(saved.targetHeight) > 0 ? Number(saved.targetHeight) : 210;
+      const bleedMm = 5;
+      const lines = req.query.lines === "0" ? false : true;
+      const sampleEdge = req.query.edge === "1";
+      const crop = (!saved.isNoCrop && !saved.preserveBleed && saved.cropWidth > 0 && saved.cropHeight > 0)
+        ? [Number(saved.cropX) || 0, Number(saved.cropY) || 0, Number(saved.cropWidth), Number(saved.cropHeight)]
+        : null;
+      const previewFilename = `colour_border_${jobId}_${Date.now()}.png`;
+      const previewPath = path.join(uploadDir, previewFilename);
+      const options = {
+        src: source,
+        dest: previewPath,
+        trimW,
+        trimH,
+        bleedMm,
+        c: Number(req.query.c) || 0,
+        m: Number(req.query.m) || 0,
+        y: Number(req.query.y) || 0,
+        k: Number(req.query.k) || 0,
+        lines,
+        page: Number(req.query.page) || 1,
+        crop,
+        sampleEdge,
+      };
+      const previewProc = spawnSync(PYTHON_BIN, [COLOUR_BORDER_SCRIPT, "preview", JSON.stringify(options)], {
+        cwd: process.cwd(),
+        env: pythonChildEnv(),
+        encoding: "utf8",
+        timeout: EXEC_TIMEOUT_MS,
+      });
+      if (previewProc.status !== 0) {
+        const detail = (previewProc.stderr || previewProc.stdout || "").slice(-400);
+        throw new Error(detail || "Colour border preview failed");
+      }
+      const previewLine = (previewProc.stdout || "").trim().split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
+      const info = previewLine ? JSON.parse(previewLine) : null;
+      if (!info?.success) {
+        return res.status(400).json({ message: info?.error || "Could not build the colour border preview" });
+      }
+      if (req.query.format === "json") {
+        return res.json({ ...info, url: `/api/jobs/${jobId}/bleed-preview-image/${previewFilename}` });
+      }
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Colour-C", String(info.c));
+      res.setHeader("X-Colour-M", String(info.m));
+      res.setHeader("X-Colour-Y", String(info.y));
+      res.setHeader("X-Colour-K", String(info.k));
+      const { createReadStream } = await import("fs");
+      createReadStream(previewPath).pipe(res);
+    } catch (error) {
+      console.error("[FAI] Colour border preview failed:", error);
+      res.status(500).json({ message: error instanceof Error ? error.message : "Could not build the colour border preview" });
+    }
+  });
+
   // Generate bleed preview with trim/cut lines
   const BLEED_PREVIEW_SCRIPT = path.join(process.cwd(), "server", "bleed_preview.py");
 
@@ -1387,7 +1611,7 @@ export async function registerRoutes(
       const validStrategies = [...BLEED_STRATEGY_QUERY_VALUES];
 
       let previewSourcePath = job.correctedPath!;
-      let previewFileType = job.fileType || 'pdf';
+      let previewFileType = pipelineTypeFor(job.fileType || 'pdf');
 
       if (strategy !== "auto" && (validStrategies as readonly string[]).includes(strategy)) {
         const variantPath = auditResults?.bleedVariants?.[strategy as keyof NonNullable<AuditResults["bleedVariants"]>];
@@ -1518,7 +1742,7 @@ export async function registerRoutes(
   app.post('/api/jobs/:id/select-bleed-method', async (req, res) => {
     try {
       const jobId = Number(req.params.id);
-      const { method } = req.body;
+      const { method, colourBorder } = req.body;
       const validMethods = [...BLEED_METHOD_POST_VALUES];
       if (!method || !(validMethods as readonly string[]).includes(method)) {
         return res.status(400).json({ message: `Invalid method: ${method}` });
@@ -1545,6 +1769,20 @@ export async function registerRoutes(
         ...auditResults,
         selectedBleedMethod: method as AuditResults["selectedBleedMethod"],
       };
+      if (method === "colourBorder" && colourBorder && typeof colourBorder === "object") {
+        const pct = (value: unknown) => {
+          const number = Number(value);
+          return Number.isFinite(number) ? Math.min(100, Math.max(0, number)) : 0;
+        };
+        updatedResults.colourBorder = {
+          c: pct(colourBorder.c),
+          m: pct(colourBorder.m),
+          y: pct(colourBorder.y),
+          k: pct(colourBorder.k),
+          label: String(colourBorder.label || "White").slice(0, 80),
+          source: String(colourBorder.source || "preset").slice(0, 20),
+        };
+      }
 
       await storage.updateJob(jobId, { auditResults: updatedResults });
 
@@ -1564,7 +1802,7 @@ export async function registerRoutes(
         try {
           await fs.access(artworkPath);
           console.log(`TRACER: [Checkpoint B] spawnPreCompile: job=${jobId} strategy="${method}" artworkPath="${artworkPath}"`);
-          spawnPreCompile(jobId, artworkPath, method, job);
+          spawnPreCompile(jobId, artworkPath, method, { ...job, auditResults: updatedResults });
         } catch (e) {
           console.log(`[FAI] Pre-compile skipped for job ${jobId}: artwork not accessible`);
         }
@@ -1743,6 +1981,369 @@ export async function registerRoutes(
     }
   });
 
+  const resolveUpscaleArtwork = (job: any, auditResults: any): string | null => {
+    const saved = coerceSavedBleedOptionsFromDb(auditResults?.savedBleedOptions);
+    const hasCrop = hasValidCropBox(saved) && !saved.isNoCrop && !saved.preserveBleed;
+    const preBleedPath = auditResults?.preBleedPath;
+    let artworkPath = hasCrop ? job.originalPath : (preBleedPath || job.originalPath);
+    if (!artworkPath || !fsSync.existsSync(artworkPath)) artworkPath = job.originalPath;
+    if (!artworkPath || !fsSync.existsSync(artworkPath)) return null;
+    return artworkPath;
+  };
+
+  const parseUpscaleJson = (stdout: string) => {
+    const lines = String(stdout || "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith("{"));
+    if (!lines.length) throw new Error("Upscale returned no JSON");
+    return JSON.parse(lines[lines.length - 1]);
+  };
+
+  const runUpscaleScript = async (action: string, artworkPath: string, options: Record<string, unknown>) => {
+    const { promisify } = await import("util");
+    const { execFile } = await import("child_process");
+    const execFileAsync = promisify(execFile);
+    const script = path.join(process.cwd(), "server", "ai_enhancements.py");
+    const { stdout } = await execFileAsync(
+      PYTHON_BIN,
+      [script, action, artworkPath, JSON.stringify(options || {})],
+      { timeout: 40000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024, env: pythonChildEnv(), cwd: process.cwd() },
+    );
+    return parseUpscaleJson(stdout as string);
+  };
+
+  app.get("/api/jobs/:id/ai-upscale/assess", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, auditResults);
+      const savedOpts = coerceSavedBleedOptionsFromDb(auditResults.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(savedOpts?.targetHeight) || 210;
+      if (!artworkPath) {
+        return res.json({
+          success: true,
+          eligible: false,
+          suggestion: false,
+          message: "Artwork is not ready to enhance yet.",
+          explanation: "Make blurry or low-resolution artwork crisp and clear.",
+          saved: auditResults.aiUpscale || null,
+        });
+      }
+      const parsed = await runUpscaleScript("ai_upscale_assess", artworkPath, {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        bleed_mm: 5,
+      });
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ ...parsed, saved: auditResults.aiUpscale || null, trimW, trimH });
+    } catch (error: any) {
+      console.error("[AI-UPSCALE] assess failed:", error?.message || error);
+      res.json({
+        success: true,
+        eligible: true,
+        suggestion: false,
+        message: "",
+        explanation: "Make blurry or low-resolution artwork crisp and clear.",
+        saved: null,
+      });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-upscale/preview", async (req, res) => {
+    const friendly = "The AI upscaler isn't available right now, so we'll keep your original artwork and continue.";
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as AuditResults;
+      const artworkPath = resolveUpscaleArtwork(job, auditResults);
+      if (!artworkPath) {
+        return res.json({ success: true, used_original: true, message: "Artwork is not ready, so the original will be used." });
+      }
+      const savedOpts = coerceSavedBleedOptionsFromDb((auditResults as any).savedBleedOptions);
+      const trimW = Number(req.body?.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.body?.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const fullPath = path.join(uploadDir, `ai-upscale-${jobId}-full.png`);
+      const beforePath = path.join(uploadDir, `ai-upscale-${jobId}-before.png`);
+      const afterPath = path.join(uploadDir, `ai-upscale-${jobId}-after.png`);
+      const parsed = await runUpscaleScript("ai_upscale", artworkPath, {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        bleed_mm: 5,
+        output_path: fullPath,
+        before_preview_path: beforePath,
+        after_preview_path: afterPath,
+      });
+      const previous = (auditResults as any).aiUpscale || {};
+      const usable = !!(parsed.success && parsed.enhanced_path && !parsed.used_original && fsSync.existsSync(fullPath));
+      const nextUpscale = usable
+        ? {
+            accepted: false,
+            provider: parsed.provider,
+            model: parsed.model,
+            version: parsed.version,
+            scale: parsed.scale,
+            enhancedPath: fullPath,
+            note: parsed.note,
+            message: parsed.message,
+            effectiveDpi: parsed.effective_dpi,
+            enhancedDpi: parsed.enhanced_dpi,
+            kind: parsed.kind,
+          }
+        : { ...previous, accepted: false, enhancedPath: undefined, note: "", message: parsed.message || friendly, provider: "original" };
+      await storage.updateJob(jobId, {
+        auditResults: { ...auditResults, aiUpscale: nextUpscale },
+      });
+      res.json({
+        success: true,
+        used_original: !usable,
+        provider: usable ? parsed.provider : "original",
+        basic: !!parsed.basic,
+        message: parsed.message || friendly,
+        effectiveDpi: parsed.effective_dpi ?? null,
+        enhancedDpi: parsed.enhanced_dpi ?? null,
+        scale: parsed.scale ?? null,
+        model: parsed.model || null,
+        version: parsed.version || null,
+        beforeUrl: usable ? `/api/jobs/${jobId}/ai-upscale/image?which=before&v=${Date.now()}` : null,
+        afterUrl: usable ? `/api/jobs/${jobId}/ai-upscale/image?which=after&v=${Date.now()}` : null,
+      });
+    } catch (error: any) {
+      const errMsg = String(error?.message || error);
+      const busy = /timed out|timeout|busy/i.test(errMsg);
+      console.error("[AI-UPSCALE] preview failed:", errMsg.slice(0, 300));
+      res.json({
+        success: true,
+        used_original: true,
+        provider: "original",
+        message: busy
+          ? "The AI upscaler is busy right now, so we'll keep your original artwork and continue."
+          : friendly,
+      });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-upscale/decision", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const auditResults = (job.auditResults || {}) as AuditResults;
+      const accepted = req.body?.accepted === true;
+      const current = (auditResults as any).aiUpscale || {};
+      if (accepted && (!current.enhancedPath || !fsSync.existsSync(current.enhancedPath))) {
+        return res.json({
+          success: true,
+          accepted: false,
+          message: "There's no enhanced artwork to accept, so the original will be used.",
+        });
+      }
+      const aiUpscale = {
+        ...current,
+        accepted,
+        note: accepted ? (current.note || "AI enhancement was applied before bleed.") : "",
+      };
+      await storage.updateJob(jobId, { auditResults: { ...auditResults, aiUpscale } });
+      res.json({
+        success: true,
+        accepted,
+        provider: current.provider || null,
+        message: accepted
+          ? (current.message || "Enhanced artwork will be used.")
+          : "Keeping your original artwork.",
+      });
+    } catch (error) {
+      console.error("[AI-UPSCALE] decision failed:", error);
+      res.status(500).json({ message: "Couldn't save that choice. Your original artwork is still safe." });
+    }
+  });
+
+  app.get("/api/jobs/:id/ai-upscale/image", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const which = req.query.which === "after" ? "after" : "before";
+      const filePath = path.join(uploadDir, `ai-upscale-${jobId}-${which}.png`);
+      if (!fsSync.existsSync(filePath)) return res.status(404).json({ message: "Preview not ready" });
+      res.setHeader("Cache-Control", "no-store");
+      res.type("png");
+      fsSync.createReadStream(filePath).pipe(res);
+    } catch (error) {
+      console.error("[AI-UPSCALE] image failed:", error);
+      res.status(404).json({ message: "Preview not ready" });
+    }
+  });
+
+  const slimArtworkPlan = (parsed: any, flags: { enhanceOverridden?: boolean; bleedOverridden?: boolean } = {}) => ({
+    detected: !!parsed?.detected,
+    reasons: Array.isArray(parsed?.reasons) ? parsed.reasons : [],
+    mismatch: !!parsed?.mismatch,
+    fit: parsed?.fit || "none",
+    offset: Number.isFinite(Number(parsed?.offset)) ? Number(parsed.offset) : 0.5,
+    bleed: parsed?.bleed || "mirror",
+    bleedOverridden: !!flags.bleedOverridden,
+    edge: parsed?.edge || { c: 0, m: 0, y: 0, k: 0 },
+    enhance: !!parsed?.enhance,
+    enhanceOverridden: !!flags.enhanceOverridden,
+    effectiveDpi: parsed?.effective_dpi ?? parsed?.effectiveDpi ?? null,
+    bright: !!parsed?.bright,
+    brightMessage: parsed?.bright_message || parsed?.brightMessage || "",
+    textStatus: parsed?.text_status || parsed?.textStatus || "unavailable",
+    textWarnings: parsed?.text_warnings || parsed?.textWarnings || [],
+    textMessage: parsed?.text_message || parsed?.textMessage || "",
+    applied: Array.isArray(parsed?.applied) ? parsed.applied : [],
+    note: parsed?.note || "",
+    blocked: false,
+    srcW: parsed?.src_w || parsed?.srcW || 0,
+    srcH: parsed?.src_h || parsed?.srcH || 0,
+    crop: parsed?.crop || null,
+  });
+
+  app.get("/api/jobs/:id/ai-artwork/assess", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const ext = artworkPath ? path.extname(artworkPath).toLowerCase() : "";
+      const fileType = String(job.fileType || "").toLowerCase();
+      const imageExt = [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"].includes(ext);
+      const imageType = ["png", "jpg", "jpeg", "webp", "tif", "tiff"].includes(fileType);
+      if (!artworkPath || (!imageExt && !imageType)) {
+        return res.json({ success: true, detected: false, blocked: false });
+      }
+      const saved = audit.aiArtwork || null;
+      const options: Record<string, unknown> = {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        screen_preview: path.join(uploadDir, `ai-artwork-${jobId}-screen.png`),
+        print_preview: path.join(uploadDir, `ai-artwork-${jobId}-print.png`),
+        source_preview: path.join(uploadDir, `ai-artwork-${jobId}-source.png`),
+      };
+      if (saved?.detected) {
+        if (saved.fit) options.fit = saved.fit;
+        if (saved.offset != null) options.offset = saved.offset;
+        if (saved.bleed) options.bleed = saved.bleed;
+        options.use_given_enhance = true;
+        options.enhance = !!saved.enhance;
+        if (saved.textMessage) {
+          options.reuse_text = {
+            text_status: saved.textStatus,
+            text_warnings: saved.textWarnings || [],
+            text_message: saved.textMessage,
+          };
+        }
+      }
+      const parsed = await runUpscaleScript("ai_artwork_assess", artworkPath, options);
+      const plan = slimArtworkPlan(parsed, {
+        enhanceOverridden: !!saved?.enhanceOverridden,
+        bleedOverridden: !!saved?.bleedOverridden,
+      });
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        ...plan,
+        saved: !!saved?.detected,
+        trimW,
+        trimH,
+        sourceUrl: `/api/jobs/${jobId}/ai-artwork/image?which=source`,
+        screenUrl: `/api/jobs/${jobId}/ai-artwork/image?which=screen`,
+        printUrl: `/api/jobs/${jobId}/ai-artwork/image?which=print`,
+      });
+    } catch (error: any) {
+      console.error("[AI-ARTWORK] assess failed:", error?.message || error);
+      res.json({ success: true, detected: false, blocked: false });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-artwork/choice", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      if (!artworkPath) return res.json({ success: true, detected: false, blocked: false });
+      const prev = audit.aiArtwork || {};
+      const body = req.body || {};
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(body.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(body.trimH) || Number(savedOpts?.targetHeight) || 210;
+      const fit = ["crop", "extend", "border", "none"].includes(body.fit) ? body.fit : (prev.fit || "crop");
+      const offset = body.offset != null ? Number(body.offset) : Number(prev.offset ?? 0.5);
+      const enhance = body.enhance != null ? body.enhance === true : !!prev.enhance;
+      const bleed = typeof body.bleed === "string" && body.bleed ? body.bleed : (prev.bleed || "mirror");
+      const enhanceOverridden = body.enhanceOverridden != null ? body.enhanceOverridden === true : !!prev.enhanceOverridden;
+      const bleedOverridden = body.bleedOverridden != null ? body.bleedOverridden === true : !!prev.bleedOverridden;
+      const textMessage = body.textMessage || prev.textMessage;
+      const options: Record<string, unknown> = {
+        trim_w_mm: trimW,
+        trim_h_mm: trimH,
+        fit,
+        offset,
+        bleed,
+        use_given_enhance: true,
+        enhance,
+        screen_preview: path.join(uploadDir, `ai-artwork-${jobId}-screen.png`),
+        print_preview: path.join(uploadDir, `ai-artwork-${jobId}-print.png`),
+        source_preview: path.join(uploadDir, `ai-artwork-${jobId}-source.png`),
+      };
+      if (textMessage) {
+        options.reuse_text = {
+          text_status: body.textStatus || prev.textStatus,
+          text_warnings: body.textWarnings || prev.textWarnings || [],
+          text_message: textMessage,
+        };
+      }
+      const parsed = await runUpscaleScript("ai_artwork_assess", artworkPath, options);
+      if (!parsed?.detected) return res.json({ success: true, detected: false, blocked: false });
+      const plan = slimArtworkPlan(parsed, { enhanceOverridden, bleedOverridden });
+      const nextAudit: any = { ...audit, aiArtwork: plan };
+      if (!bleedOverridden && plan.bleed) {
+        nextAudit.recommendedBleedMethod = plan.bleed;
+      }
+      if (!bleedOverridden && plan.bleed === "colourBorder" && plan.edge) {
+        nextAudit.colourBorder = {
+          c: Number(plan.edge.c) || 0,
+          m: Number(plan.edge.m) || 0,
+          y: Number(plan.edge.y) || 0,
+          k: Number(plan.edge.k) || 0,
+          label: "Match artwork edge",
+          source: "edge",
+        };
+      }
+      await storage.updateJob(jobId, { auditResults: nextAudit });
+      res.json({
+        ...plan,
+        saved: true,
+        sourceUrl: `/api/jobs/${jobId}/ai-artwork/image?which=source`,
+        screenUrl: `/api/jobs/${jobId}/ai-artwork/image?which=screen`,
+        printUrl: `/api/jobs/${jobId}/ai-artwork/image?which=print`,
+      });
+    } catch (error) {
+      console.error("[AI-ARTWORK] choice failed:", error);
+      res.json({ success: true, detected: false, blocked: false });
+    }
+  });
+
+  app.get("/api/jobs/:id/ai-artwork/image", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const which = req.query.which === "print" ? "print" : req.query.which === "screen" ? "screen" : "source";
+      const filePath = path.join(uploadDir, `ai-artwork-${jobId}-${which}.png`);
+      if (!fsSync.existsSync(filePath)) return res.status(404).json({ message: "Preview not ready" });
+      res.setHeader("Cache-Control", "no-store");
+      res.type("png");
+      fsSync.createReadStream(filePath).pipe(res);
+    } catch (error) {
+      console.error("[AI-ARTWORK] image failed:", error);
+      res.status(404).json({ message: "Preview not ready" });
+    }
+  });
+
   // --- Optional Text Clear-up (OCR → edit → overlay). Unused = zero pipeline change. ---
   const resolveTextClearupArtwork = (job: any, auditResults: any): string | null => {
     const p = auditResults?.preBleedPath || job.correctedPath || job.originalPath;
@@ -1761,7 +2362,7 @@ export async function registerRoutes(
       timeout: action === "ocr" || action === "apply" ? 120000 : 90000,
       encoding: "utf-8",
       maxBuffer: 8 * 1024 * 1024,
-      env: PYTHON_ENV,
+      env: pythonChildEnv(),
       cwd: process.cwd(),
     });
     return JSON.parse((stdout as string).trim());
@@ -2031,6 +2632,9 @@ export async function registerRoutes(
         "--creep-mm", String(creepMm),
         ...cropArgs,
         ...(autoShifter ? ["--auto-shifter", "2.0"] : []),
+        ...colourBorderCliArgs(effectiveStrategy, auditResults),
+        ...aiUpscaleCliArgs(auditResults),
+        ...aiArtworkCliArgs(auditResults),
       ];
 
       if (job.originalPath && job.originalPath !== artworkPath) {
@@ -2039,7 +2643,7 @@ export async function registerRoutes(
 
       const child = spawn(PYTHON_BIN, args, {
         cwd: process.cwd(),
-        env: PYTHON_ENV,
+        env: pythonChildEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       });
 
@@ -2459,23 +3063,37 @@ export async function registerRoutes(
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      const fileType = ext.replace('.', '');
-      const allowedTypes = ['pdf', 'jpg', 'jpeg', 'png'];
-      if (!allowedTypes.includes(fileType)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files are supported for cropping.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: PRINT_TOOL_REJECTION });
+      }
+
+      let sourceFormat: "ai" | "eps" | undefined;
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          sourceFormat = toolType as "ai" | "eps";
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const previewFilename = `${Date.now()}_preview.png`;
       const previewPath = path.join(cropDir, previewFilename);
 
-      // Store original file reference for later crop
-      const origFilename = `${Date.now()}_${req.file.originalname}`;
+      const base = path.basename(req.file.originalname, ext);
+      const storedExt = sourceFormat ? ".pdf" : ext;
+      const origFilename = `${Date.now()}_${base}${storedExt}`;
       const origStorePath = path.join(cropDir, origFilename);
       await fs.rename(req.file.path, origStorePath);
 
       const result = execPythonCapture([
         CROP_SCRIPT, origStorePath, previewPath,
-        fileType === 'jpeg' ? 'jpg' : fileType, "preview"
+        toolType, "preview"
       ], "CropPreview");
 
       res.json({
@@ -2483,7 +3101,8 @@ export async function registerRoutes(
         originalFilename: req.file.originalname,
         storedFilename: origFilename,
         previewFilename,
-        fileType: fileType === 'jpeg' ? 'jpg' : fileType,
+        fileType: toolType,
+        sourceFormat,
       });
     } catch (error) {
       console.error('Error generating crop preview:', error);
@@ -2521,14 +3140,15 @@ export async function registerRoutes(
         return res.status(404).json({ message: 'Source file not found. Please re-upload.' });
       }
 
-      const ext = fileType === 'pdf' ? '.pdf' : fileType === 'png' ? '.png' : '.jpg';
+      const pipelineType = pipelineTypeFor(fileType);
+      const ext = pipelineType === 'pdf' ? '.pdf' : pipelineType === 'png' ? '.png' : '.jpg';
       const basename = path.basename(storedFilename, path.extname(storedFilename))
         .replace(/^\d+_/, '');
       const outputFilename = `${Date.now()}_${basename}_cropped${ext}`;
       const outputPath = path.join(cropDir, outputFilename);
 
       const result = execPythonCapture([
-        CROP_SCRIPT, inputPath, outputPath, fileType, "crop",
+        CROP_SCRIPT, inputPath, outputPath, pipelineType, "crop",
         String(x), String(y), String(w), String(h), String(scale)
       ], "CropExecute");
 
@@ -2573,6 +3193,26 @@ export async function registerRoutes(
       const ext = path.extname(req.file.originalname || "").toLowerCase();
       const previewFilename = `file_preview_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
       const previewPath = path.join(cropDir, previewFilename);
+
+      if (isIllustratorName(req.file.originalname || "")) {
+        try {
+          const prepared = prepareIllustratorFile(tmpInput, req.file.originalname);
+          const page = Math.max(0, parseInt(String(req.body?.page ?? "0"), 10) || 0);
+          const rendered = renderIllustratorPreview(prepared.outputPath || tmpInput, previewPath, page);
+          try { await fs.unlink(tmpInput); } catch {}
+          return res.json({
+            previewUrl: `/api/manual-crop/preview-image/${previewFilename}`,
+            width: rendered.width || 0,
+            height: rendered.height || 0,
+            pageCount: rendered.pageCount ?? prepared.pageCount,
+            page: rendered.page ?? page,
+          });
+        } catch (error) {
+          try { await fs.unlink(tmpInput); } catch {}
+          const message = error instanceof Error ? error.message : "Failed to preview Illustrator file";
+          return res.status(400).json({ message, code: error instanceof IllustratorIntakeError ? error.code : undefined });
+        }
+      }
 
       const py = spawn(PYTHON_BIN, ["-c", `
 import sys, os
@@ -2640,7 +3280,7 @@ else:
 print(f'{w},{h}')
 `, tmpInput, previewPath, ext], {
         cwd: process.cwd(),
-        env: PYTHON_ENV,
+        env: pythonChildEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       });
 
@@ -2720,19 +3360,31 @@ print(f'{w},{h}')
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      const fileType = ext.replace('.', '');
-      const allowedTypes = ['pdf', 'jpg', 'jpeg', 'png'];
-      if (!allowedTypes.includes(fileType)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files can be resized.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: 'Only PDF, AI, EPS, JPG, and PNG files can be resized.' });
+      }
+
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const basename = path.basename(req.file.originalname, ext);
-      const outputFilename = `${basename}_resized_${targetWidth}x${targetHeight}mm${ext}`;
+      const outExt = toolType === "pdf" ? ".pdf" : ext;
+      const outputFilename = `${basename}_resized_${targetWidth}x${targetHeight}mm${outExt}`;
       const outputPath = path.join(resizeDir, `${Date.now()}_${outputFilename}`);
 
       const result = execPythonCapture([
         RESIZE_SCRIPT, req.file!.path, outputPath,
-        fileType === 'jpeg' ? 'jpg' : fileType,
+        toolType,
         String(targetWidth), String(targetHeight), uniform ? '1' : '0'
       ], "Resize");
 
@@ -2787,12 +3439,27 @@ print(f'{w},{h}')
       }
 
       const ext = path.extname(req.file.originalname).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png'].includes(ext)) {
-        return res.status(400).json({ message: 'Only PDF, JPG, and PNG files are supported.' });
+      if (!isAllowedPrintTool(req.file.originalname, req.file.mimetype)) {
+        return res.status(400).json({ message: PRINT_TOOL_REJECTION });
+      }
+
+      let toolType = normalizedUploadType(req.file.originalname);
+      try {
+        if (isIllustratorType(toolType)) {
+          prepareIllustratorFile(req.file.path, req.file.originalname);
+          toolType = "pdf";
+        }
+      } catch (error) {
+        if (error instanceof IllustratorIntakeError) {
+          return res.status(400).json({ message: error.message, code: error.code });
+        }
+        throw error;
       }
 
       const shrinkFactor = Math.max(0.50, Math.min(0.99, parseFloat(req.body.shrinkFactor) || 0.92));
-      const storedFilename = `${Date.now()}_${req.file.originalname}`;
+      const base = path.basename(req.file.originalname, ext);
+      const storedExt = toolType === "pdf" ? ".pdf" : ext;
+      const storedFilename = `${Date.now()}_${base}${storedExt}`;
       const storedPath = path.join(shrinkDir, storedFilename);
       await fs.rename(req.file.path, storedPath);
 
@@ -2804,7 +3471,7 @@ print(f'{w},{h}')
       res.json({
         ...result,
         storedFilename,
-        fileType: ext.replace('.', ''),
+        fileType: toolType,
         previewUrl: `/api/shrink/preview-image/${previewFilename}`,
       });
     } catch (error) {
@@ -2829,7 +3496,8 @@ print(f'{w},{h}')
         return res.status(404).json({ message: 'Source file not found. Please re-upload.' });
       }
 
-      const ext = fileType === 'pdf' ? '.pdf' : fileType === 'png' ? '.png' : '.jpg';
+      const pipelineType = pipelineTypeFor(String(fileType));
+      const ext = pipelineType === 'pdf' ? '.pdf' : pipelineType === 'png' ? '.png' : '.jpg';
       const basename = path.basename(storedFilename, path.extname(storedFilename))
         .replace(/^\d+_/, '');
       const outputFilename = `${Date.now()}_${basename}_safemargin${ext}`;
@@ -3043,7 +3711,7 @@ print(f'{w},{h}')
             try {
               const reportBuffer = await fs.readFile(healthReportPath);
               attachments.push({
-                filename: "Flyerz.co.za Artwork Intellegence Proof and Report.pdf",
+                filename: "Flyerz.co.za Artwork Intelligence Proof and Report.pdf",
                 content: reportBuffer,
               });
             } catch (e) {
@@ -3373,14 +4041,35 @@ print(f'{w},{h}')
       }
 
       const jobIds: number[] = [];
+      const errors: { filename: string; message: string }[] = [];
       for (const file of files) {
-        const fileType = path.extname(file.originalname).toLowerCase().replace('.', '') as any;
-        const normalizedType = fileType === 'jpeg' ? 'jpg' : fileType;
+        let ingested: ReturnType<typeof ingestUploadedArtwork>;
+        try {
+          ingested = ingestUploadedArtwork(file);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Could not read this file.";
+          const fileType = normalizedUploadType(file.originalname) || "ai";
+          const job = await storage.createJob({
+            filename: file.originalname,
+            originalPath: file.path,
+            fileSize: file.size,
+            fileType: fileType as any,
+          });
+          await storage.updateJob(job.id, {
+            status: 'failed',
+            errorMessage: message,
+            completedAt: new Date(),
+          });
+          jobIds.push(job.id);
+          errors.push({ filename: file.originalname, message });
+          continue;
+        }
+        const normalizedType = ingested.fileType;
         const job = await storage.createJob({
           filename: file.originalname,
           originalPath: file.path,
           fileSize: file.size,
-          fileType: normalizedType,
+          fileType: normalizedType as FileType,
         });
         await storage.updateJob(job.id, { status: 'processing' });
         jobIds.push(job.id);
@@ -3394,7 +4083,7 @@ print(f'{w},{h}')
         });
       }
 
-      return res.status(201).json({ jobIds });
+      return res.status(201).json({ jobIds, errors });
     } catch (error: any) {
       console.error('[FAI] Batch upload error:', error);
       return res.status(500).json({ message: error.message || 'Batch upload failed' });
@@ -3467,26 +4156,6 @@ print(f'{w},{h}')
     }
   });
 
-  // Seed database with example jobs (for demo purposes)
-  app.get('/api/test-pdf/download', async (_req, res) => {
-    try {
-      const filePath = path.resolve('stress_test.pdf');
-      try {
-        await fs.access(filePath);
-      } catch {
-        const { execSync: exec } = await import('child_process');
-        exec(`${PYTHON_BIN} make_test.py`, { cwd: path.resolve('.'), timeout: 30000 });
-      }
-      await fs.access(filePath);
-      res.setHeader('Content-Disposition', 'attachment; filename="stress_test.pdf"');
-      res.setHeader('Content-Type', 'application/pdf');
-      const stream = fsSync.createReadStream(filePath);
-      stream.pipe(res);
-    } catch (err: any) {
-      res.status(500).json({ error: 'Failed to generate stress_test.pdf', details: err?.message });
-    }
-  });
-
   async function seedDatabase() {
     const existingJobs = await storage.getJobs();
     if (existingJobs.length === 0) {
@@ -3495,6 +4164,8 @@ print(f'{w},{h}')
   }
 
   await seedDatabase();
+
+  registerPureCropRoutes(app);
 
   return httpServer;
 }

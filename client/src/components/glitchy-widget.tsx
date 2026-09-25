@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { glitchyPlacement } from "@/lib/glitchy-placement";
 
 type CatMode = "head" | "walking" | "sleeping" | "stretching";
 
@@ -163,6 +164,12 @@ export default function GlitchyWidget() {
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const idleRef = useRef(0);
   const wanderingRef = useRef(false);
+  const [narrow, setNarrow] = useState(false);
+  const [formFocused, setFormFocused] = useState(false);
+  const [shareOrDownloadInView, setShareOrDownloadInView] = useState(false);
+  const [userOpened, setUserOpened] = useState(false);
+  const [obstacleTops, setObstacleTops] = useState<number[]>([]);
+  const [viewportHeight, setViewportHeight] = useState(800);
 
   function getJobIdFromUrl(): number | null {
     const match = window.location.pathname.match(/\/job\/(\d+)/);
@@ -551,7 +558,91 @@ export default function GlitchyWidget() {
     };
   }, []);
 
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 768px)");
+    const apply = () => {
+      setNarrow(media.matches);
+      setViewportHeight(window.innerHeight);
+    };
+    apply();
+    media.addEventListener("change", apply);
+    window.addEventListener("resize", apply);
+    return () => {
+      media.removeEventListener("change", apply);
+      window.removeEventListener("resize", apply);
+    };
+  }, []);
+
+  useEffect(() => {
+    const fieldSelector = "input, textarea, select, [contenteditable='true']";
+    const isOutsideField = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      if (el.closest("[data-testid='glitchy-container']")) return false;
+      return !!el.closest(fieldSelector);
+    };
+    const onFocusIn = (event: FocusEvent) => setFormFocused(isOutsideField(event.target));
+    const onFocusOut = () => {
+      window.setTimeout(() => setFormFocused(isOutsideField(document.activeElement)), 0);
+    };
+    document.addEventListener("focusin", onFocusIn);
+    document.addEventListener("focusout", onFocusOut);
+    return () => {
+      document.removeEventListener("focusin", onFocusIn);
+      document.removeEventListener("focusout", onFocusOut);
+    };
+  }, []);
+
+  useEffect(() => {
+    const selector = "[data-testid='input-share-email'], [data-testid='button-share-report'], [data-testid='button-download-print-ready']";
+    let frame = 0;
+    const measure = () => {
+      const viewH = window.innerHeight;
+      const viewW = window.innerWidth;
+      const cornerLeft = viewW - 96;
+      const cornerTop = viewH - 140;
+      const tops: number[] = [];
+      let inView = false;
+      const consider = (rect: DOMRect, countsAsStep: boolean) => {
+        if (rect.width === 0 && rect.height === 0) return;
+        const onScreen = rect.bottom > 0 && rect.top < viewH && rect.right > 0 && rect.left < viewW;
+        if (countsAsStep && onScreen) inView = true;
+        const overCorner = rect.right > cornerLeft && rect.left < viewW && rect.bottom > cornerTop && rect.top < viewH;
+        if (overCorner) tops.push(rect.top);
+      };
+      document.querySelectorAll(selector).forEach((node) => {
+        consider(node.getBoundingClientRect(), true);
+      });
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        active.closest("input, textarea, select") &&
+        !active.closest("[data-testid='glitchy-container']")
+      ) {
+        consider(active.getBoundingClientRect(), false);
+      }
+      setShareOrDownloadInView(inView);
+      setObstacleTops(tops);
+      setViewportHeight(viewH);
+    };
+    const schedule = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(measure);
+    };
+    schedule();
+    window.addEventListener("scroll", schedule, true);
+    window.addEventListener("resize", schedule);
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", schedule, true);
+      window.removeEventListener("resize", schedule);
+      observer.disconnect();
+    };
+  }, [formFocused]);
+
   function handleClick() {
+    if (formFocused || shareOrDownloadInView) return;
     if (processState === "SUCCESS" && achievementPhase === "ask") {
       setAchievementPhase("reveal");
       setIsInteracting(true);
@@ -591,11 +682,13 @@ export default function GlitchyWidget() {
 
     setChatBoxVisible((v) => {
       if (v) {
+        setUserOpened(false);
         setIsInteracting(false);
         setBubbleVisible(false);
         setShowFeedback(false);
         return false;
       }
+      setUserOpened(true);
       fetchChecklist();
       return true;
     });
@@ -689,6 +782,15 @@ export default function GlitchyWidget() {
   })();
 
   const isVisible = catMode !== "head" || uiVisible || processState !== "IDLE";
+  const placement = glitchyPlacement({
+    narrow,
+    formFocused,
+    shareOrDownloadInView,
+    userOpened,
+    viewportHeight,
+    obstacleTops,
+  });
+  const showPanels = !placement.collapsed;
 
   const showBubble =
     (bubbleVisible && processState === "IDLE" && !chatBoxVisible) ||
@@ -920,6 +1022,17 @@ export default function GlitchyWidget() {
           background-color: #ff5277;
           transform: scale(1.01);
         }
+        @media (max-width: 768px) {
+          .glitchy-chat-expanded {
+            width: min(240px, calc(100vw - 24px));
+            max-width: calc(100vw - 24px);
+            min-width: 0;
+            margin-left: 0;
+          }
+          .glitchy-speech-bubble {
+            max-width: min(220px, calc(100vw - 32px));
+          }
+        }
         .error-text {
           color: #ff4b4b;
           font-weight: bold;
@@ -928,33 +1041,35 @@ export default function GlitchyWidget() {
       `}</style>
       <div
         data-testid="glitchy-container"
+        data-collapsed={placement.collapsed ? "true" : "false"}
         style={{
           position: "fixed",
-          bottom: isVisible ? 0 : -100,
-          right: wanderingRef.current ? undefined : 50,
-          left: wanderingRef.current ? posX : undefined,
-          width: 120,
+          bottom: isVisible ? placement.bottom : -100,
+          right: placement.collapsed || narrow || !wanderingRef.current ? 12 : undefined,
+          left: !placement.collapsed && !narrow && wanderingRef.current ? posX : undefined,
+          width: placement.collapsed ? 44 : 120,
           display: "flex",
           flexDirection: "column",
-          alignItems: "center",
+          alignItems: "flex-end",
           overflow: "visible",
-          zIndex: 9999,
+          zIndex: 30,
+          pointerEvents: "none",
           fontFamily: "sans-serif",
-          transformOrigin: "bottom center",
-          transition: "bottom 0.5s ease-in-out, left 2s linear",
+          transformOrigin: "bottom right",
+          transition: "bottom 0.25s ease-in-out, left 2s linear",
         }}
       >
-        {showBubble && bubbleContent && (
-          <div className="glitchy-speech-bubble" data-testid="glitchy-bubble">
+        {showPanels && showBubble && bubbleContent && (
+          <div className="glitchy-speech-bubble" data-testid="glitchy-bubble" style={{ pointerEvents: "auto" }}>
             {bubbleContent}
           </div>
         )}
 
-        {showChecklist && (
+        {showPanels && showChecklist && (
           <div
             className="glitchy-speech-bubble"
             data-testid="glitchy-checklist"
-            style={{ textAlign: "left" }}
+            style={{ textAlign: "left", pointerEvents: "auto" }}
           >
             <p style={{ margin: "0 0 5px 0", fontSize: 10, fontWeight: "bold", color: "#333" }}>
               Checklist:
@@ -973,7 +1088,7 @@ export default function GlitchyWidget() {
           </div>
         )}
 
-        {chatBoxVisible && catMode === "head" && (
+        {showPanels && chatBoxVisible && catMode === "head" && (
           <div
             className="glitchy-speech-bubble glitchy-chat-expanded"
             data-testid="glitchy-chat-box"
@@ -981,6 +1096,7 @@ export default function GlitchyWidget() {
               background: "#1a1a1a",
               color: "white",
               textAlign: "left",
+              pointerEvents: "auto",
             }}
           >
             {showFeedback ? (
@@ -1111,7 +1227,7 @@ export default function GlitchyWidget() {
           onClick={handleClick}
           onMouseEnter={handleMouseEnter}
           onMouseLeave={handleMouseLeave}
-          style={{ cursor: "pointer" }}
+          style={{ cursor: "pointer", pointerEvents: "auto" }}
         >
           <CatAvatar
             mode={catMode}

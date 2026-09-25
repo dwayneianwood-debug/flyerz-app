@@ -19,8 +19,98 @@ import shutil
 import time
 import math
 
+from artwork_types import input_kind
 from fai_temp_utils import init_fai_temp_dir, is_scratch_temp_file
 FAI_TEMP_DIR = init_fai_temp_dir()
+
+
+def _maybe_use_enhanced_raster(img, args, *, allow_pdf_page: bool = False):
+    """Swap in the accepted upscale before bleed. Failures keep the current raster."""
+    path = (getattr(args, "ai_upscale_path", "") or "").strip()
+    if not path or not os.path.exists(path):
+        if path:
+            sys.stderr.write(f"[COMPILE] AI upscale file missing — continuing with original ({path})\n")
+        return img, False
+    import cv2
+
+    loaded = cv2.imread(path, cv2.IMREAD_COLOR)
+    if loaded is None or loaded.size == 0:
+        sys.stderr.write("[COMPILE] AI upscale image unreadable — continuing with original\n")
+        return img, False
+
+    meta = {}
+    meta_path = path + ".json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle) or {}
+        except Exception as exc:
+            sys.stderr.write(f"[COMPILE] AI upscale sidecar unreadable (non-fatal): {exc}\n")
+    src_w = int(meta.get("src_w") or 0)
+    src_h = int(meta.get("src_h") or 0)
+    kind = str(meta.get("kind") or "")
+    img_h, img_w = img.shape[:2]
+    sizes_match = src_w > 0 and src_h > 0 and abs(img_w - src_w) <= 2 and abs(img_h - src_h) <= 2
+    pdf_raster = allow_pdf_page and kind == "raster_pdf"
+    if src_w and src_h and not sizes_match and not pdf_raster:
+        sys.stderr.write(
+            f"[COMPILE] AI upscale skipped — raster {img_w}x{img_h} does not match enhanced source {src_w}x{src_h}\n"
+        )
+        return img, False
+
+    height, width = loaded.shape[:2]
+    long_edge = max(height, width)
+    if long_edge > 4000:
+        scale = 4000.0 / float(long_edge)
+        loaded = cv2.resize(
+            loaded,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+        sys.stderr.write(f"[COMPILE] AI upscale capped to {loaded.shape[1]}x{loaded.shape[0]}\n")
+    sys.stderr.write(
+        f"[COMPILE] Enhanced artwork loaded before bleed: {loaded.shape[1]}x{loaded.shape[0]} from {path}\n"
+    )
+    return loaded, True
+
+
+def _apply_ai_artwork_fit(img, args, already_enhanced: bool = False):
+    """Fit an AI image to the print aspect before cover-scale. Failures keep the raster."""
+    fit = (getattr(args, "ai_artwork_fit", "") or "").strip().lower()
+    if fit not in ("crop", "extend", "border"):
+        return img
+    try:
+        from ai_artwork import apply_artwork_fit, configured_expand
+
+        source = ""
+        expand_fn = None
+        if fit == "extend" and not already_enhanced:
+            source = getattr(args, "input", "") or ""
+            expand_fn = configured_expand
+        fitted, info = apply_artwork_fit(
+            img,
+            float(args.trim_w),
+            float(args.trim_h),
+            fit,
+            float(getattr(args, "ai_artwork_offset", 0.5) or 0.5),
+            (
+                float(getattr(args, "ai_fit_c", 0) or 0),
+                float(getattr(args, "ai_fit_m", 0) or 0),
+                float(getattr(args, "ai_fit_y", 0) or 0),
+                float(getattr(args, "ai_fit_k", 0) or 0),
+            ),
+            source_path=source,
+            expand_fn=expand_fn,
+        )
+        if fitted is None or getattr(fitted, "size", 0) == 0:
+            return img
+        sys.stderr.write(
+            f"[COMPILE] AI artwork fit '{fit}' → {fitted.shape[1]}x{fitted.shape[0]} ({info.get('expand')})\n"
+        )
+        return fitted
+    except Exception as exc:
+        sys.stderr.write(f"[COMPILE] AI artwork fit skipped: {exc}\n")
+        return img
 
 
 def _cover_scale_image_to_trim_px(img, target_w_px: int, target_h_px: int, *, log_label: str = "[COMPILE]"):
@@ -93,8 +183,19 @@ def _publish_zip_bytes(zip_bytes: bytes, final_zip_path: str) -> None:
 
 # API strings matching Node `select-bleed-method`; any other value routes to auto clean-bleed
 FORCED_BLEED_API_KEYS = frozenset({
-    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint",
+    "bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint", "colourBorder",
 })
+
+
+def _border_cmyk_arg(args) -> tuple:
+    def _pct(value) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(100.0, number))
+
+    return (_pct(args.border_c), _pct(args.border_m), _pct(args.border_y), _pct(args.border_k))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1169,6 +1270,20 @@ def main():
     parser.add_argument("--crop-w", type=float, default=-1, help="Manual crop width (pixels)")
     parser.add_argument("--crop-h", type=float, default=-1, help="Manual crop height (pixels)")
     parser.add_argument("--creep-mm", type=float, default=0, help="Creep/gutter margin shift in mm for folded booklets (0 = disabled)")
+    parser.add_argument("--border-c", type=float, default=0, help="Colour-border cyan percent")
+    parser.add_argument("--border-m", type=float, default=0, help="Colour-border magenta percent")
+    parser.add_argument("--border-y", type=float, default=0, help="Colour-border yellow percent")
+    parser.add_argument("--border-k", type=float, default=0, help="Colour-border black percent")
+    parser.add_argument("--border-label", default="White", help="Colour-border display name")
+    parser.add_argument("--ai-upscale-path", default="", help="Accepted enhanced raster applied before bleed")
+    parser.add_argument("--ai-upscale-note", default="", help="Health-report note when enhancement was accepted")
+    parser.add_argument("--ai-artwork-fit", default="", help="AI image aspect fit: crop, extend, border, or none")
+    parser.add_argument("--ai-artwork-offset", type=float, default=0.5, help="Crop-to-fit position from 0 to 1")
+    parser.add_argument("--ai-artwork-note", default="", help="Health-report note listing auto-applied AI artwork defaults")
+    parser.add_argument("--ai-fit-c", type=float, default=0, help="Aspect colour-border cyan percent")
+    parser.add_argument("--ai-fit-m", type=float, default=0, help="Aspect colour-border magenta percent")
+    parser.add_argument("--ai-fit-y", type=float, default=0, help="Aspect colour-border yellow percent")
+    parser.add_argument("--ai-fit-k", type=float, default=0, help="Aspect colour-border black percent")
     parser.add_argument("--auto-shifter", type=float, default=0, help="Auto-Shifter scale-down percentage to pull content into safe zone (0 = disabled)")
     args = parser.parse_args()
 
@@ -1204,8 +1319,9 @@ def main():
             sys.stderr.write(f"[COMPILE] Using original (un-bled) file: {input_path}\n")
 
         file_ext = os.path.splitext(input_path)[1].lower()
-        is_pdf = file_ext == ".pdf"
-        is_image = file_ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp")
+        kind = input_kind(file_ext)
+        is_pdf = kind == "pdf"
+        is_image = kind == "image"
 
         compile_stats = {
             "total_spans": 0,
@@ -1223,6 +1339,7 @@ def main():
             "qr_codes_found": 0,
             "qr_codes_fixed": 0,
             "qr_scan_status": "not_run",
+            "ai_upscale_applied": False,
         }
         page_count = 1
         render_dpi = 300
@@ -1329,7 +1446,11 @@ def main():
                     f"skipping mockup auto-crop for litho bleed (Document Closed / bounds safety).\n"
                 )
 
+            img, _ai_applied = _maybe_use_enhanced_raster(img, args, allow_pdf_page=False)
+            if _ai_applied:
+                compile_stats["ai_upscale_applied"] = True
             img = _auto_trim_white_margins(img, white_thresh=250)
+            img = _apply_ai_artwork_fit(img, args, already_enhanced=_ai_applied)
 
             _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
 
@@ -1365,6 +1486,7 @@ def main():
                 target_bleed_px=target_bleed_px,
                 bleed_strategy=bleed_api_strategy,
                 dpi=float(dpi),
+                border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
             )
             sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
 
@@ -1629,6 +1751,11 @@ def main():
                                     sys.stderr.write(f"[COMPILE] PDF page 1 manual crop applied: ({pcx},{pcy}) {pcw}x{pch} -> {img_bgr.shape[1]}x{img_bgr.shape[0]}\n")
             
                             _pdf_manual_crop_active = page_num == 0 and args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+
+                            if page_num == 0:
+                                img_bgr, _ai_applied_pdf = _maybe_use_enhanced_raster(img_bgr, args, allow_pdf_page=True)
+                                if _ai_applied_pdf:
+                                    compile_stats["ai_upscale_applied"] = True
             
                             img_bgr = _auto_trim_white_margins(img_bgr, white_thresh=250)
             
@@ -1665,6 +1792,7 @@ def main():
                                 target_bleed_px=target_bleed_px_pdf,
                                 bleed_strategy=bleed_api_pdf,
                                 dpi=float(render_dpi),
+                                border_cmyk=_border_cmyk_arg(args) if bleed_api_pdf == "colourBorder" else None,
                             )
                             del img_bgr
             
@@ -2357,6 +2485,25 @@ def main():
             except Exception as oi_err:
                 sys.stderr.write(f"[COMPILE] OutputIntent embedding failed (non-fatal): {oi_err}\n")
 
+        if args.strategy == "colourBorder":
+            try:
+                from colour_border import stamp_cmyk_bleed
+
+                stamp_cmyk_bleed(
+                    args.output,
+                    _border_cmyk_arg(args),
+                    float(args.trim_w),
+                    float(args.trim_h),
+                    PRESS_DEFAULT_BLEED_MM,
+                )
+                sys.stderr.write(
+                    f"[COMPILE] Colour border stamped onto CMYK bleed "
+                    f"C{args.border_c:g} M{args.border_m:g} Y{args.border_y:g} K{args.border_k:g}\n"
+                )
+            except Exception as border_err:
+                sys.stderr.write(f"[COMPILE] Colour border CMYK stamp failed: {border_err}\n")
+                raise
+
         output_size = os.path.getsize(args.output)
         sys.stderr.write(f"[COMPILE] Press-ready PDF complete: {args.output} ({output_size} bytes)\n")
 
@@ -2389,15 +2536,30 @@ def main():
             "replicate": "Edge Replicate",
             "upscale": "Upscale",
             "ai_outpaint": "AI Outpaint (proxy inpaint)",
+            "colourBorder": "Colour Border",
             "auto": "Auto-Detect",
         }
         strategy_label = strategy_labels.get(args.strategy, args.strategy)
-        geo_action = f"Generated litho-standard 5mm bleed using {strategy_label} strategy at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
+        if args.strategy == "colourBorder":
+            bc, bm, by, bk = _border_cmyk_arg(args)
+            geo_action = (
+                f"Generated litho-standard 5mm solid colour border ({args.border_label}, "
+                f"C{bc:g} M{bm:g} Y{by:g} K{bk:g}) at {render_dpi} DPI. "
+                f"Artwork kept at trim size with no mirror or stretch. "
+                f"TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
+            )
+        else:
+            geo_action = f"Generated litho-standard 5mm bleed using {strategy_label} strategy at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
 
         if compile_stats["lenses_flattened"]:
             res_action = f"Flattened complex live transparencies (lenses) and locked resolution to {render_dpi} DPI."
         else:
             res_action = f"No live transparencies. Resolution locked to {render_dpi} DPI across {page_count} page(s)."
+        if compile_stats.get("ai_upscale_applied") and (getattr(args, "ai_upscale_note", "") or "").strip():
+            res_action = res_action + " " + args.ai_upscale_note.strip()
+        artwork_note = (getattr(args, "ai_artwork_note", "") or "").strip()
+        if artwork_note:
+            res_action = res_action + " " + artwork_note
 
         if compile_stats["hairlines_fixed"] > 0:
             hairline_action = f"Hairline strokes detected (below 0.25pt) and bulked to 0.3pt for press stability. {compile_stats['hairlines_fixed']} stroke(s) enforced."
@@ -2577,7 +2739,7 @@ def main():
                 if report_for_zip and os.path.exists(report_for_zip):
                     with open(report_for_zip, "rb") as f:
                         zf.writestr(
-                            "Flyerz.co.za Artwork Intellegence Proof and Report.pdf",
+                            "Flyerz.co.za Artwork Intelligence Proof and Report.pdf",
                             f.read(),
                         )
 

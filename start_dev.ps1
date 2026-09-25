@@ -4,7 +4,7 @@
   Flyerz local dev — nuke ports/processes, clear caches, boot unified Express+Vite (npm run dev).
 
 .NOTES
-  This app does NOT run a separate Python HTTP server: root main.py is a stub.
+  This app does NOT run a separate Python HTTP server.
   Backend + frontend dev = single process: npm run dev (tsx server/index.ts + Vite middleware).
   If your IDE depends on Node (Cursor/VS Code), run this from an external PowerShell window,
   or expect extension hosts to restart when global node.exe is killed.

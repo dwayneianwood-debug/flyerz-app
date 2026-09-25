@@ -1,3 +1,4 @@
+import "./loadEnv";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import type { AuditResults, AuditCheck, BleedOptions, JobAudit } from "@shared/schema";
 import path from "path";
@@ -5,9 +6,17 @@ import fs from "fs/promises";
 import fsSync from "fs";
 import { spawnSync } from "child_process";
 import os from "os";
+import { pythonChildEnv } from "./pythonChildEnv";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
+import { isPrintToolType } from "@shared/artwork-types";
+import {
+  auditIllustratorFile,
+  extractIllustratorPage,
+  isIllustratorType,
+  prepareIllustratorFile,
+} from "./illustratorIntake";
 
 const MAX_CONCURRENT_JOBS = 3;
 let activeJobs = 0;
@@ -71,21 +80,6 @@ const REPORT_SCRIPT = path.join(process.cwd(), "server", "health_report.py");
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
 
 const EXEC_TIMEOUT_MS = 180_000;
-
-function pythonChildEnv(): Record<string, string> {
-  const base = {
-    ...(process.env as Record<string, string>),
-    PYTHONUNBUFFERED: "1",
-    PYTHONIOENCODING: "utf-8",
-    PYTHONUTF8: "1",
-  };
-  if (!base.FAI_TEMP_DIR?.trim()) {
-    base.FAI_TEMP_DIR = getFlyerzTempRoot();
-  }
-  return base;
-}
-
-const PYTHON_ENV: Record<string, string> = pythonChildEnv();
 
 function makeResultFile(prefix: string): string {
   const id = crypto.randomBytes(8).toString("hex");
@@ -194,7 +188,7 @@ function execPython(args: string[], label: string, resultFile: string, timeoutMs
     // A single-quoted shell string is for bash only; cmd.exe does not treat '...' as quoting.
     const proc = spawnSync(PYTHON_BIN, args, {
       cwd: process.cwd(),
-      env: PYTHON_ENV,
+      env: pythonChildEnv(),
       encoding: "utf8",
       timeout: timeoutMs,
       maxBuffer: 50 * 1024 * 1024,
@@ -284,14 +278,16 @@ function runPythonBleed(
   }
 }
 
-function auditOfficeFile(fileType: string): AuditCheck[] {
+export function auditOfficeFile(fileType: string): AuditCheck[] {
+  const kind = (fileType || "Office").toUpperCase();
   return [
     {
       name: "Office File Format",
       passed: false,
-      message: `${fileType.toUpperCase()} files are not ideal for litho printing.`,
+      message: `${kind} files are not ideal for litho printing. Please send a PDF or a picture (JPG or PNG).`,
       autoFixed: false,
       details: "Recommend converting to high-resolution PDF (400 DPI) with embedded fonts and CMYK color space.",
+      severity: "HIGH",
     },
     {
       name: "Color Space",
@@ -299,6 +295,7 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Office files use RGB color space — must be converted to CMYK.",
       autoFixed: false,
       details: "Export to PDF from your application and choose CMYK color space.",
+      severity: "HIGH",
     },
     {
       name: "Font Embedding",
@@ -306,6 +303,7 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Office files may not have embedded fonts.",
       autoFixed: false,
       details: "When exporting to PDF, enable 'Embed all fonts' option.",
+      severity: "HIGH",
     },
     {
       name: "5mm Smart Bleed",
@@ -313,8 +311,50 @@ function auditOfficeFile(fileType: string): AuditCheck[] {
       message: "Smart Bleed cannot be applied to Office files. Convert to PDF first.",
       autoFixed: false,
       details: "Upload as PDF or JPG/PNG to enable automatic Smart Bleed via pixel mirroring.",
+      severity: "HIGH",
     },
   ];
+}
+
+export function isOfficeUpload(fileType: string): boolean {
+  return fileType === "docx" || fileType === "pptx";
+}
+
+/** Never show a server path. Office files get the litho-ready explanation instead of a crash. */
+export function clientSafeQuickCheckError(message: string, fileType?: string): string {
+  if (isOfficeUpload(fileType || "")) {
+    return buildOfficeQuickCheck(fileType || "docx").checks[0].message;
+  }
+  let text = String(message || "Quick check failed");
+  text = text.replace(/[A-Za-z]:\\[^\s'"]+/g, "");
+  text = text.replace(/(?:\/(?:[\w.+@=-]+)){2,}/g, "");
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text || /cannot identify image file/i.test(message)) {
+    return "We couldn't read this file. Please send a PDF or a picture (JPG or PNG).";
+  }
+  return text;
+}
+
+/** Same office checklist, shaped like a quick-check result so the first screen can show it. */
+export function buildOfficeQuickCheck(fileType: string) {
+  const ids = ["office_format", "office_color", "office_fonts", "office_bleed"];
+  const checks = auditOfficeFile(fileType).map((check, index) => ({
+    id: ids[index] || `office_${index}`,
+    name: check.name,
+    passed: false,
+    message: check.message,
+    details: check.details || "",
+    fixType: "manual" as const,
+    severity: "HIGH",
+    autoFixed: false,
+  }));
+  return {
+    checks,
+    allPassed: false,
+    passCount: 0,
+    failCount: checks.length,
+    pageCount: 1,
+  };
 }
 
 export function generateHealthReport(
@@ -525,10 +565,17 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       }),
     } as BleedOptions;
 
-    if (["pdf", "jpg", "jpeg", "png"].includes(fileType)) {
+    const illustrator = isIllustratorType(fileType) || isIllustratorType(filename);
+    if (illustrator) {
+      prepareIllustratorFile(originalPath, filename);
+    }
+
+    if (isPrintToolType(fileType) || illustrator) {
       const dir = path.dirname(originalPath);
-      const ext = path.extname(filename).toLowerCase();
-      const basename = path.basename(filename, ext);
+      const sourceExt = path.extname(filename).toLowerCase();
+      const ext = illustrator ? ".pdf" : sourceExt;
+      const basename = path.basename(filename, sourceExt || ext);
+      const pipelineType = illustrator ? "pdf" : (fileType === "jpeg" ? "jpg" : fileType);
 
       const originalWithExt = path.join(dir, `original_${jobId}_${basename}${ext}`);
       if (!path.extname(originalPath)) {
@@ -539,6 +586,28 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         }
       }
       let inputForBleed = path.extname(originalPath) ? originalPath : originalWithExt;
+      const selectedArtboard = Number((effectiveBleed as any)?.selectedPage);
+      if (illustrator && Number.isInteger(selectedArtboard) && selectedArtboard >= 0) {
+        const singlePage = path.join(dir, `original_${jobId}_${basename}_artboard${selectedArtboard + 1}.pdf`);
+        extractIllustratorPage(inputForBleed, singlePage, selectedArtboard);
+        inputForBleed = singlePage;
+        console.log(`[FAI] Illustrator artboard ${selectedArtboard + 1} selected for job ${jobId}`);
+      }
+      let illustratorChecks: AuditCheck[] = [];
+      if (illustrator) {
+        try {
+          illustratorChecks = auditIllustratorFile(inputForBleed).map((check) => ({
+            name: check.name,
+            passed: !!check.passed,
+            message: check.message || "",
+            autoFixed: false,
+            details: check.details || "",
+            severity: check.severity,
+          }));
+        } catch (auditErr) {
+          console.warn(`[FAI] Illustrator audit skipped for job ${jobId}:`, auditErr);
+        }
+      }
       const hasCropCoords = hasValidCropBox(effectiveBleed as any);
       const skipPreResize = hasCropCoords || isNoCropRoute(effectiveBleed as any);
 
@@ -560,7 +629,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         await runPythonResize(
           inputForBleed,
           resizedPath,
-          fileType === "jpeg" ? "jpg" : fileType,
+          pipelineType,
           effectiveBleed.targetWidth,
           effectiveBleed.targetHeight,
         );
@@ -571,12 +640,18 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
 
       const outputPath = path.join(dir, `processed_${jobId}_${basename}${ext}`);
 
-      result = await runPythonBleed(inputForBleed, outputPath, fileType, effectiveBleed);
+      result = await runPythonBleed(inputForBleed, outputPath, pipelineType, effectiveBleed);
       bleedPythonResult = result;
       } finally {
         console.timeEnd("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       }
       checks = result.checks || [];
+      if (illustratorChecks.length > 0) {
+        const seen = new Set(checks.map((check) => check.name));
+        for (const extra of illustratorChecks) {
+          if (!seen.has(extra.name)) checks.push(extra);
+        }
+      }
       proofPath = result.proofPath;
       proofPaths = result.proofPaths;
       proofPageCount = result.proofPageCount;
@@ -633,7 +708,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
           passed: false,
           message: `File type '${fileType}' is not supported.`,
           autoFixed: false,
-          details: "Supported types: PDF, JPG, PNG, DOCX, PPTX",
+          details: "Supported types: PDF, AI, EPS, JPG, PNG, DOCX, PPTX",
         },
       ];
     }
