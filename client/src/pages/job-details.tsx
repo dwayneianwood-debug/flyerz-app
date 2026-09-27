@@ -35,6 +35,7 @@ import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-pane
 import { BleedSizeControl } from "@/components/bleed-size-control";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
 import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
+import { precompilePollDelayMs } from "@/lib/poll-backoff";
 import { normalizeBleedMm } from "@shared/bleed-size";
 import {
   type ColourBorderChoice,
@@ -510,9 +511,22 @@ export default function JobDetails() {
         }
       } catch {}
     };
-    poll();
-    const interval = setInterval(poll, 2000);
-    return () => { cancelled = true; clearInterval(interval); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      await poll();
+      if (cancelled) return;
+      const delay = precompilePollDelayMs(
+        compilingCountRef.current > 0 ? "compiling" : "none",
+        compilingCountRef.current > 0 ? compilingCountRef.current : noneCountRef.current,
+      );
+      if (delay === false) return;
+      timer = setTimeout(() => { void tick(); }, delay);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [job?.id, job?.status, selectedBleedMethod]);
 
   useEffect(() => {

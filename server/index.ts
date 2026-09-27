@@ -2,6 +2,7 @@ import "./loadEnv";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
+import { compressResponses } from "./httpCompression";
 import { createServer } from "http";
 import os from "os";
 import path from "path";
@@ -90,6 +91,8 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+app.use(compressResponses);
 
 /** Prefer office LAN IPs over VPN/tunnel adapters when printing the team share link. */
 function flyerzFirstNonInternalIpv4(): string | null {

@@ -21,6 +21,7 @@
     "test:load-env": "tsx --test server/loadEnv.test.ts",
     "test:tidy-ups": "tsx --test server/tidyUps.test.ts client/src/lib/home-wizard-steps.test.ts client/src/lib/glitchy-placement.test.ts",
     "test:press-bleed": "tsx --test client/src/lib/bleed-preview-request.test.ts && python3 server/press_bleed_check.py",
+    "test:speed": "tsx --test server/jobList.test.ts",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

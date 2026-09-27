@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -16,7 +16,10 @@ export const fileJobs = sqliteTable("file_jobs", {
   // SQLite has no native JSONB; store JSON as text via Drizzle's JSON mode.
   auditResults: text("audit_results", { mode: "json" }).$type<Record<string, any> | null>(),
   errorMessage: text("error_message"),
-});
+}, (table) => [
+  index("idx_file_jobs_uploaded_at").on(table.uploadedAt),
+  index("idx_file_jobs_status_uploaded_at").on(table.status, table.uploadedAt),
+]);
 
 // === BASE SCHEMAS ===
 export const insertFileJobSchema = createInsertSchema(fileJobs).omit({ 
@@ -245,7 +248,29 @@ export interface FileJobResponse extends Omit<FileJob, 'auditResults'> {
   auditResults: AuditResults | null;
 }
 
-export type FileJobsListResponse = FileJobResponse[];
+/** Home-page row. Audit JSON stays on the single-job route. */
+export interface JobListItem {
+  id: number;
+  filename: string;
+  status: JobStatus;
+  uploadedAt: string;
+  fileSize: number;
+  fileType: string;
+  thumbnailUrl: string | null;
+  overallPassed: boolean | null;
+  hasCorrectedFile: boolean;
+  printReady: boolean;
+}
+
+export interface JobListPage {
+  jobs: JobListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export type FileJobsListResponse = JobListPage;
 
 // Bleed adjustment options
 export interface BleedOptions {

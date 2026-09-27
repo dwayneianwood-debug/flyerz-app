@@ -2,6 +2,7 @@ import { useCallback, useState, useEffect, useMemo, useRef } from "react";
 import { useDropzone } from "react-dropzone";
 import { UploadCloud, File, AlertCircle, Loader2, Settings2, ChevronDown, ChevronUp, Palette, Scissors, Layers, Grid3X3, Maximize2, Printer, Eye, Shield, BookOpen, Target, Move, Crosshair, Ruler, RectangleVertical, RectangleHorizontal, ImageIcon, X, CheckCircle2, XCircle, Clock, Crop } from "lucide-react";
 import { useUploadJob } from "@/hooks/use-jobs";
+import { batchPollIntervalMs } from "@/lib/poll-backoff";
 import { useLocation } from "wouter";
 import { Card } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -656,12 +657,13 @@ export function FileUpload() {
         toast({ title: "Batch uploaded", description: `${jobIds.length} files are being analyzed...` });
 
         if (batchPollRef.current) clearInterval(batchPollRef.current);
-        batchPollRef.current = setInterval(async () => {
+        let batchTicks = 0;
+        const watchBatch = async () => {
           let allDone = true;
           const updated: BatchJob[] = [];
           for (let i = 0; i < jobIds.length; i++) {
             try {
-              const jr = await fetch(`/api/jobs/${jobIds[i]}`);
+              const jr = await fetch(`/api/jobs/${jobIds[i]}/status`);
               const jd = await jr.json();
               const st = jd.status === 'complete' ? 'complete' as const : jd.status === 'failed' ? 'failed' as const : 'processing' as const;
               if (st === 'processing') allDone = false;
@@ -677,8 +679,12 @@ export function FileUpload() {
             batchPollRef.current = null;
             setBatchProcessing(false);
             toast({ title: "Batch complete", description: "All files have been processed." });
+            return;
           }
-        }, 3000);
+          batchTicks += 1;
+          batchPollRef.current = setTimeout(watchBatch, batchPollIntervalMs(batchTicks)) as unknown as ReturnType<typeof setInterval>;
+        };
+        batchPollRef.current = setTimeout(watchBatch, batchPollIntervalMs(0)) as unknown as ReturnType<typeof setInterval>;
       } catch (error) {
         setBatchProcessing(false);
         toast({ title: "Batch upload failed", description: error instanceof Error ? error.message : "Unknown error", variant: "destructive" });

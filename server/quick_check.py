@@ -64,23 +64,67 @@ def _px_to_mm(px_val, dpi):
     return round(px_val * 25.4 / dpi, 2)
 
 
+def _dpi_from_pil(img):
+    try:
+        dpi_info = img.info.get("dpi")
+        if dpi_info:
+            return float(max(dpi_info))
+        exif_data = img._getexif() if hasattr(img, '_getexif') and img._getexif() else {}
+        if exif_data:
+            x_res = exif_data.get(282)
+            if x_res:
+                if hasattr(x_res, 'numerator'):
+                    return float(x_res.numerator / x_res.denominator)
+                return float(x_res)
+    except Exception:
+        pass
+    return 72.0
+
+
 def detect_dpi_from_image(img_path):
     try:
         from PIL import Image
         with Image.open(img_path) as img:
-            dpi_info = img.info.get("dpi")
-            if dpi_info:
-                return float(max(dpi_info))
-            exif_data = img._getexif() if hasattr(img, '_getexif') and img._getexif() else {}
-            if exif_data:
-                x_res = exif_data.get(282)
-                if x_res:
-                    if hasattr(x_res, 'numerator'):
-                        return float(x_res.numerator / x_res.denominator)
-                    return float(x_res)
+            return _dpi_from_pil(img)
     except Exception:
         pass
     return 72.0
+
+
+def _alpha_issue_from_pil(img):
+    """Same wording as the transparency check, from an image that is already open."""
+    if img.mode not in ("RGBA", "LA", "PA"):
+        return ""
+    alpha = np.array(img.split()[-1])
+    if not np.any(alpha < 255):
+        return ""
+    non_opaque = int(np.sum(alpha < 255))
+    total = alpha.size
+    pct = round(non_opaque / total * 100, 1)
+    return f"Image has alpha channel with {pct}% semi-transparent pixels"
+
+
+def _write_list_thumb(img_bgr):
+    dest = os.environ.get("FLYERZ_THUMB_PATH", "").strip()
+    if not dest or img_bgr is None:
+        return
+    try:
+        height, width = img_bgr.shape[:2]
+        longest = max(height, width, 1)
+        thumb = img_bgr
+        if longest > 320:
+            scale = 320.0 / float(longest)
+            thumb = cv2.resize(
+                img_bgr,
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        folder = os.path.dirname(dest)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        cv2.imwrite(dest, thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+    except Exception as exc:
+        sys.stderr.write(f"[FAI] Thumbnail skipped: {exc}\n")
 
 
 def detect_artwork_size(doc, img_bgr, dpi, file_type):
@@ -297,7 +341,7 @@ def check_bleed(doc, img_bgr, dpi, file_type):
     return result
 
 
-def check_cmyk(doc, file_type, input_path):
+def check_cmyk(doc, file_type, input_path, image_mode=None):
     """Check if artwork is in CMYK color space."""
     result = {
         "id": "cmyk",
@@ -357,23 +401,25 @@ def check_cmyk(doc, file_type, input_path):
             result["details"] = "No explicit color space declarations found. Run through CMYK conversion to ensure print fidelity."
     else:
         try:
-            from PIL import Image
-            with Image.open(input_path) as img:
-                mode = img.mode
-                if mode == "CMYK":
-                    result["passed"] = True
-                    result["message"] = "Image is in CMYK color space — print ready"
-                    result["severity"] = "PASS"
-                else:
-                    result["message"] = f"Image is in {mode} color space — must convert to CMYK for litho printing"
-                    result["details"] = f"Current mode: {mode}. CMYK conversion required for accurate litho color reproduction."
+            mode = image_mode
+            if not mode:
+                from PIL import Image
+                with Image.open(input_path) as img:
+                    mode = img.mode
+            if mode == "CMYK":
+                result["passed"] = True
+                result["message"] = "Image is in CMYK color space — print ready"
+                result["severity"] = "PASS"
+            else:
+                result["message"] = f"Image is in {mode} color space — must convert to CMYK for litho printing"
+                result["details"] = f"Current mode: {mode}. CMYK conversion required for accurate litho color reproduction."
         except Exception as e:
             result["message"] = f"Could not determine color space: {str(e)}"
 
     return result
 
 
-def check_transparency(doc, file_type, input_path):
+def check_transparency(doc, file_type, input_path, alpha_issue=None):
     """Check for transparency, lenses, and drop shadows."""
     result = {
         "id": "transparency",
@@ -415,18 +461,18 @@ def check_transparency(doc, file_type, input_path):
                 except Exception:
                     pass
     else:
-        try:
-            from PIL import Image
-            with Image.open(input_path) as img:
-                if img.mode in ("RGBA", "LA", "PA"):
-                    alpha = np.array(img.split()[-1])
-                    if np.any(alpha < 255):
-                        non_opaque = np.sum(alpha < 255)
-                        total = alpha.size
-                        pct = round(non_opaque / total * 100, 1)
-                        issues.append(f"Image has alpha channel with {pct}% semi-transparent pixels")
-        except Exception:
-            pass
+        if alpha_issue is not None:
+            if alpha_issue:
+                issues.append(alpha_issue)
+        else:
+            try:
+                from PIL import Image
+                with Image.open(input_path) as img:
+                    issue = _alpha_issue_from_pil(img)
+                    if issue:
+                        issues.append(issue)
+            except Exception:
+                pass
 
     if issues:
         result["passed"] = False
@@ -465,7 +511,7 @@ def _raster_pixel_size(input_path, img_bgr):
         return width, height
 
 
-def check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm=None, target_h_mm=None):
+def check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm=None, target_h_mm=None, raster=None):
     """Check if artwork is 300 DPI or higher.
 
     Raster files are judged against the print size the customer chose.
@@ -503,8 +549,12 @@ def check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm=None,
             for sample in samples
         )
     else:
-        metadata_dpi = detect_dpi_from_image(input_path)
-        orig_w, orig_h = _raster_pixel_size(input_path, img_bgr)
+        if raster:
+            metadata_dpi = float(raster["dpi"])
+            orig_w, orig_h = int(raster["width"]), int(raster["height"])
+        else:
+            metadata_dpi = detect_dpi_from_image(input_path)
+            orig_w, orig_h = _raster_pixel_size(input_path, img_bgr)
         trim = _chosen_trim_mm(target_w_mm, target_h_mm)
         if trim:
             trim_w, trim_h = trim
@@ -703,6 +753,9 @@ def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
     doc = None
     img_bgr = None
     dpi = 300.0
+    image_mode = None
+    alpha_issue = None
+    raster_meta = None
 
     try:
         if _pdf_like(file_type):
@@ -726,8 +779,11 @@ def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
         else:
             from PIL import Image as PILImage
             with PILImage.open(input_path) as pil_img:
-                orig_dpi = detect_dpi_from_image(input_path)
+                orig_dpi = _dpi_from_pil(pil_img)
                 w, h = pil_img.size
+                image_mode = pil_img.mode
+                raster_meta = {"dpi": orig_dpi, "width": w, "height": h}
+                alpha_issue = _alpha_issue_from_pil(pil_img)
                 if max(w, h) > PROXY_MAX_PX:
                     pil_img.thumbnail((PROXY_MAX_PX, PROXY_MAX_PX), PILImage.LANCZOS)
                     scale = pil_img.size[0] / w
@@ -747,11 +803,12 @@ def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
 
         checks = [
             check_bleed(doc, img_bgr, dpi, file_type),
-            check_cmyk(doc, file_type, input_path),
-            check_transparency(doc, file_type, input_path),
-            check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm, target_h_mm),
+            check_cmyk(doc, file_type, input_path, image_mode),
+            check_transparency(doc, file_type, input_path, alpha_issue),
+            check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm, target_h_mm, raster_meta),
             check_print_readiness(doc, img_bgr, dpi, file_type, input_path),
         ]
+        _write_list_thumb(img_bgr)
 
         page_count = len(doc) if doc is not None else 1
         if _illustrator_source(file_type) and doc is not None:

@@ -6,9 +6,11 @@ import { Link } from "wouter";
 import { StatusBadge } from "./status-badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { motion } from "framer-motion";
+import { Button } from "@/components/ui/button";
 
 export function JobList() {
-  const { data: jobs, isLoading, error } = useJobs();
+  const { data, isLoading, error, hasNextPage, fetchNextPage, isFetchingNextPage } = useJobs();
+  const jobs = data?.pages.flatMap((page) => page.jobs) ?? [];
 
   if (isLoading) {
     return (
@@ -48,12 +50,16 @@ export function JobList() {
             key={job.id}
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: idx * 0.05 }}
+            transition={{ delay: Math.min(idx, 6) * 0.04 }}
           >
             <Link href={`/job/${job.id}`}>
               <Card className="flex items-center p-4 hover-elevate cursor-pointer border-border/50 group transition-colors hover:border-border">
-                <div className="bg-primary/5 p-3 rounded-lg text-primary mr-4 group-hover:bg-primary/10 transition-colors">
-                  <FileText className="w-6 h-6" />
+                <div className="bg-primary/5 p-3 rounded-lg text-primary mr-4 group-hover:bg-primary/10 transition-colors overflow-hidden">
+                  {job.thumbnailUrl ? (
+                    <img src={job.thumbnailUrl} alt="" className="w-6 h-6 object-cover rounded" data-testid={`img-job-thumb-${job.id}`} />
+                  ) : (
+                    <FileText className="w-6 h-6" />
+                  )}
                 </div>
                 
                 <div className="flex-1 min-w-0">
@@ -71,7 +77,7 @@ export function JobList() {
                 </div>
 
                 <div className="flex items-center gap-4 ml-4 shrink-0">
-                  <StatusBadge status={job.status as any} overallPassed={job.auditResults?.overallPassed ?? null} />
+                  <StatusBadge status={job.status as any} overallPassed={job.overallPassed} />
                   <ChevronRight className="w-5 h-5 text-muted-foreground group-hover:text-foreground transition-colors" />
                 </div>
               </Card>
@@ -79,6 +85,18 @@ export function JobList() {
           </motion.div>
         ))}
       </div>
+      {hasNextPage && (
+        <div className="flex justify-center pt-2">
+          <Button
+            variant="outline"
+            disabled={isFetchingNextPage}
+            onClick={() => void fetchNextPage()}
+            data-testid="button-load-more-jobs"
+          >
+            {isFetchingNextPage ? "Loading..." : "Load more"}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

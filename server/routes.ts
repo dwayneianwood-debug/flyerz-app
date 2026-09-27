@@ -476,16 +476,19 @@ function execQuickCheck(
   filePath: string,
   fileType: string,
   trimMm?: { width: number; height: number },
+  thumbPath?: string,
 ): any {
   const resultFile = path.join(os.tmpdir(), `qc_${crypto.randomBytes(8).toString("hex")}.json`);
   const args = [scriptPath, filePath, fileType, resultFile];
   if (trimMm && trimMm.width > 0 && trimMm.height > 0) {
     args.push(String(trimMm.width), String(trimMm.height));
   }
+  const env = pythonChildEnv();
+  if (thumbPath) env.FLYERZ_THUMB_PATH = thumbPath;
 
   const proc = spawnSync(PYTHON_BIN, args, {
     cwd: process.cwd(),
-    env: pythonChildEnv(),
+    env,
     encoding: "utf8",
     timeout: EXEC_TIMEOUT_MS,
     maxBuffer: 50 * 1024 * 1024,
@@ -657,11 +660,12 @@ const upload = multer({
 });
 
 async function ensureUploadDir() {
-  try {
-    await fs.access(uploadDir);
-  } catch {
-    await fs.mkdir(uploadDir, { recursive: true });
-  }
+  await fs.mkdir(uploadDir, { recursive: true });
+  await fs.mkdir(path.join(uploadDir, "thumbs"), { recursive: true });
+}
+
+function thumbnailFile(jobId: number): string {
+  return path.join(uploadDir, "thumbs", `${jobId}.jpg`);
 }
 
 function normalizedUploadType(originalName: string): string {
@@ -699,11 +703,28 @@ export async function registerRoutes(
 
   startJanitor(60 * 60 * 1000);
 
-  // Get all jobs
+  // Recent jobs only. Full audit JSON stays on GET /api/jobs/:id.
   app.get(api.jobs.list.path, async (req, res) => {
     try {
-      const jobs = await storage.getJobs();
-      res.json(jobs);
+      const limitRaw = Number(req.query.limit);
+      const offsetRaw = Number(req.query.offset);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(100, Math.floor(limitRaw)) : 50;
+      const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.floor(offsetRaw) : 0;
+      const statusRaw = typeof req.query.status === "string" ? req.query.status : "";
+      const allowed = new Set(["pending", "processing", "complete", "failed"]);
+      const status = allowed.has(statusRaw) ? statusRaw : undefined;
+      const page = await storage.listJobs({ limit, offset, status });
+      const jobs = await Promise.all(page.jobs.map(async (job) => {
+        let thumbnailUrl: string | null = null;
+        try {
+          await fs.access(thumbnailFile(job.id));
+          thumbnailUrl = `/api/jobs/${job.id}/thumbnail`;
+        } catch {
+          thumbnailUrl = null;
+        }
+        return { ...job, thumbnailUrl };
+      }));
+      res.json({ ...page, jobs });
     } catch (error) {
       console.error('Error fetching jobs:', error);
       res.status(500).json({ message: 'Failed to fetch jobs' });
@@ -719,6 +740,30 @@ export async function registerRoutes(
     const jobId = Number(req.params.id);
     const position = getJobQueuePosition(jobId);
     res.json({ jobId, position, queued: position !== null });
+  });
+
+  app.get('/api/jobs/:id/status', async (req, res) => {
+    try {
+      const row = await storage.getJobStatus(Number(req.params.id));
+      if (!row) return res.status(404).json({ message: 'Job not found' });
+      res.json(row);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch job status' });
+    }
+  });
+
+  app.get('/api/jobs/:id/thumbnail', async (req, res) => {
+    const jobId = Number(req.params.id);
+    if (!Number.isFinite(jobId) || jobId <= 0) return res.status(404).end();
+    const filePath = thumbnailFile(jobId);
+    try {
+      await fs.access(filePath);
+    } catch {
+      return res.status(404).end();
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    fsSync.createReadStream(filePath).pipe(res);
   });
 
   // Get single job
@@ -797,6 +842,7 @@ export async function registerRoutes(
             file.path,
             normalizedType,
             customerTrim,
+            thumbnailFile(job.id),
           );
         }
       } catch (qcError: any) {
@@ -2792,9 +2838,7 @@ export async function registerRoutes(
         const zipPath = path.join(uploadDir, `flyerz_precompile_${jobId}.zip`);
         try {
           await fs.access(zipPath);
-          const recoveryJob = await storage.getJob(jobId);
-          const recoveryAudit = recoveryJob?.auditResults as AuditResults | null;
-          const compiledStrat = recoveryAudit?.compiledStrategy;
+          const compiledStrat = await storage.getCompiledStrategy(jobId);
           if (!compiledStrat || (requestedStrategy && compiledStrat !== requestedStrategy)) {
             console.log(`[FAI] precompile-status cache-miss recovery: ZIP exists but compiledStrategy="${compiledStrat || 'MISSING'}" vs requested="${requestedStrategy}" — rejecting unknown/stale ZIP`);
             try { await fs.unlink(zipPath); } catch {}
@@ -3831,10 +3875,17 @@ print(f'{w},{h}')
     }
   });
 
+  const glitchyChecklistCache = new Map<string, { checks: { label: string; pass: boolean }[] }>();
+
   app.get('/api/glitchy-checklist/:jobId', async (req, res) => {
     try {
       const jobId = parseInt(req.params.jobId);
       if (isNaN(jobId)) return res.json({ checks: [] });
+      const stamp = await storage.getJobAuditStamp(jobId);
+      if (!stamp || stamp.bytes === 0) return res.json({ checks: [] });
+      const cacheKey = `${jobId}:${stamp.status}:${stamp.bytes}`;
+      const cached = glitchyChecklistCache.get(cacheKey);
+      if (cached) return res.json(cached);
       const job = await storage.getJob(jobId);
       if (!job || !job.auditResults) return res.json({ checks: [] });
 
@@ -3860,7 +3911,13 @@ print(f'{w},{h}')
         }
       }
 
-      res.json({ checks });
+      const body = { checks };
+      glitchyChecklistCache.set(cacheKey, body);
+      if (glitchyChecklistCache.size > 200) {
+        const oldest = glitchyChecklistCache.keys().next().value;
+        if (oldest) glitchyChecklistCache.delete(oldest);
+      }
+      res.json(body);
     } catch {
       res.json({ checks: [] });
     }
@@ -4126,8 +4183,8 @@ print(f'{w},{h}')
   });
 
   async function seedDatabase() {
-    const existingJobs = await storage.getJobs();
-    if (existingJobs.length === 0) {
+    const existingJobs = await storage.countJobs();
+    if (existingJobs === 0) {
       console.log('Seeding database with example jobs...');
     }
   }

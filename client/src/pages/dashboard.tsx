@@ -1,5 +1,6 @@
 import { Layout } from "@/components/layout";
 import { FileUpload } from "@/components/file-upload";
+import { JobList } from "@/components/job-list";
 import { HOME_WIZARD_STEPS } from "@/lib/home-wizard-steps";
 import { motion } from "framer-motion";
 import { Crop, Ruler, Upload } from "lucide-react";
@@ -61,6 +62,7 @@ export default function Dashboard() {
 
         <div className="space-y-6">
           <FileUpload />
+          <JobList />
         </div>
       </motion.div>
     </Layout>

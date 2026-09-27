@@ -1,7 +1,8 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, buildUrl } from "@shared/routes";
-import type { FileJobResponse, FileUploadResponse, BleedOptions } from "@shared/schema";
+import type { FileJobResponse, FileUploadResponse, BleedOptions, JobListPage } from "@shared/schema";
 import { extractSafeZoneLayoutMessage } from "@/lib/safe-zone-error";
+import { jobPollIntervalMs } from "@/lib/poll-backoff";
 
 function errorMessageFromResponseBody(body: unknown, fallback: string): string {
   if (body == null) return fallback;
@@ -54,16 +55,20 @@ async function handleResponse<T>(res: Response): Promise<T> {
 }
 
 export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "failed") {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ["jobs", statusFilter],
-    queryFn: async () => {
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
       const url = new URL(api.jobs.list.path, window.location.origin);
+      url.searchParams.set("limit", "50");
+      url.searchParams.set("offset", String(pageParam));
       if (statusFilter) {
         url.searchParams.append("status", statusFilter);
       }
       const res = await fetch(url.toString(), { credentials: "include" });
-      return handleResponse<FileJobResponse[]>(res);
+      return handleResponse<JobListPage>(res);
     },
+    getNextPageParam: (last) => (last.hasMore ? last.offset + last.jobs.length : undefined),
   });
 }
 
@@ -75,14 +80,7 @@ export function useJob(id: number) {
       const res = await fetch(url, { credentials: "include" });
       return handleResponse<FileJobResponse>(res);
     },
-    // Poll every 2 seconds if the job is still processing or pending
-    refetchInterval: (query) => {
-      const status = query.state?.data?.status;
-      if (status === "pending" || status === "processing" || (status as string) === "queued") {
-        return 2000;
-      }
-      return false;
-    },
+    refetchInterval: (query) => jobPollIntervalMs(query.state?.data?.status, query.state.dataUpdateCount),
   });
 }
 
