@@ -12,3 +12,22 @@ export function pressReadyHeadline(engine: { passed?: boolean; status?: string }
   if (engine?.status === "needs-attention") return "Needs attention";
   return AUTOMATIC_BLEED_LABEL;
 }
+
+/** The dropdown already says Automatic, so the first visit must still build the press file. */
+export function shouldStartAutomaticCompile(input: {
+  status?: string;
+  selected?: string;
+  alreadyStarted?: boolean;
+  hasVariants?: boolean;
+  canAssess?: boolean;
+  artworkGateReady?: boolean;
+  pressStatus?: string;
+}): boolean {
+  if (input.alreadyStarted) return false;
+  if (input.status !== "complete") return false;
+  if ((input.selected || AUTOMATIC_BLEED_ID) !== AUTOMATIC_BLEED_ID) return false;
+  if (input.hasVariants) return false;
+  if (input.canAssess && !input.artworkGateReady) return false;
+  if (input.pressStatus === "ready" || input.pressStatus === "needs-attention") return false;
+  return true;
+}

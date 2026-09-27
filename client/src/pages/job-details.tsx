@@ -33,7 +33,7 @@ import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
-import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline } from "@/lib/press-ready-ui";
+import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline, shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
 import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
 import { precompilePollDelayMs } from "@/lib/poll-backoff";
@@ -424,15 +424,21 @@ export default function JobDetails() {
   const autoSelectTriggeredRef = useRef(false);
   const layoutGlitchyDispatchedForJobRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!job || job.status !== "complete" || autoSelectTriggeredRef.current) return;
-    if (selectedBleedMethod !== "auto") return;
-    const variants = job.auditResults?.bleedVariants;
-    const hasVariants = variants && Object.keys(variants).length > 0;
-    if (hasVariants) return;
-    const canAssessArtwork = !!(job.auditResults && (job.correctedPath || job.originalPath));
-    if (canAssessArtwork && !aiArtworkGate.ready) return;
+    const variants = job?.auditResults?.bleedVariants;
+    const hasVariants = !!(variants && Object.keys(variants).length > 0);
+    const canAssessArtwork = !!(job?.auditResults && (job.correctedPath || job.originalPath));
+    if (!shouldStartAutomaticCompile({
+      status: job?.status,
+      selected: selectedBleedMethod,
+      alreadyStarted: autoSelectTriggeredRef.current,
+      hasVariants,
+      canAssess: canAssessArtwork,
+      artworkGateReady: aiArtworkGate.ready,
+      pressStatus: job?.auditResults?.pressEngine?.status,
+    })) return;
     autoSelectTriggeredRef.current = true;
-    handleBleedMethodSelect("auto");
+    // Automatic is already the selected value, so this must force the first compile.
+    handleBleedMethodSelect("auto", true);
   }, [job?.id, job?.status, job?.auditResults?.bleedVariants, job?.correctedPath, job?.originalPath, selectedBleedMethod, aiArtworkGate]);
 
   const noneCountRef = useRef(0);
