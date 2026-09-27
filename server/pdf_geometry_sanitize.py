@@ -10,11 +10,21 @@ import sys
 import fitz  # PyMuPDF
 
 
+def _box_inside(rect: "fitz.Rect", media: "fitz.Rect") -> bool:
+    try:
+        if rect.width < 0.05 or rect.height < 0.05:
+            return False
+        return media.contains(rect)
+    except Exception:
+        return False
+
+
 def aggressive_sanitize_open_document_boxes(doc: "fitz.Document") -> None:
     """
     Call immediately after fitz.open(...) before get_pixmap / transforms.
-    Forces CropBox inside MediaBox and sets BleedBox/TrimBox to match CropBox so PyMuPDF
-    does not raise \"CropBox not in MediaBox\" during raster strategies (e.g. stretch).
+    Pulls an invalid CropBox back inside the MediaBox so PyMuPDF does not raise
+    "CropBox not in MediaBox". A valid TrimBox is kept: that inset is the
+    existing bleed, and replacing it with the CropBox would add bleed twice.
     Write order: mediabox → cropbox → bleedbox → trimbox.
     """
     for i in range(doc.page_count):
@@ -27,22 +37,36 @@ def aggressive_sanitize_open_document_boxes(doc: "fitz.Document") -> None:
             cr = fitz.Rect(page.cropbox)
         except Exception:
             cr = fitz.Rect(mb)
-        try:
-            if not mb.contains(cr):
-                cr = fitz.Rect(mb)
-                sys.stderr.write(
-                    f"[GEOM-SANITIZE] Page {i + 1}: CropBox not in MediaBox — aligned Crop/Bleed/Trim to MediaBox "
-                    f"({mb.width:.2f}x{mb.height:.2f} pt).\n"
-                )
-        except Exception:
+        if not _box_inside(cr, mb):
             cr = fitz.Rect(mb)
+            sys.stderr.write(
+                f"[GEOM-SANITIZE] Page {i + 1}: CropBox not in MediaBox — CropBox set to MediaBox "
+                f"({mb.width:.2f}x{mb.height:.2f} pt).\n"
+            )
+        try:
+            tb = fitz.Rect(page.trimbox)
+        except Exception:
+            tb = fitz.Rect(cr)
+        if not _box_inside(tb, mb):
+            tb = fitz.Rect(cr)
+        try:
+            bb = fitz.Rect(page.bleedbox)
+        except Exception:
+            bb = fitz.Rect(cr)
+        if not _box_inside(bb, mb):
+            bb = fitz.Rect(cr)
+        # Trim must sit inside Bleed, and Bleed inside Crop, or some readers reject the file.
+        if not _box_inside(tb, bb):
+            bb = fitz.Rect(cr)
+        if not _box_inside(tb, bb):
+            tb = fitz.Rect(cr)
         try:
             page.set_mediabox(mb)
             page.set_cropbox(cr)
-            page.set_bleedbox(cr)
-            page.set_trimbox(cr)
+            page.set_bleedbox(bb)
+            page.set_trimbox(tb)
         except Exception as ex:
-            sys.stderr.write(f"[GEOM-SANITIZE] Page {i + 1}: aggressive box reset failed (non-fatal): {ex}\n")
+            sys.stderr.write(f"[GEOM-SANITIZE] Page {i + 1}: box repair failed (non-fatal): {ex}\n")
 
 
 def _pdf_rect_fully_inside_mediabox(r: "fitz.Rect", mb: "fitz.Rect", tol: float = 0.05) -> bool:
