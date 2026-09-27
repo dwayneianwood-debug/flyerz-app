@@ -1250,6 +1250,7 @@ def _set_pdf_metadata_boxes(pdf_path, trim_w_mm, trim_h_mm, bleed_mm=5.0):
 
 
 def main():
+    global PRESS_DEFAULT_BLEED_MM
     parser = argparse.ArgumentParser(description="Compile Press-Ready PDF")
     parser.add_argument("--input", required=True, help="Path to corrected artwork")
     parser.add_argument("--output", required=True, help="Output press-ready PDF path")
@@ -1257,6 +1258,7 @@ def main():
     parser.add_argument("--color-space", default="cmyk", help="Target color space (cmyk or rgb)")
     parser.add_argument("--trim-w", type=float, default=148, help="Trim width in mm")
     parser.add_argument("--trim-h", type=float, default=210, help="Trim height in mm")
+    parser.add_argument("--bleed-mm", type=float, default=PRESS_DEFAULT_BLEED_MM, help="Bleed on each side in mm")
     parser.add_argument("--status-file", required=True, help="Path to status JSON file")
     parser.add_argument("--result-file", required=True, help="Path to result JSON file")
     parser.add_argument("--variant-path", default="", help="Path to selected variant file (if any)")
@@ -1300,6 +1302,10 @@ def main():
 
     try:
         _prof_compile_t0 = time.time()
+        from bleed_size import clamp_bleed_mm
+        PRESS_DEFAULT_BLEED_MM = clamp_bleed_mm(args.bleed_mm)
+        import smart_bleed as _sb_bleed
+        _sb_bleed.BLEED_TARGET_MM = PRESS_DEFAULT_BLEED_MM
         _clear_press_pipeline_caches()
         _mt = press_target_media_rect(args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
         sys.stderr.write(
@@ -1562,6 +1568,8 @@ def main():
             _shape.draw_line(fitz.Point(_x1 - mark_len, bleed_y + trim_h_pt), fitz.Point(_x1, bleed_y + trim_h_pt))
             _shape.finish(color=(0, 0, 0), width=0.25)
             _shape.commit()
+            trim_rect = fitz.Rect(bleed_x, bleed_y, bleed_x + trim_w_pt, bleed_y + trim_h_pt)
+            apply_strict_page_boxes_fitz(_pkg_page, target_rect, target_rect, target_rect, trim_rect)
 
             _pdf_ram = io.BytesIO()
             _pkg_doc.save(_pdf_ram, deflate=True, garbage=4)
@@ -1861,7 +1869,7 @@ def main():
                     sys.stderr.write(f"PROFILE: [COMPILE] PyMuPDF Save took {(time.time() - _prof_save_t0)*1000:.1f}ms\n")
         
                     _prof_trim_t0 = time.time()
-                    _add_trim_marks_to_pdf(bleed_pdf_tmp, args.trim_w, args.trim_h)
+                    _add_trim_marks_to_pdf(bleed_pdf_tmp, args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
                     sys.stderr.write(f"PROFILE: [COMPILE] Trim Marks took {(time.time() - _prof_trim_t0)*1000:.1f}ms\n")
         
                     work_path = bleed_pdf_tmp
@@ -2543,13 +2551,16 @@ def main():
         if args.strategy == "colourBorder":
             bc, bm, by, bk = _border_cmyk_arg(args)
             geo_action = (
-                f"Generated litho-standard 5mm solid colour border ({args.border_label}, "
+                f"Generated litho-standard {PRESS_DEFAULT_BLEED_MM:g}mm solid colour border ({args.border_label}, "
                 f"C{bc:g} M{bm:g} Y{by:g} K{bk:g}) at {render_dpi} DPI. "
                 f"Artwork kept at trim size with no mirror or stretch. "
                 f"TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
             )
         else:
-            geo_action = f"Generated litho-standard 5mm bleed using {strategy_label} strategy at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm) and BleedBox set on all {page_count} page(s)."
+            geo_action = (
+                f"Generated litho-standard {PRESS_DEFAULT_BLEED_MM:g}mm bleed using {strategy_label} strategy "
+                f"at {render_dpi} DPI. TrimBox ({args.trim_w}x{args.trim_h}mm), BleedBox and MediaBox set on all {page_count} page(s)."
+            )
 
         if compile_stats["lenses_flattened"]:
             res_action = f"Flattened complex live transparencies (lenses) and locked resolution to {render_dpi} DPI."

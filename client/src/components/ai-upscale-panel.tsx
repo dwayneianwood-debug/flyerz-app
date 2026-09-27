@@ -177,13 +177,14 @@ interface AiUpscalePanelProps {
   jobId: number;
   trimWidthMm: number;
   trimHeightMm: number;
+  bleedMm?: number;
   onApplied?: () => void;
   /** When AI artwork is under 300 DPI, turn enhancement on and accept it. The switch still works. */
   autoStart?: boolean;
   onEnhanceChoice?: (accepted: boolean) => void;
 }
 
-export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied, autoStart = false, onEnhanceChoice }: AiUpscalePanelProps) {
+export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, bleedMm = 5, onApplied, autoStart = false, onEnhanceChoice }: AiUpscalePanelProps) {
   const [enabled, setEnabled] = useState(false);
   const [phase, setPhase] = useState<AiUpscalePhase>("idle");
   const [assess, setAssess] = useState<AiUpscaleAssess | null>(null);
@@ -197,7 +198,7 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied, au
 
   useEffect(() => {
     let cancel = false;
-    const url = `/api/jobs/${jobId}/ai-upscale/assess?trimW=${encodeURIComponent(String(trimWidthMm))}&trimH=${encodeURIComponent(String(trimHeightMm))}`;
+    const url = `/api/jobs/${jobId}/ai-upscale/assess?trimW=${encodeURIComponent(String(trimWidthMm))}&trimH=${encodeURIComponent(String(trimHeightMm))}&bleed=${encodeURIComponent(String(bleedMm))}`;
     fetch(url)
       .then((response) => response.json())
       .then((data) => {
@@ -229,7 +230,7 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied, au
     return () => {
       cancel = true;
     };
-  }, [jobId, trimWidthMm, trimHeightMm]);
+  }, [jobId, trimWidthMm, trimHeightMm, bleedMm]);
 
   const saveDecision = async (accepted: boolean) => {
     await fetch(`/api/jobs/${jobId}/ai-upscale/decision`, {
@@ -259,7 +260,7 @@ export function AiUpscalePanel({ jobId, trimWidthMm, trimHeightMm, onApplied, au
       const response = await fetch(`/api/jobs/${jobId}/ai-upscale/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trimW: trimWidthMm, trimH: trimHeightMm }),
+        body: JSON.stringify({ trimW: trimWidthMm, trimH: trimHeightMm, bleedMm }),
       });
       const data = await response.json();
       if (data?.used_original || !data?.beforeUrl || !data?.afterUrl) {

@@ -32,6 +32,10 @@ import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
+import { BleedSizeControl } from "@/components/bleed-size-control";
+import { CoverCropNotice } from "@/components/cover-crop-notice";
+import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
+import { normalizeBleedMm } from "@shared/bleed-size";
 import {
   type ColourBorderChoice,
   cmykToRgb,
@@ -162,6 +166,7 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [bleedMm, setBleedMm] = useState(5);
   const [autoEnhance, setAutoEnhance] = useState(false);
   const [aiArtworkGate, setAiArtworkGate] = useState<{ ready: boolean; bleed?: string }>({ ready: false });
   const [colourBorder, setColourBorder] = useState<ColourBorderChoice>(() => loadColourBorderChoice());
@@ -383,7 +388,8 @@ export default function JobDetails() {
     if (job?.auditResults?.selectedBleedMethod) {
       setSelectedBleedMethod(job.auditResults.selectedBleedMethod);
     }
-  }, [job?.auditResults?.selectedBleedMethod]);
+    setBleedMm(normalizeBleedMm((job?.auditResults as { savedBleedOptions?: { bleedMm?: unknown } } | null)?.savedBleedOptions?.bleedMm));
+  }, [job?.auditResults?.selectedBleedMethod, job?.id]);
 
   useEffect(() => {
     const ai = (job?.auditResults as any)?.aiEnhancements;
@@ -596,6 +602,7 @@ export default function JobDetails() {
           colorSpace: colorProfile,
           trimWidth: trimW,
           trimHeight: trimH,
+          bleedMm,
         },
         cropData: cropPayload,
         targetSize: { width: trimW, height: trimH },
@@ -614,109 +621,6 @@ export default function JobDetails() {
       return false;
     }
   };
-
-  const PREPRESS_OVERLAY_LABELS: Record<string, string> = {
-    tac_limit: "Ink Profile Updated",
-    trapping: "Trap Logic Applied",
-  };
-
-  const handleAiEnhancementToggle = async (enhancement: string, enabled: boolean) => {
-    if (!job || aiEnhanceLoading) return;
-
-    const setters: Record<string, (v: boolean) => void> = {
-      denoise: setAiDenoise,
-      sharpen_logos: setAiSharpenLogos,
-      spell_check: setAiSpellCheck,
-      tac_limit: setAiTacLimit,
-      trapping: setAiTrapping,
-      engagement_score: setAiEngagementScore,
-      background_remove: setAiBackgroundRemove,
-      text_reconstruct: setAiTextReconstruct,
-
-      expand_background: setAiExpandBackground,
-      identify_fonts: setAiIdentifyFonts,
-      test_design_style: setAiTestDesignStyle,
-    };
-
-    const isPrepressToggle = enhancement === "tac_limit" || enhancement === "trapping";
-
-    setters[enhancement]?.(enabled);
-    setAiEnhanceLoading(enhancement);
-
-    if (isPrepressToggle && enabled) {
-      setPrepressSpinnerActive(true);
-      setPrepressOverlay({ type: "loading", label: PREPRESS_OVERLAY_LABELS[enhancement] || enhancement });
-    }
-
-    try {
-      const res = await apiRequest("POST", `/api/jobs/${job.id}/ai-enhance`, {
-        enhancement,
-        enabled,
-        options: {},
-      });
-      const data = await res.json();
-
-      if (data.stub) {
-        setAiEnhanceMessages(prev => ({
-          ...prev,
-          [enhancement]: data.message || "Enhancement stub active — external API not yet connected.",
-        }));
-      } else {
-        setAiEnhanceMessages(prev => ({
-          ...prev,
-          [enhancement]: enabled ? "Enhancement applied." : "Reverted to original.",
-        }));
-      }
-
-      await queryClient.invalidateQueries({ queryKey: ["job", job.id] });
-      setProofRefreshKey(Date.now());
-      setComparisonRefreshKey(Date.now());
-
-      if (isPrepressToggle && enabled) {
-        const successLabel = PREPRESS_OVERLAY_LABELS[enhancement] || "Applied";
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        setPrepressOverlay({ type: "success", label: successLabel });
-        setTimeout(() => {
-          setPrepressOverlay(null);
-          setPrepressSpinnerActive(false);
-        }, 1200);
-      }
-    } catch (err: any) {
-      setters[enhancement]?.(false);
-      setPrepressOverlay(null);
-      setPrepressSpinnerActive(false);
-      toast({
-        title: "Enhancement Failed",
-        description: err.message || `Could not apply ${enhancement}`,
-        variant: "destructive",
-      });
-    } finally {
-      setAiEnhanceLoading(null);
-      setPrepressSpinnerActive(false);
-      setPrepressOverlay(null);
-    }
-  };
-
-  const PREMIUM_FEATURES: Record<string, string> = {
-    denoise: "Clean up photo grain",
-    sharpen_logos: "Sharpen blurry logos",
-    spell_check: "Check Spelling (SA Languages)",
-    background_remove: "Clean Background",
-    expand_background: "Expand Background",
-    identify_fonts: "Identify Fonts",
-    test_design_style: "Eye-Catching Score",
-  };
-
-  const handlePremiumToggle = (enhancement: string, checked: boolean) => {
-    handleAiEnhancementToggle(enhancement, checked);
-  };
-
-  const PremiumBadge = () => (
-    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded-full bg-gradient-to-r from-amber-100 to-yellow-100 dark:from-amber-500/20 dark:to-yellow-500/20 text-amber-700 dark:text-amber-300 border border-amber-300/40 dark:border-amber-500/30" data-testid="badge-premium">
-      <span>👑</span>
-      <span>Premium</span>
-    </span>
-  );
 
   const handleFastTrack = async () => {
     if (!job || fastTrackTriggered) return;
@@ -916,11 +820,11 @@ export default function JobDetails() {
 
   const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
     ? {
-        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1`,
-        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`,
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}`,
         trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
         trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
-        bleedMm: 5,
+        bleedMm,
       }
     : null;
 
@@ -994,14 +898,15 @@ export default function JobDetails() {
     }
   };
 
-  const loadBleedPreview = async (strategy?: string) => {
+  const loadBleedPreview = async (strategy?: string, bleedOverride?: number) => {
     if (!job || !job.correctedPath) return;
     setBleedPreviewLoading(true);
     setBleedPreviewError(null);
 
     try {
-      const strategyParam = strategy && strategy !== "auto" ? `?strategy=${strategy}` : "";
-      const res = await fetch(`/api/jobs/${job.id}/bleed-preview${strategyParam}`);
+      const chosen = typeof strategy === "string" ? strategy : selectedBleedMethod;
+      const query = bleedPreviewQuery(chosen, bleedOverride ?? bleedMm);
+      const res = await fetch(`/api/jobs/${job.id}/bleed-preview${query}`);
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.message || "Failed to generate bleed preview");
@@ -1410,21 +1315,6 @@ export default function JobDetails() {
                   <Eye className="w-4 h-4" />
                   Review
                 </button>
-                <button
-                  onClick={() => setReviewTab("tools")}
-                  className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-md text-sm font-semibold transition-all ${
-                    reviewTab === "tools"
-                      ? "bg-white dark:bg-background shadow-sm text-foreground"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                  data-testid="tab-tools"
-                >
-                  <Wrench className="w-4 h-4" />
-                  Tools
-                  {(aiEnhanceLoading) && (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />
-                  )}
-                </button>
               </div>
 
               {reviewTab === "review" && (<>
@@ -1615,7 +1505,30 @@ export default function JobDetails() {
                     </div>
                   )}
                   {job.auditResults && (job.correctedPath || job.originalPath) && (
-                    <div className="p-4 sm:p-5 border-b border-border/30">
+                    <div className="p-4 sm:p-5 border-b border-border/30 space-y-4">
+                      <CoverCropNotice
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                      />
+                      <BleedSizeControl
+                        value={bleedMm}
+                        disabled={bleedMethodLoading || bleedPreviewLoading}
+                        onChange={(mm) => {
+                          const next = normalizeBleedMm(mm);
+                          setBleedMm(next);
+                          void fetch(`/api/jobs/${job.id}/bleed-size`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ bleedMm: next }),
+                          }).then(() => {
+                            void loadBleedPreview(selectedBleedMethod, next);
+                            if (selectedBleedMethod !== "auto") {
+                              void handleBleedMethodSelect(selectedBleedMethod, true);
+                            }
+                          });
+                        }}
+                      />
                       <BleedMethodSelector
                         jobId={job.id}
                         variants={job.auditResults.bleedVariants ?? {}}
@@ -1634,6 +1547,7 @@ export default function JobDetails() {
                         jobId={job.id}
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        bleedMm={bleedMm}
                         autoStart={autoEnhance}
                         onEnhanceChoice={async (accepted) => {
                           setAutoEnhance(accepted);
@@ -1780,346 +1694,9 @@ export default function JobDetails() {
 
               </div>
 
-              <Collapsible open={openSections.outpaint} onOpenChange={(open) => toggleSection("outpaint", open)}>
-                <div className="mt-6 rounded-xl border-2 border-sky-500/20 bg-gradient-to-br from-sky-50/30 to-blue-50/20 dark:from-sky-500/5 dark:to-blue-500/5 overflow-hidden" data-testid="section-expand-background-bleed">
-                  <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-outpaint">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-sky-500/15 flex items-center justify-center shrink-0">
-                        <Expand className="w-4 h-4 text-sky-600 dark:text-sky-400" />
-                      </div>
-                      <div className="flex-1 text-left">
-                        <h4 className="text-sm font-bold text-foreground">AI Outpaint Bleed</h4>
-                        <p className="text-xs text-muted-foreground">Use AI to extend your design edges seamlessly.</p>
-                      </div>
-                      <PremiumBadge />
-                      <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-sky-100 dark:bg-sky-500/15 text-sky-700 dark:text-sky-300" data-testid="badge-generative-bleed">
-                        Generative
-                      </span>
-                      <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.outpaint ? 'rotate-180' : ''}`} />
-                    </div>
-                  </CollapsibleTrigger>
-                  <LazyCollapsibleContent isOpen={!!openSections.outpaint} betaMode={betaMode} resetKey={id}>
-                    <div className="flex items-center justify-between px-4 sm:px-5 py-4 border-t border-border/20">
-                      <div className="flex-1 mr-4">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-semibold text-foreground">Expand Background</span>
-                          {aiEnhanceLoading === "expand_background" && <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-500" />}
-                        </div>
-                        <p className="text-xs text-muted-foreground mt-0.5">AI outpainting extends your artwork edges to fill the bleed area naturally — no cropping or stretching needed.</p>
-                        {aiEnhanceMessages.expand_background && aiExpandBackground && (
-                          <p className="text-[11px] text-sky-600 dark:text-sky-400 mt-1 italic" data-testid="text-expand-background-status">{aiEnhanceMessages.expand_background}</p>
-                        )}
-                      </div>
-                      <Switch
-                        checked={aiExpandBackground}
-                        onCheckedChange={(checked) => handlePremiumToggle("expand_background", checked)}
-                        disabled={!!aiEnhanceLoading}
-                        data-testid="switch-expand-background"
-                      />
-                    </div>
-                  </LazyCollapsibleContent>
-                </div>
-              </Collapsible>
-
-              {(() => {
-                const lowerName = job.filename?.toLowerCase() || "";
-                const isPdfFile = isVectorArtwork(lowerName) || isVectorArtwork(job.fileType || "");
-                const vectorLabel = isIllustratorFile(lowerName) || isIllustratorFile(job.fileType || "") ? "Illustrator file" : "PDF";
-                return (
-                  <Collapsible open={openSections.prepress} onOpenChange={(open) => toggleSection("prepress", open)}>
-                  <div className="mt-6 rounded-xl border-2 border-blue-500/20 bg-gradient-to-br from-blue-50/30 to-slate-50/20 dark:from-blue-500/5 dark:to-slate-500/5 overflow-hidden" data-testid="section-prepress-refinements">
-                    <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-prepress">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-blue-500/15 flex items-center justify-center shrink-0">
-                          <Shield className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                        </div>
-                        <div className="flex-1 text-left">
-                          <h4 className="text-sm font-bold text-foreground" data-testid="text-prepress-title">Prepress Refinements</h4>
-                          <p className="text-xs text-muted-foreground">Press-specific fixes for your pixel data.</p>
-                        </div>
-                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-blue-100 dark:bg-blue-500/15 text-blue-700 dark:text-blue-300" data-testid="badge-prepress">
-                          Prepress
-                        </span>
-                        <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.prepress ? 'rotate-180' : ''}`} />
-                      </div>
-                    </CollapsibleTrigger>
-                    <LazyCollapsibleContent isOpen={!!openSections.prepress} betaMode={betaMode} resetKey={id}>
-                    <div className="divide-y divide-border/20">
-                      <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-tac-limit">
-                        <div className="flex-1 mr-4">
-                          <div className="flex items-center gap-2">
-                            <Droplets className="w-3.5 h-3.5 text-amber-500" />
-                            <span className="text-sm font-semibold text-foreground">Prevent soggy paper (Safe Ink limit)</span>
-                            {aiEnhanceLoading === "tac_limit" && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
-                          </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">Caps total ink coverage at 280% to prevent paper from getting too wet during litho printing.</p>
-                          {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
-                          )}
-                          {aiEnhanceMessages.tac_limit && aiTacLimit && (
-                            <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-tac-limit-status">{aiEnhanceMessages.tac_limit}</p>
-                          )}
-                        </div>
-                        <Switch
-                          checked={aiTacLimit}
-                          onCheckedChange={(checked) => handleAiEnhancementToggle("tac_limit", checked)}
-                          disabled={!!aiEnhanceLoading}
-                          data-testid="switch-tac-limit"
-                        />
-                      </div>
-                      <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-trapping">
-                        <div className="flex-1 mr-4">
-                          <div className="flex items-center gap-2">
-                            <Shield className="w-3.5 h-3.5 text-blue-500" />
-                            <span className="text-sm font-semibold text-foreground">Close white print gaps</span>
-                            {aiEnhanceLoading === "trapping" && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
-                          </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">Adds tiny overlap between colours so white gaps don't appear if the press is slightly off-register.</p>
-                          {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">{vectorLabel} detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
-                          )}
-                          {aiEnhanceMessages.trapping && aiTrapping && (
-                            <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-trapping-status">{aiEnhanceMessages.trapping}</p>
-                          )}
-                        </div>
-                        <Switch
-                          checked={aiTrapping}
-                          onCheckedChange={(checked) => handleAiEnhancementToggle("trapping", checked)}
-                          disabled={!!aiEnhanceLoading}
-                          data-testid="switch-trapping"
-                        />
-                      </div>
-                    </div>
-                    <div className="px-4 sm:px-5 py-3 bg-blue-50/50 dark:bg-blue-500/5 border-t border-border/20">
-                      <p className="text-[10px] text-muted-foreground text-center italic">
-                        Prepress operations modify pixel data directly using local processing. Your original artwork is preserved.
-                      </p>
-                    </div>
-                    </LazyCollapsibleContent>
-                  </div>
-                  </Collapsible>
-                );
-              })()}
 
               </>)}
 
-              {reviewTab === "tools" && (<>
-
-              <Collapsible open={openSections.aiEnhancements} onOpenChange={(open) => toggleSection("aiEnhancements", open)}>
-              <div className="rounded-xl border-2 border-violet-500/20 bg-gradient-to-br from-violet-50/30 to-purple-50/20 dark:from-violet-500/5 dark:to-purple-500/5 overflow-hidden" data-testid="section-ai-enhancements">
-                <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-ai-enhancements">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-violet-500/15 flex items-center justify-center shrink-0">
-                      <Sparkles className="w-4 h-4 text-violet-600 dark:text-violet-400" />
-                    </div>
-                    <div className="flex-1 text-left">
-                      <h3 className="text-base font-bold text-foreground" data-testid="text-ai-enhancements-title">AI Enhancements</h3>
-                      <p className="text-xs text-muted-foreground">Optional AI upgrades — your original is always preserved.</p>
-                    </div>
-                    <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-violet-100 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300" data-testid="badge-opt-in">
-                      Opt-In
-                    </span>
-                    <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.aiEnhancements ? 'rotate-180' : ''}`} />
-                  </div>
-                </CollapsibleTrigger>
-                <LazyCollapsibleContent isOpen={!!openSections.aiEnhancements} betaMode={betaMode} resetKey={id}>
-                <div className="divide-y divide-border/20">
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-denoise">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Clean up photo grain</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "denoise" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Reduce noise and grain from photos while preserving sharpness.</p>
-                      {aiEnhanceMessages.denoise && aiDenoise && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-denoise-status">{aiEnhanceMessages.denoise}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiDenoise}
-                      onCheckedChange={(checked) => handlePremiumToggle("denoise", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-denoise"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-sharpen-logos">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Sharpen blurry logos</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "sharpen_logos" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Detect and sharpen blurry logos using AI edge enhancement.</p>
-                      {aiEnhanceMessages.sharpen_logos && aiSharpenLogos && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-sharpen-status">{aiEnhanceMessages.sharpen_logos}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiSharpenLogos}
-                      onCheckedChange={(checked) => handlePremiumToggle("sharpen_logos", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-sharpen-logos"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-spell-check">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Check spelling (SA Languages)</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "spell_check" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">OCR-based spell check for English, Afrikaans, Zulu, Xhosa, and Sotho.</p>
-                      {aiEnhanceMessages.spell_check && aiSpellCheck && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-spell-check-status">{aiEnhanceMessages.spell_check}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiSpellCheck}
-                      onCheckedChange={(checked) => handlePremiumToggle("spell_check", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-spell-check"
-                    />
-                  </div>
-                </div>
-                <div className="px-4 sm:px-5 py-3 bg-violet-50/50 dark:bg-violet-500/5 border-t border-border/20">
-                  <p className="text-[10px] text-muted-foreground text-center italic">
-                    All enhancements are non-destructive. Your original artwork is preserved and you can revert at any time by toggling off.
-                  </p>
-                </div>
-                </LazyCollapsibleContent>
-              </div>
-              </Collapsible>
-
-              <Collapsible open={openSections.marketing} onOpenChange={(open) => toggleSection("marketing", open)}>
-              <div className="mt-6 rounded-xl border-2 border-amber-500/20 bg-gradient-to-br from-amber-50/30 to-orange-50/20 dark:from-amber-500/5 dark:to-orange-500/5 overflow-hidden" data-testid="section-power-ups">
-                <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-marketing">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-amber-500/15 flex items-center justify-center shrink-0">
-                      <Zap className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-                    </div>
-                    <div className="flex-1 text-left">
-                      <h3 className="text-base font-bold text-foreground" data-testid="text-power-ups-title">Marketing & Design</h3>
-                      <p className="text-xs text-muted-foreground">Advanced tools to level up your design.</p>
-                    </div>
-                    <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300" data-testid="badge-power-ups">
-                      Power-Ups
-                    </span>
-                    <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.marketing ? 'rotate-180' : ''}`} />
-                  </div>
-                </CollapsibleTrigger>
-                <LazyCollapsibleContent isOpen={!!openSections.marketing} betaMode={betaMode} resetKey={id}>
-                <div className="divide-y divide-border/20">
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-engagement-score">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Target className="w-3.5 h-3.5 text-rose-500" />
-                        <span className="text-sm font-semibold text-foreground">Check Eye-Catching Score</span>
-                        {aiEnhanceLoading === "engagement_score" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Get a score out of 100 showing how eye-catching your design is, with tips to improve it.</p>
-                      {aiEnhanceMessages.engagement_score && aiEngagementScore && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-engagement-score-status">{aiEnhanceMessages.engagement_score}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiEngagementScore}
-                      onCheckedChange={(checked) => handleAiEnhancementToggle("engagement_score", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-engagement-score"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-background-remove">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Eraser className="w-3.5 h-3.5 text-teal-500" />
-                        <span className="text-sm font-semibold text-foreground">Clean Background</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "background_remove" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Remove the background from your artwork, leaving just the main subject on a clean transparent layer.</p>
-                      {aiEnhanceMessages.background_remove && aiBackgroundRemove && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-background-remove-status">{aiEnhanceMessages.background_remove}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiBackgroundRemove}
-                      onCheckedChange={(checked) => handlePremiumToggle("background_remove", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-background-remove"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-text-reconstruct">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Type className="w-3.5 h-3.5 text-indigo-500" />
-                        <span className="text-sm font-semibold text-foreground">Make Text Razor Sharp</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "text_reconstruct" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Apply an unsharp mask to crisp up text edges and fine details for cleaner print output.</p>
-                      {aiEnhanceMessages.text_reconstruct && aiTextReconstruct && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-reconstruct-status">{aiEnhanceMessages.text_reconstruct}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiTextReconstruct}
-                      onCheckedChange={(checked) => handleAiEnhancementToggle("text_reconstruct", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-text-reconstruct"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-identify-fonts">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <ScanSearch className="w-3.5 h-3.5 text-emerald-500" />
-                        <span className="text-sm font-semibold text-foreground">Identify Fonts</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "identify_fonts" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Automatically detect and identify the fonts used in your artwork for accurate reproduction.</p>
-                      {aiEnhanceMessages.identify_fonts && aiIdentifyFonts && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-identify-fonts-status">{aiEnhanceMessages.identify_fonts}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiIdentifyFonts}
-                      onCheckedChange={(checked) => handlePremiumToggle("identify_fonts", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-identify-fonts"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-test-design-style">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Palette className="w-3.5 h-3.5 text-pink-500" />
-                        <span className="text-sm font-semibold text-foreground">Test Design Style</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "test_design_style" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">A/B test your design — find out if it reads as Club or Corporate, with tips to shift the vibe.</p>
-                      {aiEnhanceMessages.test_design_style && aiTestDesignStyle && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-test-design-style-status">{aiEnhanceMessages.test_design_style}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiTestDesignStyle}
-                      onCheckedChange={(checked) => handlePremiumToggle("test_design_style", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-test-design-style"
-                    />
-                  </div>
-                </div>
-                <div className="px-4 sm:px-5 py-3 bg-amber-50/50 dark:bg-amber-500/5 border-t border-border/20">
-                  <p className="text-[10px] text-muted-foreground text-center italic">
-                    These features will be powered by external AI services. Your original artwork is always preserved.
-                  </p>
-                </div>
-                </LazyCollapsibleContent>
-              </div>
-              </Collapsible>
-
-              </>)}
 
               <div className="mt-8 pt-6 border-t border-border/40">
                 <div className="text-center">
@@ -2744,7 +2321,7 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
       <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm text-red-700 dark:text-red-400">
         <AlertCircle className="w-5 h-5 shrink-0" />
         <span>{bleedPreviewError}</span>
-        <Button variant="ghost" size="sm" onClick={loadBleedPreview} className="ml-auto text-xs">Retry</Button>
+        <Button variant="ghost" size="sm" onClick={() => loadBleedPreview()} className="ml-auto text-xs" data-testid="button-retry-bleed-preview">Retry</Button>
       </div>
     );
   }
@@ -2754,7 +2331,7 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
       <div className="text-center py-8">
         <Scissors className="w-10 h-10 text-muted-foreground/40 mx-auto mb-3" />
         <p className="text-sm text-muted-foreground mb-3">Preview showing trim/cut lines and bleed boundaries.</p>
-        <Button onClick={loadBleedPreview} className="hover-elevate" data-testid="button-generate-bleed-preview">
+        <Button onClick={() => loadBleedPreview()} className="hover-elevate" data-testid="button-generate-bleed-preview">
           <Eye className="w-4 h-4 mr-2" /> Generate Bleed View
         </Button>
       </div>

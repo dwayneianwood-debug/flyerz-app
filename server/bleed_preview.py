@@ -22,7 +22,7 @@ import traceback
 
 import cv2
 import numpy as np
-import fitz
+import pymupdf as fitz
 
 
 def find_gs_binary() -> str:

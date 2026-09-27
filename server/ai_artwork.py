@@ -502,9 +502,9 @@ def check_text(path: str, spell_fn: Optional[SpellFn] = None) -> dict:
     }
 
 
-def _effective_dpi(px_w: int, px_h: int, trim_w: float, trim_h: float) -> int:
+def _effective_dpi(px_w: int, px_h: int, trim_w: float, trim_h: float, bleed_mm: float = 5.0) -> int:
     from ai_upscale import effective_print_dpi
-    return int(effective_print_dpi(px_w, px_h, trim_w, trim_h, 5.0))
+    return int(effective_print_dpi(px_w, px_h, trim_w, trim_h, bleed_mm))
 
 
 def _bleed_choice(bgr: np.ndarray) -> tuple[str, dict]:
@@ -539,9 +539,11 @@ def plan_artwork(path: str, trim_w_mm: float, trim_h_mm: float, options: Optiona
 
     trim_w = float(trim_w_mm or 148)
     trim_h = float(trim_h_mm or 210)
+    from bleed_size import clamp_bleed_mm
+    bleed_mm = clamp_bleed_mm(options.get("bleed_mm"))
     mismatch = ratios_differ(found["src_w"], found["src_h"], trim_w, trim_h)
     bleed, edge = _bleed_choice(bgr)
-    dpi_now = _effective_dpi(found["src_w"], found["src_h"], trim_w, trim_h)
+    dpi_now = _effective_dpi(found["src_w"], found["src_h"], trim_w, trim_h, bleed_mm)
     enhance = dpi_now < TARGET_DPI
     fit = "crop" if mismatch else "none"
     offset = 0.5
@@ -616,11 +618,11 @@ def plan_artwork(path: str, trim_w_mm: float, trim_h_mm: float, options: Optiona
         applied.append("page shape already matches the print size")
 
     if bleed == "colourBorder":
-        applied.append("Colour Border bleed matched to the edge colour")
+        applied.append(f"Colour Border bleed of {bleed_mm:g} mm, matched to the edge colour")
     elif bleed == "mirror":
-        applied.append("Mirror bleed, because the edges look photographic")
+        applied.append(f"Mirror bleed of {bleed_mm:g} mm, because the edges look photographic")
     else:
-        applied.append(f"{bleed} bleed")
+        applied.append(f"{bleed} bleed of {bleed_mm:g} mm")
 
     if enhance:
         applied.append(f"AI Enhance on, because the picture is about {dpi_now} DPI at this print size (under 300)")

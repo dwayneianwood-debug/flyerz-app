@@ -33,6 +33,7 @@ import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
 import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { normalizeBleedMm } from "@shared/bleed-size";
 import { pythonChildEnv } from "./pythonChildEnv";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
@@ -116,6 +117,37 @@ function nukeRamDisk() {
   try {
     fsSync.mkdirSync(ramDir, { recursive: true });
   } catch {}
+}
+
+function chosenBleedMm(saved: { bleedMm?: unknown } | null | undefined, raw?: unknown): number {
+  const candidate = raw !== undefined && raw !== null && String(raw) !== "" ? raw : saved?.bleedMm;
+  return normalizeBleedMm(candidate);
+}
+
+function pageFitCliArgs(audit: any): string[] {
+  const pageFit = audit?.pageFit;
+  if (!pageFit || pageFit.mode !== "whole") return [];
+  const method = pageFit.method === "border" ? "border" : "extend";
+  const edge = pageFit.edge || {};
+  const pct = (value: unknown) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "0";
+    return String(Math.min(100, Math.max(0, number)));
+  };
+  const fitNote = String(pageFit.note || "The whole artwork is kept. Gaps are filled instead of cropping the picture.")
+    .replace(/[\r\n]/g, " ")
+    .slice(0, 400);
+  const aiNote = String(audit?.aiArtwork?.note || "").replace(/[\r\n]/g, " ").trim();
+  const note = [aiNote, fitNote].filter(Boolean).join(" ").slice(0, 700);
+  return [
+    "--ai-artwork-fit", method,
+    "--ai-artwork-offset", "0.5",
+    "--ai-artwork-note", note,
+    "--ai-fit-c", pct(edge.c),
+    "--ai-fit-m", pct(edge.m),
+    "--ai-fit-y", pct(edge.y),
+    "--ai-fit-k", pct(edge.k),
+  ];
 }
 
 function aiArtworkCliArgs(audit: any): string[] {
@@ -208,6 +240,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     "--color-space", "cmyk",
     "--trim-w", String(trimW),
     "--trim-h", String(trimH),
+    "--bleed-mm", String(chosenBleedMm(savedOpts)),
     "--status-file", statusFile,
     "--result-file", resultFile,
     "--zip-output", zipPath,
@@ -218,6 +251,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     ...colourBorderCliArgs(strategy, auditResults),
     ...aiUpscaleCliArgs(auditResults),
     ...aiArtworkCliArgs(auditResults),
+    ...pageFitCliArgs(auditResults),
   ];
 
   args.push(
@@ -386,7 +420,7 @@ function execPythonCapture(args: string[], label: string, timeoutMs: number = EX
   }
 
   try {
-    const parsed = JSON.parse(stdout);
+    const parsed = parseCapturedJson(stdout);
     if (parsed.success === false) throw new Error(parsed.error || `${label} failed`);
     return parsed;
   } catch (err: any) {
@@ -394,6 +428,26 @@ function execPythonCapture(args: string[], label: string, timeoutMs: number = EX
       throw new Error(`${label} returned invalid JSON.`);
     }
     throw err;
+  }
+}
+
+function parseCapturedJson(stdout: string): any {
+  const trimmed = String(stdout || "").trim();
+  if (!trimmed) throw new SyntaxError("empty");
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i];
+      if (!line.startsWith("{") && !line.startsWith("[")) continue;
+      try {
+        return JSON.parse(line);
+      } catch {
+        /* keep looking for the JSON payload */
+      }
+    }
+    throw new SyntaxError("invalid");
   }
 }
 
@@ -1530,7 +1584,7 @@ export async function registerRoutes(
       const saved = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
       const trimW = Number(saved.targetWidth) > 0 ? Number(saved.targetWidth) : 148;
       const trimH = Number(saved.targetHeight) > 0 ? Number(saved.targetHeight) : 210;
-      const bleedMm = 5;
+      const bleedMm = chosenBleedMm(saved, req.query.bleed);
       const lines = req.query.lines === "0" ? false : true;
       const sampleEdge = req.query.edge === "1";
       const crop = (!saved.isNoCrop && !saved.preserveBleed && saved.cropWidth > 0 && saved.cropHeight > 0)
@@ -1627,12 +1681,11 @@ export async function registerRoutes(
         }
       }
 
-      const bleedMm = parseFloat(req.query.bleed as string) || 5;
+      const savedOpts = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
+      const bleedMm = chosenBleedMm(savedOpts, req.query.bleed);
       const basename = path.basename(job.filename, path.extname(job.filename));
       const previewFilename = `bleed_preview_${jobId}_${Date.now()}.png`;
       const previewPath = path.join(uploadDir, previewFilename);
-
-      const savedOpts = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
       const targetWidth = String(savedOpts.targetWidth ?? 148);
       const targetHeight = String(savedOpts.targetHeight ?? 210);
 
@@ -1655,6 +1708,82 @@ export async function registerRoutes(
     } catch (error) {
       console.error('Error generating bleed preview:', error);
       res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to generate bleed preview' });
+    }
+  });
+
+  app.post('/api/jobs/:id/bleed-size', async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: 'Job not found' });
+      const audit = (job.auditResults || {}) as any;
+      const saved = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const bleedMm = chosenBleedMm(saved, req.body?.bleedMm);
+      await storage.updateJob(jobId, { auditResults: { ...audit, savedBleedOptions: { ...saved, bleedMm } } });
+      res.json({ success: true, bleedMm });
+    } catch (error) {
+      res.status(500).json({ message: 'Could not save the bleed size' });
+    }
+  });
+
+  const COVER_CROP_SCRIPT = path.join(process.cwd(), 'server', 'cover_crop_notice.py');
+
+  app.get('/api/jobs/:id/cover-crop-notice', async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.json({ success: true, cropped: false });
+      const artwork = job.originalPath || job.correctedPath;
+      if (!artwork) return res.json({ success: true, cropped: false });
+      try {
+        await fs.access(artwork);
+      } catch {
+        return res.json({ success: true, cropped: false });
+      }
+      const saved = coerceSavedBleedOptionsFromDb((job.auditResults as any)?.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(saved.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(saved.targetHeight) || 210;
+      const destName = `cover_notice_${jobId}.png`;
+      const dest = path.join(uploadDir, destName);
+      const info = execPythonCapture([COVER_CROP_SCRIPT, 'preview', artwork, dest, String(trimW), String(trimH)], 'CoverCrop');
+      const pageFit = (job.auditResults as any)?.pageFit;
+      res.json({
+        ...info,
+        previewUrl: `/api/jobs/${jobId}/bleed-preview-image/${destName}?t=${Date.now()}`,
+        pageFit: pageFit?.mode || 'cover',
+      });
+    } catch (error) {
+      console.error('[FAI] Cover crop notice failed:', error);
+      res.json({ success: true, cropped: false });
+    }
+  });
+
+  app.post('/api/jobs/:id/page-fit', async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: 'Job not found' });
+      const audit = (job.auditResults || {}) as any;
+      const artwork = job.originalPath || job.correctedPath;
+      const mode = req.body?.mode === 'whole' ? 'whole' : 'cover';
+      let pageFit: any = { mode: 'cover' };
+      if (mode === 'whole' && artwork) {
+        const advice = execPythonCapture([COVER_CROP_SCRIPT, 'recommend', artwork], 'CoverFit');
+        pageFit = {
+          mode: 'whole',
+          method: advice.method === 'border' ? 'border' : 'extend',
+          edge: advice.edge || {},
+          note: advice.note || '',
+        };
+      }
+      const aiArtwork = audit.aiArtwork?.detected
+        ? { ...audit.aiArtwork, fit: mode === 'whole' ? pageFit.method : 'crop', mismatch: true }
+        : audit.aiArtwork;
+      await storage.updateJob(jobId, { auditResults: { ...audit, pageFit, aiArtwork } });
+      res.json({ success: true, mode: pageFit.mode, method: pageFit.method || null });
+    } catch (error) {
+      console.error('[FAI] Page fit failed:', error);
+      res.status(500).json({ message: 'Could not change how the artwork fits the page' });
     }
   });
 
@@ -1817,170 +1946,6 @@ export async function registerRoutes(
     }
   });
 
-  app.post('/api/jobs/:id/ai-enhance', async (req, res) => {
-    try {
-      const jobId = Number(req.params.id);
-      const { enhancement, enabled, options } = req.body;
-
-      const validEnhancements = ["denoise", "sharpen_logos", "spell_check", "tac_limit", "trapping", "engagement_score", "background_remove", "text_reconstruct", "expand_background", "identify_fonts", "test_design_style"];
-      if (typeof enhancement !== "string" || !validEnhancements.includes(enhancement)) {
-        return res.status(400).json({ message: `Invalid enhancement: ${enhancement}. Valid: ${validEnhancements.join(", ")}` });
-      }
-      if (typeof enabled !== "boolean") {
-        return res.status(400).json({ message: "Field 'enabled' must be a boolean" });
-      }
-      if (isNaN(jobId) || jobId <= 0) {
-        return res.status(400).json({ message: "Invalid job ID" });
-      }
-
-      const job = await storage.getJob(jobId);
-      if (!job) return res.status(404).json({ message: "Job not found" });
-
-      const auditResults = job.auditResults as AuditResults | null;
-      if (!auditResults) return res.status(400).json({ message: "Job has no audit results" });
-
-      console.log(`[AI-ENHANCE] job=${jobId} enhancement="${enhancement}" enabled=${enabled}`);
-
-      if (enabled) {
-        nukeRamDisk();
-      }
-
-      if (!enabled) {
-        const artworkPath = (auditResults as any).preBleedPath || job.correctedPath || job.originalPath;
-        const backupPath = artworkPath ? artworkPath + '.flyerz_backup' : null;
-        if (backupPath && fsSync.existsSync(backupPath) && artworkPath) {
-          try {
-            fsSync.copyFileSync(backupPath, artworkPath);
-            console.log(`[AI-ENHANCE] Restored original from backup: ${backupPath}`);
-          } catch (restoreErr) {
-            console.warn(`[AI-ENHANCE] Could not restore backup:`, restoreErr);
-          }
-        }
-
-        const prevResult = (auditResults as any).aiEnhancements?.[enhancement]?.result;
-        if (prevResult?.enhanced_path && prevResult.enhanced_path !== artworkPath) {
-          try {
-            if (fsSync.existsSync(prevResult.enhanced_path)) {
-              fsSync.unlinkSync(prevResult.enhanced_path);
-              console.log(`[AI-ENHANCE] Cleaned up enhanced file: ${prevResult.enhanced_path}`);
-            }
-          } catch { /* already gone */ }
-        }
-
-        const updatedResults: AuditResults = {
-          ...auditResults,
-          aiEnhancements: {
-            ...(auditResults as any).aiEnhancements,
-            [enhancement]: { enabled: false, result: null },
-          },
-        };
-        await storage.updateJob(jobId, { auditResults: updatedResults });
-        return res.json({
-          success: true,
-          enhancement,
-          enabled: false,
-          message: `${enhancement} disabled — original artwork restored.`,
-          originalPreserved: true,
-        });
-      }
-
-      const artworkPath = (auditResults as any).preBleedPath || job.correctedPath || job.originalPath;
-      if (!artworkPath || !fsSync.existsSync(artworkPath)) {
-        return res.status(400).json({ message: "Artwork file not found on disk" });
-      }
-
-      const AI_SCRIPT = path.join(process.cwd(), "server", "ai_enhancements.py");
-      const optionsJson = JSON.stringify(options || {});
-
-      try {
-        const { promisify } = await import('util');
-        const { execFile } = await import('child_process');
-        const execFileAsync = promisify(execFile);
-
-        const { stdout: result } = await execFileAsync(
-          PYTHON_BIN,
-          [AI_SCRIPT, enhancement, artworkPath, optionsJson],
-          { timeout: 35000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 }
-        );
-        const parsed = JSON.parse((result as string).trim());
-
-        if (parsed.success && parsed.enhanced_path && parsed.enhanced_path !== artworkPath && !parsed.stub) {
-          const backupPath = artworkPath + '.flyerz_backup';
-          if (!fsSync.existsSync(backupPath)) {
-            fsSync.copyFileSync(artworkPath, backupPath);
-            console.log(`[AI-ENHANCE] Backed up original: ${artworkPath} -> ${backupPath}`);
-          }
-          try {
-            fsSync.copyFileSync(parsed.enhanced_path, artworkPath);
-            console.log(`[AI-ENHANCE] Swapped enhanced result over artwork: ${parsed.enhanced_path} -> ${artworkPath}`);
-          } catch (swapErr) {
-            console.warn(`[AI-ENHANCE] Could not swap enhanced file:`, swapErr);
-          }
-        }
-
-        const updatedResults: AuditResults = {
-          ...auditResults,
-          aiEnhancements: {
-            ...(auditResults as any).aiEnhancements,
-            [enhancement]: { enabled: true, result: parsed },
-          },
-        };
-        await storage.updateJob(jobId, { auditResults: updatedResults });
-
-        res.json({
-          success: true,
-          enhancement,
-          enabled: true,
-          stub: parsed.stub || false,
-          message: parsed.message,
-          originalPreserved: parsed.original_preserved,
-          externalApiReady: parsed.external_api_ready,
-        });
-      } catch (scriptErr: any) {
-        const errMsg = scriptErr.message || String(scriptErr);
-        const isTimeout = errMsg.includes("timed out") || errMsg.includes("TIMEOUT") || errMsg.includes("busy");
-        console.error(`[AI-ENHANCE] Script error for ${enhancement}:`, errMsg.substring(0, 300));
-        res.status(isTimeout ? 408 : 500).json({
-          message: isTimeout
-            ? "AI service is busy, please try again"
-            : `Enhancement "${enhancement}" failed: ${errMsg.substring(0, 200)}`,
-        });
-      }
-    } catch (error) {
-      console.error("[AI-ENHANCE] Route error:", error);
-      res.status(500).json({ message: "AI enhancement request failed" });
-    }
-  });
-
-  app.get('/api/jobs/:id/ai-enhance-status', async (req, res) => {
-    try {
-      const jobId = Number(req.params.id);
-      const job = await storage.getJob(jobId);
-      if (!job) return res.status(404).json({ message: "Job not found" });
-
-      const auditResults = job.auditResults as any;
-      const enhancements = auditResults?.aiEnhancements || {};
-
-      res.json({
-        denoise: enhancements.denoise || { enabled: false, result: null },
-        sharpen_logos: enhancements.sharpen_logos || { enabled: false, result: null },
-        spell_check: enhancements.spell_check || { enabled: false, result: null },
-        tac_limit: enhancements.tac_limit || { enabled: false, result: null },
-        trapping: enhancements.trapping || { enabled: false, result: null },
-        engagement_score: enhancements.engagement_score || { enabled: false, result: null },
-        background_remove: enhancements.background_remove || { enabled: false, result: null },
-        text_reconstruct: enhancements.text_reconstruct || { enabled: false, result: null },
-
-        expand_background: enhancements.expand_background || { enabled: false, result: null },
-        identify_fonts: enhancements.identify_fonts || { enabled: false, result: null },
-        test_design_style: enhancements.test_design_style || { enabled: false, result: null },
-      });
-    } catch (error) {
-      console.error("[AI-ENHANCE] Status error:", error);
-      res.status(500).json({ message: "Failed to get enhancement status" });
-    }
-  });
-
   const resolveUpscaleArtwork = (job: any, auditResults: any): string | null => {
     const saved = coerceSavedBleedOptionsFromDb(auditResults?.savedBleedOptions);
     const hasCrop = hasValidCropBox(saved) && !saved.isNoCrop && !saved.preserveBleed;
@@ -2033,7 +1998,7 @@ export async function registerRoutes(
       const parsed = await runUpscaleScript("ai_upscale_assess", artworkPath, {
         trim_w_mm: trimW,
         trim_h_mm: trimH,
-        bleed_mm: 5,
+        bleed_mm: chosenBleedMm(savedOpts, req.query.bleed),
       });
       res.setHeader("Cache-Control", "no-store");
       res.json({ ...parsed, saved: auditResults.aiUpscale || null, trimW, trimH });
@@ -2070,7 +2035,7 @@ export async function registerRoutes(
       const parsed = await runUpscaleScript("ai_upscale", artworkPath, {
         trim_w_mm: trimW,
         trim_h_mm: trimH,
-        bleed_mm: 5,
+        bleed_mm: chosenBleedMm(savedOpts, req.body?.bleedMm),
         output_path: fullPath,
         before_preview_path: beforePath,
         after_preview_path: afterPath,
@@ -2220,6 +2185,7 @@ export async function registerRoutes(
       const options: Record<string, unknown> = {
         trim_w_mm: trimW,
         trim_h_mm: trimH,
+        bleed_mm: chosenBleedMm(savedOpts, req.query.bleed),
         screen_preview: path.join(uploadDir, `ai-artwork-${jobId}-screen.png`),
         print_preview: path.join(uploadDir, `ai-artwork-${jobId}-print.png`),
         source_preview: path.join(uploadDir, `ai-artwork-${jobId}-source.png`),
@@ -2282,6 +2248,7 @@ export async function registerRoutes(
       const options: Record<string, unknown> = {
         trim_w_mm: trimW,
         trim_h_mm: trimH,
+        bleed_mm: chosenBleedMm(savedOpts, body.bleedMm),
         fit,
         offset,
         bleed,
@@ -2623,6 +2590,7 @@ export async function registerRoutes(
         "--color-space", colorSpace,
         "--trim-w", String(trimWidth),
         "--trim-h", String(trimHeight),
+        "--bleed-mm", String(chosenBleedMm(compileSavedOpts, exportPreferences.bleedMm)),
         "--status-file", statusFile,
         "--result-file", resultFile,
         "--zip-output", zipPath,
@@ -2635,6 +2603,7 @@ export async function registerRoutes(
         ...colourBorderCliArgs(effectiveStrategy, auditResults),
         ...aiUpscaleCliArgs(auditResults),
         ...aiArtworkCliArgs(auditResults),
+        ...pageFitCliArgs(auditResults),
       ];
 
       if (job.originalPath && job.originalPath !== artworkPath) {

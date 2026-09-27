@@ -43,10 +43,15 @@ def friendly_mapping(check):
 
     if "Bleed" in name:
         if auto_fixed:
+            detail = msg.strip()
+            body = detail if "mm" in detail.lower() else (
+                "[FAI] We noticed your artwork was missing 'bleed' (the extra bit of colour for cutting). "
+                "Don't worry — Flyerz.co.za Artwork Intelligence has added this for you so there are no white borders."
+            )
             return {
                 "icon": "sparkle",
                 "title": "Edge Perfection",
-                "body": "[FAI] We noticed your artwork was missing 'bleed' (the extra bit of colour for cutting). Don't worry \u2014 Flyerz.co.za Artwork Intelligence has added this for you so there are no white borders.",
+                "body": body,
                 "type": "fixed"
             }
         elif passed:
