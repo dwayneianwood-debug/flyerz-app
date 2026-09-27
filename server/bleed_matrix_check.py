@@ -295,6 +295,8 @@ def contact_sheet() -> None:
 
 
 def main() -> None:
+    from press_ready_engine import is_full_page_crop
+    record("full-page crop is not a hand crop", is_full_page_crop(0, 0, 1, 1) and not is_full_page_crop(0.1, 0.1, 0.4, 0.5), "")
     started = time.time()
     folder = tempfile.mkdtemp(prefix="bleed-matrix-")
     rasters = make_rasters(folder)

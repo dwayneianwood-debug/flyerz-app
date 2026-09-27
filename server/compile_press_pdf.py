@@ -1400,7 +1400,10 @@ def main():
         work_path = input_path
         _tmp_chain = []
 
-        _has_crop = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+        from press_ready_engine import is_full_page_crop
+        # The No Crop route always sends a full-page box. That must not skip the engine.
+        _full_page_crop = is_full_page_crop(args.crop_x, args.crop_y, args.crop_w, args.crop_h)
+        _has_crop = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0 and not _full_page_crop
         if is_pdf and _has_crop:
             import fitz as _fitz_precrop
             import gc as _gc_precrop
@@ -1528,7 +1531,7 @@ def main():
             if _ai_applied:
                 compile_stats["ai_upscale_applied"] = True
 
-            _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+            _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0 and not _full_page_crop
             _compile_heal_meta = {}
             if (
                 not _manual_crop_active
@@ -1895,7 +1898,7 @@ def main():
                                     img_bgr = img_bgr[pcy:pcy + pch, pcx:pcx + pcw]
                                     sys.stderr.write(f"[COMPILE] PDF page 1 manual crop applied: ({pcx},{pcy}) {pcw}x{pch} -> {img_bgr.shape[1]}x{img_bgr.shape[0]}\n")
             
-                            _pdf_manual_crop_active = page_num == 0 and args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
+                            _pdf_manual_crop_active = page_num == 0 and args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0 and not _full_page_crop
 
                             if page_num == 0:
                                 img_bgr, _ai_applied_pdf = _maybe_use_enhanced_raster(img_bgr, args, allow_pdf_page=True)

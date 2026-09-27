@@ -70,6 +70,15 @@ def _px(mm: float, dpi: float) -> int:
     return max(1, int(round((float(mm) / 25.4) * float(dpi))))
 
 
+def is_full_page_crop(x: float, y: float, w: float, h: float) -> bool:
+    """The No Crop safety box is the whole page (0, 0, 1, 1). That is not a hand crop."""
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return False
+    if x <= 1.0 and y <= 1.0 and w <= 1.0 and h <= 1.0:
+        return x <= 0.02 and y <= 0.02 and w >= 0.98 and h >= 0.98
+    return False
+
+
 def replicate_available() -> bool:
     """One short account check. No credit, no token, or no network means local fill."""
     if _REPLICATE["checked"]:
