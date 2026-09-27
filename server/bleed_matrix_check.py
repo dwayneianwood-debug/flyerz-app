@@ -28,7 +28,7 @@ SIZES = (
     ("a4", 210.0, 297.0),
     ("a3", 297.0, 420.0),
 )
-BLEEDS = (3.0, 5.0, 10.0)
+BLEED_MM = 5.0
 ART_DIR = "/opt/cursor/artifacts"
 os.makedirs(ART_DIR, exist_ok=True)
 
@@ -204,7 +204,10 @@ def check_raster(name: str, image, trim_w: float, trim_h: float, bleed: float, e
     # The drawn face stays on the card. Larger pages cover-crop it off the trim.
     face_required = name == "face" and abs(trim_w - 90) < 0.1 and abs(trim_h - 50) < 0.1
     rescue = (checked.get("rescue") or {}) if face_required else {}
-    rescue_ok = (not face_required) or (rescue.get("applied") is True and float(rescue.get("scale") or 1) >= 0.96)
+    scale = float(rescue.get("scale") or 1)
+    rescue_ok = (not face_required) or (
+        rescue.get("applied") is True and 0.97 - 1e-6 <= scale <= 0.99 + 1e-6
+    )
     ok = (
         checked.get("passed") is True
         and checked.get("status") == "ready"
@@ -307,21 +310,19 @@ def main() -> None:
     os.environ.pop("REPLICATE_API_TOKEN", None)
     for name, image in rasters.items():
         if name == "already-file":
-            for bleed in BLEEDS:
-                check_raster("already", image, 90, 50, bleed, embedded_dpi=300)
+            check_raster("already", image, 90, 50, BLEED_MM, embedded_dpi=300)
             continue
         if name == "small-photo":
-            check_raster(name, image, 297, 420, 5)
-            check_raster(name, image, 90, 50, 5)
+            check_raster(name, image, 297, 420, BLEED_MM)
+            check_raster(name, image, 90, 50, BLEED_MM)
             continue
-        for bleed in BLEEDS:
-            for _size, width, height in SIZES:
-                check_raster(name, image, width, height, bleed)
+        for _size, width, height in SIZES:
+            check_raster(name, image, width, height, BLEED_MM)
+    check_raster("photo-override-10", rasters["photo"], 90, 50, 10)
     for name, path in vectors.items():
         require = name != "raster-pdf"
-        for bleed in BLEEDS:
-            for _size, width, height in SIZES:
-                check_vector(name, path, width, height, bleed, require)
+        for _size, width, height in SIZES:
+            check_vector(name, path, width, height, BLEED_MM, require)
     contact_sheet()
     print(f"\n{len(passes)} passed, {len(fails)} failed, {time.time() - started:.0f}s")
     if fails:

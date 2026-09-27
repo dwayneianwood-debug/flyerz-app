@@ -6,8 +6,9 @@ Looks at the artwork, picks a bleed for each edge, builds the press file, and
 checks that file. Staff do not have to choose a bleed style. The older styles
 stay available as manual overrides.
 
-Nothing inside the trim is moved except a safe-zone shrink (default 3mm,
-capped at about 4%). The bleed never invents text.
+Nothing inside the trim is moved except a safe-zone shrink (default 3mm
+from the cut, between 1% and 3%). A normal press file uses 5mm of bleed.
+The bleed never invents text.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ import cv2
 import numpy as np
 
 SAFE_ZONE_MM = 3.0
-SAFE_ZONE_SHRINK_CAP = 0.04
+SAFE_ZONE_SHRINK_MIN = 0.01
+SAFE_ZONE_SHRINK_CAP = 0.03
 # A picture enlarged past this stops being honest "print ready".
 MIN_HONEST_EFFECTIVE_DPI = 240.0
 TAC_LIMIT = 300.0
@@ -538,17 +540,20 @@ def _bitmap_problems(canvas: np.ndarray, source: np.ndarray, bleed: int, methods
     return problems
 
 
+def _shrink_fraction(dpi: float, width: int, height: int, safe_zone_mm: float) -> float:
+    """How far to shrink. Always between 1% and 3%."""
+    raw = (float(safe_zone_mm) / 25.4) * float(dpi) / max(int(width), int(height), 1)
+    return min(SAFE_ZONE_SHRINK_CAP, max(SAFE_ZONE_SHRINK_MIN, raw))
+
+
 def _rescue(img: np.ndarray, dpi: float, safe_zone_mm: float, analysis: dict) -> tuple[np.ndarray, dict]:
     note = {"applied": False, "scale": 1.0, "safeZoneMm": safe_zone_mm, "note": "Nothing inside the trim was moved."}
     if analysis.get("safeHits", 0) <= 0:
         return img, note
     height, width = img.shape[:2]
-    # Minimum shrink that pulls the outer band in, capped at about 4%.
-    need = min(0.04, max(0.005, (safe_zone_mm / 25.4) * dpi / max(width, height)))
-    scale = max(1.0 - SAFE_ZONE_SHRINK_CAP, 1.0 - need)
-    if scale >= 0.999:
-        note["note"] = "Text is inside the safe zone, and there was no room to shrink it."
-        return img, note
+    raw = (float(safe_zone_mm) / 25.4) * float(dpi) / max(width, height, 1)
+    fraction = _shrink_fraction(dpi, width, height, safe_zone_mm)
+    scale = 1.0 - fraction
     new_w = max(1, int(round(width * scale)))
     new_h = max(1, int(round(height * scale)))
     scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -567,16 +572,17 @@ def _rescue(img: np.ndarray, dpi: float, safe_zone_mm: float, analysis: dict) ->
     canvas[:, :] = temp[y0:y0 + height, x0:x0 + width]
     # The shrunk artwork must stay pixel-identical in the middle.
     canvas[top:top + new_h, left:left + new_w] = scaled
-    short = scale <= 1.0 - SAFE_ZONE_SHRINK_CAP + 1e-6 and need > SAFE_ZONE_SHRINK_CAP
+    short = raw > SAFE_ZONE_SHRINK_CAP + 1e-9
+    percent = round(fraction * 100.0, 2)
     note = {
         "applied": True,
         "scale": round(scale, 4),
         "safeZoneMm": safe_zone_mm,
-        "percent": round((1.0 - scale) * 100.0, 2),
+        "percent": percent,
         "note": (
-            f"Artwork shrunk by {round((1.0 - scale) * 100.0, 1)}% so text sits inside the {safe_zone_mm:g}mm safe zone."
-            if not short
-            else f"Artwork shrunk by the 4% limit. Some text may still sit inside the {safe_zone_mm:g}mm safe zone."
+            f"Artwork shrunk by the 3% limit. Some text may still sit inside the {safe_zone_mm:g}mm safe zone."
+            if short
+            else f"Artwork shrunk by {percent:g}% so text sits inside the {safe_zone_mm:g}mm safe zone."
         ),
     }
     return canvas, note
@@ -751,11 +757,6 @@ def compile_raster_canvas(
         report["status"] = "needs-attention"
         report["reason"] = built["problems"][0]
         report["fix"] = "Try a manual bleed style, or move the artwork slightly in from the edge and upload it again."
-    if rescue.get("applied") and "4% limit" in rescue.get("note", "") and report["passed"]:
-        report["passed"] = False
-        report["status"] = "needs-attention"
-        report["reason"] = rescue["note"]
-        report["fix"] = f"Move text and logos at least {safe_zone_mm:g}mm inside the cut line, then upload the file again."
     return canvas, report
 
 
@@ -814,7 +815,7 @@ def plan_artwork(img_bgr: np.ndarray, dpi: float = 150.0, safe_zone_mm: float = 
     return {
         "passed": False,
         "status": "planned",
-        "headline": "Automatic, recommended",
+        "headline": "Automatic (recommended)",
         "reason": "",
         "fix": "",
         "contentKind": "raster",

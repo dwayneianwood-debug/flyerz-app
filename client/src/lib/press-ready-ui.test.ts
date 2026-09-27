@@ -9,7 +9,7 @@ test("automatic stays first and the headline follows the press check", () => {
   assert.equal(pressReadyHeadline({ passed: true, status: "ready" }), "Ready for press");
   assert.equal(pressReadyHeadline({ status: "needs-attention" }), "Needs attention");
   assert.equal(pressReadyHeadline({ status: "planned" }), AUTOMATIC_BLEED_LABEL);
-  assert.equal(AUTOMATIC_BLEED_LABEL, "Automatic, recommended");
+  assert.equal(AUTOMATIC_BLEED_LABEL, "Automatic (recommended)");
   assert.equal(shouldStartAutomaticCompile({
     status: "complete",
     selected: "auto",

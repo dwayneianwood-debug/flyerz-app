@@ -53,7 +53,7 @@ export function BleedSizeControl({
         </label>
       </div>
       <p className="mt-1 text-[11px] text-muted-foreground" data-testid="text-bleed-size">
-        {current} mm of bleed on every side. This is used for the cut-line preview, the press file, and the health report.
+        {current} mm on every side. A normal job uses 5 mm. This override is used for the cut-line preview, the press file, and the health report.
       </p>
     </div>
   );

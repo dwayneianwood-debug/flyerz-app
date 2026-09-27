@@ -1533,24 +1533,29 @@ export default function JobDetails() {
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
                       />
-                      <BleedSizeControl
-                        value={bleedMm}
-                        disabled={bleedMethodLoading || bleedPreviewLoading}
-                        onChange={(mm) => {
-                          const next = normalizeBleedMm(mm);
-                          setBleedMm(next);
-                          void fetch(`/api/jobs/${job.id}/bleed-size`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ bleedMm: next }),
-                          }).then(() => {
-                            void loadBleedPreview(selectedBleedMethod, next);
-                            if (selectedBleedMethod !== "auto") {
-                              void handleBleedMethodSelect(selectedBleedMethod, true);
-                            }
-                          });
-                        }}
-                      />
+                      <details className="text-sm" data-testid="advanced-bleed-size">
+                        <summary className="cursor-pointer text-xs text-muted-foreground">
+                          Advanced bleed size. A normal Flyerz job stays at 5 mm.
+                        </summary>
+                        <BleedSizeControl
+                          value={bleedMm}
+                          disabled={bleedMethodLoading || bleedPreviewLoading}
+                          onChange={(mm) => {
+                            const next = normalizeBleedMm(mm);
+                            setBleedMm(next);
+                            void fetch(`/api/jobs/${job.id}/bleed-size`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ bleedMm: next }),
+                            }).then(() => {
+                              void loadBleedPreview(selectedBleedMethod, next);
+                              if (selectedBleedMethod !== "auto") {
+                                void handleBleedMethodSelect(selectedBleedMethod, true);
+                              }
+                            });
+                          }}
+                        />
+                      </details>
                       <BleedMethodSelector
                         jobId={job.id}
                         variants={job.auditResults.bleedVariants ?? {}}
