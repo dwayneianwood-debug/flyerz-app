@@ -33,6 +33,7 @@ import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
+import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline } from "@/lib/press-ready-ui";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
 import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
 import { precompilePollDelayMs } from "@/lib/poll-backoff";
@@ -108,6 +109,10 @@ const PHASE_LABELS = [
 ];
 
 const BLEED_METHOD_LABELS = {
+  auto: {
+    label: AUTOMATIC_BLEED_LABEL,
+    description: "The press-ready engine checks each edge and fills only the bleed. You can still pick a style yourself below.",
+  },
   bgExtract: {
     label: "Background Extract",
     description: "Extends only the background colour, ideal for artwork with text near the edge.",
@@ -426,9 +431,8 @@ export default function JobDetails() {
     if (hasVariants) return;
     const canAssessArtwork = !!(job.auditResults && (job.correctedPath || job.originalPath));
     if (canAssessArtwork && !aiArtworkGate.ready) return;
-    const recommended = aiArtworkGate.bleed || job.auditResults?.recommendedBleedMethod || "mirror";
     autoSelectTriggeredRef.current = true;
-    handleBleedMethodSelect(recommended);
+    handleBleedMethodSelect("auto");
   }, [job?.id, job?.status, job?.auditResults?.bleedVariants, job?.correctedPath, job?.originalPath, selectedBleedMethod, aiArtworkGate]);
 
   const noneCountRef = useRef(0);
@@ -436,7 +440,6 @@ export default function JobDetails() {
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
-    if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
     compilingCountRef.current = 0;
@@ -531,7 +534,6 @@ export default function JobDetails() {
 
   useEffect(() => {
     if (!job?.auditResults?.compiledPdfPath || compileTaskId) return;
-    if (selectedBleedMethod === "auto") return;
     if (preCompileState !== "ready") return;
 
     const dlUrl = `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
@@ -1052,7 +1054,7 @@ export default function JobDetails() {
                 <span>{format(new Date(job.uploadedAt), "MMM d, h:mm a")}</span>
               </div>
             </div>
-            <StatusBadge status={job.status as any} overallPassed={job.auditResults?.overallPassed ?? null} />
+            <StatusBadge status={job.status as any} overallPassed={job.auditResults?.overallPassed === true && job.auditResults?.pressEngine?.passed === true} />
           </div>
         </Card>
 
@@ -1552,6 +1554,9 @@ export default function JobDetails() {
                         loading={bleedMethodLoading}
                         colourBorder={colourBorder}
                         onColourBorderChange={handleColourBorderChange}
+                        pressEngine={job.auditResults.pressEngine}
+                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof` : null}
+                        afterUrl={bleedPreview?.previewUrls?.[0]?.url || null}
                       />
                     </div>
                   )}
@@ -1915,7 +1920,13 @@ export default function JobDetails() {
                   transition={{ delay: 0.3 }}
                   className="text-3xl font-extrabold font-display mb-3" data-testid="text-phase3-title"
                 >
-                  Your artwork is <span className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-500">print-ready!</span>
+                  {job.auditResults?.pressEngine?.passed === true ? (
+                    <>Your artwork is <span className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-500">print-ready!</span></>
+                  ) : job.auditResults?.pressEngine?.status === "needs-attention" ? (
+                    <>Needs attention</>
+                  ) : (
+                    <>Review the press check before printing.</>
+                  )}
                 </motion.h2>
               </div>
 
@@ -2680,7 +2691,7 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
@@ -2689,11 +2700,23 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
   loading: boolean;
   colourBorder: ColourBorderChoice;
   onColourBorderChange: (next: ColourBorderChoice) => void;
+  pressEngine?: {
+    passed?: boolean;
+    status?: string;
+    headline?: string;
+    reason?: string;
+    fix?: string;
+    rescue?: { note?: string };
+    edges?: Array<{ side: string; note: string }>;
+  } | null;
+  beforeUrl?: string | null;
+  afterUrl?: string | null;
 }) {
-  /** Always list every registered strategy; variant paths may be partial if generation skipped a tile. */
-  const methods = [...BLEED_STRATEGY_IDS];
-  const activeMethod = selected === "auto" ? recommended : selected;
+  /** Automatic is the default. The older styles stay as manual overrides. */
+  const methods = ["auto", ...BLEED_STRATEGY_IDS];
+  const activeMethod = selected || "auto";
   const activeInfo = activeMethod ? BLEED_METHOD_LABELS[activeMethod as keyof typeof BLEED_METHOD_LABELS] : null;
+  const engineAttention = pressEngine?.status === "needs-attention";
 
   if (methods.length === 0) return null;
 
@@ -2720,10 +2743,10 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
         >
           {methods.map((method) => {
             const info = BLEED_METHOD_LABELS[method as keyof typeof BLEED_METHOD_LABELS];
-            const isRecommended = method === recommended;
+            const isRecommended = method === "auto" || method === recommended;
             return (
               <option key={method} value={method} data-testid={`option-bleed-method-${method}`}>
-                {info?.label ?? method}{isRecommended ? " (Recommended)" : ""}
+                {info?.label ?? method}{method === "auto" ? "" : isRecommended && method === recommended ? " (manual)" : ""}
               </option>
             );
           })}
@@ -2733,10 +2756,34 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             {activeInfo.description}
           </p>
         )}
+        {activeMethod === "auto" && (
+          <div className="rounded-lg border border-border/60 bg-white dark:bg-background p-3 space-y-2" data-testid="panel-press-ready">
+            <p className={`text-sm font-semibold ${engineAttention ? "text-amber-700" : "text-green-700"}`} data-testid="text-press-ready-headline">
+              {pressReadyHeadline(pressEngine)}
+            </p>
+            {pressEngine?.reason && (
+              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-reason">{pressEngine.reason} {pressEngine.fix}</p>
+            )}
+            {pressEngine?.rescue?.note && (
+              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-rescue">{pressEngine.rescue.note}</p>
+            )}
+            <ul className="space-y-1" data-testid="list-press-ready-edges">
+              {(pressEngine?.edges || []).map((edge) => (
+                <li key={edge.side} className="text-xs text-foreground">{edge.note}</li>
+              ))}
+            </ul>
+            {(beforeUrl || afterUrl) && (
+              <div className="grid grid-cols-2 gap-2">
+                {beforeUrl && <img src={beforeUrl} alt="Artwork before bleed" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-before" />}
+                {afterUrl && <img src={afterUrl} alt="Artwork with bleed and cut line" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-after" />}
+              </div>
+            )}
+          </div>
+        )}
         {activeMethod === "colourBorder" && (
           <ColourBorderPicker value={colourBorder} onChange={onColourBorderChange} disabled={loading} />
         )}
-        {activeMethod && (
+        {activeMethod && activeMethod !== "auto" && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
             <div className="aspect-[16/9]">
               {activeMethod === "colourBorder" ? (

@@ -77,7 +77,7 @@ export function JobList() {
                 </div>
 
                 <div className="flex items-center gap-4 ml-4 shrink-0">
-                  <StatusBadge status={job.status as any} overallPassed={job.overallPassed} />
+                  <StatusBadge status={job.status as any} overallPassed={job.printReady} />
                   <ChevronRight className="w-5 h-5 text-muted-foreground group-hover:text-foreground transition-colors" />
                 </div>
               </Card>

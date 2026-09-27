@@ -7948,6 +7948,12 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
 
     safety_status_val = variant_result.get("safetyStatus", "SAFE")
 
+    press_plan = None
+    try:
+        from press_ready_engine import plan_artwork
+        press_plan = plan_artwork(img, float(original_dpi or 150))
+    except Exception as plan_err:
+        sys.stderr.write(f"[BLEED] Press-ready plan skipped: {plan_err}\n")
     del img
     if bleed_img is not None:
         del bleed_img
@@ -7985,6 +7991,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         "finalTic": 0,
         "autoHealEvent": auto_heal_event,
         "crop_box": full_page_crop_box,
+        "pressEngine": press_plan,
     }
     if variant_result.get("paths"):
         result["bleedVariants"] = variant_result["paths"]

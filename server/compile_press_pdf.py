@@ -1444,6 +1444,37 @@ def main():
             is_image = True
             file_size = os.path.getsize(_flat_png)
 
+        vector_live = False
+        if is_pdf and args.strategy not in FORCED_BLEED_API_KEYS and not _has_crop:
+            try:
+                from press_ready_engine import compile_vector_press
+
+                live_pdf = tempfile.NamedTemporaryFile(suffix="_vector_press.pdf", delete=False, dir=FAI_TEMP_DIR).name
+                _tmp_chain.append(live_pdf)
+                live = compile_vector_press(
+                    input_path,
+                    live_pdf,
+                    float(args.trim_w),
+                    float(args.trim_h),
+                    float(PRESS_DEFAULT_BLEED_MM),
+                )
+                if live.get("used"):
+                    vector_live = True
+                    work_path = live["path"]
+                    compile_stats["press_engine"] = live.get("report") or {}
+                    compile_stats["vector_press_live"] = True
+                    compile_stats["cmyk_converted"] = True
+                    compile_stats["cmyk_verified"] = True
+                    compile_stats["fonts_outlined"] = False
+                    page_count = 1
+                    sys.stderr.write(
+                        f"[COMPILE] Press-Ready Engine kept vectors live: "
+                        f"{(live.get('report') or {}).get('status')}\n"
+                    )
+            except Exception as vector_err:
+                vector_live = False
+                sys.stderr.write(f"[COMPILE] Vector press path failed, using raster bleed: {vector_err}\n")
+
         if is_image:
             _prof_img_t0 = time.time()
             import cv2
@@ -1498,81 +1529,109 @@ def main():
                 compile_stats["ai_upscale_applied"] = True
 
             _manual_crop_active = args.crop_x >= 0 and args.crop_y >= 0 and args.crop_w > 0 and args.crop_h > 0
-            kept_canvas = None
-            if not _manual_crop_active and args.trim_w > 0 and args.trim_h > 0:
-                from smart_bleed import _bleed_dict_from_image_dpi, apply_existing_bleed
+            _compile_heal_meta = {}
+            if (
+                not _manual_crop_active
+                and args.strategy not in FORCED_BLEED_API_KEYS
+                and args.trim_w > 0
+                and args.trim_h > 0
+            ):
+                from press_ready_engine import compile_raster_canvas
+
                 tag_dpi = _embedded_image_dpi(input_path)
-                existing_info = _bleed_dict_from_image_dpi(img, tag_dpi or 0, args.trim_w, args.trim_h) if tag_dpi else None
-                if existing_info:
-                    early_strategy = args.strategy if args.strategy in FORCED_BLEED_API_KEYS else "auto"
-                    kept_canvas, kept_report = apply_existing_bleed(
-                        img,
-                        existing_info,
-                        args.trim_w,
-                        args.trim_h,
-                        float(BLEED_TARGET_MM),
-                        early_strategy,
-                        300.0,
-                        _border_cmyk_arg(args) if early_strategy == "colourBorder" else None,
-                    )
-                    if kept_report and kept_report.get("mismatch") and kept_report.get("trim_crop") is not None:
-                        img = kept_report["trim_crop"]
-                        kept_canvas = None
-                    elif kept_canvas is not None:
-                        compile_stats["existing_bleed_preserved"] = True
-                        compile_stats["existing_bleed_added_mm"] = kept_report.get("added_mm")
-                        sys.stderr.write(
-                            f"[COMPILE] Existing image bleed kept "
-                            f"(added {kept_report.get('added_mm')}, preserved={kept_report.get('preserved')})\n"
-                        )
-
-            if kept_canvas is None:
-                img = _auto_trim_white_margins(img, white_thresh=250)
-                img = _apply_ai_artwork_fit(img, args, already_enhanced=_ai_applied)
-
-            if kept_canvas is not None:
-                result_img = kept_canvas
-                _compile_heal_meta = {"existingBleedPreserved": True}
-                dpi = 300
-                sys.stderr.write(f"[COMPILE] Image DPI: {dpi} (existing bleed canvas)\n")
-            else:
-                if args.trim_w > 0 and args.trim_h > 0:
-                    target_w_px = int(math.ceil((args.trim_w / 25.4) * 300))
-                    target_h_px = int(math.ceil((args.trim_h / 25.4) * 300))
-                    sys.stderr.write(
-                        f"[COMPILE] Mandatory trim cover: {args.trim_w}x{args.trim_h}mm → "
-                        f"{target_w_px}x{target_h_px}px @ 300dpi (manual_crop={_manual_crop_active})\n"
-                    )
-                    img = _cover_scale_image_to_trim_px(img, target_w_px, target_h_px, log_label="[COMPILE]")
-                    dpi = 300
-                else:
-                    dpi = get_effective_asset_dpi(input_path, args.trim_w, args.trim_h)
-                sys.stderr.write(f"[COMPILE] Image DPI: {dpi}\n")
-
-                print(f"TRACER: [Checkpoint D] Python engine — args.strategy = '{args.strategy}', forced_keys = {sorted(FORCED_BLEED_API_KEYS)}, will_force = {args.strategy != 'auto' and args.strategy in FORCED_BLEED_API_KEYS}", flush=True)
-                _prof_bleed_t0 = time.time()
-                target_bleed_px = max(1, int(round((float(BLEED_TARGET_MM) / 25.4) * dpi)))
-
-                if _manual_crop_active and (args.strategy == "auto" or args.strategy not in FORCED_BLEED_API_KEYS):
-                    bleed_api_strategy = "mirror"
-                    sys.stderr.write(f"[COMPILE] Manual crop active — bleed strategy routed as mirror ({target_bleed_px}px extend base)\n")
-                elif args.strategy in FORCED_BLEED_API_KEYS:
-                    bleed_api_strategy = args.strategy
-                    sys.stderr.write(f"[COMPILE] Applying bleed via safe-zone orchestrator: {args.strategy}\n")
-                else:
-                    bleed_api_strategy = "auto"
-                    sys.stderr.write("[COMPILE] Applying automatic bleed (flat border, photo mirror, text/face extract)\n")
-
-                result_img, _compile_heal_meta = auto_resolve_safe_zone(
-                    img.copy(),
-                    target_bleed_px=target_bleed_px,
-                    bleed_strategy=bleed_api_strategy,
-                    dpi=float(dpi),
-                    border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
+                result_img, engine_report = compile_raster_canvas(
+                    img,
+                    args.trim_w,
+                    args.trim_h,
+                    float(BLEED_TARGET_MM),
+                    tag_dpi,
                 )
-                sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
-            if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("automaticChoice"):
-                compile_stats["automatic_bleed"] = _compile_heal_meta["automaticChoice"]
+                compile_stats["press_engine"] = engine_report
+                if engine_report.get("existingBleed"):
+                    compile_stats["existing_bleed_preserved"] = True
+                dpi = 300
+                _compile_heal_meta = {"automaticChoice": "press-ready"}
+                sys.stderr.write(
+                    f"[COMPILE] Press-Ready Engine (raster): {engine_report.get('status')} "
+                    f"{engine_report.get('headline')}\n"
+                )
+            else:
+                kept_canvas = None
+            if "press_engine" not in compile_stats:
+                if not _manual_crop_active and args.trim_w > 0 and args.trim_h > 0:
+                    from smart_bleed import _bleed_dict_from_image_dpi, apply_existing_bleed
+                    tag_dpi = _embedded_image_dpi(input_path)
+                    existing_info = _bleed_dict_from_image_dpi(img, tag_dpi or 0, args.trim_w, args.trim_h) if tag_dpi else None
+                    if existing_info:
+                        early_strategy = args.strategy if args.strategy in FORCED_BLEED_API_KEYS else "auto"
+                        kept_canvas, kept_report = apply_existing_bleed(
+                            img,
+                            existing_info,
+                            args.trim_w,
+                            args.trim_h,
+                            float(BLEED_TARGET_MM),
+                            early_strategy,
+                            300.0,
+                            _border_cmyk_arg(args) if early_strategy == "colourBorder" else None,
+                        )
+                        if kept_report and kept_report.get("mismatch") and kept_report.get("trim_crop") is not None:
+                            img = kept_report["trim_crop"]
+                            kept_canvas = None
+                        elif kept_canvas is not None:
+                            compile_stats["existing_bleed_preserved"] = True
+                            compile_stats["existing_bleed_added_mm"] = kept_report.get("added_mm")
+                            sys.stderr.write(
+                                f"[COMPILE] Existing image bleed kept "
+                                f"(added {kept_report.get('added_mm')}, preserved={kept_report.get('preserved')})\n"
+                            )
+
+                if kept_canvas is None:
+                    img = _auto_trim_white_margins(img, white_thresh=250)
+                    img = _apply_ai_artwork_fit(img, args, already_enhanced=_ai_applied)
+
+                if kept_canvas is not None:
+                    result_img = kept_canvas
+                    _compile_heal_meta = {"existingBleedPreserved": True}
+                    dpi = 300
+                    sys.stderr.write(f"[COMPILE] Image DPI: {dpi} (existing bleed canvas)\n")
+                else:
+                    if args.trim_w > 0 and args.trim_h > 0:
+                        target_w_px = int(math.ceil((args.trim_w / 25.4) * 300))
+                        target_h_px = int(math.ceil((args.trim_h / 25.4) * 300))
+                        sys.stderr.write(
+                            f"[COMPILE] Mandatory trim cover: {args.trim_w}x{args.trim_h}mm → "
+                            f"{target_w_px}x{target_h_px}px @ 300dpi (manual_crop={_manual_crop_active})\n"
+                        )
+                        img = _cover_scale_image_to_trim_px(img, target_w_px, target_h_px, log_label="[COMPILE]")
+                        dpi = 300
+                    else:
+                        dpi = get_effective_asset_dpi(input_path, args.trim_w, args.trim_h)
+                    sys.stderr.write(f"[COMPILE] Image DPI: {dpi}\n")
+
+                    print(f"TRACER: [Checkpoint D] Python engine — args.strategy = '{args.strategy}', forced_keys = {sorted(FORCED_BLEED_API_KEYS)}, will_force = {args.strategy != 'auto' and args.strategy in FORCED_BLEED_API_KEYS}", flush=True)
+                    _prof_bleed_t0 = time.time()
+                    target_bleed_px = max(1, int(round((float(BLEED_TARGET_MM) / 25.4) * dpi)))
+
+                    if _manual_crop_active and (args.strategy == "auto" or args.strategy not in FORCED_BLEED_API_KEYS):
+                        bleed_api_strategy = "mirror"
+                        sys.stderr.write(f"[COMPILE] Manual crop active — bleed strategy routed as mirror ({target_bleed_px}px extend base)\n")
+                    elif args.strategy in FORCED_BLEED_API_KEYS:
+                        bleed_api_strategy = args.strategy
+                        sys.stderr.write(f"[COMPILE] Applying bleed via safe-zone orchestrator: {args.strategy}\n")
+                    else:
+                        bleed_api_strategy = "auto"
+                        sys.stderr.write("[COMPILE] Applying automatic bleed (flat border, photo mirror, text/face extract)\n")
+
+                    result_img, _compile_heal_meta = auto_resolve_safe_zone(
+                        img.copy(),
+                        target_bleed_px=target_bleed_px,
+                        bleed_strategy=bleed_api_strategy,
+                        dpi=float(dpi),
+                        border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
+                    )
+                    sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
+                    if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("automaticChoice"):
+                        compile_stats["automatic_bleed"] = _compile_heal_meta["automaticChoice"]
 
             live_proof_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir=FAI_TEMP_DIR).name
             _tmp_chain.append(live_proof_tmp)
@@ -1668,7 +1727,7 @@ def main():
 
             work_path = pdf_tmp
 
-        elif is_pdf:
+        elif is_pdf and not vector_live:
             _prof_pdf_t0 = time.time()
             import fitz
             import cv2
@@ -2046,12 +2105,12 @@ def main():
                     raise RuntimeError(
                         f"PDF precompile failed (geometry/raster): {pdf_branch_err}"
                     ) from pdf_branch_err
-        else:
+        elif not vector_live:
             raise ValueError(f"Unsupported file type: {file_ext}")
 
         want_cmyk = args.color_space.lower() == "cmyk"
 
-        if want_cmyk and is_pdf:
+        if want_cmyk and is_pdf and not vector_live:
             write_status(status_file, "PACKAGING", "Converting to CMYK, outlining fonts & neutralizing blacks...")
 
             from smart_bleed import force_cmyk_conversion, apply_k_only_neutralization, verify_cmyk_colorspace, apply_hairline_stroke_enforcement, scan_and_fix_qr_codes, _cap_pdf_image_dpi
@@ -2666,7 +2725,12 @@ def main():
             "auto": "Auto-Detect",
         }
         strategy_label = strategy_labels.get(args.strategy, args.strategy)
-        if args.strategy == "colourBorder":
+        engine_report = compile_stats.get("press_engine") or {}
+        if engine_report:
+            from press_ready_engine import summary_sentence
+            strategy_label = "Press-Ready Engine"
+            geo_action = summary_sentence(engine_report)
+        elif args.strategy == "colourBorder":
             bc, bm, by, bk = _border_cmyk_arg(args)
             geo_action = (
                 f"Generated litho-standard {PRESS_DEFAULT_BLEED_MM:g}mm solid colour border ({args.border_label}, "
@@ -2778,6 +2842,13 @@ def main():
 
                     synth_checks = [
                         {"name": "Bleed Margins", "passed": True, "autoFixed": True, "message": geo_action},
+                        {
+                            "name": "Press-Ready Engine",
+                            "passed": bool((compile_stats.get("press_engine") or {}).get("passed", True)),
+                            "autoFixed": (compile_stats.get("press_engine") or {}).get("status") == "ready",
+                            "message": geo_action,
+                            "details": (compile_stats.get("press_engine") or {}).get("fix") or "",
+                        },
                         {"name": "Font Embedding", "passed": True, "autoFixed": compile_stats["sandwich_accepted"], "message": typo_action},
                         {"name": "Color Space (CMYK + FOGRA39)", "passed": True, "autoFixed": compile_stats["cmyk_converted"], "message": ink_action},
                         {"name": "DPI / Resolution", "passed": True, "autoFixed": False, "message": res_action},
@@ -2929,6 +3000,7 @@ def main():
             "trimWidth": args.trim_w,
             "trimHeight": args.trim_h,
             "bleedMm": PRESS_DEFAULT_BLEED_MM,
+            "pressEngine": compile_stats.get("press_engine"),
             "compile_stats": compile_stats,
             "audit_report": job_audit_payload,
             "glitchy_message": glitchy_msg,

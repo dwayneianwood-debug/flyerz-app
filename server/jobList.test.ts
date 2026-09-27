@@ -30,6 +30,7 @@ test("job list page omits audit JSON and keeps the sort indexes", async () => {
         overallPassed: i === 2,
         fixesApplied: 0,
         complianceReport: `SECRET-AUDIT-BLOB-${i}`,
+        pressEngine: i === 2 ? { passed: true, status: "ready", headline: "Ready for press" } : { passed: false, status: "planned" },
       },
     });
   }

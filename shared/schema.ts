@@ -193,6 +193,21 @@ export interface AuditResults {
     resolution_and_lenses?: { action_taken: string };
   };
   jobAudit?: JobAudit;
+  /** Press-Ready Engine: per-edge choice and the press-file check. */
+  pressEngine?: {
+    passed?: boolean;
+    status?: "ready" | "needs-attention" | "planned";
+    headline?: string;
+    reason?: string;
+    fix?: string;
+    contentKind?: string;
+    existingBleed?: boolean;
+    safeZoneMm?: number;
+    replicate?: string;
+    resolutionNote?: string;
+    rescue?: { applied?: boolean; scale?: number; note?: string; safeZoneMm?: number };
+    edges?: Array<{ side: string; kind: string; method: string; note: string }>;
+  };
   /** Present when Shrink & Re-Bleed auto-heal fired during bleed generation (image path). */
   autoHealEvent?: {
     applied: boolean;

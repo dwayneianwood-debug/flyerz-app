@@ -202,6 +202,7 @@ type ListRow = {
   file_type: string;
   has_corrected: number;
   overall_passed: unknown;
+  press_passed: unknown;
 };
 
 export class DatabaseStorage implements IStorage {
@@ -223,7 +224,8 @@ export class DatabaseStorage implements IStorage {
       .prepare(
         `SELECT id, filename, status, uploaded_at, file_size, file_type,
                 CASE WHEN corrected_path IS NOT NULL AND corrected_path != '' THEN 1 ELSE 0 END AS has_corrected,
-                json_extract(audit_results, '$.overallPassed') AS overall_passed
+                json_extract(audit_results, '$.overallPassed') AS overall_passed,
+                json_extract(audit_results, '$.pressEngine.passed') AS press_passed
          FROM file_jobs
          ${where}
          ORDER BY uploaded_at DESC, id DESC
@@ -232,6 +234,7 @@ export class DatabaseStorage implements IStorage {
       .all(...args, limit, offset) as ListRow[];
     const jobs: JobListItem[] = rows.map((row) => {
       const overallPassed = passedFlag(row.overall_passed);
+      const pressPassed = passedFlag(row.press_passed);
       const uploaded = new Date(row.uploaded_at);
       return {
         id: row.id,
@@ -243,7 +246,7 @@ export class DatabaseStorage implements IStorage {
         thumbnailUrl: null,
         overallPassed,
         hasCorrectedFile: row.has_corrected === 1,
-        printReady: row.status === "complete" && overallPassed === true,
+        printReady: row.status === "complete" && overallPassed === true && pressPassed === true,
       };
     });
     const total = Number(totalRow?.n || 0);

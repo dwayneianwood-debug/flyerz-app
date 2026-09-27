@@ -41,6 +41,21 @@ def friendly_mapping(check):
     auto_fixed = check.get("autoFixed", False)
     msg = check.get("message", "")
 
+    if "Press-Ready" in name:
+        if passed:
+            return {
+                "icon": "check" if not auto_fixed else "sparkle",
+                "title": "Ready for press",
+                "body": msg or "Each edge was filled and the press file was checked.",
+                "type": "fixed" if auto_fixed else "good",
+            }
+        return {
+            "icon": "warn",
+            "title": "Needs attention",
+            "body": msg or "The press file still needs a change before it can be printed.",
+            "type": "issue",
+        }
+
     if "Bleed" in name:
         if auto_fixed:
             detail = msg.strip()
