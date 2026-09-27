@@ -131,6 +131,50 @@ test("a large script is brotli-compressed and the response finishes", async () =
   }
 });
 
+test("a file that already sent its headers is not compressed again", async () => {
+  const app = express();
+  app.use(compressResponses);
+  const payload = "console.log('already-sent');\n".repeat(80);
+  app.get("/headed.js", (_req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "application/javascript",
+      "Content-Length": Buffer.byteLength(payload),
+    });
+    Readable.from([payload]).pipe(res);
+  });
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  try {
+    const raw = await new Promise<{ status: number; encoding: string; body: Buffer }>((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/headed.js", headers: { "Accept-Encoding": "br" } },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          res.on("end", () => resolve({
+            status: res.statusCode || 0,
+            encoding: String(res.headers["content-encoding"] || ""),
+            body: Buffer.concat(chunks),
+          }));
+        },
+      );
+      req.setTimeout(3000, () => {
+        req.destroy();
+        reject(new Error("headed response hung"));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(raw.status, 200);
+    assert.equal(raw.encoding, "");
+    assert.equal(raw.body.toString("utf8"), payload);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("static files and compression pick long cache and brotli", () => {
   assert.equal(cacheControlForStaticFile("C:\\app\\dist\\public\\index.html"), "no-cache");
   assert.equal(

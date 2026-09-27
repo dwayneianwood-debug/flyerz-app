@@ -68,7 +68,13 @@ export function compressResponses(req: Request, res: Response, next: NextFunctio
   };
 
   res.write = ((chunk: any, enc?: any, cb?: any) => {
-    if (passthrough) return origWrite(chunk, enc, cb);
+    // A file stream may call writeHead before the body. Do not buffer that body
+    // and then try to strip Content-Length after the headers have gone out.
+    if (passthrough || res.headersSent) {
+      passthrough = true;
+      decided = true;
+      return origWrite(chunk, enc, cb);
+    }
     if (!decided) {
       decided = true;
       if (!wantsCompression()) {
@@ -85,7 +91,7 @@ export function compressResponses(req: Request, res: Response, next: NextFunctio
 
   res.end = ((chunk?: any, enc?: any, cb?: any) => {
     const { payload, callback } = endArgs(chunk, enc, cb);
-    if (passthrough) return origEnd(chunk, enc, cb);
+    if (passthrough || res.headersSent) return origEnd(chunk, enc, cb);
     if (!decided) {
       decided = true;
       if (!wantsCompression()) return origEnd(chunk, enc, cb);
