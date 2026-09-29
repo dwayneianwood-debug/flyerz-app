@@ -962,11 +962,23 @@ def convert_cmyk_keep_text(src: str, dest: str) -> None:
         "-dBufferSpace=50000000",
         "-dMaxBitmap=50000000",
         "-dBandBufferSpace=50000000",
-        "-c", "<< /MaxBitmap 50000000 /BufferSize 50000000 >> setuserparams << /HWResolution [300 300] >> setpagedevice",
+        "-sColorConversionStrategyForImages=CMYK",
+        "-dDownsampleColorImages=false",
+        "-dDownsampleGrayImages=false",
+        "-dDownsampleMonoImages=false",
+        "-c",
+        "<< /AutoFilterColorImages false /AutoFilterGrayImages false "
+        "/ColorImageFilter /FlateEncode /GrayImageFilter /FlateEncode "
+        "/DownsampleColorImages false /DownsampleGrayImages false >> setdistillerparams "
+        "<< /MaxBitmap 50000000 /BufferSize 50000000 >> setuserparams "
+        "<< /HWResolution [300 300] >> setpagedevice",
         "-f", src,
     ]
     if os.path.isfile(icc):
         cmd.insert(cmd.index("-f"), f"-sDefaultCMYKProfile={icc}")
+    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
+    if os.path.isfile(srgb):
+        cmd.insert(cmd.index("-f"), f"-sDefaultRGBProfile={srgb}")
     subprocess.run(cmd, check=True, timeout=90, capture_output=True)
 
 

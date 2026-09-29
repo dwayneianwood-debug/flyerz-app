@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image
 
 BLEED_MM = 5.0
+SAFE_ZONE_MM = 3.0
 TARGET_DPI = 300
 MAX_LONG_EDGE = 4500
 MM_TO_PT = 72.0 / 25.4
@@ -563,8 +564,30 @@ def _normalise_hook_block(block: dict, index: int, bgr: np.ndarray) -> dict:
     return made
 
 
+def _ink_and_background(roi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Median ink colour and the flat colour behind it."""
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    flat = roi.reshape(-1, 3).astype(np.float32)
+    dist = np.linalg.norm(flat - bg, axis=1)
+    cutoff = float(np.percentile(dist, 88))
+    ink_px = flat[dist >= max(cutoff, 20)]
+    ink = np.median(ink_px, axis=0) if ink_px.size else bg
+    return ink, bg
+
+
 def _mask_from_blocks(bgr: np.ndarray, blocks: list) -> np.ndarray:
-    """Cover the glyphs only, then dilate by a couple of pixels. Panels and borders stay."""
+    """Glyph pixels only, including the soft edge, then a small dilate.
+
+    The search is the original OCR box plus a few pixels, so a halo that sits
+    just outside the box is still removed. A pixel counts only when it is the
+    ink colour (or a blend toward it), so a border next to the line is left alone.
+    """
     height, width = bgr.shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
     for block in blocks:
@@ -575,28 +598,42 @@ def _mask_from_blocks(bgr: np.ndarray, blocks: list) -> np.ndarray:
         y1 = min(height, int(round((y + bh) * height)))
         if x1 - x0 < 2 or y1 - y0 < 2:
             continue
-        roi = bgr[y0:y1, x0:x1]
-        border = np.concatenate([
-            roi[0].reshape(-1, 3),
-            roi[-1].reshape(-1, 3),
-            roi[:, 0],
-            roi[:, -1],
-        ]).astype(np.float32)
-        bg = np.median(border, axis=0)
-        dist = np.linalg.norm(roi.astype(np.float32) - bg, axis=2)
-        ink = np.zeros(dist.shape, dtype=np.uint8)
-        ink[dist > 28] = 255
-        mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], ink)
-    if mask.any():
+        ink, _border_bg = _ink_and_background(bgr[y0:y1, x0:x1])
+        # The box edge often cuts through the letters, so the background colour
+        # is taken from the ring just outside the original glyphs.
+        pad = 14
+        X0 = max(0, x0 - pad)
+        Y0 = max(0, y0 - pad)
+        X1 = min(width, x1 + pad)
+        Y1 = min(height, y1 + pad)
+        ring = np.ones((Y1 - Y0, X1 - X0), dtype=bool)
+        ring[(y0 - Y0):(y1 - Y0), (x0 - X0):(x1 - X0)] = False
+        outer = bgr[Y0:Y1, X0:X1]
+        if ring.any():
+            bg = np.median(outer[ring], axis=0).astype(np.float32)
+        else:
+            bg = _border_bg
+        roi = outer.astype(np.float32)
+        axis = ink - bg
+        rel = roi - bg
+        scale = float(np.dot(axis, axis)) or 1.0
+        # 0 = background colour, 1 = the ink colour. Soft edges sit between them.
+        blend = np.clip((rel * axis).sum(axis=2) / scale, 0.0, 1.0)
+        closest = bg + blend[..., None] * axis
+        residual = np.linalg.norm(roi - closest, axis=2)
+        glyph = ((residual < 28) & (blend > 0.06)).astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        grown = cv2.dilate(glyph, kernel, iterations=2)
+        # Keep the extra pixels on the same ink, so a border beside the line stays.
+        grown[(residual > 38) & (glyph == 0)] = 0
+        mask[Y0:Y1, X0:X1] = np.maximum(mask[Y0:Y1, X0:X1], grown)
     return mask
 
 
 def _local_inpaint(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if not mask.any():
         return bgr
-    return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA)
+    return cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
 
 
 def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tuple[np.ndarray, float, int, int]:
@@ -625,19 +662,85 @@ def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tupl
     return crop, new_w / float(width), x0, y0
 
 
-def _cap_ratio(face) -> float:
-    """Cap height as a fraction of the em. Liberation Sans is about 0.73."""
-    if face is None:
-        return 0.73
+def _cap_ratio(fontfile: Optional[str]) -> float:
+    """Cap height of H as a fraction of the em size."""
+    if not fontfile or not os.path.exists(fontfile):
+        return 0.72
     try:
-        glyph = face.has_glyph(ord("H"))
-        box = face.glyph_bbox(glyph, fontsize=1)
-        height = abs(float(box.y1) - float(box.y0))
-        if 0.4 < height < 1.2:
-            return height
+        from PIL import ImageFont
+        font = ImageFont.truetype(fontfile, 200)
+        box = font.getbbox("H")
+        ratio = (float(box[3]) - float(box[1])) / 200.0
+        if 0.45 < ratio < 0.95:
+            return ratio
     except Exception:
         pass
-    return 0.73
+    return 0.72
+
+
+def _flat_container(bgr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> Optional[tuple]:
+    """Interior of a flat panel the line sits on, inset so type does not touch the border."""
+    height, width = bgr.shape[:2]
+    x0 = max(0, min(width - 1, x0))
+    x1 = max(x0 + 1, min(width, x1))
+    y0 = max(0, min(height - 1, y0))
+    y1 = max(y0 + 1, min(height, y1))
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    _ink, bg = _ink_and_background(roi)
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    if float(np.std(border)) > 18:
+        return None
+
+    def scan(fixed: int, start: int, step: int, limit: int, horizontal: bool) -> Optional[int]:
+        extent = width if horizontal else height
+        pos = start
+        skipped = 0
+        while 0 <= pos < extent and skipped < 16:
+            pixel = bgr[fixed, pos] if horizontal else bgr[pos, fixed]
+            if float(np.linalg.norm(pixel.astype(np.float32) - bg)) <= 26:
+                break
+            pos += step
+            skipped += 1
+        else:
+            return None
+        clear = 0
+        last = pos
+        while 0 <= pos < extent:
+            pixel = bgr[fixed, pos] if horizontal else bgr[pos, fixed]
+            if float(np.linalg.norm(pixel.astype(np.float32) - bg)) > 26:
+                return last if clear >= 5 else None
+            last = pos
+            clear += 1
+            pos += step
+            if clear >= limit:
+                return None
+        return None
+
+    mid_y = (y0 + y1) // 2
+    mid_x = (x0 + x1) // 2
+    left = scan(mid_y, x0, -1, x0 + 1, True)
+    right = scan(mid_y, x1 - 1, 1, width - x1 + 1, True)
+    top = scan(mid_x, y0, -1, y0 + 1, False)
+    bottom = scan(mid_x, y1 - 1, 1, height - y1 + 1, False)
+    if left is None and right is None and top is None and bottom is None:
+        return None
+    inset = 3
+    box = (
+        0 if left is None else left + inset,
+        0 if top is None else top + inset,
+        width - 1 if right is None else right - inset,
+        height - 1 if bottom is None else bottom - inset,
+    )
+    if box[2] <= box[0] + 4 or box[3] <= box[1] + 4:
+        return None
+    return box
 
 
 def _hex_rgb(value: str) -> tuple[float, float, float]:
@@ -690,7 +793,61 @@ def _write_preview(path: str, bgr: np.ndarray, max_px: int = 900) -> None:
     Image.fromarray(rgb).save(path, format="PNG", dpi=(TARGET_DPI, TARGET_DPI))
 
 
-def _typeset(background: np.ndarray, blocks: list, out_pdf: str, trim_w_mm: float, trim_h_mm: float, src_shape: tuple, scale: float, off_x: int, off_y: int) -> None:
+def _page_rect(px: float, py: float, pw: float, ph: float, canvas_w: int, canvas_h: int, media_w: float, media_h: float):
+    import pymupdf as fitz
+    return fitz.Rect(
+        px / canvas_w * media_w,
+        py / canvas_h * media_h,
+        (px + pw) / canvas_w * media_w,
+        (py + ph) / canvas_h * media_h,
+    )
+
+
+def _fit_line(face, text, rect, media_w, media_h, src_w, src_h, scale, off_x, off_y, canvas_w, canvas_h, source_bgr, x, y, bw, bh, fontfile):
+    """Match the OCR cap height, then keep the line no wider than that box.
+
+    The line also stays inside the 3 mm safe zone and inside a flat panel when
+    the original words sat on one.
+    """
+    import pymupdf as fitz
+
+    cap = _cap_ratio(fontfile)
+    size = max(4.0, rect.height / cap)
+    natural = face.text_length(text, fontsize=size) if face is not None else rect.width
+    safe_pt = (BLEED_MM + SAFE_ZONE_MM) * MM_TO_PT
+    safe = fitz.Rect(safe_pt, safe_pt, media_w - safe_pt, media_h - safe_pt)
+    allowed = rect & safe
+    if source_bgr is not None:
+        sx0 = int(round(x * src_w))
+        sy0 = int(round(y * src_h))
+        sx1 = int(round((x + bw) * src_w))
+        sy1 = int(round((y + bh) * src_h))
+        container = _flat_container(source_bgr, sx0, sy0, sx1, sy1)
+        if container is not None:
+            cx0 = container[0] * scale - off_x
+            cy0 = container[1] * scale - off_y
+            cw = (container[2] - container[0]) * scale
+            ch = (container[3] - container[1]) * scale
+            panel = _page_rect(cx0, cy0, cw, ch, canvas_w, canvas_h, media_w, media_h)
+            clipped = allowed & panel
+            if clipped.width > 4 and clipped.height > 2:
+                allowed = clipped
+    if allowed.width < 2 or allowed.height < 2:
+        allowed = rect & safe if (rect & safe).width > 2 else rect
+    origin_x = max(rect.x0, allowed.x0)
+    baseline = min(rect.y1, allowed.y1)
+    top = max(rect.y0, allowed.y0)
+    if baseline - size * cap < top:
+        size = max(4.0, (baseline - top) / cap)
+        natural = face.text_length(text, fontsize=size) if face is not None else natural
+    max_w = min(rect.width * 1.01, max(1.0, allowed.x1 - origin_x))
+    hscale = 1.0
+    if natural > max_w and natural > 0:
+        hscale = max_w / natural
+    return origin_x, baseline, size, hscale
+
+
+def _typeset(background: np.ndarray, blocks: list, out_pdf: str, trim_w_mm: float, trim_h_mm: float, src_shape: tuple, scale: float, off_x: int, off_y: int, source_bgr: Optional[np.ndarray] = None) -> None:
     import pymupdf as fitz
 
     canvas_h, canvas_w = background.shape[:2]
@@ -733,15 +890,22 @@ def _typeset(background: np.ndarray, blocks: list, out_pdf: str, trim_w_mm: floa
         fontname = "FlyerzSansBold" if use_bold else "FlyerzSans" if regular else "helv"
         fontfile = bold if use_bold else regular
         face = fitz.Font(fontfile=fontfile) if fontfile else None
-        # OCR height is the ink, not the em square. Cap height fills that box.
-        cap = _cap_ratio(face)
-        size = max(6.0, rect.height / cap)
         colour = _hex_rgb(str(block.get("color_hex") or "#111111"))
-        if face is not None:
-            while size > 6 and face.text_length(text, fontsize=size) > rect.width * 1.04:
-                size *= 0.96
-        # Baseline is the bottom of an all-caps OCR box.
-        page.insert_text((rect.x0, rect.y1), text, fontname=fontname, fontsize=size, color=colour)
+        origin_x, baseline, size, hscale = _fit_line(
+            face, text, rect, media_w, media_h, src_w, src_h, scale, off_x, off_y,
+            canvas_w, canvas_h, source_bgr, x, y, bw, bh, fontfile,
+        )
+        if hscale < 0.999:
+            page.insert_text(
+                (origin_x, baseline),
+                text,
+                fontname=fontname,
+                fontsize=size,
+                color=colour,
+                morph=(fitz.Point(origin_x, baseline), fitz.Matrix(hscale, 1)),
+            )
+        else:
+            page.insert_text((origin_x, baseline), text, fontname=fontname, fontsize=size, color=colour)
     bleed_pt = BLEED_MM * MM_TO_PT
     trim = fitz.Rect(bleed_pt, bleed_pt, media_w - bleed_pt, media_h - bleed_pt)
     page.set_mediabox(page.rect)
@@ -943,7 +1107,7 @@ def _rebuild(path: str, options: dict) -> dict:
             _write_preview(options["clean_path"], background, max_px=max(background.shape[:2]))
 
     out_pdf = options.get("output_pdf") or os.path.join(tempfile.gettempdir(), "ai-rebuild.pdf")
-    _typeset(background, blocks, out_pdf, trim_w, trim_h, source.shape, scale, off_x, off_y)
+    _typeset(background, blocks, out_pdf, trim_w, trim_h, source.shape, scale, off_x, off_y, source)
     font_note = "Words were typeset with bundled Liberation Sans." if os.path.exists(FONT_REGULAR) else "Words were typeset with a built-in font."
     steps.append({"name": "Retypeset", "engine": "local", "ok": True, "note": font_note})
 

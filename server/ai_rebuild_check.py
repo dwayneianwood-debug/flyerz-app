@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -254,8 +255,8 @@ def _draw_flyer(path: str, kind: str) -> None:
     canvas = Image.new("RGB", (1024, 1024), (18, 52, 120))
     draw = ImageDraw.Draw(canvas)
     font_path = os.path.join(os.path.dirname(__file__), "fonts", "LiberationSans-Bold.ttf")
-    big = ImageFont.truetype(font_path, 78)
-    mid = ImageFont.truetype(font_path, 48)
+    big = ImageFont.truetype(font_path, 64)
+    mid = ImageFont.truetype(font_path, 46)
     # A5-portrait cover keeps roughly the centre 72% of a square. Keep shapes and type inside that band.
     if kind == "panel":
         for y in range(0, 1024, 8):
@@ -264,9 +265,9 @@ def _draw_flyer(path: str, kind: str) -> None:
         draw.ellipse([500, 50, 820, 370], fill=(230, 90, 40))
         draw.rounded_rectangle([180, 420, 844, 960], radius=42, fill=(12, 28, 70), outline=(210, 170, 90), width=8)
         lines = [
-            ("GRAND OPENING", big, (190, 500), (255, 236, 180)),
-            ("50% OFF PRINTS", mid, (220, 660), (255, 255, 255)),
-            ("SATURDAY 10AM", mid, (220, 780), (180, 220, 255)),
+            ("GRAND OPENING", big, (250, 520), (255, 236, 180)),
+            ("50% OFF PRINTS", mid, (250, 660), (255, 255, 255)),
+            ("SATURDAY 10AM", mid, (250, 790), (180, 220, 255)),
         ]
     else:
         rng = np.random.default_rng(3)
@@ -277,8 +278,8 @@ def _draw_flyer(path: str, kind: str) -> None:
         draw = ImageDraw.Draw(canvas)
         draw.ellipse([560, 620, 860, 920], fill=(40, 140, 90))
         lines = [
-            ("SUMMER MARKET", big, (160, 180), (255, 244, 210)),
-            ("FRESH DAILY", mid, (210, 320), (255, 255, 255)),
+            ("SUMMER MARKET", big, (250, 180), (255, 244, 210)),
+            ("FRESH DAILY", mid, (250, 320), (255, 255, 255)),
         ]
     for text, font, xy, fill in lines:
         x, y = xy
@@ -340,6 +341,107 @@ def _ink_colour(bgr: np.ndarray, line: dict) -> tuple:
         ink = flat
     colour = np.median(ink, axis=0)
     return int(colour[2]), int(colour[1]), int(colour[0])
+
+
+def _page_box(block: dict, src_shape, scale: float, off_x: int, off_y: int, canvas_w: int, canvas_h: int) -> tuple:
+    src_h, src_w = src_shape[:2]
+    x, y, bw, bh = [float(v) for v in block["bbox"][:4]]
+    px = x * src_w * scale - off_x
+    py = y * src_h * scale - off_y
+    pw = bw * src_w * scale
+    ph = bh * src_h * scale
+    return px / canvas_w, py / canvas_h, (px + pw) / canvas_w, (py + ph) / canvas_h
+
+
+def _ink_bbox(bgr: np.ndarray, rgb: tuple, band: tuple) -> tuple:
+    """Tight box of pixels close to rgb, inside a vertical band of the page."""
+    height, width = bgr.shape[:2]
+    y0 = max(0, int(band[0] * height))
+    y1 = min(height, int(band[1] * height))
+    view = cv2.cvtColor(bgr[y0:y1], cv2.COLOR_BGR2RGB).astype(np.int16)
+    dist = np.linalg.norm(view - np.array(rgb, np.int16), axis=2)
+    ys, xs = np.where(dist <= 42)
+    if len(xs) < 20:
+        return None
+    return xs.min() / width, (ys.min() + y0) / height, xs.max() / width, (ys.max() + y0) / height
+
+
+def _lab_delta(left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
+    def lab(img: np.ndarray) -> np.ndarray:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        matrix = np.array([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ], np.float32)
+        xyz = lin @ matrix.T
+        xyz[..., 0] /= 0.95047
+        xyz[..., 2] /= 1.08883
+        def f(channel):
+            return np.where(channel > 0.008856, np.cbrt(channel), 7.787 * channel + 16.0 / 116.0)
+        fx, fy, fz = f(xyz[..., 0]), f(xyz[..., 1]), f(xyz[..., 2])
+        return np.dstack([116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)])
+    return np.linalg.norm(lab(left_bgr) - lab(right_bgr), axis=2)
+
+
+def _proof_bgr(pdf_path: str, dest_png: str) -> np.ndarray:
+    """RGB proof of a press PDF through the same FOGRA39 profile."""
+    icc = os.path.join(os.path.dirname(__file__), "profiles", "CoatedFOGRA39.icc")
+    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
+    cmd = [
+        "gs", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m",
+        f"-sOutputFile={dest_png}", "-r110",
+        "-dRenderIntent=1", "-dBlackPtComp=1",
+        "-dNumRenderingThreads=1", "-dBufferSpace=50000000", "-dMaxBitmap=50000000",
+        "-f", pdf_path,
+    ]
+    if os.path.isfile(icc):
+        cmd.insert(-2, f"-sDefaultCMYKProfile={icc}")
+    if os.path.isfile(srgb):
+        cmd.insert(-2, f"-sOutputICCProfile={srgb}")
+    subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+    image = cv2.imread(dest_png, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError("proof render failed")
+    return image
+
+
+def test_inpaint_removes_the_letters() -> None:
+    """After the letters are removed, and before new type is drawn, nothing readable remains."""
+    from ai_rebuild import _local_inpaint, _mask_from_blocks, read_text_blocks
+
+    reset_providers()
+    folder = tempfile.mkdtemp()
+    for kind, phrases in (("panel", ("GRAND OPENING", "50% OFF PRINTS", "SATURDAY 10AM")), ("photo", ("SUMMER MARKET", "FRESH DAILY"))):
+        src = os.path.join(folder, f"{kind}-mask.png")
+        _draw_flyer(src, kind)
+        image = cv2.imread(src, cv2.IMREAD_COLOR)
+        blocks, _engine, _note = read_text_blocks(image)
+        mask = _mask_from_blocks(image, blocks)
+        clean = _local_inpaint(image, mask)
+        found = " | ".join(line["text"] for line in _ocr_bgr(clean))
+        for phrase in phrases:
+            check(f"{kind}-no-ghost-ocr", phrase not in found and not any(word in found for word in phrase.split() if len(word) > 3), found)
+        height, width = clean.shape[:2]
+        for block in blocks:
+            x, y, bw, bh = [float(v) for v in block["bbox"][:4]]
+            x0, y0 = int(x * width), int(y * height)
+            x1, y1 = int((x + bw) * width), int((y + bh) * height)
+            roi = clean[y0:y1, x0:x1].astype(np.float32)
+            if roi.size == 0:
+                continue
+            med = np.median(roi.reshape(-1, 3), axis=0)
+            inside = np.linalg.norm(roi - med, axis=2)
+            above = clean[max(0, y0 - 36):max(0, y0 - 4), x0:x1]
+            if above.size == 0:
+                continue
+            neighbor = np.linalg.norm(above.astype(np.float32) - np.median(above.reshape(-1, 3), axis=0), axis=2)
+            check(
+                f"{kind}-flat-{block['text']}",
+                float(np.percentile(inside, 99)) <= float(np.percentile(neighbor, 99)) + 12,
+                f"{np.percentile(inside, 99):.1f} vs {np.percentile(neighbor, 99):.1f}",
+            )
 
 
 def test_restore_spaces_from_gaps() -> None:
@@ -430,6 +532,77 @@ def test_press_pdf_shows_the_words() -> None:
             text_doc.close()
             for phrase, _expected_y, _rgb in expect:
                 check(f"{kind}-vector-{phrase}", phrase in press_text, press_text.replace("\n", " | "))
+            from ai_rebuild import _cover, _target_pixels
+            canvas_w, canvas_h = _target_pixels(trim_w, trim_h)
+            _fitted, scale, off_x, off_y = _cover(source, canvas_w, canvas_h, sharpen=False)
+            safe_x = (5.0 + 3.0) / (trim_w + 10.0)
+            safe_y = (5.0 + 3.0) / (trim_h + 10.0)
+            by_phrase = {}
+            for block in result.get("blocks") or []:
+                by_phrase[str(block.get("text") or "")] = block
+            for phrase, _expected_y, rgb in expect:
+                block = by_phrase.get(phrase)
+                check(f"{kind}-block-{phrase}", block is not None, str(list(by_phrase)))
+                if block is None:
+                    continue
+                ox0, oy0, ox1, oy1 = _page_box(block, source.shape, scale, off_x, off_y, canvas_w, canvas_h)
+                found_box = _ink_bbox(rendered, rgb, (oy0 - 0.04, oy1 + 0.04))
+                check(f"{kind}-ink-{phrase}", found_box is not None, phrase)
+                if found_box is None:
+                    continue
+                rx0, ry0, rx1, ry1 = found_box
+                bw = max(ox1 - ox0, 1e-4)
+                bh = max(oy1 - oy0, 1e-4)
+                inside = (
+                    rx0 >= ox0 - 0.02 * bw and rx1 <= ox1 + 0.02 * bw
+                    and ry0 >= oy0 - 0.02 * bh and ry1 <= oy1 + 0.02 * bh
+                )
+                check(
+                    f"{kind}-fit-{phrase}",
+                    inside,
+                    f"render {rx0:.3f},{ry0:.3f},{rx1:.3f},{ry1:.3f} ocr {ox0:.3f},{oy0:.3f},{ox1:.3f},{oy1:.3f}",
+                )
+                check(
+                    f"{kind}-safe-{phrase}",
+                    rx0 >= safe_x - 0.004 and rx1 <= 1 - safe_x + 0.004 and ry0 >= safe_y - 0.004 and ry1 <= 1 - safe_y + 0.004,
+                    f"{rx0:.3f},{ry0:.3f},{rx1:.3f},{ry1:.3f}",
+                )
+            # Same CMYK profile on the original picture and on the press file.
+            import pymupdf as fitz
+            ref_pdf = os.path.join(folder, f"{kind}-ref.pdf")
+            ref_doc = fitz.open()
+            ref_page = ref_doc.new_page(width=(trim_w + 10) * 72 / 25.4, height=(trim_h + 10) * 72 / 25.4)
+            ok, encoded = cv2.imencode(".png", _fitted)
+            check(f"{kind}-ref-png", ok)
+            ref_page.insert_image(ref_page.rect, stream=encoded.tobytes())
+            ref_doc.save(ref_pdf)
+            ref_doc.close()
+            from press_ready_engine import convert_cmyk_keep_text
+            ref_cmyk = os.path.join(folder, f"{kind}-ref-cmyk.pdf")
+            convert_cmyk_keep_text(ref_pdf, ref_cmyk)
+            proof_press = _proof_bgr(press, os.path.join(folder, f"{kind}-press-proof.png"))
+            proof_ref = _proof_bgr(ref_cmyk, os.path.join(folder, f"{kind}-ref-proof.png"))
+            if proof_press.shape[:2] != proof_ref.shape[:2]:
+                proof_press = cv2.resize(proof_press, (proof_ref.shape[1], proof_ref.shape[0]), interpolation=cv2.INTER_AREA)
+            ignore = np.zeros(proof_ref.shape[:2], np.uint8)
+            for phrase, _expected_y, _rgb in expect:
+                block = by_phrase.get(phrase)
+                if not block:
+                    continue
+                ox0, oy0, ox1, oy1 = _page_box(block, source.shape, scale, off_x, off_y, canvas_w, canvas_h)
+                pad_x = 0.02 * (ox1 - ox0) + 0.008
+                pad_y = 0.02 * (oy1 - oy0) + 0.008
+                cv2.rectangle(
+                    ignore,
+                    (int((ox0 - pad_x) * ignore.shape[1]), int((oy0 - pad_y) * ignore.shape[0])),
+                    (int((ox1 + pad_x) * ignore.shape[1]), int((oy1 + pad_y) * ignore.shape[0])),
+                    255,
+                    -1,
+                )
+            delta = _lab_delta(proof_ref, proof_press)
+            kept = delta[ignore < 128]
+            mean_de = float(kept.mean()) if kept.size else 99.0
+            check(f"{kind}-deltae", mean_de < 3.0, f"{mean_de:.2f}")
     finally:
         if saved is not None:
             os.environ["REPLICATE_API_TOKEN"] = saved
@@ -443,5 +616,6 @@ if __name__ == "__main__":
     test_provider_crash_falls_back()
     test_real_local_ocr()
     test_restore_spaces_from_gaps()
+    test_inpaint_removes_the_letters()
     test_press_pdf_shows_the_words()
     print("AI rebuild checks passed")
