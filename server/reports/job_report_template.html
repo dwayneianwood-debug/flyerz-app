@@ -183,6 +183,25 @@
   </p>
   {% endif %}
 
+  {% if ai_rebuild and ai_rebuild.detected %}
+  <h2>AI Rebuild</h2>
+  <p>{{ ai_rebuild.message or ai_rebuild.recommendation or "AI-generated artwork was rebuilt for the press." }}</p>
+  {% if ai_rebuild.ocrText %}
+  <p><strong>Text found:</strong> {{ ai_rebuild.ocrText }}</p>
+  {% endif %}
+  {% if ai_rebuild.steps %}
+  {% for step in ai_rebuild.steps %}
+  <p class="muted">{{ step.name }} · {{ step.engine }}{% if step.note %} — {{ step.note }}{% endif %}</p>
+  {% endfor %}
+  {% endif %}
+  {% if ai_rebuild.beforePath or ai_rebuild.afterPath %}
+  <p>
+    {% if ai_rebuild.beforePath %}<img src="{{ ai_rebuild.beforePath }}" width="220" alt="Before"/>{% endif %}
+    {% if ai_rebuild.afterPath %}<img src="{{ ai_rebuild.afterPath }}" width="220" alt="After"/>{% endif %}
+  </p>
+  {% endif %}
+  {% endif %}
+
   <h2>Channel results (this job)</h2>
 
   {% if checks and checks|length > 0 %}

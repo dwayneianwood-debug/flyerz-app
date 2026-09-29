@@ -32,6 +32,7 @@ import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
+import { AiRebuildPanel } from "@/components/ai-rebuild-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
 import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline, shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
@@ -1188,6 +1189,11 @@ export default function JobDetails() {
                       }
                     }}
                   />
+                  <AiRebuildPanel
+                    jobId={job.id}
+                    trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                    trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                  />
                 </div>
               )}
 
@@ -1523,6 +1529,11 @@ export default function JobDetails() {
                             void handleBleedMethodSelect(selectedBleedMethod, true);
                           }
                         }}
+                      />
+                      <AiRebuildPanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
                       />
                     </div>
                   )}

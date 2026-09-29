@@ -1320,6 +1320,7 @@ def main():
     parser.add_argument("--border-label", default="White", help="Colour-border display name")
     parser.add_argument("--ai-upscale-path", default="", help="Accepted enhanced raster applied before bleed")
     parser.add_argument("--ai-upscale-note", default="", help="Health-report note when enhancement was accepted")
+    parser.add_argument("--ai-rebuild-note", default="", help="Health-report note when AI Rebuild was used")
     parser.add_argument("--ai-artwork-fit", default="", help="AI image aspect fit: crop, extend, border, or none")
     parser.add_argument("--ai-artwork-offset", type=float, default=0.5, help="Crop-to-fit position from 0 to 1")
     parser.add_argument("--ai-artwork-note", default="", help="Health-report note listing auto-applied AI artwork defaults")
@@ -2858,6 +2859,14 @@ def main():
                         {"name": "Hairline Stroke Enforcement", "passed": True, "autoFixed": hairline_auto, "message": hairline_action},
                         {"name": "QR Code Integrity", "passed": qr_passed, "autoFixed": qr_auto, "message": qr_action},
                     ]
+                    rebuild_note = (getattr(args, "ai_rebuild_note", "") or "").strip()
+                    if rebuild_note:
+                        synth_checks.append({
+                            "name": "AI Rebuild",
+                            "passed": True,
+                            "autoFixed": True,
+                            "message": rebuild_note,
+                        })
 
                     report_proofs = []
                     if proof_before_zip and os.path.exists(proof_before_zip):

@@ -1115,6 +1115,16 @@ if __name__ == "__main__":
             float(options.get("trim_h_mm", 210)),
             options,
         )
+    elif action == "ai_rebuild_assess":
+        from ai_rebuild import assess as assess_ai_rebuild
+        result = assess_ai_rebuild(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+        )
+    elif action == "ai_rebuild":
+        from ai_rebuild import rebuild as rebuild_ai_artwork
+        result = rebuild_ai_artwork(input_path, options)
     else:
         result = {"error": f"Unknown action: {action}"}
         sys.exit(1)

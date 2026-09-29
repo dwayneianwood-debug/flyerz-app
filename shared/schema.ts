@@ -150,6 +150,25 @@ export interface AuditResults {
     srcW?: number;
     srcH?: number;
   };
+  /** Automatic rebuild of likely AI raster artwork. Absent means not assessed. */
+  aiRebuild?: {
+    detected?: boolean;
+    assessed?: boolean;
+    skipped?: boolean;
+    autoRebuild?: boolean;
+    accepted?: boolean;
+    success?: boolean;
+    reasons?: string[];
+    recommendation?: string;
+    blocks?: Array<{ id: string; text: string; bbox?: number[]; color_hex?: string; bold?: boolean }>;
+    ocrText?: string;
+    steps?: Array<{ name: string; engine: string; ok?: boolean; note?: string }>;
+    pdfPath?: string;
+    note?: string;
+    message?: string;
+    replicate?: string;
+    effectiveDpi?: number | null;
+  };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;

@@ -35,6 +35,7 @@ import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 import { normalizeBleedMm } from "@shared/bleed-size";
 import { pythonChildEnv } from "./pythonChildEnv";
+import { choosePressInput } from "./aiRebuildPolicy";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import {
@@ -174,6 +175,17 @@ function aiArtworkCliArgs(audit: any): string[] {
   ];
 }
 
+function aiRebuildCliArgs(strategy: string, audit: any): string[] {
+  if (strategy !== "auto") return [];
+  const saved = audit?.aiRebuild;
+  if (!saved?.detected || saved.skipped || saved.accepted === false) return [];
+  const pdf = typeof saved.pdfPath === "string" ? saved.pdfPath : "";
+  if (!pdf || !fsSync.existsSync(pdf)) return [];
+  const note = String(saved.note || "").replace(/[\r\n]/g, " ").trim();
+  if (!note) return [];
+  return ["--ai-rebuild-note", note.slice(0, 700)];
+}
+
 function aiUpscaleCliArgs(audit: any): string[] {
   const saved = audit?.aiUpscale;
   if (!saved?.accepted) return [];
@@ -251,6 +263,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
     ...colourBorderCliArgs(strategy, auditResults),
     ...aiUpscaleCliArgs(auditResults),
     ...aiArtworkCliArgs(auditResults),
+    ...aiRebuildCliArgs(strategy, auditResults),
     ...pageFitCliArgs(auditResults),
   ];
 
@@ -1324,6 +1337,17 @@ export async function registerRoutes(
         artworkSize: audit?.artworkSize ?? null,
         originalDpi: audit?.originalDpi ?? null,
         aiEnhanced: audit?.aiEnhanced ?? null,
+        aiRebuild: audit?.aiRebuild
+          ? {
+              ...audit.aiRebuild,
+              beforePath: fsSync.existsSync(path.join(uploadDir, `ai-rebuild-${jobId}-before.png`))
+                ? path.join(uploadDir, `ai-rebuild-${jobId}-before.png`)
+                : "",
+              afterPath: fsSync.existsSync(path.join(uploadDir, `ai-rebuild-${jobId}-after.png`))
+                ? path.join(uploadDir, `ai-rebuild-${jobId}-after.png`)
+                : "",
+            }
+          : null,
         rightSafety: audit?.rightSafety ?? null,
         criticalSafeZone: audit?.criticalSafeZone ?? null,
       };
@@ -1975,11 +1999,23 @@ export async function registerRoutes(
       }
       console.log(`DEBUG: select-bleed-method Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${selectHasCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
 
+      let compileAudit: any = updatedResults;
+      if (method === "auto" && !selectHasCrop && artworkPath && job.status === "complete") {
+        try {
+          const trimW = Number(selectSavedOpts?.targetWidth) || 148;
+          const trimH = Number(selectSavedOpts?.targetHeight) || 210;
+          compileAudit = await ensureAiRebuild(job, updatedResults, trimW, trimH);
+          artworkPath = choosePressInput("auto", compileAudit, artworkPath, (file) => fsSync.existsSync(file));
+        } catch (rebuildErr) {
+          console.error("[AI-REBUILD] select-bleed kept the original:", rebuildErr);
+        }
+      }
+
       if (artworkPath && job.status === "complete") {
         try {
           await fs.access(artworkPath);
           console.log(`TRACER: [Checkpoint B] spawnPreCompile: job=${jobId} strategy="${method}" artworkPath="${artworkPath}"`);
-          spawnPreCompile(jobId, artworkPath, method, { ...job, auditResults: updatedResults });
+          spawnPreCompile(jobId, artworkPath, method, { ...job, auditResults: compileAudit });
         } catch (e) {
           console.log(`[FAI] Pre-compile skipped for job ${jobId}: artwork not accessible`);
         }
@@ -2022,6 +2058,189 @@ export async function registerRoutes(
     );
     return parseUpscaleJson(stdout as string);
   };
+
+  const AI_REBUILD_SCRIPT = path.join(process.cwd(), "server", "ai_rebuild.py");
+  const rebuildInflight = new Map<number, Promise<any>>();
+
+  const runAiRebuildScript = async (action: string, artworkPath: string, options: Record<string, unknown>) => {
+    const { promisify } = await import("util");
+    const { execFile } = await import("child_process");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(
+      PYTHON_BIN,
+      [AI_REBUILD_SCRIPT, action, artworkPath, JSON.stringify(options || {})],
+      { timeout: 120000, encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, env: pythonChildEnv(), cwd: process.cwd() },
+    );
+    return parseUpscaleJson(stdout as string);
+  };
+
+  const slimRebuild = (parsed: any, skipped = false) => ({
+    detected: !!parsed?.detected,
+    assessed: true,
+    skipped,
+    autoRebuild: !!parsed?.detected && !skipped,
+    reasons: Array.isArray(parsed?.reasons) ? parsed.reasons : [],
+    recommendation: String(parsed?.recommendation || ""),
+    blocks: Array.isArray(parsed?.blocks) ? parsed.blocks : [],
+    ocrText: String(parsed?.ocrText || ""),
+    steps: Array.isArray(parsed?.steps) ? parsed.steps : [],
+    pdfPath: typeof parsed?.pdfPath === "string" ? parsed.pdfPath : "",
+    note: String(parsed?.note || ""),
+    message: String(parsed?.message || ""),
+    replicate: String(parsed?.replicate || ""),
+    effectiveDpi: parsed?.effective_dpi ?? parsed?.effectiveDpi ?? null,
+    success: parsed?.success !== false,
+  });
+
+  const rebuildView = (jobId: number, saved: any) => {
+    const before = path.join(uploadDir, `ai-rebuild-${jobId}-before.png`);
+    const after = path.join(uploadDir, `ai-rebuild-${jobId}-after.png`);
+    return {
+      ...(saved || {}),
+      ready: !!(saved?.pdfPath && fsSync.existsSync(saved.pdfPath)),
+      beforeUrl: fsSync.existsSync(before) ? `/api/jobs/${jobId}/ai-rebuild/image?which=before` : "",
+      afterUrl: fsSync.existsSync(after) ? `/api/jobs/${jobId}/ai-rebuild/image?which=after` : "",
+    };
+  };
+
+  const ensureAiRebuild = async (job: any, audit: any, trimW: number, trimH: number, edits?: unknown[]) => {
+    const saved = audit?.aiRebuild || {};
+    const jobId = Number(job.id);
+    if (saved.skipped && !edits) return audit;
+    if (!edits && saved.assessed && saved.detected === false) return audit;
+    if (!edits && !saved.skipped && saved.detected && saved.pdfPath && fsSync.existsSync(saved.pdfPath)) {
+      await storage.updateJob(jobId, { auditResults: audit });
+      return audit;
+    }
+    if (!edits && rebuildInflight.has(jobId)) return rebuildInflight.get(jobId);
+    const task = (async () => {
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      if (!artworkPath) return audit;
+      const before = path.join(uploadDir, `ai-rebuild-${jobId}-before.png`);
+      const after = path.join(uploadDir, `ai-rebuild-${jobId}-after.png`);
+      const pdf = path.join(uploadDir, `ai-rebuild-${jobId}.pdf`);
+      const clean = path.join(uploadDir, `ai-rebuild-${jobId}-clean.png`);
+      try {
+        const parsed = await runAiRebuildScript("rebuild", artworkPath, {
+          trim_w_mm: trimW,
+          trim_h_mm: trimH,
+          output_pdf: pdf,
+          before_path: before,
+          after_path: after,
+          clean_path: clean,
+          blocks: edits,
+          force: Array.isArray(edits),
+        });
+        const next = { ...audit, aiRebuild: slimRebuild(parsed, false) };
+        await storage.updateJob(jobId, { auditResults: next });
+        return next;
+      } catch (error: any) {
+        console.error("[AI-REBUILD] fallback to original:", error?.message || error);
+        const next = {
+          ...audit,
+          aiRebuild: {
+            ...(audit?.aiRebuild || {}),
+            assessed: true,
+            detected: false,
+            skipped: false,
+            success: false,
+            pdfPath: "",
+            message: `AI Rebuild was skipped so the job can continue. ${String(error?.message || error).slice(0, 180)}`,
+            steps: [],
+          },
+        };
+        await storage.updateJob(jobId, { auditResults: next });
+        return next;
+      }
+    })();
+    if (!edits) rebuildInflight.set(jobId, task);
+    try {
+      return await task;
+    } finally {
+      if (!edits) rebuildInflight.delete(jobId);
+    }
+  };
+
+  app.get("/api/jobs/:id/ai-rebuild", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const saved = audit.aiRebuild;
+      if (saved?.assessed && (saved.detected === false || saved.pdfPath || saved.skipped)) {
+        return res.json(rebuildView(jobId, saved));
+      }
+      const artworkPath = resolveUpscaleArtwork(job, audit);
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(req.query.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(req.query.trimH) || Number(savedOpts?.targetHeight) || 210;
+      if (!artworkPath) return res.json({ detected: false, assessed: true });
+      const parsed = await runAiRebuildScript("assess", artworkPath, { trim_w_mm: trimW, trim_h_mm: trimH });
+      res.setHeader("Cache-Control", "no-store");
+      res.json(rebuildView(jobId, {
+        ...(saved || {}),
+        detected: !!parsed?.detected,
+        autoRebuild: !!parsed?.autoRebuild,
+        reasons: parsed?.reasons || [],
+        recommendation: parsed?.recommendation || "",
+        message: parsed?.message || saved?.message || "",
+        skipped: !!saved?.skipped,
+      }));
+    } catch (error: any) {
+      console.error("[AI-REBUILD] assess failed:", error?.message || error);
+      res.json({ detected: false, assessed: true });
+    }
+  });
+
+  app.post("/api/jobs/:id/ai-rebuild/run", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const job = await storage.getJob(jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      const audit = (job.auditResults || {}) as any;
+      const body = req.body || {};
+      const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
+      const trimW = Number(body.trimW) || Number(savedOpts?.targetWidth) || 148;
+      const trimH = Number(body.trimH) || Number(savedOpts?.targetHeight) || 210;
+      if (body.skipped === true) {
+        const next = {
+          ...audit,
+          aiRebuild: {
+            ...(audit.aiRebuild || {}),
+            detected: true,
+            assessed: true,
+            skipped: true,
+            autoRebuild: false,
+          },
+        };
+        await storage.updateJob(jobId, { auditResults: next });
+        return res.json(rebuildView(jobId, next.aiRebuild));
+      }
+      const edits = Array.isArray(body.blocks) ? body.blocks : undefined;
+      const cleared = { ...audit, aiRebuild: { ...(audit.aiRebuild || {}), skipped: false, detected: audit.aiRebuild?.detected !== false } };
+      const next = await ensureAiRebuild(job, cleared, trimW, trimH, edits);
+      res.json(rebuildView(jobId, next?.aiRebuild || { detected: false }));
+    } catch (error: any) {
+      console.error("[AI-REBUILD] run failed:", error?.message || error);
+      res.json({ detected: false, success: false, message: "AI Rebuild was skipped so the job can continue." });
+    }
+  });
+
+  app.get("/api/jobs/:id/ai-rebuild/image", async (req, res) => {
+    try {
+      const jobId = Number(req.params.id);
+      const which = req.query.which === "after" ? "after" : "before";
+      const filePath = path.join(uploadDir, `ai-rebuild-${jobId}-${which}.png`);
+      if (!fsSync.existsSync(filePath)) return res.status(404).json({ message: "Preview not ready" });
+      res.setHeader("Cache-Control", "no-store");
+      res.type("png");
+      fsSync.createReadStream(filePath).pipe(res);
+    } catch (error) {
+      console.error("[AI-REBUILD] image failed:", error);
+      res.status(404).json({ message: "Preview not ready" });
+    }
+  });
 
   app.get("/api/jobs/:id/ai-upscale/assess", async (req, res) => {
     try {
@@ -2601,9 +2820,18 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Artwork file not found on disk" });
       }
 
-      console.log(`DEBUG: Compiling PDF for Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${hasManualCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
-
       const effectiveStrategy = selectedStrategy;
+      let compileAudit: any = auditResults;
+      if (effectiveStrategy === "auto" && !hasManualCrop) {
+        try {
+          compileAudit = await ensureAiRebuild(job, auditResults, Number(trimWidth) || 148, Number(trimHeight) || 210);
+          artworkPath = choosePressInput("auto", compileAudit, artworkPath, (file) => fsSync.existsSync(file));
+        } catch (rebuildErr) {
+          console.error("[AI-REBUILD] compile kept the original:", rebuildErr);
+        }
+      }
+
+      console.log(`DEBUG: Compiling PDF for Job #${jobId}. Source: ${artworkPath}, Manual Crop Active: ${hasManualCrop}, preBleedPath: ${preBleedPath || 'NONE'}`);
 
       const cropArgs = [
         "--crop-x", String(cropSource.cropX || 0),
@@ -2651,6 +2879,7 @@ export async function registerRoutes(
         ...colourBorderCliArgs(effectiveStrategy, auditResults),
         ...aiUpscaleCliArgs(auditResults),
         ...aiArtworkCliArgs(auditResults),
+        ...aiRebuildCliArgs(effectiveStrategy, compileAudit),
         ...pageFitCliArgs(auditResults),
       ];
 

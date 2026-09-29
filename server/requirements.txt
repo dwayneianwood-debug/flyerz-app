@@ -13,3 +13,7 @@ xhtml2pdf>=0.2.15
 python-dotenv>=1.0.0
 requests>=2.31.0
 google-genai>=2.0.0
+# AI Rebuild local OCR. Pip wheels for Windows without admin and without a compiler.
+# Also installs onnxruntime, opencv-python, shapely, pyclipper, tqdm, protobuf, and flatbuffers.
+# If this import fails, AI Rebuild still runs and records that OCR was unavailable.
+rapidocr-onnxruntime>=1.3.24
