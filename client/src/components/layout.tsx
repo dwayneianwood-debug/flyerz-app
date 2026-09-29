@@ -88,6 +88,16 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 Dashboard
               </Button>
             </Link>
+            <Link href="/print-ready">
+              <Button
+                variant={location === "/print-ready" ? "secondary" : "ghost"}
+                size="sm"
+                className="font-medium rounded-full"
+                data-testid="nav-print-ready"
+              >
+                Print-ready
+              </Button>
+            </Link>
 
             <div className="relative" ref={toolsRef}>
               <Button 

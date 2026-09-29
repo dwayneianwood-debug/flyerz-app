@@ -3,7 +3,8 @@ import { FileUpload } from "@/components/file-upload";
 import { JobList } from "@/components/job-list";
 import { HOME_WIZARD_STEPS } from "@/lib/home-wizard-steps";
 import { motion } from "framer-motion";
-import { Crop, Ruler, Upload } from "lucide-react";
+import { Crop, Ruler, Upload, Zap } from "lucide-react";
+import { Link } from "wouter";
 
 const STEP_ICONS = [Upload, Ruler, Crop];
 
@@ -26,6 +27,23 @@ export default function Dashboard() {
             Upload your artwork, choose the size, then crop and submit. Three steps to print-ready artwork.
           </p>
         </div>
+
+        <Link href="/print-ready">
+          <div
+            className="mb-8 rounded-2xl border border-primary/30 bg-primary/5 px-5 py-4 text-left hover:bg-primary/10 transition-colors cursor-pointer"
+            data-testid="link-make-print-ready"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-primary text-white flex items-center justify-center shrink-0">
+                <Zap className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-lg font-bold font-display text-foreground">Make it print-ready</p>
+                <p className="text-sm text-muted-foreground">Drop a client's file, pick the size, and get a press PDF. No extra questions.</p>
+              </div>
+            </div>
+          </div>
+        </Link>
 
         <div className="mb-8" data-testid="wizard-steps-preview">
           <div className="flex items-center justify-center gap-0 px-4 sm:px-16">

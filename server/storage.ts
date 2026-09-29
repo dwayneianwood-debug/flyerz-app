@@ -203,6 +203,7 @@ type ListRow = {
   has_corrected: number;
   overall_passed: unknown;
   press_passed: unknown;
+  quick_light: unknown;
 };
 
 export class DatabaseStorage implements IStorage {
@@ -211,12 +212,21 @@ export class DatabaseStorage implements IStorage {
     return Number(row?.n || 0);
   }
 
-  async listJobs(options: { limit: number; offset: number; status?: string }): Promise<JobListPage> {
+  async listJobs(options: { limit: number; offset: number; status?: string; attention?: boolean }): Promise<JobListPage> {
     const limit = Math.min(100, Math.max(1, Math.floor(options.limit)));
     const offset = Math.max(0, Math.floor(options.offset));
     const status = options.status;
-    const where = status ? "WHERE status = ?" : "";
-    const args = status ? [status] : [];
+    const clauses: string[] = [];
+    const args: unknown[] = [];
+    if (status) {
+      clauses.push("status = ?");
+      args.push(status);
+    }
+    if (options.attention) {
+      clauses.push("json_extract(audit_results, '$.quickPrint.light') IN ('amber', 'red')");
+      clauses.push("COALESCE(json_extract(audit_results, '$.quickPrint.approved'), 0) != 1");
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const totalRow = sqlite
       .prepare(`SELECT COUNT(*) AS n FROM file_jobs ${where}`)
       .get(...args) as { n: number };
@@ -225,7 +235,8 @@ export class DatabaseStorage implements IStorage {
         `SELECT id, filename, status, uploaded_at, file_size, file_type,
                 CASE WHEN corrected_path IS NOT NULL AND corrected_path != '' THEN 1 ELSE 0 END AS has_corrected,
                 json_extract(audit_results, '$.overallPassed') AS overall_passed,
-                json_extract(audit_results, '$.pressEngine.passed') AS press_passed
+                json_extract(audit_results, '$.pressEngine.passed') AS press_passed,
+                json_extract(audit_results, '$.quickPrint.light') AS quick_light
          FROM file_jobs
          ${where}
          ORDER BY uploaded_at DESC, id DESC
@@ -236,6 +247,9 @@ export class DatabaseStorage implements IStorage {
       const overallPassed = passedFlag(row.overall_passed);
       const pressPassed = passedFlag(row.press_passed);
       const uploaded = new Date(row.uploaded_at);
+      const quickLight = row.quick_light === "green" || row.quick_light === "amber" || row.quick_light === "red"
+        ? row.quick_light
+        : null;
       return {
         id: row.id,
         filename: row.filename,
@@ -247,6 +261,7 @@ export class DatabaseStorage implements IStorage {
         overallPassed,
         hasCorrectedFile: row.has_corrected === 1,
         printReady: row.status === "complete" && overallPassed === true && pressPassed === true,
+        quickLight,
       };
     });
     const total = Number(totalRow?.n || 0);
@@ -257,6 +272,18 @@ export class DatabaseStorage implements IStorage {
       offset,
       hasMore: offset + jobs.length < total,
     };
+  }
+
+  async listQuickPrint(limit: number): Promise<{ id: number }[]> {
+    const cap = Math.min(24, Math.max(1, Math.floor(limit)));
+    return sqlite
+      .prepare(
+        `SELECT id FROM file_jobs
+         WHERE json_extract(audit_results, '$.quickPrint.light') IN ('green', 'amber', 'red')
+         ORDER BY uploaded_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(cap) as { id: number }[];
   }
 
   async getJobStatus(id: number): Promise<{ id: number; status: string; errorMessage: string | null } | undefined> {

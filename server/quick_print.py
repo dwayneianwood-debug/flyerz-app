@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""One-step press file for sales.
+
+Decides the product fit, AI rebuild, and 5mm bleed without asking. The press
+PDF itself is built by the existing compile script and Press-Ready Engine.
+This module does not change those engines.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+from typing import Optional
+
+BLEED_MM = 5.0
+UPSCALE_AMBER = 3.0
+ASPECT_AMBER = 0.12
+OCR_AMBER = 0.55
+MAX_HONEST_UPSCALE = 4.0
+MIN_DPI_AFTER_UPSCALE = 150.0
+MM_TO_PT = 72.0 / 25.4
+
+OFFICE_EXT = {".doc", ".docx", ".ppt", ".pptx"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
+VECTOR_EXT = {".pdf", ".ai", ".eps"}
+
+OFFICE_MESSAGE = (
+    "Thanks for sending this. Word and PowerPoint files cannot go on the printing press. "
+    "Please send a PDF (in Word or PowerPoint choose File, then Save as PDF) "
+    "or a high-resolution JPG or PNG. A print file should be about 300 DPI at the finished size, "
+    "with 5mm of extra image around the edge if you can."
+)
+CORRUPT_MESSAGE = (
+    "We could not open this file. It may be damaged, or it was saved in a program we cannot read. "
+    "Please send it again as a PDF, JPG, or PNG."
+)
+COMPILE_MESSAGE = (
+    "We could not build a press file from this. Please send a PDF or a clear JPG or PNG of the artwork."
+)
+
+
+def _products() -> list:
+    path = os.path.join(os.path.dirname(__file__), "..", "shared", "quick-print-products.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _product_by_id(product_id: str) -> Optional[dict]:
+    for product in _products():
+        if product.get("id") == product_id:
+            return product
+    return None
+
+
+def _cover_scale(src_w: int, src_h: int, trim_w: float, trim_h: float) -> float:
+    target_w = max(1.0, float(trim_w) / 25.4 * 300.0)
+    target_h = max(1.0, float(trim_h) / 25.4 * 300.0)
+    return max(target_w / max(1, src_w), target_h / max(1, src_h))
+
+
+def too_small(src_w: int, src_h: int, trim_w: float, trim_h: float) -> bool:
+    scale = _cover_scale(src_w, src_h, trim_w, trim_h)
+    if scale <= 0:
+        return True
+    after = (300.0 / scale) * MAX_HONEST_UPSCALE
+    return after < MIN_DPI_AFTER_UPSCALE
+
+
+def too_small_message(label: str, trim_w: float, trim_h: float) -> str:
+    need_w = int(math.ceil(float(trim_w) / 25.4 * 300.0))
+    need_h = int(math.ceil(float(trim_h) / 25.4 * 300.0))
+    return (
+        f"Thanks for the picture. It is too small to print sharply on {label}, even if we enlarge it. "
+        f"Please send a larger file. For {label} that is about {need_w} × {need_h} pixels, "
+        "or a PDF exported from the design program."
+    )
+
+
+def decide_light(facts: dict) -> dict:
+    """Traffic light. Amber is only for a real risk. Red means no press file."""
+    kind = facts.get("kind")
+    if kind == "office":
+        return {"light": "red", "reasons": ["Word and PowerPoint files cannot be printed as they are."], "clientMessage": OFFICE_MESSAGE}
+    if kind in ("corrupt", "unsupported") or facts.get("readable") is False:
+        return {"light": "red", "reasons": ["The file could not be read."], "clientMessage": CORRUPT_MESSAGE}
+    if facts.get("tooSmall"):
+        return {
+            "light": "red",
+            "reasons": ["The picture is far too small to print at this size."],
+            "clientMessage": facts.get("tooSmallMessage") or too_small_message("this size", 148, 210),
+        }
+    if not facts.get("compiled"):
+        return {
+            "light": "red",
+            "reasons": [facts.get("compileError") or "A press file could not be built."],
+            "clientMessage": COMPILE_MESSAGE,
+        }
+
+    reasons = []
+    if facts.get("ocrLow"):
+        reasons.append("The rebuilt text was hard to read, so check the spelling before it is printed.")
+    if facts.get("textNearTrim"):
+        reasons.append("Some text is still very close to the trim after the safe-zone shrink.")
+    upscale = float(facts.get("upscale") or 1)
+    if upscale >= UPSCALE_AMBER:
+        reasons.append(f"The picture was enlarged {upscale:.1f} times to reach print size. Glance at fine detail.")
+    if facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
+        reasons.append("The picture was a different shape, so the edges were extended. Glance at those edges.")
+    if facts.get("enginePassed") is False:
+        note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
+        if note not in reasons:
+            reasons.append(note)
+    if reasons:
+        return {"light": "amber", "reasons": reasons, "clientMessage": ""}
+    return {"light": "green", "reasons": [], "clientMessage": ""}
+
+
+def _safe_name(name: str) -> str:
+    base = os.path.basename(name or "artwork").replace("\x00", "")
+    return base[:180] or "artwork"
+
+
+def _ext(path: str, filename: str) -> str:
+    return os.path.splitext(filename or path)[1].lower()
+
+
+def _to_bgr(img):
+    import cv2
+    import numpy as np
+
+    if img is None:
+        return None
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+        bgr = img[:, :, :3].astype(np.float32)
+        white = np.full_like(bgr, 255)
+        return (bgr * alpha + white * (1.0 - alpha)).astype(np.uint8)
+    return img[:, :, :3].copy()
+
+
+def _read_image(path: str):
+    import cv2
+
+    return _to_bgr(cv2.imread(path, cv2.IMREAD_UNCHANGED))
+
+
+def _write_png(img, path: str) -> None:
+    import cv2
+    from PIL import Image
+
+    ok = cv2.imwrite(path, img)
+    if not ok:
+        raise RuntimeError("could not write the working picture")
+    with Image.open(path) as im:
+        im.save(path, format="PNG", dpi=(300, 300))
+
+
+def _pdf_trim_mm(path: str) -> Optional[tuple]:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        if doc.page_count < 1:
+            return None
+        page = doc[0]
+        box = page.trimbox if page.trimbox.width > 2 and page.trimbox.height > 2 else page.mediabox
+        return (box.width * 25.4 / 72.0, box.height * 25.4 / 72.0)
+    finally:
+        doc.close()
+
+
+def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
+    best = None
+    rotated = False
+    for product in _products():
+        if abs(width_mm - product["widthMm"]) <= tolerance and abs(height_mm - product["heightMm"]) <= tolerance:
+            return product, False
+        if abs(width_mm - product["heightMm"]) <= tolerance and abs(height_mm - product["widthMm"]) <= tolerance:
+            best = product
+            rotated = True
+    return best, rotated
+
+
+def _render_pdf_image(path: str):
+    import numpy as np
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        long_pt = max(page.rect.width, page.rect.height, 1)
+        zoom = min(300.0 / 72.0, 4500.0 / long_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        return arr[:, :, :3][:, :, ::-1].copy()
+    finally:
+        doc.close()
+
+
+def _prepare_vector(path: str, ext: str) -> tuple:
+    if ext not in (".ai", ".eps"):
+        return path, ""
+    from illustrator_intake import prepare_illustrator_file
+
+    prepared = prepare_illustrator_file(path, ext)
+    if not prepared.get("success"):
+        return "", "This Illustrator file could not be opened. In Illustrator, save a PDF copy and send that."
+    return prepared.get("pdfPath") or path, ""
+
+
+def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tuple:
+    import cv2
+
+    height, width = img.shape[:2]
+    src = width / float(height)
+    target = float(trim_w) / float(trim_h)
+    swap = float(trim_h) / float(trim_w)
+    delta = abs(src - target) / target
+    swap_delta = abs(src - swap) / swap
+    if swap_delta < 0.08 and swap_delta + 0.01 < delta:
+        turned = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        decisions.append("The picture was turned on its side so it matches the product. It was not stretched.")
+        return turned, True
+    return img, False
+
+
+def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
+    from ai_artwork import apply_artwork_fit, ratios_differ
+
+    height, width = img.shape[:2]
+    src = width / float(max(height, 1))
+    target = float(trim_w) / float(trim_h)
+    delta = abs(src - target) / target if target else 0
+    if not ratios_differ(width, height, trim_w, trim_h):
+        decisions.append("The picture already matches the product shape, so nothing was cropped or stretched.")
+        return img, False, delta
+
+    def _no_remote(_path):
+        return {"stub": True, "success": False}
+
+    fitted, _info = apply_artwork_fit(
+        img,
+        trim_w,
+        trim_h,
+        "extend",
+        0.5,
+        (0, 0, 0, 0),
+        source_path=source_path,
+        expand_fn=_no_remote,
+    )
+    if fitted is None or getattr(fitted, "size", 0) == 0:
+        fitted = img
+    decisions.append(
+        "The picture was a different shape from the product. The whole picture was kept and the edges were extended. It was not stretched."
+    )
+    return fitted, True, delta
+
+
+def _text_near_trim(report: dict) -> bool:
+    rescue = (report or {}).get("rescue") or {}
+    note = str(rescue.get("note") or "")
+    if "may still sit" in note:
+        return True
+    try:
+        percent = float(rescue.get("percent") or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    return bool(rescue.get("applied")) and percent >= 2.9
+
+
+def _boxes_mm(path: str) -> dict:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        media = page.mediabox
+        trim = page.trimbox
+        return {
+            "mediaWidthMm": round(media.width * 25.4 / 72.0, 2),
+            "mediaHeightMm": round(media.height * 25.4 / 72.0, 2),
+            "trimWidthMm": round(trim.width * 25.4 / 72.0, 2),
+            "trimHeightMm": round(trim.height * 25.4 / 72.0, 2),
+        }
+    finally:
+        doc.close()
+
+
+def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
+    script = os.path.join(os.path.dirname(__file__), "compile_press_pdf.py")
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    status = tempfile.NamedTemporaryFile(prefix="quick-status-", suffix=".json", delete=False)
+    result = tempfile.NamedTemporaryFile(prefix="quick-result-", suffix=".json", delete=False)
+    status.close()
+    result.close()
+    cmd = [
+        sys.executable,
+        script,
+        "--input", src,
+        "--output", output_pdf,
+        "--strategy", "auto",
+        "--color-space", "cmyk",
+        "--trim-w", str(trim_w),
+        "--trim-h", str(trim_h),
+        "--bleed-mm", str(BLEED_MM),
+        "--status-file", status.name,
+        "--result-file", result.name,
+        "--base-name", "quick-print",
+        "--creep-mm", "0",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=240,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        payload = {}
+        if os.path.exists(result.name):
+            try:
+                with open(result.name, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception:
+                payload = {}
+        payload["returncode"] = proc.returncode
+        if proc.returncode != 0 and not payload.get("error"):
+            tail = (proc.stderr or "")[-500:]
+            payload["error"] = tail or "The press compile did not finish."
+        return payload
+    finally:
+        for path in (status.name, result.name):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _write_proof(press_path: str, png_path: str, pdf_path: str, caption: str) -> None:
+    import pymupdf as fitz
+
+    src = fitz.open(press_path)
+    try:
+        page = src[0]
+        proof = fitz.open()
+        footer = 32
+        out = proof.new_page(width=page.rect.width, height=page.rect.height + footer)
+        out.show_pdf_page(page.rect, src, 0)
+        trim = page.trimbox
+        out.draw_rect(trim, color=(0.86, 0.05, 0.45), width=1.4)
+        out.insert_text(
+            (14, page.rect.height + 20),
+            caption[:180],
+            fontsize=8,
+            fontname="helv",
+            color=(0.15, 0.15, 0.15),
+        )
+        proof.save(pdf_path, deflate=True, garbage=4)
+        pix = out.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+        pix.save(png_path)
+        proof.close()
+    finally:
+        src.close()
+
+
+def _blank(light_info: dict, decisions: list, product: dict, quantity, notes: str) -> dict:
+    return {
+        "light": light_info["light"],
+        "reasons": light_info["reasons"],
+        "decisions": decisions,
+        "clientMessage": light_info["clientMessage"],
+        "pressPath": "",
+        "proofPng": "",
+        "proofPdf": "",
+        "bleedMm": BLEED_MM,
+        "existingBleedKept": False,
+        "productId": product.get("id"),
+        "productLabel": product.get("label"),
+        "trimW": product.get("widthMm"),
+        "trimH": product.get("heightMm"),
+        "quantity": quantity,
+        "notes": notes,
+        "upscale": 0,
+        "pressEngine": None,
+        "enginePassed": False,
+    }
+
+
+def make_print_ready(
+    src_path: str,
+    output_dir: str,
+    trim_w: float,
+    trim_h: float,
+    product_id: str,
+    product_label: str,
+    filename: str = "",
+    quantity=None,
+    notes: str = "",
+    detect_size: bool = False,
+) -> dict:
+    os.makedirs(output_dir, exist_ok=True)
+    display = _safe_name(filename or os.path.basename(src_path))
+    decisions = [
+        "Sales quick mode decided this file on its own. Nobody was asked a question.",
+        "Bleed is 5 mm on every side.",
+        "Colour is handled by the press engine (CMYK, rich black kept).",
+    ]
+    product = {"id": product_id, "label": product_label, "widthMm": trim_w, "heightMm": trim_h}
+    ext = _ext(src_path, display)
+
+    if detect_size and ext in VECTOR_EXT | IMAGE_EXT:
+        try:
+            if ext in IMAGE_EXT:
+                img = _read_image(src_path)
+                if img is not None:
+                    # Pixel size is not a trim size. Leave the default product.
+                    pass
+            else:
+                opened, prep_error = _prepare_vector(src_path, ext) if ext in (".ai", ".eps") else (src_path, "")
+                if opened and not prep_error:
+                    measured = _pdf_trim_mm(opened)
+                    if measured:
+                        found, _rotated = _match_product(*measured)
+                        if found:
+                            product = found
+                            trim_w = float(found["widthMm"])
+                            trim_h = float(found["heightMm"])
+                            decisions.append(f"The file's trim matches {found['label']}, so that size was used.")
+        except Exception:
+            pass
+
+    decisions.insert(3, f"Product set to {product.get('label')} ({trim_w:g} × {trim_h:g} mm).")
+    if quantity:
+        decisions.append(f"Quantity noted: {quantity}.")
+    if notes:
+        decisions.append(f"Note from sales: {notes[:240]}")
+
+    if ext in OFFICE_EXT:
+        info = decide_light({"kind": "office"})
+        return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+
+    if ext not in IMAGE_EXT | VECTOR_EXT:
+        info = decide_light({"kind": "unsupported", "readable": False})
+        return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+
+    if not os.path.exists(src_path) or os.path.getsize(src_path) < 16:
+        info = decide_light({"kind": "corrupt", "readable": False})
+        return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+
+    work_path = src_path
+    raster = None
+    aspect_extended = False
+    aspect_delta = 0.0
+    upscale = 1.0
+    existing_kept = False
+    ocr_low = False
+
+    try:
+        if ext in (".ai", ".eps"):
+            opened, prep_error = _prepare_vector(src_path, ext)
+            if prep_error or not opened:
+                info = decide_light({"kind": "corrupt", "readable": False})
+                info["clientMessage"] = prep_error or CORRUPT_MESSAGE
+                info["reasons"] = ["This Illustrator file could not be opened."]
+                return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+            work_path = opened
+            ext = ".pdf"
+            decisions.append("The Illustrator file was read onto the normal PDF path.")
+
+        if ext == ".pdf":
+            measured = _pdf_trim_mm(work_path)
+            matches = False
+            if measured:
+                matches = abs(measured[0] - trim_w) <= 2 and abs(measured[1] - trim_h) <= 2
+                decisions.append(
+                    f"The PDF trim is {measured[0]:.1f} × {measured[1]:.1f} mm."
+                )
+            if matches:
+                decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
+            else:
+                decisions.append(
+                    "The PDF shape does not match the product. The page was placed whole and the edges were extended. It was not stretched."
+                )
+                raster = _render_pdf_image(work_path)
+                ext = ".png"
+        if ext in IMAGE_EXT or raster is not None:
+            if raster is None:
+                raster = _read_image(work_path)
+            if raster is None:
+                info = decide_light({"kind": "corrupt", "readable": False})
+                return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+            src_h, src_w = raster.shape[:2]
+            upscale = _cover_scale(src_w, src_h, trim_w, trim_h)
+            if too_small(src_w, src_h, trim_w, trim_h):
+                info = decide_light({
+                    "tooSmall": True,
+                    "tooSmallMessage": too_small_message(str(product.get("label") or "this size"), trim_w, trim_h),
+                })
+                return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+            from ai_rebuild import assess, rebuild
+
+            # Assess the original file. Extending the shape must not hide an AI-sized picture.
+            assess_path = src_path if _ext(src_path, display) in IMAGE_EXT else work_path
+            verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
+            detected = bool(verdict.get("detected"))
+            raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
+            raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
+            fitted_path = os.path.join(output_dir, "fitted.png")
+            _write_png(raster, fitted_path)
+            work_path = fitted_path
+            if detected:
+                decisions.append("This looks like AI-generated artwork, so AI Rebuild ran before the press engine.")
+                rebuilt = rebuild(work_path, {
+                    "trim_w_mm": trim_w,
+                    "trim_h_mm": trim_h,
+                    "output_pdf": os.path.join(output_dir, "rebuilt.pdf"),
+                    "force": True,
+                })
+                for step in rebuilt.get("steps") or []:
+                    note = str(step.get("note") or step.get("name") or "").strip()
+                    if note:
+                        decisions.append(f"AI Rebuild: {note[:220]}")
+                if rebuilt.get("success") and rebuilt.get("pdfPath") and os.path.exists(rebuilt["pdfPath"]):
+                    rebuilt_pdf = rebuilt["pdfPath"]
+                    work_path = rebuilt_pdf
+                    scores = [
+                        float(block.get("score") or 0)
+                        for block in (rebuilt.get("blocks") or [])
+                        if str(block.get("text") or "").strip()
+                    ]
+                    ocr_low = bool(scores) and min(scores) < OCR_AMBER
+                else:
+                    ocr_low = False
+                    decisions.append("AI Rebuild did not change the file, so the picture continued to the press engine.")
+            else:
+                decisions.append("This was not treated as AI artwork, so AI Rebuild stayed off.")
+            if upscale >= 1.15:
+                decisions.append(f"The original picture needs about {upscale:.1f}× to reach 300 DPI at this size. The press file is built at 300 DPI.")
+            else:
+                decisions.append("The original picture is already sharp enough for 300 DPI at this size.")
+    except Exception as exc:
+        info = decide_light({"kind": "corrupt", "readable": False})
+        decisions.append(f"The file could not be prepared ({str(exc)[:140]}).")
+        return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+
+    press_path = os.path.join(output_dir, "press.pdf")
+    compiled = _compile(work_path, press_path, trim_w, trim_h)
+    engine = compiled.get("pressEngine") or {}
+    press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
+    if isinstance(engine, dict) and engine.get("existingBleed"):
+        existing_kept = True
+        decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
+    elif press_ok:
+        decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
+    if isinstance(engine, dict) and engine.get("headline"):
+        decisions.append(f"Press engine: {engine.get('headline')}.")
+
+    facts = {
+        "kind": "image",
+        "readable": True,
+        "tooSmall": False,
+        "compiled": press_ok,
+        "compileError": str(compiled.get("error") or "")[:180],
+        "ocrLow": ocr_low,
+        "textNearTrim": _text_near_trim(engine if isinstance(engine, dict) else {}),
+        "upscale": upscale,
+        "aspectExtended": aspect_extended,
+        "aspectDelta": aspect_delta,
+        "enginePassed": bool(engine.get("passed")) if press_ok else False,
+        "engineReason": (engine.get("reason") if isinstance(engine, dict) else "") or "",
+    }
+    info = decide_light(facts)
+    result = _blank(info, decisions, product, quantity, notes)
+    result["upscale"] = round(upscale, 3)
+    result["existingBleedKept"] = existing_kept
+    result["enginePassed"] = facts["enginePassed"]
+    result["pressEngine"] = engine if isinstance(engine, dict) else None
+    if press_ok and info["light"] != "red":
+        result["pressPath"] = press_path
+        try:
+            boxes = _boxes_mm(press_path)
+            result.update(boxes)
+        except Exception:
+            pass
+        proof_png = os.path.join(output_dir, "proof.png")
+        proof_pdf = os.path.join(output_dir, "proof.pdf")
+        try:
+            _write_proof(
+                press_path,
+                proof_png,
+                proof_pdf,
+                "Proof. The pink line is the trim. This is not the press file.",
+            )
+            result["proofPng"] = proof_png
+            result["proofPdf"] = proof_pdf
+            decisions.append("A client proof with the trim line was made. No approval step is required.")
+        except Exception as exc:
+            decisions.append(f"The press file is ready. The proof picture could not be drawn ({str(exc)[:80]}).")
+    elif not press_ok:
+        result["pressPath"] = ""
+    result["decisions"] = decisions
+    return _finish(result, output_dir)
+
+
+def _finish(result: dict, output_dir: str) -> dict:
+    result_path = os.path.join(output_dir, "result.json")
+    with open(result_path, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2)
+    lines = [f"Result: {str(result.get('light') or '').upper()}"]
+    for line in result.get("decisions") or []:
+        lines.append(f"- {line}")
+    for line in result.get("reasons") or []:
+        lines.append(f"- Look: {line}")
+    if result.get("clientMessage"):
+        lines.append("")
+        lines.append(result["clientMessage"])
+    with open(os.path.join(output_dir, "decisions.txt"), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Make one file print-ready")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--trim-w", type=float, default=148)
+    parser.add_argument("--trim-h", type=float, default=210)
+    parser.add_argument("--product-id", default="a5")
+    parser.add_argument("--product-label", default="A5")
+    parser.add_argument("--filename", default="")
+    parser.add_argument("--quantity", type=int, default=0)
+    parser.add_argument("--notes", default="")
+    parser.add_argument("--detect-size", action="store_true")
+    parser.add_argument("--result", default="")
+    args = parser.parse_args()
+    if args.product_id and args.product_id != "auto":
+        chosen = _product_by_id(args.product_id)
+        if chosen:
+            args.trim_w = float(chosen["widthMm"])
+            args.trim_h = float(chosen["heightMm"])
+            args.product_label = chosen["label"]
+    result = make_print_ready(
+        args.input,
+        args.output_dir,
+        args.trim_w,
+        args.trim_h,
+        args.product_id,
+        args.product_label,
+        filename=args.filename,
+        quantity=args.quantity or None,
+        notes=args.notes or "",
+        detect_size=bool(args.detect_size or args.product_id == "auto"),
+    )
+    text = json.dumps(result)
+    if args.result:
+        with open(args.result, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    sys.stdout.write(text + "\n")
+
+
+if __name__ == "__main__":
+    main()

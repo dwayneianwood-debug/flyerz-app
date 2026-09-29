@@ -169,6 +169,24 @@ export interface AuditResults {
     replicate?: string;
     effectiveDpi?: number | null;
   };
+  /** One-step sales quick mode. Absent on ordinary jobs. */
+  quickPrint?: {
+    light?: "green" | "amber" | "red";
+    approved?: boolean;
+    reasons?: string[];
+    decisions?: string[];
+    clientMessage?: string;
+    pressPath?: string;
+    proofPng?: string;
+    proofPdf?: string;
+    productId?: string;
+    productLabel?: string;
+    quantity?: number | null;
+    notes?: string;
+    bleedMm?: number;
+    existingBleedKept?: boolean;
+    upscale?: number;
+  };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;
@@ -294,6 +312,8 @@ export interface JobListItem {
   overallPassed: boolean | null;
   hasCorrectedFile: boolean;
   printReady: boolean;
+  /** Set when the job was made by sales quick mode. */
+  quickLight?: "green" | "amber" | "red" | null;
 }
 
 export interface JobListPage {

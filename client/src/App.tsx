@@ -5,6 +5,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/dashboard";
+import PrintReady from "@/pages/print-ready";
 import JobDetails from "@/pages/job-details";
 import PureCrop from "@/pages/pure-crop";
 import SafeMarginShrink from "@/pages/safe-margin-shrink";
@@ -20,6 +21,7 @@ function Router() {
     <Switch>
       <Route path="/dashboard/rules" component={DashboardRules}/>
       <Route path="/" component={Dashboard}/>
+      <Route path="/print-ready" component={PrintReady}/>
       <Route path="/job/:id" component={JobDetails}/>
       <Route path="/crop" component={PureCrop}/>
       <Route path="/shrink" component={SafeMarginShrink}/>

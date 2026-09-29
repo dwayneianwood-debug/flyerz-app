@@ -38,6 +38,7 @@ import { pythonChildEnv } from "./pythonChildEnv";
 import { choosePressInput } from "./aiRebuildPolicy";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
+import { registerQuickPrintRoutes } from "./quickPrintRoutes";
 import {
   IllustratorIntakeError,
   INVALID_UPLOAD_MESSAGE,
@@ -717,6 +718,7 @@ export async function registerRoutes(
   await ensureUploadDir();
 
   startJanitor(60 * 60 * 1000);
+  registerQuickPrintRoutes(app);
 
   // Recent jobs only. Full audit JSON stays on GET /api/jobs/:id.
   app.get(api.jobs.list.path, async (req, res) => {
@@ -728,7 +730,8 @@ export async function registerRoutes(
       const statusRaw = typeof req.query.status === "string" ? req.query.status : "";
       const allowed = new Set(["pending", "processing", "complete", "failed"]);
       const status = allowed.has(statusRaw) ? statusRaw : undefined;
-      const page = await storage.listJobs({ limit, offset, status });
+      const attention = req.query.attention === "1" || req.query.attention === "true";
+      const page = await storage.listJobs({ limit, offset, status, attention });
       const jobs = await Promise.all(page.jobs.map(async (job) => {
         let thumbnailUrl: string | null = null;
         try {

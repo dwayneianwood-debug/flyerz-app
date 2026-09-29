@@ -54,9 +54,9 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json();
 }
 
-export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "failed") {
+export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "failed", attentionOnly?: boolean) {
   return useInfiniteQuery({
-    queryKey: ["jobs", statusFilter],
+    queryKey: ["jobs", statusFilter, attentionOnly ? "attention" : "all"],
     initialPageParam: 0,
     queryFn: async ({ pageParam }) => {
       const url = new URL(api.jobs.list.path, window.location.origin);
@@ -64,6 +64,9 @@ export function useJobs(statusFilter?: "pending" | "processing" | "complete" | "
       url.searchParams.set("offset", String(pageParam));
       if (statusFilter) {
         url.searchParams.append("status", statusFilter);
+      }
+      if (attentionOnly) {
+        url.searchParams.set("attention", "1");
       }
       const res = await fetch(url.toString(), { credentials: "include" });
       return handleResponse<JobListPage>(res);
