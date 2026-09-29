@@ -232,8 +232,15 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
 
 
 def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
-    from ai_artwork import apply_artwork_fit, ratios_differ
+    """Keep the whole picture and fill the gap with a 1-pixel edge copy.
 
+    A full mirror would repeat the artwork when the gap is taller than the file.
+    The press engine is not involved here.
+    """
+    import cv2
+    from ai_artwork import ratios_differ
+
+    del source_path
     height, width = img.shape[:2]
     src = width / float(max(height, 1))
     target = float(trim_w) / float(trim_h)
@@ -241,24 +248,18 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
     if not ratios_differ(width, height, trim_w, trim_h):
         decisions.append("The picture already matches the product shape, so nothing was cropped or stretched.")
         return img, False, delta
-
-    def _no_remote(_path):
-        return {"stub": True, "success": False}
-
-    fitted, _info = apply_artwork_fit(
-        img,
-        trim_w,
-        trim_h,
-        "extend",
-        0.5,
-        (0, 0, 0, 0),
-        source_path=source_path,
-        expand_fn=_no_remote,
-    )
-    if fitted is None or getattr(fitted, "size", 0) == 0:
-        fitted = img
+    if src > target:
+        new_h = max(height, int(round(width / target)))
+        pad = new_h - height
+        top = pad // 2
+        fitted = cv2.copyMakeBorder(img, top, pad - top, 0, 0, cv2.BORDER_REPLICATE)
+    else:
+        new_w = max(width, int(round(height * target)))
+        pad = new_w - width
+        left = pad // 2
+        fitted = cv2.copyMakeBorder(img, 0, 0, left, pad - left, cv2.BORDER_REPLICATE)
     decisions.append(
-        "The picture was a different shape from the product. The whole picture was kept and the edges were extended. It was not stretched."
+        "The picture was a different shape from the product. The whole picture was kept and the gap was filled by repeating the outer pixel. It was not stretched and the picture was not copied."
     )
     return fitted, True, delta
 

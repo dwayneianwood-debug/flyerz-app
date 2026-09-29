@@ -182,10 +182,10 @@ def test_wide(root: str) -> None:
     green = (rgb[:, :, 1] > 90) & (rgb[:, :, 1] > rgb[:, :, 0] + 30) & (rgb[:, :, 1] > rgb[:, :, 2] + 20)
     check("wide-keeps-both-ends", int(red.sum()) > 30 and int(blue.sum()) > 30, f"red {int(red.sum())} blue {int(blue.sum())}")
     import cv2
-    _count, _labels, stats, _cent = cv2.connectedComponentsWithStats(green.astype(np.uint8), 8)
-    areas = stats[1:, cv2.CC_STAT_AREA] if len(stats) > 1 else []
-    check("wide-has-centre", len(areas) > 0 and int(areas.max()) > 20, str(areas[:5] if len(areas) else "none"))
-    blob = stats[1 + int(np.argmax(areas))]
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(green.astype(np.uint8), 8)
+    big = [stats[i] for i in range(1, count) if stats[i][cv2.CC_STAT_AREA] > 40]
+    check("wide-has-centre", len(big) == 1, f"{len(big)} green marks")
+    blob = big[0]
     ratio = float(blob[cv2.CC_STAT_WIDTH]) / float(max(1, blob[cv2.CC_STAT_HEIGHT]))
     check(
         "wide-not-stretched",
