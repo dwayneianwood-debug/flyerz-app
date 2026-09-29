@@ -307,7 +307,7 @@ def _rapid_blocks(bgr: np.ndarray) -> list:
         bw = max(2.0, x1 - x0)
         bh = max(2.0, y1 - y0)
         blocks.append(_block(index, text, x0, y0, bw, bh, width, height, bgr, score))
-    return blocks
+    return _space_blocks(blocks, bgr)
 
 
 def _block(index: int, text: str, x: float, y: float, w: float, h: float, width: int, height: int, bgr: np.ndarray, score: float = 1) -> dict:
@@ -330,8 +330,8 @@ def _text_hex(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> str:
     if roi.size == 0:
         return "#111111"
     flat = roi.reshape(-1, 3).astype(np.float32)
-    if flat.shape[0] > 800:
-        flat = flat[:: max(1, flat.shape[0] // 800)]
+    if flat.shape[0] > 2500:
+        flat = flat[:: max(1, flat.shape[0] // 2500)]
     border = np.concatenate([
         roi[0, :, :],
         roi[-1, :, :],
@@ -340,10 +340,119 @@ def _text_hex(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> str:
     ]).astype(np.float32)
     bg = np.median(border, axis=0)
     dist = np.linalg.norm(flat - bg, axis=1)
-    ink = flat[dist > 28] if np.any(dist > 28) else flat
+    # Antialiased edges sit between the ink and the panel. Keep only the farthest pixels.
+    cutoff = float(np.percentile(dist, 90))
+    ink = flat[dist >= max(cutoff, 18)] if np.any(dist >= 18) else flat
     colour = np.median(ink, axis=0)
     rgb = (int(colour[2]), int(colour[1]), int(colour[0]))
     return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
+    """Pixel widths of words inside one OCR line. Large gaps are the spaces OCR dropped."""
+    height, width = bgr.shape[:2]
+    x, y, bw, bh = [float(v) for v in bbox[:4]]
+    x0 = max(0, int(round(x * width)))
+    y0 = max(0, int(round(y * height)))
+    x1 = min(width, int(round((x + bw) * width)))
+    y1 = min(height, int(round((y + bh) * height)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []
+    roi = bgr[y0:y1, x0:x1]
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    dist = np.linalg.norm(roi.astype(np.float32) - bg, axis=2)
+    columns = (dist > 28).any(axis=0)
+    runs: list = []
+    start = None
+    for index, on in enumerate(columns):
+        if on and start is None:
+            start = index
+        elif not on and start is not None:
+            runs.append([start, index - 1])
+            start = None
+    if start is not None:
+        runs.append([start, len(columns) - 1])
+    merged: list = []
+    for run in runs:
+        if merged and run[0] - merged[-1][1] <= 2:
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+    if len(merged) < 2:
+        return []
+    gaps = [merged[i + 1][0] - merged[i][1] - 1 for i in range(len(merged) - 1)]
+    threshold = max(float(np.median(gaps)) * 2.4, (y1 - y0) * 0.32)
+    groups = [[merged[0][0], merged[0][1]]]
+    for gap, run in zip(gaps, merged[1:]):
+        if gap >= threshold:
+            groups.append([run[0], run[1]])
+        else:
+            groups[-1][1] = run[1]
+    if len(groups) < 2:
+        return []
+    return [group[1] - group[0] + 1 for group in groups]
+
+
+def _allocate_chars(count: int, weights: list) -> list:
+    if count <= 0 or not weights:
+        return []
+    if len(weights) == 1:
+        return [count]
+    total = float(sum(weights)) or 1.0
+    raw = [count * weight / total for weight in weights]
+    base = [int(value) for value in raw]
+    if count >= len(weights):
+        for index, value in enumerate(base):
+            if value <= 0:
+                base[index] = 1
+        while sum(base) > count:
+            largest = max(range(len(base)), key=lambda item: base[item])
+            if base[largest] <= 1:
+                break
+            base[largest] -= 1
+    leftover = count - sum(base)
+    order = sorted(range(len(base)), key=lambda item: raw[item] - int(raw[item]), reverse=True)
+    step = 0
+    while leftover > 0:
+        base[order[step % len(order)]] += 1
+        leftover -= 1
+        step += 1
+    return base
+
+
+def restore_spaces(text: str, bgr: np.ndarray, bbox: list) -> str:
+    """Put back spaces OCR swallowed, using the gaps between glyphs."""
+    compact = "".join(str(text or "").split())
+    if len(compact) < 2:
+        return str(text or "").strip()
+    weights = _word_group_widths(bgr, bbox)
+    if len(weights) < 2:
+        return str(text or "").strip()
+    counts = _allocate_chars(len(compact), weights)
+    if sum(counts) != len(compact) or any(count <= 0 for count in counts):
+        return str(text or "").strip()
+    parts = []
+    cursor = 0
+    for count in counts:
+        parts.append(compact[cursor:cursor + count])
+        cursor += count
+    return " ".join(parts)
+
+
+def _space_blocks(blocks: list, bgr: np.ndarray) -> list:
+    spaced = []
+    for block in blocks:
+        item = dict(block)
+        item["text"] = restore_spaces(str(item.get("text") or ""), bgr, item.get("bbox") or [0, 0, 1, 0.1])
+        if item["text"]:
+            spaced.append(item)
+    return spaced
 
 
 def _looks_bold(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
@@ -414,7 +523,8 @@ def read_text_blocks(bgr: np.ndarray) -> tuple[list, str, str]:
     if _OCR is not None:
         try:
             blocks = _OCR(bgr) or []
-            return [_normalise_hook_block(b, i, bgr) for i, b in enumerate(blocks)], "hook", "OCR used the supplied reader."
+            made = [_normalise_hook_block(b, i, bgr) for i, b in enumerate(blocks)]
+            return _space_blocks(made, bgr), "hook", "OCR used the supplied reader."
         except Exception as exc:
             return [], "none", f"OCR reader failed: {str(exc)[:160]}"
     try:
@@ -427,7 +537,7 @@ def read_text_blocks(bgr: np.ndarray) -> tuple[list, str, str]:
         rapid_err = ""
     blocks, gem_err = _gemini_blocks(bgr)
     if blocks:
-        return blocks, "gemini", "OCR used Gemini because local RapidOCR found no text."
+        return _space_blocks(blocks, bgr), "gemini", "OCR used Gemini because local RapidOCR found no text."
     note = "No text was read."
     if rapid_err:
         note = f"Local OCR was not available ({rapid_err})."
@@ -453,17 +563,30 @@ def _normalise_hook_block(block: dict, index: int, bgr: np.ndarray) -> dict:
     return made
 
 
-def _mask_from_blocks(shape: tuple, blocks: list) -> np.ndarray:
-    height, width = shape[:2]
+def _mask_from_blocks(bgr: np.ndarray, blocks: list) -> np.ndarray:
+    """Cover the glyphs only, then dilate by a couple of pixels. Panels and borders stay."""
+    height, width = bgr.shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
     for block in blocks:
-        x, y, bw, bh = block["bbox"]
-        x0 = int(round(x * width))
-        y0 = int(round(y * height))
-        x1 = int(round((x + bw) * width))
-        y1 = int(round((y + bh) * height))
-        pad = max(2, int(round(0.12 * (y1 - y0))))
-        cv2.rectangle(mask, (x0 - pad, y0 - pad), (x1 + pad, y1 + pad), 255, -1)
+        x, y, bw, bh = [float(v) for v in block["bbox"][:4]]
+        x0 = max(0, int(round(x * width)))
+        y0 = max(0, int(round(y * height)))
+        x1 = min(width, int(round((x + bw) * width)))
+        y1 = min(height, int(round((y + bh) * height)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        roi = bgr[y0:y1, x0:x1]
+        border = np.concatenate([
+            roi[0].reshape(-1, 3),
+            roi[-1].reshape(-1, 3),
+            roi[:, 0],
+            roi[:, -1],
+        ]).astype(np.float32)
+        bg = np.median(border, axis=0)
+        dist = np.linalg.norm(roi.astype(np.float32) - bg, axis=2)
+        ink = np.zeros(dist.shape, dtype=np.uint8)
+        ink[dist > 28] = 255
+        mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], ink)
     if mask.any():
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -473,14 +596,15 @@ def _mask_from_blocks(shape: tuple, blocks: list) -> np.ndarray:
 def _local_inpaint(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if not mask.any():
         return bgr
-    return cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
+    return cv2.inpaint(bgr, mask, 2, cv2.INPAINT_TELEA)
 
 
 def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tuple[np.ndarray, float, int, int]:
+    """Scale with cover (the larger ratio) and crop the overflow. Never stretch or letterbox."""
     height, width = bgr.shape[:2]
     scale = max(target_w / float(width), target_h / float(height))
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
+    new_w = max(target_w, int(math.ceil(width * scale - 1e-9)))
+    new_h = max(target_h, int(math.ceil(height * scale - 1e-9)))
     resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
     if sharpen:
         from ai_upscale import light_sharpen_bgr
@@ -489,9 +613,31 @@ def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tupl
     y0 = max(0, (new_h - target_h) // 2)
     crop = resized[y0:y0 + target_h, x0:x0 + target_w]
     if crop.shape[0] != target_h or crop.shape[1] != target_w:
-        crop = cv2.resize(resized, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-        x0, y0, scale = 0, 0, target_w / float(width)
-    return crop, scale, x0, y0
+        fitted = cv2.copyMakeBorder(
+            crop,
+            0,
+            max(0, target_h - crop.shape[0]),
+            0,
+            max(0, target_w - crop.shape[1]),
+            cv2.BORDER_REPLICATE,
+        )
+        crop = fitted[:target_h, :target_w]
+    return crop, new_w / float(width), x0, y0
+
+
+def _cap_ratio(face) -> float:
+    """Cap height as a fraction of the em. Liberation Sans is about 0.73."""
+    if face is None:
+        return 0.73
+    try:
+        glyph = face.has_glyph(ord("H"))
+        box = face.glyph_bbox(glyph, fontsize=1)
+        height = abs(float(box.y1) - float(box.y0))
+        if 0.4 < height < 1.2:
+            return height
+    except Exception:
+        pass
+    return 0.73
 
 
 def _hex_rgb(value: str) -> tuple[float, float, float]:
@@ -574,22 +720,28 @@ def _typeset(background: np.ndarray, blocks: list, out_pdf: str, trim_w_mm: floa
         cy = sy * scale - off_y
         cw = sw * scale
         ch = sh * scale
-        # PDF origin is the bottom left.
-        x0 = cx / canvas_w * media_w
-        y1 = media_h - (cy / canvas_h * media_h)
-        x1 = (cx + cw) / canvas_w * media_w
-        y0 = media_h - ((cy + ch) / canvas_h * media_h)
-        rect = fitz.Rect(x0, min(y0, y1), max(x0, x1), max(y0, y1))
+        # Page coordinates start at the top left, the same way as the pixels.
+        rect = fitz.Rect(
+            cx / canvas_w * media_w,
+            cy / canvas_h * media_h,
+            (cx + cw) / canvas_w * media_w,
+            (cy + ch) / canvas_h * media_h,
+        )
         if rect.width < 2 or rect.height < 2:
             continue
-        fontname = "FlyerzSansBold" if block.get("bold") and bold else "FlyerzSans" if regular else "helv"
-        size = max(6.0, rect.height * 0.78)
+        use_bold = bool(block.get("bold") and bold)
+        fontname = "FlyerzSansBold" if use_bold else "FlyerzSans" if regular else "helv"
+        fontfile = bold if use_bold else regular
+        face = fitz.Font(fontfile=fontfile) if fontfile else None
+        # OCR height is the ink, not the em square. Cap height fills that box.
+        cap = _cap_ratio(face)
+        size = max(6.0, rect.height / cap)
         colour = _hex_rgb(str(block.get("color_hex") or "#111111"))
-        for _ in range(6):
-            spare = page.insert_textbox(rect, text, fontname=fontname, fontsize=size, color=colour, align=1)
-            if spare >= 0:
-                break
-            size *= 0.85
+        if face is not None:
+            while size > 6 and face.text_length(text, fontsize=size) > rect.width * 1.04:
+                size *= 0.96
+        # Baseline is the bottom of an all-caps OCR box.
+        page.insert_text((rect.x0, rect.y1), text, fontname=fontname, fontsize=size, color=colour)
     bleed_pt = BLEED_MM * MM_TO_PT
     trim = fitz.Rect(bleed_pt, bleed_pt, media_w - bleed_pt, media_h - bleed_pt)
     page.set_mediabox(page.rect)
@@ -781,7 +933,7 @@ def _rebuild(path: str, options: dict) -> dict:
         blocks, ocr_engine, ocr_note = read_text_blocks(source)
         blocks = _apply_edits(blocks, edits or [])
         steps.append({"name": "OCR", "engine": "local" if ocr_engine in ("local", "hook") else ocr_engine, "ok": True, "note": ocr_note})
-        mask = _mask_from_blocks(source.shape, blocks)
+        mask = _mask_from_blocks(source, blocks)
         clean, inpaint_engine, inpaint_note = _remove_text(source, mask, credit)
         steps.append({"name": "Remove text", "engine": inpaint_engine, "ok": True, "note": inpaint_note})
         target_w, target_h = _target_pixels(trim_w, trim_h)
