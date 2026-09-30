@@ -28,6 +28,7 @@ import { execSync, spawnSync } from "child_process";
 import fsSync from "fs";
 import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
+import { registerJobCleanupRoutes } from "./jobCleanup";
 import crypto from "crypto";
 import { createTask, getTask, updateTask, cleanStaleTasks } from "./taskQueue";
 import { getGlitchyWorker } from "./glitchyWorker";
@@ -725,6 +726,7 @@ export async function registerRoutes(
   await ensureUploadDir();
 
   startJanitor(60 * 60 * 1000);
+  registerJobCleanupRoutes(app);
   registerQuickPrintRoutes(app);
 
   // Recent jobs only. Full audit JSON stays on GET /api/jobs/:id.

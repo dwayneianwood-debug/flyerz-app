@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
+import { backupDatabaseFile } from "./jobCleanup";
 import type { FileJobResponse, CreateFileJobRequest, UpdateFileJobRequest, JobListItem, JobListPage, JobStatus } from "@shared/schema";
 
 export interface IStorage {
@@ -398,3 +399,11 @@ export class DatabaseStorage implements IStorage {
 }
 
 export const storage = new DatabaseStorage();
+
+export function databaseFilePath(): string {
+  return dbPath;
+}
+
+export function backupDatabaseTo(dest: string): boolean {
+  return backupDatabaseFile((sql) => sqlite.exec(sql), dest);
+}

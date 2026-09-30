@@ -260,7 +260,7 @@ const listenHost = flyerzResolveListenHost();
       port,
       host: listenHost,
     },
-    () => {
+    async () => {
       log(`Server listening on ${listenHost}:${port}`);
       flyerzPrintTeamSharingBanner(port, listenHost);
 
@@ -288,6 +288,8 @@ const listenHost = flyerzResolveListenHost();
         console.log("[GATEKEEPER] Skipped because SKIP_GATEKEEPER=1.");
         gatekeeperPassed = true;
         log("app fully initialized");
+        const { startJobCleanup } = await import("./jobCleanup");
+        startJobCleanup();
         return;
       }
 
@@ -305,6 +307,8 @@ const listenHost = flyerzResolveListenHost();
         console.log("[GATEKEEPER] All gates passed — application cleared to start.");
         gatekeeperPassed = true;
         log("app fully initialized");
+        const { startJobCleanup } = await import("./jobCleanup");
+        startJobCleanup();
       } catch (err: any) {
         console.error(
           "\n╔══════════════════════════════════════════════════════════╗"
