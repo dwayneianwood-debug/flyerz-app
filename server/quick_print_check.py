@@ -312,9 +312,99 @@ def test_extended_band_does_not_streak() -> None:
         check(f"{name}-keeps-picture", middle.shape == picture.shape and np.array_equal(middle, picture))
 
 
+def _orange(bgr: np.ndarray) -> np.ndarray:
+    """The test disc is pure magenta, which this gradient never is."""
+    rgb = bgr[:, :, ::-1].astype(np.int16)
+    return (rgb[:, :, 0] > 220) & (rgb[:, :, 2] > 220) & (rgb[:, :, 1] < 40)
+
+
+def _disc_picture(top: int, size: int = 360) -> np.ndarray:
+    """Gradient with a strong orange disc. `top` is the disc's top row (negative overlaps the edge)."""
+    picture = _gradient_picture(size, size, 4)
+    radius = 70
+    cy = top + radius
+    cx = int(size * 0.72)
+    yy, xx = np.ogrid[:size, :size]
+    disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+    picture[disc] = (255, 0, 255)
+    return picture
+
+
+def _top_band(picture: np.ndarray):
+    from quick_print import _extend_to_product, decide_light
+
+    fitted, extended, delta = _extend_to_product(picture, 148, 210, "", [])
+    pad = (fitted.shape[0] - picture.shape[0]) // 2
+    band = fitted[:pad]
+    info = decide_light({
+        "compiled": True,
+        "enginePassed": True,
+        "aspectExtended": extended,
+        "aspectDelta": delta,
+        "upscale": 1,
+    })
+    return band, pad, info, fitted, picture
+
+
+def test_nearby_object_does_not_enter_the_band() -> None:
+    """A strong colour just inside the old 64px window must not stain the new edge."""
+    import cv2
+
+    picture = _disc_picture(40)
+    check("near-inside-old-window", bool(_orange(picture[:64]).any()))
+    check("near-outside-thin-edge", not bool(_orange(picture[:5]).any()))
+    band, pad, info, fitted, picture = _top_band(picture)
+    check("near-pad", pad >= 8, str(pad))
+    check("near-no-orange", int(_orange(band).sum()) == 0, str(int(_orange(band).sum())))
+    smooth = cv2.GaussianBlur(band, (0, 0), 3)
+    hot = (np.max(np.abs(band.astype(np.float32) - smooth), axis=2) > 45).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(hot, 8)
+    blobs = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] > 6]
+    check("near-no-patches", not blobs, str(blobs[:6]))
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    second = np.diff(gray.mean(axis=1), n=2)
+    check("near-smooth", float(np.max(np.abs(second))) < 2.5, f"{float(np.max(np.abs(second))):.2f}")
+    middle = fitted[pad:pad + picture.shape[0]]
+    check("near-keeps-picture", np.array_equal(middle, picture))
+    check("near-amber", info["light"] == "amber" and any("extended" in line for line in info["reasons"]), str(info))
+
+
+def test_touching_object_stays_reasonable_and_amber() -> None:
+    """A colour that does touch the edge may continue, but only as that edge, and the job stays amber."""
+    import cv2
+
+    picture = _disc_picture(-30)
+    check("touch-on-edge", bool(_orange(picture[:1]).any()))
+    band, _pad, info, fitted, picture = _top_band(picture)
+    edge_orange = _orange(picture[:1])[0]
+    cols = np.where(edge_orange)[0]
+    check("touch-has-span", cols.size > 10, str(cols.size))
+    lo = int(cols.min()) - 24
+    hi = int(cols.max()) + 24
+    band_orange = _orange(band)
+    stray = [int(x) for x in np.where(band_orange.any(axis=0))[0] if x < lo or x > hi]
+    check("touch-orange-stays-with-object", not stray, str(stray[:8]))
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(band_orange.astype(np.uint8), 8)
+    floating = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 12:
+            continue
+        top = int(stats[index, cv2.CC_STAT_TOP])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if top + height < band.shape[0] - 1:
+            floating.append((area, int(stats[index, cv2.CC_STAT_WIDTH]), height))
+    check("touch-no-floating-dashes", not floating, str(floating))
+    check("touch-amber", info["light"] == "amber" and any("extended" in line for line in info["reasons"]), str(info))
+    middle = fitted[(fitted.shape[0] - picture.shape[0]) // 2:][:picture.shape[0]]
+    check("touch-keeps-picture", np.array_equal(middle, picture))
+
+
 def main() -> None:
     test_rules()
     test_extended_band_does_not_streak()
+    test_nearby_object_does_not_enter_the_band()
+    test_touching_object_stays_reasonable_and_amber()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
     try:
         test_word(root)

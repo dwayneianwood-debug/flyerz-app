@@ -236,9 +236,17 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
     return img, False
 
 
-def _pad_colour_and_grain(band, pad: int, forward: bool):
-    """Continue one edge. Colour follows the blurred edge. Grain is shuffled so it does not streak.
+# Only the outer few pixels. A shape a short way in (the old 64px window) must not be copied out.
+EDGE_SAMPLE_PX = 5
 
+
+def _pad_colour_and_grain(band, pad: int, forward: bool):
+    """Continue one edge from a few pixels at the rim.
+
+    Colour is the median of that thin strip, with outlier colours dropped, then
+    a light horizontal blur so a gradient carries on smoothly. Grain is new
+    low-amplitude noise matched to that rim. Rows from inside the picture are
+    never copied, so an object that does not touch the edge cannot streak.
     `band` is the strip next to the edge. When forward is true, the last row is the edge.
     """
     import cv2
@@ -248,27 +256,42 @@ def _pad_colour_and_grain(band, pad: int, forward: bool):
         return np.zeros((0, band.shape[1], 3), np.float32)
     work = band if forward else band[::-1]
     work = np.ascontiguousarray(work.astype(np.float32))
-    band_h, width = work.shape[:2]
-    colour = cv2.GaussianBlur(work, (0, 0), 7)
-    edge = colour[-1]
-    slope = (colour[-1] - colour[0]) / float(max(band_h - 1, 1))
-    slope = np.clip(slope, -1.5, 1.5)
+    height, width = work.shape[:2]
+    depth = min(EDGE_SAMPLE_PX, height)
+    strip = work[-depth:]
+    median = np.median(strip, axis=0)
+    distance = np.linalg.norm(strip - median[None, :, :], axis=2)
+    mad = float(np.median(distance)) if distance.size else 0.0
+    # A strong object on part of the strip is far from the median. Grain is not.
+    thresh = max(36.0, mad * 4.0)
+    outlier = distance > thresh
+    cleaned = strip.copy()
+    if outlier.any():
+        filled = np.repeat(median[None, :, :], depth, axis=0)
+        cleaned[outlier] = filled[outlier]
+    blurred = np.empty_like(cleaned)
+    for index in range(depth):
+        row = cleaned[index].reshape(1, width, 3)
+        blurred[index] = cv2.GaussianBlur(row, (0, 0), 5).reshape(width, 3)
+    edge = blurred[-1]
+    far = blurred[0]
+    slope = (edge - far) / float(max(depth - 1, 1))
+    slope = np.clip(slope, -0.55, 0.55)
     steps = np.arange(1, pad + 1, dtype=np.float32)[:, None, None]
-    fade = np.exp(-steps / 56.0)
+    fade = np.exp(-steps / 64.0)
     continued = edge[None, :, :] + slope[None, :, :] * steps * fade
-    residual = work - colour
-    target = np.std(residual, axis=0)
-    rng = np.random.default_rng(band_h * 10007 + width * 17 + pad)
-    grain = np.empty((pad, width, 3), np.float32)
-    picks = rng.integers(0, band_h, size=pad)
-    shifts = rng.integers(0, max(width, 1), size=pad)
-    for index in range(pad):
-        grain[index] = np.roll(residual[int(picks[index])], int(shifts[index]), axis=0)
-    current = np.std(grain, axis=0)
-    grain *= (target / np.maximum(current, 1e-3))[None, :, :]
+    residual = cleaned - median[None, :, :]
+    inlier = ~outlier
+    sigma = np.zeros(3, np.float32)
+    for channel in range(3):
+        vals = residual[:, :, channel][inlier]
+        sigma[channel] = float(np.std(vals)) if vals.size else 0.0
+    sigma = np.clip(sigma, 0.0, 32.0)
+    rng = np.random.default_rng((depth * 10007 + width * 17 + pad) % (2**32))
+    grain = rng.normal(0.0, 1.0, (pad, width, 3)).astype(np.float32) * sigma.reshape(1, 1, 3)
     true_edge = work[-1]
     arrive = np.clip(steps / 8.0, 0.0, 1.0)
-    grain_in = np.clip((steps - 1.0) / 4.0, 0.0, 1.0)
+    grain_in = np.clip((steps - 2.0) / 6.0, 0.0, 1.0)
     mixed = true_edge[None, :, :] * (1.0 - arrive) + continued * arrive
     out = np.clip(mixed + grain * grain_in, 0, 255)
     if not forward:
@@ -281,7 +304,7 @@ def _extend_vertical(img, top: int, bottom: int):
 
     parts = []
     height = img.shape[0]
-    band_h = min(64, max(8, height // 4))
+    band_h = min(EDGE_SAMPLE_PX, height)
     if top:
         parts.append(_pad_colour_and_grain(img[:band_h], top, forward=False))
     parts.append(img.astype(np.float32))

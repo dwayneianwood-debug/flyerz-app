@@ -39,9 +39,36 @@ if not os.path.isdir(FAI_TEMP_DIR):
 
 REPLICATE_API_URL = "https://api.replicate.com/v1"
 REPLICATE_POLL_INTERVAL_S = 2
-REPLICATE_TIMEOUT_S = 25
+# One step (create, rate-limit waits, and poll). Cold starts need more than 25s.
+REPLICATE_TIMEOUT_S = 90
+# Prefer: wait can hold the create call. Keep that socket inside the step budget.
+REPLICATE_CREATE_TIMEOUT_S = 60
+# Low credit: prediction creation is limited to about one burst every 10 seconds.
+REPLICATE_RATE_LIMIT_RETRIES = 3
+REPLICATE_RATE_LIMIT_WAIT_S = 10
 DOWNLOAD_CHUNK_SIZE = 65536
 MAX_UPLOAD_BYTES = 20_000_000
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(max(0.0, float(seconds)))
+
+
+def _retry_after_seconds(headers) -> float:
+    raw = ""
+    try:
+        if headers is not None:
+            raw = headers.get("Retry-After") or headers.get("retry-after") or ""
+    except Exception:
+        raw = ""
+    text = str(raw).strip()
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        return float(REPLICATE_RATE_LIMIT_WAIT_S)
+    if seconds < 0:
+        return float(REPLICATE_RATE_LIMIT_WAIT_S)
+    return seconds
 
 
 def _get_replicate_token() -> str:
@@ -135,7 +162,8 @@ def _to_data_uri(image_path: str) -> str:
 
 
 def _replicate_create_prediction(model_owner: str, model_name: str,
-                                  model_input: dict, token: str, version: str = "") -> dict:
+                                  model_input: dict, token: str, version: str = "",
+                                  deadline: float = None) -> dict:
     if version:
         url = f"{REPLICATE_API_URL}/predictions"
         body = {"version": version, "input": model_input}
@@ -143,18 +171,44 @@ def _replicate_create_prediction(model_owner: str, model_name: str,
         url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
         body = {"input": model_input}
     payload = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers=external_headers({
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Prefer": "wait",
-    }))
-    with urllib.request.urlopen(req, timeout=min(REPLICATE_TIMEOUT_S, 30)) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    if deadline is None:
+        deadline = time.time() + REPLICATE_TIMEOUT_S
+    last_error = None
+    for attempt in range(REPLICATE_RATE_LIMIT_RETRIES + 1):
+        remaining = deadline - time.time()
+        if remaining <= 0.05:
+            if last_error is not None:
+                raise last_error
+            raise TimeoutError("AI service is busy, please try again")
+        req = urllib.request.Request(url, data=payload, headers=external_headers({
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "wait",
+        }))
+        timeout = min(REPLICATE_CREATE_TIMEOUT_S, remaining)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code != 429 or attempt >= REPLICATE_RATE_LIMIT_RETRIES:
+                raise
+            wait = _retry_after_seconds(getattr(exc, "headers", None))
+            try:
+                exc.read()
+            except Exception:
+                pass
+            if wait > (deadline - time.time()) - 1.0:
+                raise
+            _pause(wait)
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError("AI service is busy, please try again")
 
 
 def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> dict:
     while time.time() < deadline:
-        time.sleep(REPLICATE_POLL_INTERVAL_S)
+        _pause(REPLICATE_POLL_INTERVAL_S)
         req = urllib.request.Request(poll_url, headers=external_headers({
             "Authorization": f"Bearer {token}",
         }))
@@ -163,6 +217,17 @@ def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> di
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("status") in ("succeeded", "failed", "canceled"):
                     return data
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                wait = _retry_after_seconds(getattr(exc, "headers", None))
+                try:
+                    exc.read()
+                except Exception:
+                    pass
+                if wait > deadline - time.time():
+                    return None
+                _pause(wait)
+            continue
         except Exception:
             continue
     return None
@@ -211,11 +276,13 @@ def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
 
     try:
         prediction = _replicate_create_prediction(
-            model_owner, model_name, model_input, token, version=version
+            model_owner, model_name, model_input, token, version=version, deadline=deadline,
         )
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:200]
+        body = e.read().decode("utf-8", errors="replace")[:240]
         return None, f"API error {e.code}: {body}"
+    except TimeoutError:
+        return None, "AI service is busy, please try again"
     except Exception as e:
         if "timed out" in str(e).lower() or "timeout" in str(e).lower():
             return None, "AI service is busy, please try again"

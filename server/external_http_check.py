@@ -56,12 +56,16 @@ class ExternalHttpTests(unittest.TestCase):
         self._token = os.environ.get("REPLICATE_API_TOKEN")
         self._gemini = os.environ.get("GEMINI_API_KEY")
         self._poll = ai_enhancements.REPLICATE_POLL_INTERVAL_S
+        self._pause = ai_enhancements._pause
+        self._timeout = ai_enhancements.REPLICATE_TIMEOUT_S
         press_ready_engine._REPLICATE["checked_at"] = 0.0
         press_ready_engine._REPLICATE["ok"] = False
 
     def tearDown(self):
         urllib.request.urlopen = self._urlopen
         ai_enhancements.REPLICATE_POLL_INTERVAL_S = self._poll
+        ai_enhancements._pause = self._pause
+        ai_enhancements.REPLICATE_TIMEOUT_S = self._timeout
         press_ready_engine._REPLICATE["checked_at"] = 0.0
         press_ready_engine._REPLICATE["ok"] = False
         if self._token is None:
@@ -199,9 +203,10 @@ class ExternalHttpTests(unittest.TestCase):
         real = ai_enhancements._call_replicate
         ai_enhancements._call_replicate = fake_call
         try:
-            result = ai_rebuild._replicate_inpaint(original, mask)
+            result, err = ai_rebuild._replicate_inpaint(original, mask)
         finally:
             ai_enhancements._call_replicate = real
+        self.assertEqual(err, "")
         self.assertIsNotNone(result)
         self.assertEqual(result.shape, original.shape)
         # A corner far from the letters stays exact. The foreign 8×8 picture is
@@ -222,6 +227,105 @@ class ExternalHttpTests(unittest.TestCase):
         self.assertEqual(mismatched.shape, original.shape)
         self.assertTrue(np.array_equal(mismatched[far], original[far]))
         self.assertLess(abs(int(mismatched[8, 13, 2]) - 30), 40)
+
+    def _http_error(self, url: str, code: int, body: bytes, retry_after: str = ""):
+        import io
+        from email.message import EmailMessage
+
+        headers = EmailMessage()
+        if retry_after:
+            headers["Retry-After"] = retry_after
+        return urllib.error.HTTPError(url, code, "error", headers, io.BytesIO(body))
+
+    def test_rate_limit_waits_and_retries(self):
+        calls = {"n": 0}
+        slept = []
+        timeouts = []
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            timeouts.append(timeout)
+            self.assertEqual(_user_agent(req), USER_AGENT)
+            if calls["n"] == 1:
+                raise self._http_error(req.full_url, 429, b'{"detail":"throttled once"}', "7")
+            data = json.dumps({
+                "id": "p1",
+                "status": "succeeded",
+                "output": "https://example.test/out.png",
+            }).encode("utf-8")
+            return _Body(data)
+
+        urllib.request.urlopen = fake_urlopen
+        ai_enhancements._pause = lambda seconds: slept.append(seconds)
+        created = ai_enhancements._replicate_create_prediction(
+            "nightmareai", "real-esrgan", {"image": "data:image/png;base64,YQ=="}, "test-token",
+            version="f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa",
+        )
+        self.assertEqual(created.get("status"), "succeeded")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(slept, [7])
+        self.assertEqual(ai_enhancements.REPLICATE_TIMEOUT_S, 90)
+        self.assertGreaterEqual(timeouts[0], 60)
+
+    def test_rate_limit_error_is_the_replicate_message(self):
+        calls = {"n": 0}
+        slept = []
+        body = b'{"detail":"Request was throttled. Your rate limit is 1 request per 10 seconds."}'
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise self._http_error(req.full_url, 429, body, "10")
+
+        urllib.request.urlopen = fake_urlopen
+        ai_enhancements._pause = lambda seconds: slept.append(seconds)
+        os.environ["REPLICATE_API_TOKEN"] = "test-token"
+        out, err = ai_enhancements._call_replicate(
+            "ai_rebuild_upscale", "nightmareai", "real-esrgan", {"image": "x"}, version="abc",
+        )
+        self.assertIsNone(out)
+        self.assertIn("Request was throttled", err)
+        self.assertIn("API error 429", err)
+        self.assertNotIn("not available", err.lower())
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(slept, [10, 10, 10])
+
+        picture = np.full((24, 32, 3), 40, np.uint8)
+        _fitted, engine, detail, _scale, _x, _y = ai_rebuild._enlarge(picture, 48, 72, "ok")
+        self.assertEqual(engine, "local")
+        self.assertIn("Request was throttled", detail)
+        self.assertNotIn("not available", detail.lower())
+
+        mask = np.zeros((24, 32), np.uint8)
+        mask[4:10, 4:14] = 255
+        _filled, inpaint_engine, inpaint_detail = ai_rebuild._remove_text(picture, mask, "ok")
+        self.assertEqual(inpaint_engine, "local")
+        self.assertIn("Request was throttled", inpaint_detail)
+        self.assertNotIn("not available", inpaint_detail.lower())
+
+    def test_step_budget_is_90_seconds_and_still_stops(self):
+        self.assertEqual(ai_enhancements.REPLICATE_TIMEOUT_S, 90)
+        ai_enhancements.REPLICATE_TIMEOUT_S = 0.35
+        ai_enhancements.REPLICATE_POLL_INTERVAL_S = 0
+        ai_enhancements._pause = lambda _seconds: None
+
+        def fake_urlopen(req, timeout=None):
+            data = json.dumps({
+                "id": "p1",
+                "status": "processing",
+                "urls": {"get": "https://api.replicate.com/v1/predictions/p1", "cancel": ""},
+            }).encode("utf-8")
+            return _Body(data)
+
+        urllib.request.urlopen = fake_urlopen
+        os.environ["REPLICATE_API_TOKEN"] = "test-token"
+        started = time.time()
+        out, err = ai_enhancements._call_replicate(
+            "ai_upscale", "nightmareai", "real-esrgan", {"image": "x"}, version="abc",
+        )
+        elapsed = time.time() - started
+        self.assertIsNone(out)
+        self.assertIn("busy", err.lower())
+        self.assertLess(elapsed, 3.0)
 
 
 if __name__ == "__main__":

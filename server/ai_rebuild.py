@@ -1076,15 +1076,15 @@ def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.nda
             except Exception as exc:
                 note = f"Replicate inpaint failed ({str(exc)[:120]}). Local fallback used."
         else:
-            remote = _replicate_inpaint(bgr, mask)
+            remote, err = _replicate_inpaint(bgr, mask)
             if remote is not None:
                 return remote, "replicate", "Text was removed with Replicate inpainting (bria/eraser)."
-            note = note or "Replicate inpaint was not available. Local fallback used."
+            note = f"{err} Local fallback used." if err else (note or "Replicate inpaint was not available. Local fallback used.")
     filled = _local_inpaint(bgr, mask)
     engine = "local"
     detail = "Text was removed with OpenCV inpaint on this computer."
     if note:
-        detail = detail + " " + note
+        detail = f"{note} {detail}"
     return filled, engine, detail
 
 
@@ -1181,7 +1181,7 @@ def composite_inpaint(original: np.ndarray, filled: np.ndarray, mask: np.ndarray
     return harmonize_fill(original, filled, mask)
 
 
-def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> tuple[Optional[np.ndarray], str]:
     folder = ""
     try:
         from ai_enhancements import _call_replicate, _to_data_uri
@@ -1204,13 +1204,13 @@ def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray
             version=INPAINT_MODEL_VERSION,
         )
         if err or not out or not os.path.exists(str(out)):
-            return None
+            return None, err or "Replicate inpaint was not available."
         loaded = cv2.imread(str(out), cv2.IMREAD_COLOR)
         if loaded is None:
-            return None
-        return composite_inpaint(bgr, loaded, mask)
-    except Exception:
-        return None
+            return None, "Replicate inpaint returned an unreadable image."
+        return composite_inpaint(bgr, loaded, mask), ""
+    except Exception as exc:
+        return None, f"Replicate inpaint failed ({str(exc)[:180]})."
     finally:
         if folder:
             shutil.rmtree(folder, ignore_errors=True)
@@ -1231,19 +1231,20 @@ def _enlarge(clean: np.ndarray, target_w: int, target_h: int, credit: str) -> tu
             except Exception as exc:
                 note = f"Replicate upscale failed ({str(exc)[:120]}). Local fallback used."
         else:
-            remote = _replicate_upscale(clean, target_w, target_h)
+            remote, err = _replicate_upscale(clean, target_w, target_h)
             if remote is not None:
                 fitted, _scale, _x0, _y0 = _cover(remote, target_w, target_h, sharpen=False)
                 return fitted, "replicate", "Background enlarged with the Replicate upscaler.", place_scale, place_x, place_y
-            note = note or "Replicate upscale was not available. Local fallback used."
+            note = f"{err} Local fallback used." if err else (note or "Replicate upscale was not available. Local fallback used.")
     fitted, _scale, _x0, _y0 = _cover(clean, target_w, target_h, sharpen=True)
     detail = "Background enlarged with Lanczos and a light sharpen on this computer."
     if note:
-        detail = detail + " " + note
+        detail = f"{note} {detail}"
     return fitted, "local", detail, place_scale, place_x, place_y
 
 
-def _replicate_upscale(bgr: np.ndarray, target_w: int, target_h: int) -> Optional[np.ndarray]:
+def _replicate_upscale(bgr: np.ndarray, target_w: int, target_h: int) -> tuple[Optional[np.ndarray], str]:
+    folder = ""
     try:
         from ai_enhancements import _call_replicate, _to_data_uri
         from ai_upscale import UPSCALE_MODEL_NAME, UPSCALE_MODEL_OWNER, UPSCALE_MODEL_VERSION
@@ -1260,11 +1261,16 @@ def _replicate_upscale(bgr: np.ndarray, target_w: int, target_h: int) -> Optiona
             version=UPSCALE_MODEL_VERSION,
         )
         if err or not out or not os.path.exists(str(out)):
-            return None
+            return None, err or "Replicate upscale was not available."
         loaded = cv2.imread(str(out), cv2.IMREAD_COLOR)
-        return loaded if loaded is not None else None
-    except Exception:
-        return None
+        if loaded is None:
+            return None, "Replicate upscale returned an unreadable image."
+        return loaded, ""
+    except Exception as exc:
+        return None, f"Replicate upscale failed ({str(exc)[:180]})."
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _rebuild(path: str, options: dict) -> dict:
