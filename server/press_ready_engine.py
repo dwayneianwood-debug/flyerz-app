@@ -940,8 +940,8 @@ def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float
 
 
 def _gs_bin() -> str:
-    found = shutil.which("gs")
-    return found or "gs"
+    from gs_binary import find_gs_binary
+    return find_gs_binary()
 
 
 def convert_cmyk_keep_text(src: str, dest: str) -> None:

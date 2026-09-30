@@ -292,10 +292,9 @@ def _draw_flyer(path: str, kind: str) -> None:
 
 
 def _ocr_bgr(bgr: np.ndarray) -> list:
-    from rapidocr_onnxruntime import RapidOCR
+    from ocr_reader import local_rows
 
-    engine = RapidOCR()
-    result, _elapsed = engine(bgr)
+    result = local_rows(bgr)
     lines = []
     height, width = bgr.shape[:2]
     for item in result or []:

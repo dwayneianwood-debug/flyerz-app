@@ -179,7 +179,7 @@ export function QuickResultCard(props: {
       )}
       <div className="mt-4 flex flex-wrap gap-2">
         {light !== "red" && card.hasPress && (
-          <a href={`/api/jobs/${card.id}/download/corrected`}>
+          <a href={`/api/jobs/${card.id}/download/press-ready`}>
             <Button type="button" className="font-bold" data-testid={`link-download-press-${card.id}`}>Download press PDF</Button>
           </a>
         )}

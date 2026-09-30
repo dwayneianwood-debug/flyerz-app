@@ -31,16 +31,8 @@ FAI_TEMP_DIR = init_fai_temp_dir()
 
 
 def find_gs_binary() -> str:
-    gs_path = shutil.which("gs")
-    if gs_path:
-        return gs_path
-
-    nix_matches = globmod.glob("/nix/store/*/bin/gs")
-    for p in sorted(nix_matches, reverse=True):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 GS_BIN = find_gs_binary()

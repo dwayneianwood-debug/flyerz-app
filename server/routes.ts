@@ -39,6 +39,7 @@ import { choosePressInput } from "./aiRebuildPolicy";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import { registerQuickPrintRoutes } from "./quickPrintRoutes";
+import { firstExistingPressFile } from "./pressDownload";
 import {
   IllustratorIntakeError,
   INVALID_UPLOAD_MESSAGE,
@@ -711,6 +712,12 @@ function isPathSafe(filePath: string): boolean {
   return resolved.startsWith(uploadsResolved) || resolved.startsWith(cwd);
 }
 
+function existingPressFile(job: { correctedPath?: string | null; auditResults?: AuditResults | null }): string | null {
+  return firstExistingPressFile(job, isPathSafe, (filePath) => {
+    try { return fsSync.existsSync(filePath); } catch { return false; }
+  });
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -1218,11 +1225,12 @@ export async function registerRoutes(
         filePath = job.originalPath;
         filename = job.filename;
       } else if (type === 'corrected') {
-        if (!job.correctedPath) {
+        const quickFile = job.auditResults?.quickPrint ? existingPressFile(job) : "";
+        if (!job.correctedPath && !quickFile) {
           return res.status(404).json({ message: 'Corrected file not available' });
         }
-        filePath = job.correctedPath;
-        filename = `corrected_${job.filename}`;
+        filePath = job.correctedPath || quickFile || "";
+        filename = job.auditResults?.quickPrint ? `Print Ready Artwork.pdf` : `corrected_${job.filename}`;
       } else if (type === 'report') {
         if (!job.auditResults) {
           return res.status(404).json({ message: 'Report not available' });
@@ -1232,13 +1240,9 @@ export async function registerRoutes(
         res.setHeader('Content-Disposition', `attachment; filename="compliance_report_${job.id}.txt"`);
         return res.send(report);
       } else if (type === 'press-ready') {
-        const auditResults = job.auditResults as AuditResults | null;
-        const compiledPath = auditResults?.compiledPdfPath;
-        if (!compiledPath || !isPathSafe(compiledPath)) {
+        const compiledPath = existingPressFile(job);
+        if (!compiledPath) {
           return res.status(404).json({ message: 'No compiled PDF available' });
-        }
-        try { await fs.access(compiledPath); } catch {
-          return res.status(404).json({ message: 'Compiled PDF file not found on disk' });
         }
         const downloadName = `Print Ready Artwork.pdf`;
         return res.download(compiledPath, downloadName);
@@ -3031,15 +3035,10 @@ export async function registerRoutes(
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
 
-      const auditResults = job.auditResults as AuditResults | null;
-      const compiledPath = auditResults?.compiledPdfPath;
+      const compiledPath = existingPressFile(job);
 
-      if (!compiledPath || !isPathSafe(compiledPath)) {
+      if (!compiledPath) {
         return res.status(404).json({ message: "No compiled PDF available" });
-      }
-
-      try { await fs.access(compiledPath); } catch {
-        return res.status(404).json({ message: "Compiled PDF file not found on disk" });
       }
 
       const downloadName = `Print Ready Artwork.pdf`;
@@ -3203,12 +3202,15 @@ export async function registerRoutes(
         }
       }
 
-      const compiledPath = auditResults?.compiledPdfPath;
-      if (!compiledPath || !isPathSafe(compiledPath)) {
+      const compiledPath = existingPressFile(job);
+      if (!compiledPath) {
         return res.status(404).json({ message: "No compiled PDF available. Please compile first." });
       }
-      try { await fs.access(compiledPath); } catch {
-        return res.status(404).json({ message: "Compiled PDF file not found on disk" });
+      if (auditResults?.quickPrint?.pressPath) {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", 'attachment; filename="Print Ready Artwork.pdf"');
+        fsSync.createReadStream(compiledPath).pipe(res);
+        return;
       }
 
       return res.status(404).json({ message: "Press-ready ZIP not found. Please recompile by selecting a bleed strategy." });

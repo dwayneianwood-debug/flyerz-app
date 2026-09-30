@@ -58,6 +58,7 @@ test("result cards show green download, amber reasons, and a red client message"
   );
   assert.match(green, /GREEN/);
   assert.match(green, /Download press PDF/);
+  assert.match(green, /\/api\/jobs\/1\/download\/press-ready/);
   assert.match(green, /img-proof-1/);
 
   const amber = renderToStaticMarkup(

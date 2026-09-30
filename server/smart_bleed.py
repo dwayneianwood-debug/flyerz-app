@@ -67,18 +67,8 @@ def _timer_log(label: str, t0: float) -> None:
 
 
 def find_gs_binary() -> str:
-    # Windows installers ship gswin64c.exe / gswin64.exe; Unix typically provides "gs".
-    for cmd in ("gs", "gswin64c", "gswin64"):
-        gs_path = shutil.which(cmd)
-        if gs_path:
-            return gs_path
-
-    nix_matches = globmod.glob("/nix/store/*/bin/gs")
-    for p in sorted(nix_matches, reverse=True):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 GS_BIN = find_gs_binary()

@@ -69,7 +69,8 @@ def _call_gemini_vision(image_path: str, prompt: str) -> tuple:
     mime_type = parts[0].split(":")[1].split(";")[0]
     b64_data = parts[1]
 
-    url = f"{GEMINI_API_URL}/models/gemini-2.0-flash:generateContent?key={key}"
+    from gemini_api import gemini_generate_content_url
+    url = gemini_generate_content_url(key)
     payload = json.dumps({
         "contents": [{
             "parts": [

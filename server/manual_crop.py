@@ -30,14 +30,8 @@ PREVIEW_MAX_PX = 1200
 
 
 def find_gs_binary():
-    gs = shutil.which("gs")
-    if gs:
-        return gs
-    import glob
-    matches = glob.glob("/nix/store/*/bin/gs")
-    if matches:
-        return matches[0]
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 def get_image_info(input_path, file_type):

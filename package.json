@@ -24,7 +24,7 @@
     "test:press-bleed": "tsx --test client/src/lib/bleed-preview-request.test.ts client/src/lib/press-ready-ui.test.ts && python3 server/press_bleed_check.py",
     "test:bleed-matrix": "python3 server/bleed_matrix_check.py",
     "test:speed": "tsx --test server/jobList.test.ts",
-    "test:quick-print": "tsx --test server/quickPrint.test.ts client/src/pages/print-ready-view.test.tsx && python3 server/quick_print_check.py",
+    "test:quick-print": "tsx --test server/quickPrint.test.ts server/pressDownload.test.ts client/src/pages/print-ready-view.test.tsx && python3 server/gs_binary_check.py && python3 server/ocr_reader_check.py && python3 server/quick_print_check.py",
     "db:push": "drizzle-kit push",
     "db:push:local": "drizzle-kit push"
   },

@@ -75,7 +75,8 @@ def _call_gemini_json(bgr, prompt: str, max_output_tokens: int = 4096) -> tuple:
 
     vision_bgr, _ = _resize_for_vision(bgr)
     mime, b64 = _bgr_to_jpeg_b64(vision_bgr)
-    url = f"{GEMINI_API_URL}/models/gemini-2.0-flash:generateContent?key={key}"
+    from gemini_api import gemini_generate_content_url
+    url = gemini_generate_content_url(key)
     payload = json.dumps(
         {
             "contents": [

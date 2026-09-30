@@ -540,13 +540,16 @@ export default function JobDetails() {
   }, [job?.id, job?.status, selectedBleedMethod]);
 
   useEffect(() => {
-    if (!job?.auditResults?.compiledPdfPath || compileTaskId) return;
-    if (preCompileState !== "ready") return;
+    const quickPath = job?.auditResults?.quickPrint?.pressPath;
+    if ((!job?.auditResults?.compiledPdfPath && !quickPath) || compileTaskId) return;
+    if (preCompileState !== "ready" && !quickPath) return;
 
-    const dlUrl = `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+    const dlUrl = quickPath
+      ? `/api/jobs/${job.id}/download/press-ready`
+      : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
     setCompileState("COMPLETE");
     setCompileDownloadUrl(dlUrl);
-  }, [job?.auditResults?.compiledPdfPath, selectedBleedMethod, preCompileState]);
+  }, [job?.id, job?.auditResults?.compiledPdfPath, job?.auditResults?.quickPrint?.pressPath, selectedBleedMethod, preCompileState]);
 
   useEffect(() => {
     if (!compileTaskId || !job) return;
@@ -984,6 +987,11 @@ export default function JobDetails() {
   const allReviewsChecked = bleedChecked && (hasComparison ? comparisonChecked : true) && !prepressSpinnerActive;
   const canDownload = isComplete && overallPassed && (hasProof ? proofChecked : true);
   const hasCorrectedFile = isComplete && overallPassed && job.correctedPath;
+  const quickPressReady = isComplete && Boolean(job.auditResults?.quickPrint?.pressPath || (job.auditResults?.quickPrint && job.correctedPath));
+  const pressDownloadHref = quickPressReady
+    ? `/api/jobs/${job.id}/download/press-ready`
+    : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+  const pressDownloadName = quickPressReady ? "Print Ready Artwork.pdf" : "Print Ready Artwork.zip";
 
   const currentBleedPage = bleedPreview?.previewUrls?.[bleedPreviewPage];
 
@@ -1579,6 +1587,7 @@ export default function JobDetails() {
                         pressEngine={job.auditResults.pressEngine}
                         beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof` : null}
                         afterUrl={bleedPreview?.previewUrls?.[0]?.url || null}
+                        pressDownloadHref={quickPressReady ? pressDownloadHref : null}
                       />
                     </div>
                   )}
@@ -1883,7 +1892,7 @@ export default function JobDetails() {
                       const methodLabel = BLEED_METHOD_LABELS[selectedBleedMethod as keyof typeof BLEED_METHOD_LABELS]?.label || selectedBleedMethod;
                       const audit = job.auditResults?.jobAudit;
                       const auditResults = job.auditResults as any;
-                      const dlUrl = compileDownloadUrl || `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+                      const dlUrl = compileDownloadUrl || pressDownloadHref;
 
                       window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
                         downloadUrl: dlUrl,
@@ -2058,8 +2067,8 @@ export default function JobDetails() {
                   {preCompileReady ? (
                     <>
                       <a
-                        href={`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`}
-                        download="Print Ready Artwork.zip"
+                        href={pressDownloadHref}
+                        download={pressDownloadName}
                         target="_blank"
                         rel="noopener noreferrer"
                         onClick={() => { setHasDownloaded(true); }}
@@ -2160,15 +2169,15 @@ export default function JobDetails() {
                     </>
                   ) : (
                     <a
-                      href={hasUserSelectedBleed ? `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}` : "#"}
-                      download="Print Ready Artwork.zip"
+                      href={(hasUserSelectedBleed || quickPressReady) ? pressDownloadHref : "#"}
+                      download={pressDownloadName}
                       target="_blank"
                       rel="noopener noreferrer"
                       onClick={(e) => {
-                        if (!hasUserSelectedBleed) { e.preventDefault(); return; }
+                        if (!hasUserSelectedBleed && !quickPressReady) { e.preventDefault(); return; }
                         setHasDownloaded(true);
                       }}
-                      className={`w-full bg-green-600 hover:bg-green-700 text-white gap-2 shadow-md shadow-green-500/20 text-base py-5 inline-flex items-center justify-center rounded-md font-medium transition-colors ${!hasUserSelectedBleed ? 'opacity-50 pointer-events-none' : ''}`}
+                      className={`w-full bg-green-600 hover:bg-green-700 text-white gap-2 shadow-md shadow-green-500/20 text-base py-5 inline-flex items-center justify-center rounded-md font-medium transition-colors ${!hasUserSelectedBleed && !quickPressReady ? 'opacity-50 pointer-events-none' : ''}`}
                       data-testid="button-download-print-ready"
                     >
                       <Download className="w-5 h-5 mr-2" /> Download Print Ready Artwork
@@ -2713,7 +2722,7 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
@@ -2733,6 +2742,7 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
   } | null;
   beforeUrl?: string | null;
   afterUrl?: string | null;
+  pressDownloadHref?: string | null;
 }) {
   /** Automatic is the default. The older styles stay as manual overrides. */
   const methods = ["auto", ...BLEED_STRATEGY_IDS];
@@ -2783,6 +2793,9 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             <p className={`text-sm font-semibold ${engineAttention ? "text-amber-700" : "text-green-700"}`} data-testid="text-press-ready-headline">
               {pressReadyHeadline(pressEngine)}
             </p>
+            {pressDownloadHref && (
+              <a href={pressDownloadHref} className="inline-flex text-sm font-semibold underline" data-testid="link-job-press-download">Download press PDF</a>
+            )}
             {pressEngine?.reason && (
               <p className="text-xs text-muted-foreground" data-testid="text-press-ready-reason">{pressEngine.reason} {pressEngine.fix}</p>
             )}

@@ -61,7 +61,6 @@ _OCR: Optional[OcrFn] = None
 _INPAINT: Optional[InpaintFn] = None
 _UPSCALE: Optional[UpscaleFn] = None
 _ACCOUNT: Optional[AccountFn] = None
-_RAPID = None
 
 
 def set_providers(
@@ -288,12 +287,9 @@ def _assess(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> d
 
 
 def _rapid_blocks(bgr: np.ndarray) -> list:
-    global _RAPID
-    from rapidocr_onnxruntime import RapidOCR
+    from ocr_reader import local_rows
 
-    if _RAPID is None:
-        _RAPID = RapidOCR()
-    result, _elapsed = _RAPID(bgr)
+    result = local_rows(bgr)
     if not result:
         return []
     height, width = bgr.shape[:2]
@@ -491,8 +487,10 @@ def _gemini_blocks(bgr: np.ndarray) -> tuple[list, str]:
             }],
             "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
         }
+        from gemini_api import gemini_generate_content_url
+
         req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}",
+            gemini_generate_content_url(key),
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",

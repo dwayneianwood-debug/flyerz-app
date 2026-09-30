@@ -186,6 +186,7 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     overallPassed: result.light === "green" && enginePassed,
     fixesApplied: result.light === "red" ? 0 : checks.length,
     complianceReport: result.decisions.join(" "),
+    compiledPdfPath: result.pressPath || undefined,
     quickPrint: { ...quickPrint, approved: false },
     pressEngine,
   } as AuditResults;
