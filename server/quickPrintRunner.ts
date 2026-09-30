@@ -6,6 +6,7 @@ import type { AuditResults, FileType } from "@shared/schema";
 import { quickPrintProduct, QUICK_PRINT_PRODUCTS } from "@shared/quickPrint";
 import { pythonChildEnv } from "./pythonChildEnv";
 import { storage } from "./storage";
+import { jobProgressPath, writeJobProgress } from "./jobProgress";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
 const SCRIPT = path.join(process.cwd(), "server", "quick_print.py");
@@ -41,6 +42,9 @@ export interface QuickRunResult {
   mediaHeightMm?: number;
   trimWidthMm?: number;
   trimHeightMm?: number;
+  rebuildPdf?: string;
+  rebuildBefore?: string;
+  rebuildAfter?: string;
 }
 
 function asResult(raw: Record<string, unknown>): QuickRunResult {
@@ -67,6 +71,9 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     mediaHeightMm: raw.mediaHeightMm == null ? undefined : Number(raw.mediaHeightMm),
     trimWidthMm: raw.trimWidthMm == null ? undefined : Number(raw.trimWidthMm),
     trimHeightMm: raw.trimHeightMm == null ? undefined : Number(raw.trimHeightMm),
+    rebuildPdf: raw.rebuildPdf ? String(raw.rebuildPdf) : "",
+    rebuildBefore: raw.rebuildBefore ? String(raw.rebuildBefore) : "",
+    rebuildAfter: raw.rebuildAfter ? String(raw.rebuildAfter) : "",
   };
 }
 
@@ -97,7 +104,7 @@ export function fileTypeForName(filename: string): FileType {
   return "pdf";
 }
 
-export function runQuickPrintFile(inputPath: string, outputDir: string, options: QuickRunOptions): Promise<QuickRunResult> {
+export function runQuickPrintFile(inputPath: string, outputDir: string, options: QuickRunOptions & { jobId?: number }): Promise<QuickRunResult> {
   const product = options.productId === "custom"
     ? resolveQuickProduct("custom", options.trimW, options.trimH)
     : options.productId === "auto"
@@ -117,11 +124,18 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
     "--notes", options.notes || "",
   ];
   if (options.detectSize || options.productId === "auto") args.push("--detect-size");
+  const progressFile = options.jobId ? jobProgressPath(options.jobId) : "";
+  if (progressFile) {
+    if (options.jobId) writeJobProgress(options.jobId, "fitting");
+    args.push("--progress-file", progressFile);
+  }
 
   return new Promise((resolve, reject) => {
+    const env = pythonChildEnv();
+    if (progressFile) env.JOB_PROGRESS_FILE = progressFile;
     const child = spawn(PYTHON_BIN, args, {
       cwd: process.cwd(),
-      env: pythonChildEnv(),
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -181,6 +195,7 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     checks.push({ name: "Quick print", passed: false, message: result.clientMessage, autoFixed: false });
   }
   const { pressEngine, ...quickPrint } = result;
+  const reused = publishQuickReuse(jobId, result);
   const audit = {
     checks,
     overallPassed: result.light === "green" && enginePassed,
@@ -189,6 +204,7 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     compiledPdfPath: result.pressPath || undefined,
     quickPrint: { ...quickPrint, approved: false },
     pressEngine,
+    ...reused,
   } as AuditResults;
   await storage.updateJob(jobId, {
     status: "complete",
@@ -196,6 +212,37 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     completedAt: new Date(),
     auditResults: audit,
   });
+}
+
+function copyIfPresent(source: string | undefined, dest: string): boolean {
+  if (!source || !fs.existsSync(source)) return false;
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(source, dest);
+  return true;
+}
+
+/** Point the job page at the picture quick mode already enlarged, so it does not call Replicate again. */
+export function publishQuickReuse(jobId: number, result: QuickRunResult): Record<string, unknown> {
+  const upload = path.join(process.cwd(), "uploads");
+  const dir = jobOutputDir(jobId);
+  const upscaled = fs.existsSync(path.join(dir, "upscaled.png")) ? path.join(dir, "upscaled.png") : result.rebuildAfter;
+  const beforeSrc = fs.existsSync(path.join(dir, "fitted.png")) ? path.join(dir, "fitted.png") : result.rebuildBefore;
+  const upBefore = path.join(upload, `ai-upscale-${jobId}-before.png`);
+  const upAfter = path.join(upload, `ai-upscale-${jobId}-after.png`);
+  const upFull = path.join(upload, `ai-upscale-${jobId}-full.png`);
+  const copiedAfter = copyIfPresent(upscaled, upAfter);
+  copyIfPresent(upscaled, upFull);
+  copyIfPresent(beforeSrc, upBefore);
+  if (!copiedAfter) return {};
+  return {
+    aiUpscale: {
+      accepted: true,
+      provider: "quick-print",
+      enhancedPath: upFull,
+      message: "Quick mode already enlarged this artwork. The original lettering was kept.",
+      note: "Reused the quick-mode upscale.",
+    },
+  };
 }
 
 export function jobOutputDir(jobId: number): string {

@@ -35,6 +35,8 @@ import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-pane
 import { AiRebuildPanel } from "@/components/ai-rebuild-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
 import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline, shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
+import { proceedButtonState } from "@/lib/job-page-actions";
+import { displayPercent, formatElapsed } from "@shared/jobProgress";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
 import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
 import { precompilePollDelayMs } from "@/lib/poll-backoff";
@@ -154,6 +156,7 @@ export default function JobDetails() {
   const processJob = useProcessJob();
   
   const [progress, setProgress] = useState(0);
+  const [elapsedTick, setElapsedTick] = useState(0);
   const [proofChecked, setProofChecked] = useState(false);
   const [hasDownloaded, setHasDownloaded] = useState(false);
   const [shareEmail, setShareEmail] = useState('');
@@ -264,6 +267,12 @@ export default function JobDetails() {
 
 
   useEffect(() => {
+    if (job?.status !== "processing" && job?.status !== "pending") return;
+    const clock = setInterval(() => setElapsedTick((n) => n + 1), 1000);
+    return () => clearInterval(clock);
+  }, [job?.status]);
+
+  useEffect(() => {
     if (job && (job.status as string) === "queued") {
       const jobId = job.id;
       setProgress(0);
@@ -284,10 +293,6 @@ export default function JobDetails() {
       return () => clearInterval(pollQueue);
     } else if (job?.status === "processing") {
       window.dispatchEvent(new CustomEvent("glitchy:queue-dequeued"));
-      const interval = setInterval(() => {
-        setProgress(p => Math.min(p + Math.random() * 15, 95));
-      }, 500);
-      return () => clearInterval(interval);
     } else if (job?.status === "complete" || job?.status === "failed") {
       setProgress(100);
     } else {
@@ -428,6 +433,11 @@ export default function JobDetails() {
     const variants = job?.auditResults?.bleedVariants;
     const hasVariants = !!(variants && Object.keys(variants).length > 0);
     const canAssessArtwork = !!(job?.auditResults && (job.correctedPath || job.originalPath));
+    const hasExistingPress = Boolean(
+      job?.auditResults?.quickPrint?.pressPath
+      || job?.auditResults?.compiledPdfPath
+      || (job?.auditResults?.quickPrint && job?.correctedPath),
+    );
     if (!shouldStartAutomaticCompile({
       status: job?.status,
       selected: selectedBleedMethod,
@@ -436,6 +446,7 @@ export default function JobDetails() {
       canAssess: canAssessArtwork,
       artworkGateReady: aiArtworkGate.ready,
       pressStatus: job?.auditResults?.pressEngine?.status,
+      hasExistingPress,
     })) return;
     autoSelectTriggeredRef.current = true;
     // Automatic is already the selected value, so this must force the first compile.
@@ -998,6 +1009,19 @@ export default function JobDetails() {
   const isFailed = job.status === "failed";
   const hasUserSelectedBleed = selectedBleedMethod !== "auto";
   const preCompileReady = preCompileState === "ready" || compileState === "COMPLETE";
+  const hasAutomaticPress = Boolean(
+    quickPressReady
+    || job.auditResults?.compiledPdfPath
+    || preCompileReady,
+  );
+  const proceed = proceedButtonState({
+    allReviewsChecked,
+    selectedBleedMethod,
+    prepressSpinnerActive,
+    preCompileState,
+    preCompileReady,
+    hasAutomaticPress,
+  });
   const fastTrackEligible = (() => {
     if (!isComplete || !overallPassed || !job.auditResults?.checks) return false;
     const checks = job.auditResults.checks;
@@ -1125,15 +1149,19 @@ export default function JobDetails() {
                 <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto" data-testid="text-processing-description">
                   {isQueued
                     ? "The press room is busy. Your file is in line and will be processed as soon as a slot opens."
-                    : "We're checking fonts, colors, bleeds, and more. This usually takes a few seconds."}
+                    : (job.progress?.note || "We're fitting the picture and building the press file. The original lettering is kept.")}
                 </p>
                 {!isQueued && (
-                  <div className="max-w-xs mx-auto">
+                  <div className="max-w-xs mx-auto" data-testid="job-progress">
                     <div className="flex justify-between text-xs font-medium mb-1 text-primary">
-                      <span>Processing</span>
-                      <span>{Math.round(progress)}%</span>
+                      <span data-testid="text-job-stage">{job.progress?.stage || "Starting…"}</span>
+                      <span data-testid="text-job-percent">{displayPercent(job.status, job.progress?.percent)}%</span>
                     </div>
-                    <Progress value={progress} className="h-2.5 bg-primary/10" />
+                    <Progress value={displayPercent(job.status, job.progress?.percent)} className="h-2.5 bg-primary/10" />
+                    <p className="text-xs text-muted-foreground mt-2" data-testid="text-job-elapsed">
+                      {formatElapsed(job.progress?.startedAt ? Math.max(0, Math.round((Date.now() - job.progress.startedAt) / 1000)) : job.progress?.elapsedSec)}
+                      <span className="sr-only">{elapsedTick}</span>
+                    </p>
                   </div>
                 )}
               </Card>
@@ -1598,7 +1626,7 @@ export default function JobDetails() {
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
                         bleedMm={bleedMm}
-                        autoStart={autoEnhance}
+                        autoStart={autoEnhance && isComplete && !job.auditResults?.quickPrint}
                         onEnhanceChoice={async (accepted) => {
                           setAutoEnhance(accepted);
                           try {
@@ -1764,7 +1792,13 @@ export default function JobDetails() {
                     <>
                       <p className="text-sm text-muted-foreground flex items-center justify-center gap-2 mb-3">
                         <AlertCircle className="w-4 h-4" />
-                        {prepressSpinnerActive ? "Processing prepress refinement..." : "Please review and confirm all sections above to proceed"}
+                        {proceed.spinning
+                          ? "Preparing artwork..."
+                          : proceed.label === "Choose a bleed method to continue"
+                            ? "Choose a bleed style above. Automatic is already selected, and it counts once the press file is ready."
+                            : prepressSpinnerActive
+                              ? "Processing prepress refinement..."
+                              : "Please review and confirm all sections above to proceed"}
                       </p>
                       <div className="flex items-center justify-center gap-3 mb-4">
                         <span className={`text-xs px-2 py-1 rounded-full ${bleedChecked ? 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}>
@@ -1879,11 +1913,11 @@ export default function JobDetails() {
                   <Button
                     size="lg"
                     className={`gap-2 transition-all duration-300 ${
-                      allReviewsChecked && hasUserSelectedBleed && preCompileReady
+                      !proceed.disabled
                         ? "bg-green-600 hover:bg-green-700 text-white shadow-lg shadow-green-500/20 hover-elevate"
                         : "bg-muted text-muted-foreground cursor-not-allowed"
                     }`}
-                    disabled={!allReviewsChecked || !hasUserSelectedBleed || !preCompileReady}
+                    disabled={proceed.disabled}
                     onClick={() => {
                       setProofChecked(true);
                       setPhase3Confirmed(true);
@@ -1910,12 +1944,12 @@ export default function JobDetails() {
                     }}
                     data-testid="button-proceed-to-download"
                   >
-                    {(prepressSpinnerActive || !hasUserSelectedBleed || (preCompileState === "compiling")) ? (
-                      <><Loader2 className="w-5 h-5 animate-spin" /> Preparing artwork...</>
-                    ) : !allReviewsChecked ? (
-                      <>Review required to proceed</>
-                    ) : (
+                    {proceed.spinning ? (
+                      <><Loader2 className="w-5 h-5 animate-spin" /> {proceed.label}</>
+                    ) : proceed.label === "Proceed to Download" ? (
                       <>Proceed to Download <ArrowRight className="w-5 h-5" /></>
+                    ) : (
+                      <>{proceed.label}</>
                     )}
                   </Button>
                 </div>

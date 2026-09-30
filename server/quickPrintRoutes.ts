@@ -13,6 +13,8 @@ import {
   runQuickPrintFile,
   saveQuickResult,
 } from "./quickPrintRunner";
+import { beginJobRun, endJobRun } from "./jobRunLock";
+import { readJobProgress, writeJobProgress } from "./jobProgress";
 import { startQuickPrintWatcher } from "./quickPrintWatcher";
 import type { AuditResults } from "@shared/schema";
 import type { QuickPrintCard } from "@shared/quickPrint";
@@ -73,6 +75,18 @@ export function slimQuickCard(job: {
     productLabel: String(quick?.productLabel || ""),
     quantity: quick?.quantity == null ? null : Number(quick.quantity),
     notes: String(quick?.notes || ""),
+    ...progressFields(job.id),
+  };
+}
+
+function progressFields(jobId: number): { stage?: string; percent?: number; elapsedSec?: number; note?: string } {
+  const progress = readJobProgress(jobId);
+  if (!progress) return {};
+  return {
+    stage: progress.stage,
+    percent: progress.percent,
+    elapsedSec: progress.elapsedSec,
+    note: progress.note,
   };
 }
 
@@ -89,11 +103,16 @@ async function runJob(jobId: number, inputPath: string, filename: string, body: 
       quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,
       notes,
       filename,
+      jobId,
     });
     await saveQuickResult(jobId, result);
+    writeJobProgress(jobId, "done");
   } catch (error) {
     const message = error instanceof Error ? error.message : "We could not build a press file from this.";
     await saveQuickResult(jobId, redFallback(message));
+    writeJobProgress(jobId, "done", message);
+  } finally {
+    endJobRun(jobId, "quick");
   }
 }
 
@@ -183,12 +202,19 @@ export function registerQuickPrintRoutes(app: Express) {
         fileType: fileTypeForName(file.originalname || filename),
       });
       await storage.updateJob(job.id, { status: "processing" });
-      created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named });
+      const hold = beginJobRun(job.id, "quick");
+      if (!hold.started) {
+        created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: true });
+        continue;
+      }
+      writeJobProgress(job.id, "fitting", "Original lettering is kept. Text is not retyped.");
+      created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: false });
     }
     res.status(202).json({
       jobs: created.map(({ id, filename, status }) => ({ id, filename, status })),
     });
     for (const job of created) {
+      if (job.skip) continue;
       void runJob(job.id, job.inputPath, job.filename, req.body || {});
     }
   });

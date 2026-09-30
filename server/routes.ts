@@ -37,6 +37,8 @@ import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 import { normalizeBleedMm } from "@shared/bleed-size";
 import { pythonChildEnv } from "./pythonChildEnv";
 import { choosePressInput } from "./aiRebuildPolicy";
+import { JobAlreadyRunning, duplicateRun } from "./jobRunLock";
+import { readJobProgress } from "./jobProgress";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import { registerQuickPrintRoutes } from "./quickPrintRoutes";
@@ -800,7 +802,7 @@ export async function registerRoutes(
       if (!job) {
         return res.status(404).json({ message: 'Job not found' });
       }
-      res.json(job);
+      res.json({ ...job, progress: readJobProgress(job.id) });
     } catch (error) {
       console.error('Error fetching job:', error);
       res.status(500).json({ message: 'Failed to fetch job' });
@@ -1110,6 +1112,7 @@ export async function registerRoutes(
       }
 
       processFile(job.id, true, bleedOptions).catch((error: Error) => {
+        if (error instanceof JobAlreadyRunning) return;
         console.error(`Error processing job ${job.id}:`, error);
         storage.updateJob(job.id, {
           status: 'failed',
@@ -1139,8 +1142,15 @@ export async function registerRoutes(
         return res.status(404).json({ message: 'Job not found' });
       }
 
-      if (job.status === 'processing') {
-        return res.status(400).json({ message: 'Job is already being processed' });
+      if (duplicateRun(job.status, jobId)) {
+        return res.json({
+          joined: true,
+          alreadyRunning: true,
+          status: job.status,
+          jobId,
+          message: 'This job is already being processed.',
+          progress: readJobProgress(jobId),
+        });
       }
 
       let bleedOptions = sanitizeBleedOptions(
@@ -1184,6 +1194,16 @@ export async function registerRoutes(
       try {
         await processFile(jobId, true, bleedOptions);
       } catch (error: any) {
+        if (error instanceof JobAlreadyRunning) {
+          return res.json({
+            joined: true,
+            alreadyRunning: true,
+            status: 'processing',
+            jobId,
+            message: 'This job is already being processed.',
+            progress: readJobProgress(jobId),
+          });
+        }
         console.error(`Error processing job ${jobId}:`, error);
         const msg = error instanceof Error ? error.message : String(error);
         const layoutRejection = isSafeZoneLayoutRejectionMessage(msg);
@@ -2094,6 +2114,9 @@ export async function registerRoutes(
     ocrText: String(parsed?.ocrText || ""),
     steps: Array.isArray(parsed?.steps) ? parsed.steps : [],
     pdfPath: typeof parsed?.pdfPath === "string" ? parsed.pdfPath : "",
+    refused: !!parsed?.refused,
+    discarded: !!parsed?.discarded,
+    accepted: parsed?.accepted === true,
     note: String(parsed?.note || ""),
     message: String(parsed?.message || ""),
     replicate: String(parsed?.replicate || ""),
@@ -2112,9 +2135,11 @@ export async function registerRoutes(
     };
   };
 
-  const ensureAiRebuild = async (job: any, audit: any, trimW: number, trimH: number, edits?: unknown[]) => {
+  const ensureAiRebuild = async (job: any, audit: any, trimW: number, trimH: number, edits?: unknown[], optIn = false) => {
     const saved = audit?.aiRebuild || {};
     const jobId = Number(job.id);
+    if (!edits && !optIn) return audit;
+    if (duplicateRun(job.status, jobId)) return audit;
     if (saved.skipped && !edits) return audit;
     if (!edits && saved.assessed && saved.detected === false) return audit;
     if (!edits && !saved.skipped && saved.detected && saved.pdfPath && fsSync.existsSync(saved.pdfPath)) {
@@ -2138,7 +2163,8 @@ export async function registerRoutes(
           after_path: after,
           clean_path: clean,
           blocks: edits,
-          force: Array.isArray(edits),
+          force: true,
+          opt_in: true,
         });
         const next = { ...audit, aiRebuild: slimRebuild(parsed, false) };
         await storage.updateJob(jobId, { auditResults: next });
@@ -2212,6 +2238,31 @@ export async function registerRoutes(
       const savedOpts = coerceSavedBleedOptionsFromDb(audit.savedBleedOptions);
       const trimW = Number(body.trimW) || Number(savedOpts?.targetWidth) || 148;
       const trimH = Number(body.trimH) || Number(savedOpts?.targetHeight) || 210;
+      if (duplicateRun(job.status, jobId)) {
+        return res.json({
+          joined: true,
+          alreadyRunning: true,
+          status: job.status,
+          progress: readJobProgress(jobId),
+          ...(audit.aiRebuild || { detected: false }),
+        });
+      }
+      if (body.accept === true) {
+        const saved = audit.aiRebuild || {};
+        if (!saved.pdfPath || !fsSync.existsSync(saved.pdfPath) || saved.refused) {
+          return res.json(rebuildView(jobId, {
+            ...saved,
+            accepted: false,
+            message: saved.message || "There's no approved rebuild. The original lettering stays.",
+          }));
+        }
+        const next = { ...audit, aiRebuild: { ...saved, accepted: true, optIn: true } };
+        await storage.updateJob(jobId, { auditResults: next });
+        return res.json(rebuildView(jobId, next.aiRebuild));
+      }
+      if (body.optIn !== true && !Array.isArray(body.blocks)) {
+        return res.json(rebuildView(jobId, audit.aiRebuild || { detected: !!audit.aiRebuild?.detected, skipped: true }));
+      }
       if (body.skipped === true) {
         const next = {
           ...audit,
@@ -2227,8 +2278,8 @@ export async function registerRoutes(
         return res.json(rebuildView(jobId, next.aiRebuild));
       }
       const edits = Array.isArray(body.blocks) ? body.blocks : undefined;
-      const cleared = { ...audit, aiRebuild: { ...(audit.aiRebuild || {}), skipped: false, detected: audit.aiRebuild?.detected !== false } };
-      const next = await ensureAiRebuild(job, cleared, trimW, trimH, edits);
+      const cleared = { ...audit, aiRebuild: { ...(audit.aiRebuild || {}), skipped: false, optIn: true, accepted: false, detected: audit.aiRebuild?.detected !== false } };
+      const next = await ensureAiRebuild(job, cleared, trimW, trimH, edits, true);
       res.json(rebuildView(jobId, next?.aiRebuild || { detected: false }));
     } catch (error: any) {
       console.error("[AI-REBUILD] run failed:", error?.message || error);
@@ -2297,7 +2348,31 @@ export async function registerRoutes(
       const jobId = Number(req.params.id);
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
+      if (duplicateRun(job.status, jobId)) {
+        return res.json({
+          joined: true,
+          success: true,
+          used_original: true,
+          status: job.status,
+          progress: readJobProgress(jobId),
+          message: "This job is already being processed.",
+        });
+      }
       const auditResults = (job.auditResults || {}) as AuditResults;
+      const reusedAfter = path.join(uploadDir, `ai-upscale-${jobId}-after.png`);
+      const reusedBefore = path.join(uploadDir, `ai-upscale-${jobId}-before.png`);
+      const quickAlready = (auditResults as any)?.aiUpscale?.provider === "quick-print"
+        || (!!(auditResults as any)?.quickPrint && fsSync.existsSync(reusedAfter));
+      if (quickAlready && fsSync.existsSync(reusedAfter) && fsSync.existsSync(reusedBefore)) {
+        return res.json({
+          success: true,
+          used_original: false,
+          provider: "quick-print",
+          message: "Quick mode already enlarged this artwork. The original lettering was kept.",
+          beforeUrl: `/api/jobs/${jobId}/ai-upscale/image?which=before`,
+          afterUrl: `/api/jobs/${jobId}/ai-upscale/image?which=after`,
+        });
+      }
       const artworkPath = resolveUpscaleArtwork(job, auditResults);
       if (!artworkPath) {
         return res.json({ success: true, used_original: true, message: "Artwork is not ready, so the original will be used." });
@@ -2506,6 +2581,16 @@ export async function registerRoutes(
       const jobId = Number(req.params.id);
       const job = await storage.getJob(jobId);
       if (!job) return res.status(404).json({ message: "Job not found" });
+      if (duplicateRun(job.status, jobId)) {
+        return res.json({
+          joined: true,
+          success: true,
+          detected: false,
+          status: job.status,
+          progress: readJobProgress(jobId),
+          message: "This job is already being processed.",
+        });
+      }
       const audit = (job.auditResults || {}) as any;
       const artworkPath = resolveUpscaleArtwork(job, audit);
       if (!artworkPath) return res.json({ success: true, detected: false, blocked: false });

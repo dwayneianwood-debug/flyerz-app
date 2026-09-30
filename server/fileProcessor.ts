@@ -7,6 +7,8 @@ import fsSync from "fs";
 import { spawnSync } from "child_process";
 import os from "os";
 import { pythonChildEnv } from "./pythonChildEnv";
+import { beginJobRun, endJobRun, JobAlreadyRunning } from "./jobRunLock";
+import { runWithJobProgress, writeJobProgress } from "./jobProgress";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
@@ -512,12 +514,19 @@ export function startJanitor(intervalMs: number = 60 * 60 * 1000): void {
 }
 
 export async function processFile(jobId: number, applyFixes: boolean = true, bleedOptions?: BleedOptions): Promise<void> {
+  const hold = beginJobRun(jobId, "process");
+  if (!hold.started) throw new JobAlreadyRunning(hold.current);
   await acquireSlot(jobId);
 
   try {
-    await processFileInternal(jobId, applyFixes, bleedOptions);
+    await runWithJobProgress(jobId, async () => {
+      writeJobProgress(jobId, "checking");
+      await processFileInternal(jobId, applyFixes, bleedOptions);
+      writeJobProgress(jobId, "done");
+    });
   } finally {
     releaseSlot();
+    endJobRun(jobId, "process");
   }
 }
 
@@ -640,7 +649,9 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
 
       const outputPath = path.join(dir, `processed_${jobId}_${basename}${ext}`);
 
+      writeJobProgress(jobId, "press");
       result = await runPythonBleed(inputForBleed, outputPath, pipelineType, effectiveBleed);
+      writeJobProgress(jobId, "proof");
       bleedPythonResult = result;
       } finally {
         console.timeEnd("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");

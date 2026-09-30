@@ -226,29 +226,9 @@ export function AiArtworkPanel({ jobId, trimWidthMm, trimHeightMm, onPlan, onRef
           onPlanRef.current?.({ detected: false, applyBleed: false });
           return;
         }
-        let current = data;
-        if (!data.saved) {
-          const saved = await fetch(`/api/jobs/${jobId}/ai-artwork/choice`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              trimW: trimWidthMm,
-              trimH: trimHeightMm,
-              fit: data.fit,
-              offset: data.offset ?? 0.5,
-              enhance: data.enhance,
-              bleed: data.bleed,
-              textStatus: data.textStatus,
-              textWarnings: data.textWarnings,
-              textMessage: data.textMessage,
-            }),
-          });
-          const body = await saved.json();
-          if (body?.detected) current = body;
-        }
         if (cancel) return;
-        setPlan(current);
-        onPlanRef.current?.({ ...current, applyBleed: !data.saved });
+        setPlan(data);
+        onPlanRef.current?.({ ...data, applyBleed: false });
       })
       .catch(() => {
         if (!cancel) onPlanRef.current?.({ detected: false, applyBleed: false });

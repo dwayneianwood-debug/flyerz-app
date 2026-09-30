@@ -225,20 +225,20 @@ def test_flyer(root: str) -> None:
     if result.get("proofPng") and os.path.exists(result["proofPng"]):
         shutil.copyfile(result["proofPng"], os.path.join(ART, "quick-print-ai-flyer-proof.png"))
     joined = " ".join(result.get("decisions") or [])
-    check("flyer-records-decisions", "5 mm" in joined and "AI Rebuild" in joined, joined[:400])
+    check("flyer-records-decisions", "5 mm" in joined and "lettering" in joined.lower() and "not retyped" in joined.lower(), joined[:500])
 
 
 def test_shapes(root: str) -> None:
-    """Square flyer: OCR calls the circle O. Quick mode must leave it and flag amber."""
+    """Square flyer. Quick mode keeps the circle and the original lettering. It does not retype."""
     from ai_rebuild_check import _draw_shape_flyer, _orange_disc
 
     path = os.path.join(root, "shapes.png")
     _draw_shape_flyer(path)
     out = tempfile.mkdtemp(prefix="quick-shapes-")
     result = make_print_ready(path, out, 148, 148, "custom", "148 × 148 mm", filename="shapes.png")
-    check("shapes-amber", result["light"] == "amber", f"{result['light']} {result.get('reasons')}")
-    check("shapes-reason", any("left unchanged" in line for line in result.get("reasons") or []), str(result.get("reasons")))
     check("shapes-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
+    joined = " ".join(result.get("decisions") or [])
+    check("shapes-keeps-lettering", "not retyped" in joined.lower(), joined[:400])
     rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-shape-circle.png"))
     disc = _orange_disc(rendered)
     check("shapes-circle", disc is not None, "" if disc else "no orange disc")
@@ -248,8 +248,10 @@ def test_shapes(root: str) -> None:
     import pymupdf as fitz
     doc = fitz.open(result["pressPath"])
     text = doc[0].get_text("text") or ""
+    images = doc[0].get_images()
     doc.close()
-    check("shapes-words", "MARKET DAY" in text and "SATURDAY 9AM" in text, text.replace("\n", " | ")[:180])
+    check("shapes-not-retyped", "MARKET DAY" not in text and "SATURDAY" not in text, text.replace("\n", " | ")[:180])
+    check("shapes-still-a-picture", len(images) >= 1, str(len(images)))
 
 
 def _column_variance(strip: np.ndarray) -> float:

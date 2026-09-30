@@ -19,6 +19,8 @@ export interface AiRebuildStep {
 export interface AiRebuildPlan {
   detected?: boolean;
   skipped?: boolean;
+  refused?: boolean;
+  accepted?: boolean;
   reasons?: string[];
   recommendation?: string;
   blocks?: AiRebuildBlock[];
@@ -45,12 +47,16 @@ export function AiRebuildPanelView({
   onToggle,
   onText,
   onSave,
+  onPreview,
+  onApprove,
 }: {
   plan: AiRebuildPlan;
   busy?: boolean;
   onToggle: (enabled: boolean) => void;
   onText: (id: string, text: string) => void;
   onSave: () => void;
+  onPreview?: () => void;
+  onApprove?: () => void;
 }) {
   const enabled = !plan.skipped;
   return (
@@ -61,27 +67,53 @@ export function AiRebuildPanelView({
         </div>
         <div className="flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-base font-bold text-foreground" data-testid="text-ai-rebuild-title">AI Rebuild</h3>
+            <h3 className="text-base font-bold text-foreground" data-testid="text-ai-rebuild-title">Original lettering</h3>
             <span className="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-violet-600 text-white" data-testid="badge-ai-rebuild">
-              AI artwork — rebuild recommended
+              Words stay as drawn
             </span>
           </div>
           <p className="text-sm text-muted-foreground mt-1" data-testid="text-ai-rebuild-recommendation">
-            {plan.recommendation || "This looks like AI-generated artwork. Rebuild is on so the words are retyped crisp and the picture is enlarged for the press."}
+            {plan.recommendation || "The picture is enlarged and the original lettering is kept. Retyping is optional and has to be approved."}
           </p>
         </div>
+      </div>
+      <div className="mt-3">
+        <button
+          type="button"
+          onClick={onPreview}
+          disabled={busy}
+          className="text-sm font-semibold px-3 py-2 rounded-md bg-violet-600 text-white disabled:opacity-50"
+          data-testid="button-rebuild-text"
+        >
+          {busy ? "Checking the lettering…" : "Rebuild text as sharp type"}
+        </button>
+        <p className="mt-1 text-xs text-muted-foreground">Optional. You will see a before and after, and nothing changes until you approve it.</p>
       </div>
 
       {plan.reasons && plan.reasons.length > 0 ? (
         <p className="mt-3 text-xs text-muted-foreground" data-testid="text-ai-rebuild-reasons">{plan.reasons.join(" · ")}</p>
       ) : null}
 
+      {plan.ready && !plan.refused ? (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={onApprove}
+            disabled={busy || plan.accepted}
+            className="text-sm font-semibold px-3 py-2 rounded-md border border-violet-600 text-violet-800 disabled:opacity-50"
+            data-testid="button-approve-rebuild"
+          >
+            {plan.accepted ? "Approved for the press file" : "Approve this rebuild"}
+          </button>
+        </div>
+      ) : null}
+
       <div className="mt-3 flex items-center justify-between gap-3 rounded-lg bg-white/70 dark:bg-background/40 px-3 py-2">
         <div>
-          <p className="text-sm font-medium">Rebuild automatically</p>
-          <p className="text-xs text-muted-foreground">On for this kind of file. Turn it off to print the upload as supplied.</p>
+          <p className="text-sm font-medium">Keep the original lettering</p>
+          <p className="text-xs text-muted-foreground">On by default. Turn this off only after you have approved a rebuild.</p>
         </div>
-        <Switch checked={enabled} onCheckedChange={onToggle} disabled={busy} data-testid="switch-ai-rebuild" />
+        <Switch checked={enabled && !plan.accepted} onCheckedChange={onToggle} disabled={busy} data-testid="switch-ai-rebuild" />
       </div>
 
       {plan.blocks && plan.blocks.length > 0 ? (
@@ -156,22 +188,8 @@ export function AiRebuildPanel({ jobId, trimWidthMm, trimHeightMm }: { jobId: nu
     const load = async () => {
       const response = await fetch(`/api/jobs/${jobId}/ai-rebuild?trimW=${trimWidthMm}&trimH=${trimHeightMm}`);
       const data = await response.json();
-      if (cancel || !data?.detected) {
-        if (!cancel) setPlan(data?.detected ? data : null);
-        return;
-      }
-      setPlan(data);
-      if (!data.skipped && !data.ready) {
-        setBusy(true);
-        const run = await fetch(`/api/jobs/${jobId}/ai-rebuild/run`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ trimW: trimWidthMm, trimH: trimHeightMm, skipped: false }),
-        });
-        const built = await run.json();
-        if (!cancel && built?.detected) setPlan(built);
-        if (!cancel) setBusy(false);
-      }
+      if (cancel) return;
+      setPlan(data?.detected ? data : null);
     };
     load().catch(() => {
       if (!cancel) setPlan(null);
@@ -198,10 +216,27 @@ export function AiRebuildPanel({ jobId, trimWidthMm, trimHeightMm }: { jobId: nu
     }
   };
 
+  const preview = async () => {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/ai-rebuild/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trimW: trimWidthMm, trimH: trimHeightMm, optIn: true }),
+      });
+      const data = await response.json();
+      if (data) setPlan(data.detected ? data : { ...(plan || {}), ...data, detected: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <AiRebuildPanelView
       plan={plan}
       busy={busy}
+      onPreview={() => { void preview(); }}
+      onApprove={() => { void send({ accept: true, optIn: true }); }}
       onToggle={(enabled) => {
         setPlan({ ...plan, skipped: !enabled });
         void send({ skipped: !enabled, blocks: plan.blocks });

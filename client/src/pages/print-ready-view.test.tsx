@@ -109,6 +109,35 @@ test("result cards show green download, amber reasons, and a red client message"
   assert.equal(red.includes("Download press PDF"), false);
 });
 
+test("a job that is still running shows the real stage", () => {
+  const html = renderToStaticMarkup(
+    <QuickResultCard
+      card={{
+        id: 9,
+        filename: "leaflet.png",
+        status: "processing",
+        light: null,
+        reasons: [],
+        decisions: [],
+        clientMessage: "",
+        approved: false,
+        hasPress: false,
+        hasProof: false,
+        productLabel: "A5",
+        quantity: null,
+        notes: "",
+        stage: "Enlarging the artwork",
+        elapsedSec: 12,
+        note: "Original lettering is kept. Text is not retyped.",
+      }}
+    />,
+  );
+  assert.match(html, /Enlarging the artwork/);
+  assert.match(html, /12s/);
+  assert.match(html, /not retyped/);
+  assert.equal(html.includes("95%"), false);
+});
+
 test("drop folder control is off unless the box is ticked", () => {
   const html = renderToStaticMarkup(
     <WatcherSettings

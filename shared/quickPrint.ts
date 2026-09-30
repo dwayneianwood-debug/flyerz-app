@@ -32,4 +32,9 @@ export interface QuickPrintCard {
   productLabel: string;
   quantity: number | null;
   notes: string;
+  /** Set while quick mode is still working. */
+  stage?: string;
+  percent?: number;
+  elapsedSec?: number;
+  note?: string;
 }

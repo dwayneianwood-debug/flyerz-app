@@ -22,9 +22,12 @@ export function shouldStartAutomaticCompile(input: {
   canAssess?: boolean;
   artworkGateReady?: boolean;
   pressStatus?: string;
+  /** Quick mode or an earlier compile already made the press PDF. */
+  hasExistingPress?: boolean;
 }): boolean {
   if (input.alreadyStarted) return false;
-  if (input.status !== "complete") return false;
+  if (input.status === "processing" || input.status !== "complete") return false;
+  if (input.hasExistingPress) return false;
   if ((input.selected || AUTOMATIC_BLEED_ID) !== AUTOMATIC_BLEED_ID) return false;
   if (input.hasVariants) return false;
   if (input.canAssess && !input.artworkGateReady) return false;

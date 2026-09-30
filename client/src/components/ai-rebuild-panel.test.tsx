@@ -24,8 +24,9 @@ test("AI rebuild badge is on by default and shows the words that were read", () 
       onSave: () => {},
     }),
   );
-  assert.match(html, /AI artwork — rebuild recommended/);
-  assert.match(html, /Rebuild automatically/);
+  assert.match(html, /Words stay as drawn/);
+  assert.match(html, /Rebuild text as sharp type/);
+  assert.match(html, /Keep the original lettering/);
   assert.match(html, /value="SALE"/);
   assert.match(html, /Text found: SALE/);
   assert.match(html, /on this computer/);

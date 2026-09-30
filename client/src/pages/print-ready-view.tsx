@@ -120,7 +120,11 @@ export function QuickResultCard(props: {
     return (
       <Card className="p-5 border-border" data-testid={`card-quick-result-${card.id}`}>
         <p className="font-semibold">{card.filename}</p>
-        <p className="text-sm text-muted-foreground mt-1">Making the press file…</p>
+        <p className="text-sm text-muted-foreground mt-1" data-testid={`text-quick-stage-${card.id}`}>
+          {card.stage || "Making the press file…"}
+          {card.elapsedSec != null ? ` · ${card.elapsedSec}s` : ""}
+        </p>
+        {card.note ? <p className="text-xs text-muted-foreground mt-1">{card.note}</p> : null}
       </Card>
     );
   }

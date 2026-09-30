@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """One-step press file for sales.
 
-Decides the product fit, AI rebuild, and 5mm bleed without asking. The press
-PDF itself is built by the existing compile script and Press-Ready Engine.
-This module does not change those engines.
+Decides the product fit and 5mm bleed without asking. AI raster artwork is
+enlarged and the original lettering is kept. Text is never retyped here.
+The press PDF is built by the existing compile script and Press-Ready Engine.
 """
 
 from __future__ import annotations
@@ -620,7 +620,7 @@ def make_print_ready(
                     "tooSmallMessage": too_small_message(str(product.get("label") or "this size"), trim_w, trim_h),
                 })
                 return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
-            from ai_rebuild import assess, rebuild
+            from ai_rebuild import assess
 
             # Assess the original file. Extending the shape must not hide an AI-sized picture.
             assess_path = src_path if _ext(src_path, display) in IMAGE_EXT else work_path
@@ -631,35 +631,32 @@ def make_print_ready(
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
             work_path = fitted_path
+            _mark("enlarging", "Original lettering is kept. Text is not retyped.")
             if detected:
-                decisions.append("This looks like AI-generated artwork, so AI Rebuild ran before the press engine.")
-                rebuilt = rebuild(work_path, {
+                decisions.append("This looks like AI-generated artwork. The original lettering is kept and the picture is enlarged. Text is not retyped.")
+            else:
+                decisions.append("This was not treated as AI artwork. The original lettering is kept and text is not retyped.")
+            upscaled_path = os.path.join(output_dir, "upscaled.png")
+            try:
+                from ai_upscale import apply_ai_upscale
+
+                enlarged = apply_ai_upscale(fitted_path, {
                     "trim_w_mm": trim_w,
                     "trim_h_mm": trim_h,
-                    "output_pdf": os.path.join(output_dir, "rebuilt.pdf"),
-                    "force": True,
+                    "bleed_mm": 0,
+                    "output_path": upscaled_path,
                 })
-                for step in rebuilt.get("steps") or []:
-                    note = str(step.get("note") or step.get("name") or "").strip()
-                    if note:
-                        decisions.append(f"AI Rebuild: {note[:220]}")
-                if rebuilt.get("success") and rebuilt.get("pdfPath") and os.path.exists(rebuilt["pdfPath"]):
-                    rebuilt_pdf = rebuilt["pdfPath"]
-                    work_path = rebuilt_pdf
-                    scores = [
-                        float(block.get("score") or 0)
-                        for block in (rebuilt.get("blocks") or [])
-                        if str(block.get("text") or "").strip()
-                    ]
-                    ocr_low = bool(scores) and min(scores) < OCR_AMBER
-                    ocr_doubtful = bool(rebuilt.get("doubtful"))
-                    ocr_doubtful_reason = str(rebuilt.get("doubtfulReason") or "")
+            except Exception as exc:
+                enlarged = {"used_original": True, "message": str(exc)[:160]}
+            if enlarged.get("enhanced_path") and os.path.exists(str(enlarged.get("enhanced_path"))) and not enlarged.get("used_original"):
+                work_path = str(enlarged["enhanced_path"])
+                provider = str(enlarged.get("provider") or "basic")
+                if provider == "replicate":
+                    decisions.append("The picture was enlarged with Real-ESRGAN. The original lettering was kept.")
                 else:
-                    ocr_low = False
-                    ocr_doubtful = False
-                    decisions.append("AI Rebuild did not change the file, so the picture continued to the press engine.")
+                    decisions.append("The picture was enlarged with Lanczos on this computer. The original lettering was kept.")
             else:
-                decisions.append("This was not treated as AI artwork, so AI Rebuild stayed off.")
+                decisions.append("The original picture was kept and will be placed at 300 DPI. The lettering was not retyped.")
             if upscale >= 1.15:
                 decisions.append(f"The original picture needs about {upscale:.1f}× to reach 300 DPI at this size. The press file is built at 300 DPI.")
             else:
@@ -670,6 +667,7 @@ def make_print_ready(
         return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
 
     press_path = os.path.join(output_dir, "press.pdf")
+    _mark("press", "Original lettering is kept. Text is not retyped.")
     compiled = _compile(work_path, press_path, trim_w, trim_h)
     engine = compiled.get("pressEngine") or {}
     press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
@@ -710,6 +708,7 @@ def make_print_ready(
             result.update(boxes)
         except Exception:
             pass
+        _mark("proof", "Original lettering is kept. Text is not retyped.")
         proof_png = os.path.join(output_dir, "proof.png")
         proof_pdf = os.path.join(output_dir, "proof.pdf")
         try:
@@ -730,7 +729,17 @@ def make_print_ready(
     return _finish(result, output_dir)
 
 
+def _mark(stage: str, note: str = "") -> None:
+    try:
+        from job_progress import write_progress_from_env
+
+        write_progress_from_env(stage, note)
+    except Exception:
+        pass
+
+
 def _finish(result: dict, output_dir: str) -> dict:
+    _mark("done", "Original lettering is kept. Text is not retyped.")
     result_path = os.path.join(output_dir, "result.json")
     with open(result_path, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
@@ -759,8 +768,12 @@ def main() -> None:
     parser.add_argument("--quantity", type=int, default=0)
     parser.add_argument("--notes", default="")
     parser.add_argument("--detect-size", action="store_true")
+    parser.add_argument("--progress-file", default="")
     parser.add_argument("--result", default="")
     args = parser.parse_args()
+    if args.progress_file:
+        os.environ["JOB_PROGRESS_FILE"] = args.progress_file
+        _mark("fitting", "Original lettering is kept. Text is not retyped.")
     if args.product_id and args.product_id != "auto":
         chosen = _product_by_id(args.product_id)
         if chosen:

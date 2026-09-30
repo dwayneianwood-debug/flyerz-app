@@ -298,6 +298,16 @@ export interface UpdateFileJobRequest {
 // Response types
 export interface FileJobResponse extends Omit<FileJob, 'auditResults'> {
   auditResults: AuditResults | null;
+  /** Live stage while a run is going. Absent once the file is gone. */
+  progress?: {
+    stage: string;
+    stageId?: string;
+    percent: number;
+    startedAt: number;
+    updatedAt: number;
+    note?: string;
+    elapsedSec?: number;
+  } | null;
 }
 
 /** Home-page row. Audit JSON stays on the single-job route. */

@@ -7,13 +7,28 @@ const audit = {
   aiRebuild: {
     detected: true,
     skipped: false,
+    accepted: true,
     pdfPath: "/tmp/rebuilt.pdf",
   },
 };
 
-test("automatic compile uses the rebuilt pdf when it is on disk", () => {
+test("automatic compile uses an approved rebuild and ignores one that was not accepted", () => {
   const chosen = choosePressInput("auto", audit, "/tmp/original.png", (file) => file.endsWith("rebuilt.pdf"));
   assert.equal(chosen, "/tmp/rebuilt.pdf");
+  const unapproved = choosePressInput(
+    "auto",
+    { aiRebuild: { ...audit.aiRebuild, accepted: false } },
+    "/tmp/original.png",
+    () => true,
+  );
+  assert.equal(unapproved, "/tmp/original.png");
+  const pending = choosePressInput(
+    "auto",
+    { aiRebuild: { detected: true, skipped: false, pdfPath: "/tmp/rebuilt.pdf" } },
+    "/tmp/original.png",
+    () => true,
+  );
+  assert.equal(pending, "/tmp/original.png");
 });
 
 test("manual bleed styles keep the original file", () => {

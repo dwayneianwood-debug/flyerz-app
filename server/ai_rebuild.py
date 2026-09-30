@@ -1324,6 +1324,23 @@ def _rebuild(path: str, options: dict) -> dict:
         doubtful = DOUBTFUL_REASON in (ocr_note or "")
         blocks = _apply_edits(blocks, edits or [])
         steps.append({"name": "OCR", "engine": "local" if ocr_engine in ("local", "hook") else ocr_engine, "ok": True, "note": ocr_note})
+        if options.get("opt_in"):
+            from rebuild_policy import retype_refusal
+
+            refused = retype_refusal(blocks, source)
+            if refused:
+                return {
+                    "success": False,
+                    "detected": True,
+                    "refused": True,
+                    "discarded": True,
+                    "pdfPath": "",
+                    "blocks": blocks,
+                    "steps": steps,
+                    "reasons": refused,
+                    "message": refused[0],
+                    "note": " ".join(refused),
+                }
         mask = _mask_from_blocks(source, blocks)
         clean, inpaint_engine, inpaint_note = _remove_text(source, mask, credit)
         steps.append({"name": "Remove text", "engine": inpaint_engine, "ok": True, "note": inpaint_note})
@@ -1342,8 +1359,49 @@ def _rebuild(path: str, options: dict) -> dict:
     after_path = options.get("after_path") or ""
     if before_path:
         _write_preview(before_path, source)
-    if after_path and os.path.exists(out_pdf):
-        _write_preview(after_path, _render_page(out_pdf))
+    rendered_page = _render_page(out_pdf) if os.path.exists(out_pdf) else None
+    if after_path and rendered_page is not None:
+        _write_preview(after_path, rendered_page)
+    if options.get("opt_in") and rendered_page is not None:
+        from rebuild_policy import design_damage_reason
+
+        baseline, _base_scale, _base_x, _base_y = _cover(source, background.shape[1], background.shape[0], sharpen=False)
+        mapped = []
+        src_h, src_w = source.shape[:2]
+        canvas_h, canvas_w = background.shape[:2]
+        for block in blocks:
+            box = block.get("bbox") or [0, 0, 0, 0]
+            x, y, bw, bh = [float(v) for v in box[:4]]
+            cx = x * src_w * scale - off_x
+            cy = y * src_h * scale - off_y
+            cw = bw * src_w * scale
+            ch = bh * src_h * scale
+            mapped.append({
+                **block,
+                "bbox": [cx / canvas_w, cy / canvas_h, cw / canvas_w, ch / canvas_h],
+            })
+        compared = rendered_page
+        if compared.shape[0] != canvas_h or compared.shape[1] != canvas_w:
+            compared = cv2.resize(compared, (canvas_w, canvas_h), interpolation=cv2.INTER_AREA)
+        damage = design_damage_reason(baseline, compared, mapped)
+        if damage:
+            try:
+                os.remove(out_pdf)
+            except OSError:
+                pass
+            return {
+                "success": False,
+                "detected": True,
+                "refused": True,
+                "discarded": True,
+                "damaged": True,
+                "pdfPath": "",
+                "blocks": blocks,
+                "steps": steps,
+                "reasons": [damage],
+                "message": damage,
+                "note": damage,
+            }
 
     ocr_text = " | ".join(str(block.get("text") or "").strip() for block in blocks if str(block.get("text") or "").strip())
     engines = ", ".join(f"{step['name']} {step['engine']}" for step in steps)

@@ -15,7 +15,7 @@ export function choosePressInput(
 ): string {
   if (strategy !== "auto") return originalPath;
   const saved = audit?.aiRebuild;
-  if (!saved?.detected || saved.skipped || saved.accepted === false) return originalPath;
+  if (!saved?.detected || saved.skipped || saved.accepted !== true) return originalPath;
   const pdf = typeof saved.pdfPath === "string" ? saved.pdfPath : "";
   if (!pdf || !pdfExists(pdf)) return originalPath;
   return pdf;

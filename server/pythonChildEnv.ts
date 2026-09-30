@@ -1,4 +1,5 @@
 import { getFlyerzTempRoot } from "./envPaths";
+import { progressFileFromContext } from "./jobProgress";
 
 /** Built at call time so a `.env` loaded during startup is included. */
 export function pythonChildEnv(): Record<string, string> {
@@ -11,5 +12,7 @@ export function pythonChildEnv(): Record<string, string> {
   if (!env.FAI_TEMP_DIR?.trim()) {
     env.FAI_TEMP_DIR = getFlyerzTempRoot();
   }
+  const progressFile = progressFileFromContext();
+  if (progressFile) env.JOB_PROGRESS_FILE = progressFile;
   return env;
 }
