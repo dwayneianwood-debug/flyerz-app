@@ -27,6 +27,7 @@ import urllib.error
 import base64
 
 from fai_temp_utils import init_fai_temp_dir
+from http_headers import external_headers
 
 FAI_TEMP_DIR = init_fai_temp_dir()
 if not os.path.isdir(FAI_TEMP_DIR):
@@ -85,9 +86,9 @@ def _call_gemini_vision(image_path: str, prompt: str) -> tuple:
         }
     }).encode("utf-8")
 
-    req = urllib.request.Request(url, data=payload, headers={
+    req = urllib.request.Request(url, data=payload, headers=external_headers({
         "Content-Type": "application/json",
-    })
+    }))
 
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as resp:
@@ -142,11 +143,11 @@ def _replicate_create_prediction(model_owner: str, model_name: str,
         url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
         body = {"input": model_input}
     payload = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={
+    req = urllib.request.Request(url, data=payload, headers=external_headers({
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Prefer": "wait",
-    })
+    }))
     with urllib.request.urlopen(req, timeout=min(REPLICATE_TIMEOUT_S, 30)) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -154,9 +155,9 @@ def _replicate_create_prediction(model_owner: str, model_name: str,
 def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> dict:
     while time.time() < deadline:
         time.sleep(REPLICATE_POLL_INTERVAL_S)
-        req = urllib.request.Request(poll_url, headers={
+        req = urllib.request.Request(poll_url, headers=external_headers({
             "Authorization": f"Bearer {token}",
-        })
+        }))
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -170,9 +171,9 @@ def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> di
 def _replicate_cancel(cancel_url: str, token: str):
     try:
         if cancel_url:
-            req = urllib.request.Request(cancel_url, method="POST", headers={
+            req = urllib.request.Request(cancel_url, method="POST", headers=external_headers({
                 "Authorization": f"Bearer {token}",
-            })
+            }))
             urllib.request.urlopen(req, timeout=3)
     except Exception:
         pass
@@ -183,7 +184,7 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
     out_path = fd.name
     fd.close()
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=external_headers())
         with urllib.request.urlopen(req, timeout=15) as resp:
             with open(out_path, "wb") as f:
                 while True:

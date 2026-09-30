@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 
 from fai_temp_utils import init_fai_temp_dir
+from http_headers import external_headers
 
 FAI_TEMP_DIR = init_fai_temp_dir()
 if not os.path.isdir(FAI_TEMP_DIR):
@@ -94,7 +95,9 @@ def _call_gemini_json(bgr, prompt: str, max_output_tokens: int = 4096) -> tuple:
             },
         }
     ).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=payload, headers=external_headers({"Content-Type": "application/json"})
+    )
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as resp:
             raw = json.loads(resp.read().decode("utf-8"))

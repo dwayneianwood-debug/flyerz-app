@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import traceback
@@ -30,6 +31,8 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 from PIL import Image
+
+from http_headers import external_headers
 
 BLEED_MM = 5.0
 SAFE_ZONE_MM = 3.0
@@ -44,6 +47,14 @@ DOUBTFUL_REASON = (
 )
 MAX_LONG_EDGE = 4500
 MM_TO_PT = 72.0 / 25.4
+
+# Official object-removal model. White mask pixels are removed.
+# The old unversioned stability-ai/stable-diffusion-inpainting slug is not an
+# official Replicate model, and its fixed ~512px picture was discarded.
+# https://replicate.com/bria/eraser/versions/2757d1ac2f1291af219f5f10e8ecba15e92e7c05253e2841295f3ba6bff6adc4
+INPAINT_MODEL_OWNER = "bria"
+INPAINT_MODEL_NAME = "eraser"
+INPAINT_MODEL_VERSION = "2757d1ac2f1291af219f5f10e8ecba15e92e7c05253e2841295f3ba6bff6adc4"
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_REGULAR = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
@@ -106,7 +117,7 @@ def replicate_credit_status() -> str:
     try:
         req = urllib.request.Request(
             "https://api.replicate.com/v1/account",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=external_headers({"Authorization": f"Bearer {token}"}),
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             return "ok" if getattr(resp, "status", 200) == 200 else "error"
@@ -581,7 +592,7 @@ def _gemini_blocks(bgr: np.ndarray) -> tuple[list, str]:
         req = urllib.request.Request(
             gemini_generate_content_url(key),
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=external_headers({"Content-Type": "application/json"}),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=25) as resp:
@@ -1051,7 +1062,7 @@ def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.nda
         else:
             remote = _replicate_inpaint(bgr, mask)
             if remote is not None:
-                return remote, "replicate", "Text was removed with Replicate inpainting."
+                return remote, "replicate", "Text was removed with Replicate inpainting (bria/eraser)."
             note = note or "Replicate inpaint was not available. Local fallback used."
     filled = _local_inpaint(bgr, mask)
     engine = "local"
@@ -1061,7 +1072,37 @@ def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.nda
     return filled, engine, detail
 
 
+def composite_inpaint(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Keep every unmasked pixel exactly. Paint the model only where the mask is set.
+
+    The model often returns a different size (the old inpainter was about 512px).
+    That picture is scaled back to the artwork, then copied through the mask.
+    """
+    base = original
+    if base.ndim == 2:
+        base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    elif base.shape[2] > 3:
+        base = base[:, :, :3]
+    paint = filled
+    if paint.ndim == 2:
+        paint = cv2.cvtColor(paint, cv2.COLOR_GRAY2BGR)
+    elif paint.shape[2] > 3:
+        paint = paint[:, :, :3]
+    height, width = base.shape[:2]
+    if paint.shape[0] != height or paint.shape[1] != width:
+        paint = cv2.resize(paint, (width, height), interpolation=cv2.INTER_LANCZOS4)
+    cover = mask[:, :, 0] if mask.ndim == 3 else mask
+    if cover.shape[0] != height or cover.shape[1] != width:
+        cover = cv2.resize(cover, (width, height), interpolation=cv2.INTER_NEAREST)
+    alpha = cover.astype(np.float32) / 255.0
+    blended = paint.astype(np.float32) * alpha[..., None] + base.astype(np.float32) * (1.0 - alpha[..., None])
+    out = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+    out[cover == 0] = base[cover == 0]
+    return out
+
+
 def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    folder = ""
     try:
         from ai_enhancements import _call_replicate, _to_data_uri
 
@@ -1072,22 +1113,27 @@ def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray
         cv2.imwrite(mask_path, mask)
         out, err = _call_replicate(
             "ai_rebuild_inpaint",
-            "stability-ai",
-            "stable-diffusion-inpainting",
+            INPAINT_MODEL_OWNER,
+            INPAINT_MODEL_NAME,
             {
                 "image": _to_data_uri(image_path),
                 "mask": _to_data_uri(mask_path),
-                "prompt": "clean background, no text, no letters",
+                "preserve_alpha": False,
+                "content_moderation": False,
             },
+            version=INPAINT_MODEL_VERSION,
         )
         if err or not out or not os.path.exists(str(out)):
             return None
         loaded = cv2.imread(str(out), cv2.IMREAD_COLOR)
-        if loaded is None or loaded.shape[:2] != bgr.shape[:2]:
+        if loaded is None:
             return None
-        return loaded
+        return composite_inpaint(bgr, loaded, mask)
     except Exception:
         return None
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _enlarge(clean: np.ndarray, target_w: int, target_h: int, credit: str) -> tuple[np.ndarray, str, str, float, int, int]:

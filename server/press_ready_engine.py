@@ -17,11 +17,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 import cv2
 import numpy as np
+
+from http_headers import external_headers
 
 SAFE_ZONE_MM = 3.0
 SAFE_ZONE_SHRINK_MIN = 0.01
@@ -51,7 +54,10 @@ METHOD_NOTE = {
     "kept": "kept the bleed already in the file",
 }
 
-_REPLICATE = {"checked": False, "ok": False}
+# A "no" (no credit, blocked, or offline) is tried again after a few minutes.
+# A "yes" stays for this run so the account is not checked on every page.
+REPLICATE_NEGATIVE_TTL_S = 5 * 60
+_REPLICATE = {"checked_at": 0.0, "ok": False}
 _FACE = None
 
 
@@ -82,17 +88,26 @@ def is_full_page_crop(x: float, y: float, w: float, h: float) -> bool:
 
 
 def replicate_available() -> bool:
-    """One short account check. No credit, no token, or no network means local fill."""
-    if _REPLICATE["checked"]:
-        return bool(_REPLICATE["ok"])
-    _REPLICATE["checked"] = True
+    """One short account check. No credit, no token, or no network means local fill.
+
+    A negative answer expires after a few minutes so adding credit, or a
+    Cloudflare block that has cleared, is picked up without restarting.
+    """
+    now = time.monotonic()
+    checked_at = float(_REPLICATE.get("checked_at") or 0.0)
+    if checked_at > 0:
+        if _REPLICATE.get("ok"):
+            return True
+        if (now - checked_at) < REPLICATE_NEGATIVE_TTL_S:
+            return False
     token = (os.environ.get("REPLICATE_API_TOKEN") or "").strip()
+    _REPLICATE["checked_at"] = now
     if not token:
         _REPLICATE["ok"] = False
         return False
     request = urllib.request.Request(
         "https://api.replicate.com/v1/account",
-        headers={"Authorization": f"Bearer {token}"},
+        headers=external_headers({"Authorization": f"Bearer {token}"}),
     )
     try:
         with urllib.request.urlopen(request, timeout=3) as response:
