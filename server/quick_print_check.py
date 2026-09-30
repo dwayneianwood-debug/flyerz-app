@@ -261,6 +261,51 @@ def _column_variance(strip: np.ndarray) -> float:
     return float(np.mean(np.var(gray, axis=0)))
 
 
+def _streak(strip: np.ndarray, outward_axis: int) -> float:
+    """How much the band is striped along the edge.
+
+    Average along the outward direction, remove the slow gradient, and report
+    the std of what is left. Column-shaped noise survives that average.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if gray.shape[outward_axis] < 1 or gray.size == 0:
+        return 0.0
+    profile = gray.mean(axis=outward_axis)
+    length = int(profile.shape[0])
+    if length < 8:
+        return float(np.std(profile))
+    sigma = max(8.0, 0.04 * length)
+    smooth = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), sigma).ravel()
+    return float(np.std(profile - smooth))
+
+
+def _no_more_streak_than_the_edge(name: str, band: np.ndarray, edge: np.ndarray, outward_axis: int, seam_at_end: bool = True) -> None:
+    # The few pixels against the picture repeat the real rim. The stripes a
+    # customer would see are the rest of the band.
+    drop = 6
+    if band.shape[outward_axis] > drop + 8:
+        if outward_axis == 0:
+            band = band[:-drop] if seam_at_end else band[drop:]
+        else:
+            band = band[:, :-drop] if seam_at_end else band[:, drop:]
+    depth = min(band.shape[outward_axis], edge.shape[outward_axis])
+    if outward_axis == 0:
+        band_part = band[:depth]
+        edge_part = edge[:depth]
+    else:
+        band_part = band[:, :depth]
+        edge_part = edge[:, :depth]
+    band_s = _streak(band_part, outward_axis)
+    edge_s = _streak(edge_part, outward_axis)
+    check(
+        f"{name}-no-columns",
+        band_s <= edge_s * 1.05 + 0.25,
+        f"band {band_s:.3f} edge {edge_s:.3f}",
+    )
+
+
 def _gradient_picture(width: int, height: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     yy = np.linspace(0, 1, height)[:, None]
@@ -282,34 +327,64 @@ def _texture_picture(width: int, height: int, seed: int) -> np.ndarray:
     return np.clip(picture, 0, 255).astype(np.uint8)
 
 
+def _flat_picture(width: int, height: int) -> np.ndarray:
+    return np.full((height, width, 3), (40, 90, 160), np.uint8)
+
+
+def _photo_picture(width: int, height: int, seed: int) -> np.ndarray:
+    """Slow patches plus fine grain, the way a photograph looks at a small size."""
+    import cv2
+
+    rng = np.random.default_rng(seed)
+    coarse = rng.normal(0, 1, (max(2, height // 10), max(2, width // 10), 3)).astype(np.float32)
+    coarse = cv2.resize(coarse, (width, height), interpolation=cv2.INTER_CUBIC)
+    coarse = cv2.GaussianBlur(coarse, (0, 0), 1.6)
+    fine = rng.normal(0, 1, (height, width, 3)).astype(np.float32)
+    return np.clip(118 + coarse * 16 + fine * 7, 0, 255).astype(np.uint8)
+
+
 def test_extended_band_does_not_streak() -> None:
-    """The shape gap must not repeat one row of pixels down the page."""
+    """The shape gap must not turn edge noise into columns, or repeat one row."""
     import cv2
     from quick_print import _extend_to_product
 
     for name, picture in (
         ("gradient", _gradient_picture(360, 360, 5)),
         ("texture", _texture_picture(360, 360, 9)),
+        ("flat", _flat_picture(360, 360)),
+        ("photo", _photo_picture(360, 360, 13)),
     ):
         fitted, extended, _delta = _extend_to_product(picture, 148, 210, "", [])
         check(f"{name}-extended", extended is True and fitted.shape[0] > picture.shape[0], str(fitted.shape))
         pad = (fitted.shape[0] - picture.shape[0]) // 2
         check(f"{name}-pad", pad >= 8, str(pad))
         band = fitted[:pad]
-        neighbour = fitted[pad:pad + pad]
-        band_var = _column_variance(band)
-        neighbour_var = _column_variance(neighbour)
-        rel = abs(band_var - neighbour_var) / max(neighbour_var, 1.0)
-        old = cv2.copyMakeBorder(picture, pad, fitted.shape[0] - picture.shape[0] - pad, 0, 0, cv2.BORDER_REPLICATE)
-        old_rel = abs(_column_variance(old[:pad]) - neighbour_var) / max(neighbour_var, 1.0)
-        check(
-            f"{name}-no-streak",
-            rel < 0.45 and rel < old_rel * 0.75,
-            f"rel {rel:.3f} old {old_rel:.3f} band {band_var:.1f} neighbour {neighbour_var:.1f}",
-        )
-        # The original picture is still in the middle, not stretched.
+        neighbour = picture[:pad]
+        _no_more_streak_than_the_edge(name, band, neighbour, outward_axis=0)
+        bottom = fitted[-pad:]
+        _no_more_streak_than_the_edge(f"{name}-bottom", bottom, picture[-pad:], outward_axis=0, seam_at_end=False)
+        if name in ("gradient", "texture", "photo"):
+            band_var = _column_variance(band)
+            old = cv2.copyMakeBorder(picture, pad, fitted.shape[0] - picture.shape[0] - pad, 0, 0, cv2.BORDER_REPLICATE)
+            old_var = _column_variance(old[:pad])
+            check(
+                f"{name}-not-a-copied-row",
+                band_var > old_var + 0.5,
+                f"band {band_var:.2f} copied-row {old_var:.2f}",
+            )
         middle = fitted[pad:pad + picture.shape[0]]
         check(f"{name}-keeps-picture", middle.shape == picture.shape and np.array_equal(middle, picture))
+
+    # Portrait picture on a landscape product: the gap is at the sides.
+    portrait = _photo_picture(240, 420, 21)
+    fitted, extended, _delta = _extend_to_product(portrait, 210, 148, "", [])
+    check("side-extended", extended is True and fitted.shape[1] > portrait.shape[1], str(fitted.shape))
+    side = (fitted.shape[1] - portrait.shape[1]) // 2
+    check("side-pad", side >= 8, str(side))
+    _no_more_streak_than_the_edge("side-left", fitted[:, :side], portrait[:, :side], outward_axis=1)
+    _no_more_streak_than_the_edge("side-right", fitted[:, -side:], portrait[:, -side:], outward_axis=1, seam_at_end=False)
+    middle = fitted[:, side:side + portrait.shape[1]]
+    check("side-keeps-picture", middle.shape == portrait.shape and np.array_equal(middle, portrait))
 
 
 def _orange(bgr: np.ndarray) -> np.ndarray:
@@ -379,8 +454,10 @@ def test_touching_object_stays_reasonable_and_amber() -> None:
     edge_orange = _orange(picture[:1])[0]
     cols = np.where(edge_orange)[0]
     check("touch-has-span", cols.size > 10, str(cols.size))
-    lo = int(cols.min()) - 24
-    hi = int(cols.max()) + 24
+    # The edge colour is blurred along the rim, so the object softens sideways.
+    spread = int(round(0.04 * picture.shape[1] * 3)) + 8
+    lo = int(cols.min()) - spread
+    hi = int(cols.max()) + spread
     band_orange = _orange(band)
     stray = [int(x) for x in np.where(band_orange.any(axis=0))[0] if x < lo or x > hi]
     check("touch-orange-stays-with-object", not stray, str(stray[:8]))

@@ -238,18 +238,30 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
 
 # Only the outer few pixels. A shape a short way in (the old 64px window) must not be copied out.
 EDGE_SAMPLE_PX = 5
+# Colour along the edge is blurred this hard, so pixel noise cannot become a column.
+EDGE_LOWPASS_FRACTION = 0.04
+
+
+def _lowpass_along(row, fraction: float = EDGE_LOWPASS_FRACTION):
+    """Blur one row along its length. `row` is (width, 3)."""
+    import cv2
+    import numpy as np
+
+    width = int(row.shape[0])
+    sigma = max(1.0, float(fraction) * width)
+    blurred = cv2.GaussianBlur(np.ascontiguousarray(row.reshape(1, width, 3)), (0, 0), sigma)
+    return blurred.reshape(width, 3)
 
 
 def _pad_colour_and_grain(band, pad: int, forward: bool):
     """Continue one edge from a few pixels at the rim.
 
-    Colour is the median of that thin strip, with outlier colours dropped, then
-    a light horizontal blur so a gradient carries on smoothly. Grain is new
-    low-amplitude noise matched to that rim. Rows from inside the picture are
-    never copied, so an object that does not touch the edge cannot streak.
+    The colour is a heavy blur along the edge, so it only changes as slowly as
+    the real gradient. Further out it eases toward an even smoother blur.
+    Grain is fresh noise, the same in every direction, matched to the rim.
+    Nothing is copied out of the picture, and the join is feathered over a few pixels.
     `band` is the strip next to the edge. When forward is true, the last row is the edge.
     """
-    import cv2
     import numpy as np
 
     if pad <= 0:
@@ -269,30 +281,35 @@ def _pad_colour_and_grain(band, pad: int, forward: bool):
     if outlier.any():
         filled = np.repeat(median[None, :, :], depth, axis=0)
         cleaned[outlier] = filled[outlier]
-    blurred = np.empty_like(cleaned)
-    for index in range(depth):
-        row = cleaned[index].reshape(1, width, 3)
-        blurred[index] = cv2.GaussianBlur(row, (0, 0), 5).reshape(width, 3)
-    edge = blurred[-1]
-    far = blurred[0]
-    slope = (edge - far) / float(max(depth - 1, 1))
-    slope = np.clip(slope, -0.55, 0.55)
+    edge = _lowpass_along(cleaned[-1], EDGE_LOWPASS_FRACTION)
+    # The bulk of a long band eases toward a still smoother colour, so a wiggle
+    # in the rim is not drawn down the page. The join itself stays on the 4% blur.
+    broad = _lowpass_along(edge, 0.15)
+    broad_far = _lowpass_along(_lowpass_along(cleaned[0], EDGE_LOWPASS_FRACTION), 0.15)
+    slope = np.clip((broad - broad_far) / float(max(depth - 1, 1)), -0.35, 0.35)
     steps = np.arange(1, pad + 1, dtype=np.float32)[:, None, None]
-    fade = np.exp(-steps / 64.0)
-    continued = edge[None, :, :] + slope[None, :, :] * steps * fade
-    residual = cleaned - median[None, :, :]
+    fade = np.exp(-steps / 80.0)
+    ease = np.clip((steps - 4.0) / 24.0, 0.0, 1.0)
+    continued = edge[None, :, :] * (1.0 - ease) + broad[None, :, :] * ease
+    continued = continued + slope[None, :, :] * steps * fade
+    # Grain is the pixel-to-pixel ripple, one amplitude for the whole edge.
+    # A per-column amount, or the slow colour itself, would draw stripes.
     inlier = ~outlier
+    pair = inlier[:, :-1] & inlier[:, 1:] if width > 1 else inlier
     sigma = np.zeros(3, np.float32)
-    for channel in range(3):
-        vals = residual[:, :, channel][inlier]
-        sigma[channel] = float(np.std(vals)) if vals.size else 0.0
+    if width > 1:
+        delta = cleaned[:, 1:, :] - cleaned[:, :-1, :]
+        for channel in range(3):
+            vals = delta[:, :, channel][pair]
+            sigma[channel] = float(np.std(vals) / np.sqrt(2.0)) if vals.size else 0.0
     sigma = np.clip(sigma, 0.0, 32.0)
     rng = np.random.default_rng((depth * 10007 + width * 17 + pad) % (2**32))
     grain = rng.normal(0.0, 1.0, (pad, width, 3)).astype(np.float32) * sigma.reshape(1, 1, 3)
     true_edge = work[-1]
-    arrive = np.clip(steps / 8.0, 0.0, 1.0)
-    grain_in = np.clip((steps - 2.0) / 6.0, 0.0, 1.0)
-    mixed = true_edge[None, :, :] * (1.0 - arrive) + continued * arrive
+    # A few pixels only. Longer than that, a copy of the rim would read as a stripe.
+    seam = np.clip(steps / 4.0, 0.0, 1.0)
+    grain_in = np.clip(steps / 4.0, 0.0, 1.0)
+    mixed = true_edge[None, :, :] * (1.0 - seam) + continued * seam
     out = np.clip(mixed + grain * grain_in, 0, 255)
     if not forward:
         out = out[::-1]
