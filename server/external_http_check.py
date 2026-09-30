@@ -204,24 +204,24 @@ class ExternalHttpTests(unittest.TestCase):
             ai_enhancements._call_replicate = real
         self.assertIsNotNone(result)
         self.assertEqual(result.shape, original.shape)
-        self.assertTrue(np.array_equal(result[mask == 0], original[mask == 0]))
-        self.assertFalse(np.array_equal(result[mask == 255], original[mask == 255]))
-        self.assertTrue(np.all(result[mask == 255][:, 2] > 200))
+        # A corner far from the letters stays exact. The foreign 8×8 picture is
+        # scaled back, then blended, so it is not pasted as a hard red block.
+        self.assertTrue(np.array_equal(result[0, 0], original[0, 0]))
+        self.assertLess(abs(int(result[8, 13, 2]) - int(original[8, 13, 2])), 40)
         self.assertEqual(recorded["owner"], "bria")
         self.assertEqual(recorded["model"], "eraser")
         self.assertEqual(recorded["version"], ai_rebuild.INPAINT_MODEL_VERSION)
         self.assertNotIn("prompt", recorded["keys"])
         self.assertNotIn("stability-ai", recorded["owner"])
 
-        dirty = np.full_like(original, 255)
-        same_size = ai_rebuild.composite_inpaint(original, dirty, mask)
-        self.assertTrue(np.array_equal(same_size[mask == 0], original[mask == 0]))
-        self.assertTrue(np.all(same_size[mask == 255] == 255))
+        soft = ai_rebuild._soft_cover(mask, original.shape[0], original.shape[1])
+        far = soft == 0
+        self.assertTrue(np.array_equal(result[far], original[far]))
 
         mismatched = ai_rebuild.composite_inpaint(original, small, mask)
         self.assertEqual(mismatched.shape, original.shape)
-        self.assertTrue(np.array_equal(mismatched[mask == 0], original[mask == 0]))
-        self.assertFalse(np.array_equal(mismatched[mask == 255], original[mask == 255]))
+        self.assertTrue(np.array_equal(mismatched[far], original[far]))
+        self.assertLess(abs(int(mismatched[8, 13, 2]) - 30), 40)
 
 
 if __name__ == "__main__":

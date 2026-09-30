@@ -236,13 +236,80 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
     return img, False
 
 
-def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
-    """Keep the whole picture and fill the gap with a 1-pixel edge copy.
+def _pad_colour_and_grain(band, pad: int, forward: bool):
+    """Continue one edge. Colour follows the blurred edge. Grain is shuffled so it does not streak.
 
-    A full mirror would repeat the artwork when the gap is taller than the file.
-    The press engine is not involved here.
+    `band` is the strip next to the edge. When forward is true, the last row is the edge.
     """
     import cv2
+    import numpy as np
+
+    if pad <= 0:
+        return np.zeros((0, band.shape[1], 3), np.float32)
+    work = band if forward else band[::-1]
+    work = np.ascontiguousarray(work.astype(np.float32))
+    band_h, width = work.shape[:2]
+    colour = cv2.GaussianBlur(work, (0, 0), 7)
+    edge = colour[-1]
+    slope = (colour[-1] - colour[0]) / float(max(band_h - 1, 1))
+    slope = np.clip(slope, -1.5, 1.5)
+    steps = np.arange(1, pad + 1, dtype=np.float32)[:, None, None]
+    fade = np.exp(-steps / 56.0)
+    continued = edge[None, :, :] + slope[None, :, :] * steps * fade
+    residual = work - colour
+    target = np.std(residual, axis=0)
+    rng = np.random.default_rng(band_h * 10007 + width * 17 + pad)
+    grain = np.empty((pad, width, 3), np.float32)
+    picks = rng.integers(0, band_h, size=pad)
+    shifts = rng.integers(0, max(width, 1), size=pad)
+    for index in range(pad):
+        grain[index] = np.roll(residual[int(picks[index])], int(shifts[index]), axis=0)
+    current = np.std(grain, axis=0)
+    grain *= (target / np.maximum(current, 1e-3))[None, :, :]
+    true_edge = work[-1]
+    arrive = np.clip(steps / 8.0, 0.0, 1.0)
+    grain_in = np.clip((steps - 1.0) / 4.0, 0.0, 1.0)
+    mixed = true_edge[None, :, :] * (1.0 - arrive) + continued * arrive
+    out = np.clip(mixed + grain * grain_in, 0, 255)
+    if not forward:
+        out = out[::-1]
+    return out
+
+
+def _extend_vertical(img, top: int, bottom: int):
+    import numpy as np
+
+    parts = []
+    height = img.shape[0]
+    band_h = min(64, max(8, height // 4))
+    if top:
+        parts.append(_pad_colour_and_grain(img[:band_h], top, forward=False))
+    parts.append(img.astype(np.float32))
+    if bottom:
+        parts.append(_pad_colour_and_grain(img[-band_h:], bottom, forward=True))
+    return np.clip(np.concatenate(parts, axis=0), 0, 255).astype(np.uint8)
+
+
+def _extend_edges(img, top: int, bottom: int, left: int, right: int):
+    """Grow a picture without copying one row of pixels down the page."""
+    import numpy as np
+
+    out = img
+    if top or bottom:
+        out = _extend_vertical(out, top, bottom)
+    if left or right:
+        turned = np.ascontiguousarray(np.transpose(out, (1, 0, 2)))
+        turned = _extend_vertical(turned, left, right)
+        out = np.ascontiguousarray(np.transpose(turned, (1, 0, 2)))
+    return out
+
+
+def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
+    """Keep the whole picture. Fill a shape gap by continuing the edge, not by copying one pixel.
+
+    A full mirror would repeat the artwork when the gap is taller than the file.
+    Repeating the outer pixel draws streaks on a gradient. The press engine is not involved here.
+    """
     from ai_artwork import ratios_differ
 
     del source_path
@@ -257,14 +324,14 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
         new_h = max(height, int(round(width / target)))
         pad = new_h - height
         top = pad // 2
-        fitted = cv2.copyMakeBorder(img, top, pad - top, 0, 0, cv2.BORDER_REPLICATE)
+        fitted = _extend_edges(img, top, pad - top, 0, 0)
     else:
         new_w = max(width, int(round(height * target)))
         pad = new_w - width
         left = pad // 2
-        fitted = cv2.copyMakeBorder(img, 0, 0, left, pad - left, cv2.BORDER_REPLICATE)
+        fitted = _extend_edges(img, 0, 0, left, pad - left)
     decisions.append(
-        "The picture was a different shape from the product. The whole picture was kept and the gap was filled by repeating the outer pixel. It was not stretched and the picture was not copied."
+        "The picture was a different shape from the product. The whole picture was kept and the gap was filled by continuing the edge colour and texture. It was not stretched and the picture was not copied."
     )
     return fitted, True, delta
 

@@ -737,6 +737,22 @@ def _local_inpaint(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
 
 
+def _canvas_placement(src_w: int, src_h: int, target_w: int, target_h: int) -> tuple[float, int, int]:
+    """Where a pixel of the original artwork lands on the print canvas.
+
+    The upscaler may hand back a 2× or 4× picture. Word boxes are still measured
+    on the original, so every enlarge path uses this same mapping.
+    """
+    src_w = max(int(src_w), 1)
+    src_h = max(int(src_h), 1)
+    scale = max(float(target_w) / float(src_w), float(target_h) / float(src_h))
+    new_w = max(int(target_w), int(math.ceil(src_w * scale - 1e-9)))
+    new_h = max(int(target_h), int(math.ceil(src_h * scale - 1e-9)))
+    x0 = max(0, (new_w - int(target_w)) // 2)
+    y0 = max(0, (new_h - int(target_h)) // 2)
+    return new_w / float(src_w), x0, y0
+
+
 def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tuple[np.ndarray, float, int, int]:
     """Scale with cover (the larger ratio) and crop the overflow. Never stretch or letterbox."""
     height, width = bgr.shape[:2]
@@ -1056,7 +1072,7 @@ def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.nda
             try:
                 filled = _INPAINT(bgr, mask)
                 if filled is not None and getattr(filled, "shape", None) == bgr.shape:
-                    return filled, "replicate", "Text was removed with Replicate inpainting."
+                    return harmonize_fill(bgr, filled, mask), "replicate", "Text was removed with Replicate inpainting."
             except Exception as exc:
                 note = f"Replicate inpaint failed ({str(exc)[:120]}). Local fallback used."
         else:
@@ -1072,33 +1088,97 @@ def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.nda
     return filled, engine, detail
 
 
-def composite_inpaint(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Keep every unmasked pixel exactly. Paint the model only where the mask is set.
+def _as_bgr(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] > 3:
+        return image[:, :, :3]
+    return image
 
-    The model often returns a different size (the old inpainter was about 512px).
-    That picture is scaled back to the artwork, then copied through the mask.
-    """
-    base = original
-    if base.ndim == 2:
-        base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-    elif base.shape[2] > 3:
-        base = base[:, :, :3]
-    paint = filled
-    if paint.ndim == 2:
-        paint = cv2.cvtColor(paint, cv2.COLOR_GRAY2BGR)
-    elif paint.shape[2] > 3:
-        paint = paint[:, :, :3]
-    height, width = base.shape[:2]
-    if paint.shape[0] != height or paint.shape[1] != width:
-        paint = cv2.resize(paint, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+def _soft_cover(mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Dilate the letter mask and feather the edge so the fill does not sit in a hard hole."""
     cover = mask[:, :, 0] if mask.ndim == 3 else mask
     if cover.shape[0] != height or cover.shape[1] != width:
         cover = cv2.resize(cover, (width, height), interpolation=cv2.INTER_NEAREST)
-    alpha = cover.astype(np.float32) / 255.0
-    blended = paint.astype(np.float32) * alpha[..., None] + base.astype(np.float32) * (1.0 - alpha[..., None])
-    out = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
-    out[cover == 0] = base[cover == 0]
+    binary = np.where(cover > 16, 255, 0).astype(np.uint8)
+    if not binary.any():
+        return binary
+    radius = max(2, min(7, int(round(min(height, width) * 0.008))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    sigma = max(1.2, radius * 0.55)
+    return cv2.GaussianBlur(dilated, (0, 0), sigma)
+
+
+def _continued_colour(original: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Low-frequency colour with the letters taken out, so a gradient keeps going."""
+    low = cv2.GaussianBlur(original, (0, 0), 3.2)
+    paint = np.where(hole > 16, 255, 0).astype(np.uint8)
+    if not paint.any():
+        return low
+    return cv2.inpaint(low, paint, 4, cv2.INPAINT_TELEA)
+
+
+def _matched_grain(original: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Grain taken from the ring around the letters and scattered into the hole."""
+    low = cv2.GaussianBlur(original, (0, 0), 1.7)
+    residual = original.astype(np.float32) - low.astype(np.float32)
+    hole_bool = hole > 16
+    residual[hole_bool] = 0
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    wide = cv2.dilate(hole_bool.astype(np.uint8) * 255, kernel, iterations=1) > 0
+    ring = wide & ~hole_bool
+    samples = residual[ring]
+    grain = np.zeros_like(residual)
+    count = int(hole_bool.sum())
+    if samples.shape[0] < 8 or count == 0:
+        return grain
+    rng = np.random.default_rng(7)
+    grain[hole_bool] = samples[rng.integers(0, samples.shape[0], size=count)]
+    softened = cv2.GaussianBlur(grain, (0, 0), 0.45)
+    target = np.std(samples, axis=0)
+    current = np.std(softened[hole_bool], axis=0)
+    scale = target / np.maximum(current, 1e-3)
+    grain[hole_bool] = softened[hole_bool] * scale
+    return grain
+
+
+def harmonize_fill(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Paste a fill back so the hole keeps the local colour and the local grain.
+
+    A smooth eraser result on a noisy gradient leaves a letter-shaped shadow.
+    The edge is feathered, the colour is pulled toward the surrounding picture
+    when the fill disagrees with it, and grain from next to the letters is
+    laid into the hole. Pixels outside that feather stay exactly as they were.
+    """
+    base = _as_bgr(original)
+    paint = _as_bgr(filled)
+    height, width = base.shape[:2]
+    if paint.shape[0] != height or paint.shape[1] != width:
+        paint = cv2.resize(paint, (width, height), interpolation=cv2.INTER_LANCZOS4)
+    soft = _soft_cover(mask, height, width)
+    if soft is None or not soft.any():
+        return base.copy()
+    local = _continued_colour(base, soft).astype(np.float32)
+    model = cv2.GaussianBlur(paint, (0, 0), 1.1).astype(np.float32)
+    delta = np.linalg.norm(model - local, axis=2)
+    trust = np.clip(1.0 - (delta - 8.0) / 36.0, 0.0, 1.0)
+    colour = model * trust[..., None] + local * (1.0 - trust[..., None])
+    painted = np.clip(colour + _matched_grain(base, soft), 0, 255)
+    alpha = (soft.astype(np.float32) / 255.0)[..., None]
+    out = np.clip(np.rint(base.astype(np.float32) * (1.0 - alpha) + painted * alpha), 0, 255).astype(np.uint8)
+    out[soft == 0] = base[soft == 0]
     return out
+
+
+def composite_inpaint(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Scale a model picture back to the artwork and keep only the masked area.
+
+    The model often returns a different size. Unmasked pixels outside the
+    feather stay exact. The hole is blended so it does not show a hard edge.
+    """
+    return harmonize_fill(original, filled, mask)
 
 
 def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
@@ -1138,26 +1218,29 @@ def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray
 
 def _enlarge(clean: np.ndarray, target_w: int, target_h: int, credit: str) -> tuple[np.ndarray, str, str, float, int, int]:
     note = _credit_note(credit)
+    # Word boxes are on the picture before any upscaler. Fit that picture, not
+    # the 4× result, or the type lands at a quarter of the size in the corner.
+    place_scale, place_x, place_y = _canvas_placement(clean.shape[1], clean.shape[0], target_w, target_h)
     if credit == "ok":
         if _UPSCALE is not None:
             try:
                 bigger = _UPSCALE(clean, target_w, target_h)
                 if bigger is not None:
-                    fitted, scale, x0, y0 = _cover(bigger, target_w, target_h, sharpen=False)
-                    return fitted, "replicate", "Background enlarged with the Replicate upscaler.", scale, x0, y0
+                    fitted, _scale, _x0, _y0 = _cover(bigger, target_w, target_h, sharpen=False)
+                    return fitted, "replicate", "Background enlarged with the Replicate upscaler.", place_scale, place_x, place_y
             except Exception as exc:
                 note = f"Replicate upscale failed ({str(exc)[:120]}). Local fallback used."
         else:
             remote = _replicate_upscale(clean, target_w, target_h)
             if remote is not None:
-                fitted, scale, x0, y0 = _cover(remote, target_w, target_h, sharpen=False)
-                return fitted, "replicate", "Background enlarged with the Replicate upscaler.", scale, x0, y0
+                fitted, _scale, _x0, _y0 = _cover(remote, target_w, target_h, sharpen=False)
+                return fitted, "replicate", "Background enlarged with the Replicate upscaler.", place_scale, place_x, place_y
             note = note or "Replicate upscale was not available. Local fallback used."
-    fitted, scale, x0, y0 = _cover(clean, target_w, target_h, sharpen=True)
+    fitted, _scale, _x0, _y0 = _cover(clean, target_w, target_h, sharpen=True)
     detail = "Background enlarged with Lanczos and a light sharpen on this computer."
     if note:
         detail = detail + " " + note
-    return fitted, "local", detail, scale, x0, y0
+    return fitted, "local", detail, place_scale, place_x, place_y
 
 
 def _replicate_upscale(bgr: np.ndarray, target_w: int, target_h: int) -> Optional[np.ndarray]:

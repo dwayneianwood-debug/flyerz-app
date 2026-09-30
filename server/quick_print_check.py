@@ -252,8 +252,69 @@ def test_shapes(root: str) -> None:
     check("shapes-words", "MARKET DAY" in text and "SATURDAY 9AM" in text, text.replace("\n", " | ")[:180])
 
 
+def _column_variance(strip: np.ndarray) -> float:
+    import cv2
+
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if gray.shape[0] < 2:
+        return 0.0
+    return float(np.mean(np.var(gray, axis=0)))
+
+
+def _gradient_picture(width: int, height: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    yy = np.linspace(0, 1, height)[:, None]
+    xx = np.linspace(0, 1, width)[None, :]
+    field = yy * 0.65 + xx * 0.35
+    picture = np.zeros((height, width, 3), np.float32)
+    picture[..., 0] = 30 + field * 90
+    picture[..., 1] = 24 + field * 40
+    picture[..., 2] = 90 + (1.0 - field) * 100
+    picture += rng.normal(0, 9, picture.shape)
+    return np.clip(picture, 0, 255).astype(np.uint8)
+
+
+def _texture_picture(width: int, height: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    picture = rng.normal(110, 28, (height, width, 3))
+    import cv2
+    picture = cv2.GaussianBlur(picture.astype(np.float32), (0, 0), 1.1)
+    return np.clip(picture, 0, 255).astype(np.uint8)
+
+
+def test_extended_band_does_not_streak() -> None:
+    """The shape gap must not repeat one row of pixels down the page."""
+    import cv2
+    from quick_print import _extend_to_product
+
+    for name, picture in (
+        ("gradient", _gradient_picture(360, 360, 5)),
+        ("texture", _texture_picture(360, 360, 9)),
+    ):
+        fitted, extended, _delta = _extend_to_product(picture, 148, 210, "", [])
+        check(f"{name}-extended", extended is True and fitted.shape[0] > picture.shape[0], str(fitted.shape))
+        pad = (fitted.shape[0] - picture.shape[0]) // 2
+        check(f"{name}-pad", pad >= 8, str(pad))
+        band = fitted[:pad]
+        neighbour = fitted[pad:pad + pad]
+        band_var = _column_variance(band)
+        neighbour_var = _column_variance(neighbour)
+        rel = abs(band_var - neighbour_var) / max(neighbour_var, 1.0)
+        old = cv2.copyMakeBorder(picture, pad, fitted.shape[0] - picture.shape[0] - pad, 0, 0, cv2.BORDER_REPLICATE)
+        old_rel = abs(_column_variance(old[:pad]) - neighbour_var) / max(neighbour_var, 1.0)
+        check(
+            f"{name}-no-streak",
+            rel < 0.45 and rel < old_rel * 0.75,
+            f"rel {rel:.3f} old {old_rel:.3f} band {band_var:.1f} neighbour {neighbour_var:.1f}",
+        )
+        # The original picture is still in the middle, not stretched.
+        middle = fitted[pad:pad + picture.shape[0]]
+        check(f"{name}-keeps-picture", middle.shape == picture.shape and np.array_equal(middle, picture))
+
+
 def main() -> None:
     test_rules()
+    test_extended_band_does_not_streak()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
     try:
         test_word(root)

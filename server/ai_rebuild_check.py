@@ -678,6 +678,112 @@ def _region_delta(source_bgr: np.ndarray, rendered_bgr: np.ndarray, box: tuple) 
     return float(np.mean(np.abs(left - right)))
 
 
+def _span_boxes(path: str) -> list:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        found = []
+        for block in doc[0].get_text("dict")["blocks"]:
+            for line in block.get("lines") or []:
+                for span in line.get("spans") or []:
+                    text = str(span.get("text") or "").strip()
+                    if not text:
+                        continue
+                    box = tuple(float(v) for v in span["bbox"])
+                    found.append((text, box, float(span["size"])))
+        return found
+    finally:
+        doc.close()
+
+
+def test_upscaled_text_matches_local_placement() -> None:
+    """A 4× upscaler must not shrink the words or slide them into the corner."""
+
+    def ocr(_bgr):
+        return [
+            {"id": "t1", "text": "MARKET DAY", "bbox": [0.12, 0.18, 0.50, 0.09], "color_hex": "#ffffff", "bold": True, "score": 1},
+            {"id": "t2", "text": "SATURDAY 9AM", "bbox": [0.12, 0.32, 0.46, 0.07], "color_hex": "#ffffff", "bold": False, "score": 1},
+        ]
+
+    def inpaint(bgr, _mask):
+        return bgr.copy()
+
+    def upscale(bgr, _tw, _th):
+        return cv2.resize(bgr, (bgr.shape[1] * 4, bgr.shape[0] * 4), interpolation=cv2.INTER_CUBIC)
+
+    folder = tempfile.mkdtemp()
+    src = os.path.join(folder, "plain.png")
+    Image.new("RGB", (320, 320), (36, 48, 120)).save(src)
+    local_pdf = os.path.join(folder, "local.pdf")
+    remote_pdf = os.path.join(folder, "remote.pdf")
+    set_providers(ocr=ocr, inpaint=inpaint, account=lambda: "none")
+    try:
+        local = rebuild(src, {"trim_w_mm": 148, "trim_h_mm": 210, "output_pdf": local_pdf, "force": True})
+    finally:
+        reset_providers()
+    set_providers(ocr=ocr, inpaint=inpaint, upscale=upscale, account=lambda: "ok")
+    try:
+        remote = rebuild(src, {"trim_w_mm": 148, "trim_h_mm": 210, "output_pdf": remote_pdf, "force": True})
+    finally:
+        reset_providers()
+    engines = {step["name"]: step["engine"] for step in remote.get("steps") or []}
+    check("upscale-used", engines.get("Upscale") == "replicate" and local.get("success") is True, str(engines))
+    left = _span_boxes(local_pdf)
+    right = _span_boxes(remote_pdf)
+    check("upscale-same-lines", [item[0] for item in left] == [item[0] for item in right] == ["MARKET DAY", "SATURDAY 9AM"], str(left))
+    for (ltext, lbox, lsize), (rtext, rbox, rsize) in zip(left, right):
+        origin = max(abs(lbox[0] - rbox[0]), abs(lbox[1] - rbox[1]), abs(lbox[2] - rbox[2]), abs(lbox[3] - rbox[3]))
+        check(f"upscale-place-{ltext}", origin < 1.5, f"{origin:.2f} local {lbox} remote {rbox}")
+        check(f"upscale-size-{ltext}", abs(lsize - rsize) / max(lsize, 1) < 0.04, f"local {lsize:.2f} remote {rsize:.2f}")
+        check(f"upscale-not-quarter-{ltext}", rsize > lsize * 0.8, f"{rsize:.2f} vs {lsize:.2f}")
+
+
+def _texture_energy(img: np.ndarray, selected: np.ndarray) -> float:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    high = gray - cv2.GaussianBlur(gray, (0, 0), 1.6)
+    values = high[selected]
+    if values.size == 0:
+        return 0.0
+    return float(np.std(values))
+
+
+def test_fill_matches_noisy_gradient() -> None:
+    """A smooth eraser fill must not leave a flat letter-shaped patch on a noisy gradient."""
+    from ai_rebuild import composite_inpaint
+
+    height, width = 240, 300
+    rng = np.random.default_rng(4)
+    yy = np.linspace(0, 1, height)[:, None]
+    xx = np.linspace(0, 1, width)[None, :]
+    field = yy * 0.72 + xx * 0.28
+    truth = np.zeros((height, width, 3), np.float32)
+    truth[..., 0] = 28 + field * 100
+    truth[..., 1] = 18 + field * 55
+    truth[..., 2] = 78 + (1.0 - field) * 120
+    truth += rng.normal(0, 7.5, truth.shape)
+    truth = np.clip(truth, 0, 255).astype(np.uint8)
+    painted = truth.copy()
+    cv2.putText(painted, "MARKET", (24, 92), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (245, 245, 245), 3, cv2.LINE_AA)
+    cv2.putText(painted, "DAY", (24, 142), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (245, 245, 245), 3, cv2.LINE_AA)
+    mask = np.zeros((height, width), np.uint8)
+    mask[55:155, 18:250] = 255
+    smooth = cv2.GaussianBlur(painted, (0, 0), 11)
+    bad = painted.copy()
+    bad[mask > 0] = smooth[mask > 0]
+    fixed = composite_inpaint(painted, bad, mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    hole = cv2.erode(mask, kernel, iterations=1) > 0
+    inside = _texture_energy(fixed, hole)
+    reference = _texture_energy(truth, hole)
+    bad_energy = _texture_energy(bad, hole)
+    rel = abs(inside - reference) / max(reference, 1e-3)
+    check("grain-matches-neighbour", rel < 0.45 and inside > bad_energy * 1.4, f"fixed {inside:.2f} truth {reference:.2f} bad {bad_energy:.2f} rel {rel:.2f}")
+    colour = float(np.mean(np.abs(fixed[hole].astype(np.float32) - truth[hole].astype(np.float32))))
+    bad_colour = float(np.mean(np.abs(bad[hole].astype(np.float32) - truth[hole].astype(np.float32))))
+    check("colour-matches-gradient", colour < 14 and colour < bad_colour, f"fixed {colour:.1f} bad {bad_colour:.1f}")
+
+
 def test_circle_stays_a_circle() -> None:
     """A circle, a badge, and a lone letter stay pixels. Real words are still retyped."""
     from ai_rebuild import DOUBTFUL_REASON
@@ -736,6 +842,8 @@ if __name__ == "__main__":
     test_restore_spaces_from_gaps()
     test_inpaint_removes_the_letters()
     test_doubtful_marks_are_not_retyped()
+    test_upscaled_text_matches_local_placement()
+    test_fill_matches_noisy_gradient()
     test_circle_stays_a_circle()
     test_press_pdf_shows_the_words()
     print("AI rebuild checks passed")
