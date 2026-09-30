@@ -225,11 +225,24 @@ def test_flyer(root: str) -> None:
     if result.get("proofPng") and os.path.exists(result["proofPng"]):
         shutil.copyfile(result["proofPng"], os.path.join(ART, "quick-print-ai-flyer-proof.png"))
     joined = " ".join(result.get("decisions") or [])
-    check("flyer-records-decisions", "5 mm" in joined and "lettering" in joined.lower() and "not retyped" in joined.lower(), joined[:500])
+    check("flyer-records-decisions", "5 mm" in joined and "vector" in joined.lower(), joined[:700])
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    page = doc[0]
+    text = page.get_text("text") or ""
+    fonts = page.get_fonts()
+    images = page.get_images()
+    info = doc.extract_image(images[0][0]) if images else {}
+    inset = float(page.trimbox.x0) * 25.4 / 72.0
+    doc.close()
+    check("flyer-vector-text", "MARKET" in text.upper(), text.replace("\n", " | ")[:240])
+    check("flyer-embedded-font", bool(fonts) and all("+" in str(item[3]) for item in fonts), str(fonts)[:240])
+    check("flyer-cmyk-image", info.get("colorspace") == 4, str(info.get("colorspace")))
+    check("flyer-trim-inset", abs(inset - 5) < 0.5, f"{inset:.2f}")
 
 
 def test_shapes(root: str) -> None:
-    """Square flyer. Quick mode keeps the circle and the original lettering. It does not retype."""
+    """Square flyer. The circle stays in the picture. The real lines become vector type."""
     from ai_rebuild_check import _draw_shape_flyer, _orange_disc
 
     path = os.path.join(root, "shapes.png")
@@ -238,7 +251,7 @@ def test_shapes(root: str) -> None:
     result = make_print_ready(path, out, 148, 148, "custom", "148 × 148 mm", filename="shapes.png")
     check("shapes-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
     joined = " ".join(result.get("decisions") or [])
-    check("shapes-keeps-lettering", "not retyped" in joined.lower(), joined[:400])
+    check("shapes-sets-type", "vector" in joined.lower(), joined[:500])
     rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-shape-circle.png"))
     disc = _orange_disc(rendered)
     check("shapes-circle", disc is not None, "" if disc else "no orange disc")
@@ -250,7 +263,7 @@ def test_shapes(root: str) -> None:
     text = doc[0].get_text("text") or ""
     images = doc[0].get_images()
     doc.close()
-    check("shapes-not-retyped", "MARKET DAY" not in text and "SATURDAY" not in text, text.replace("\n", " | ")[:180])
+    check("shapes-vector-words", "MARKET" in text.upper(), text.replace("\n", " | ")[:180])
     check("shapes-still-a-picture", len(images) >= 1, str(len(images)))
 
 

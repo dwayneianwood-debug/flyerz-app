@@ -207,7 +207,7 @@ export function registerQuickPrintRoutes(app: Express) {
         created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: true });
         continue;
       }
-      writeJobProgress(job.id, "fitting", "Original lettering is kept. Text is not retyped.");
+      writeJobProgress(job.id, "fitting", "Fitting the picture to the product.");
       created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: false });
     }
     res.status(202).json({

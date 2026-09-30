@@ -299,7 +299,7 @@ def _assess(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> d
         "src_h": int(base.get("src_h") or src_h),
         "effective_dpi": dpi_now,
         "recommendation": (
-            "This looks like AI-generated artwork. Rebuild is on: words are retyped crisp and the picture is enlarged for the press."
+            "This looks like AI-generated artwork. Quick mode sets the words as vector type and enlarges the picture. If that check fails, the original lettering is kept and the job is marked amber."
             if detected
             else ""
         ),

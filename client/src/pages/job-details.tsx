@@ -1149,7 +1149,7 @@ export default function JobDetails() {
                 <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto" data-testid="text-processing-description">
                   {isQueued
                     ? "The press room is busy. Your file is in line and will be processed as soon as a slot opens."
-                    : (job.progress?.note || "We're fitting the picture and building the press file. The original lettering is kept.")}
+                    : (job.progress?.note || "We're fitting the picture and building the press file.")}
                 </p>
                 {!isQueued && (
                   <div className="max-w-xs mx-auto" data-testid="job-progress">

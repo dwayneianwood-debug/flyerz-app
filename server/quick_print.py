@@ -2,8 +2,9 @@
 """One-step press file for sales.
 
 Decides the product fit and 5mm bleed without asking. AI raster artwork is
-enlarged and the original lettering is kept. Text is never retyped here.
-The press PDF is built by the existing compile script and Press-Ready Engine.
+set as vector type (vector text rebuild v2). If that check fails, the picture
+is only enlarged, the original lettering stays, and the job is marked amber.
+The press PDF for every other file is built by the existing compile script.
 """
 
 from __future__ import annotations
@@ -116,6 +117,10 @@ def decide_light(facts: dict) -> dict:
         reasons.append(f"The picture was enlarged {upscale:.1f} times to reach print size. Glance at fine detail.")
     if facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
         reasons.append("The picture was a different shape, so the edges were extended. Glance at those edges.")
+    if facts.get("vectorAmber"):
+        note = str(facts.get("vectorAmberReason") or "").strip()
+        if note and note not in reasons:
+            reasons.append(note)
     if facts.get("enginePassed") is False:
         note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
         if note not in reasons:
@@ -524,7 +529,7 @@ def make_print_ready(
     decisions = [
         "Sales quick mode decided this file on its own. Nobody was asked a question.",
         "Bleed is 5 mm on every side.",
-        "Colour is handled by the press engine (CMYK, rich black kept).",
+        "The press file is CMYK, with rich black kept.",
     ]
     product = {"id": product_id, "label": product_label, "widthMm": trim_w, "heightMm": trim_h}
     ext = _ext(src_path, display)
@@ -577,6 +582,8 @@ def make_print_ready(
     ocr_low = False
     ocr_doubtful = False
     ocr_doubtful_reason = ""
+    vector_built = None
+    lettering_note = "The original lettering is kept."
 
     try:
         if ext in (".ai", ".eps"):
@@ -631,33 +638,64 @@ def make_print_ready(
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
             work_path = fitted_path
-            _mark("enlarging", "Original lettering is kept. Text is not retyped.")
             if detected:
-                decisions.append("This looks like AI-generated artwork. The original lettering is kept and the picture is enlarged. Text is not retyped.")
-            else:
-                decisions.append("This was not treated as AI artwork. The original lettering is kept and text is not retyped.")
-            upscaled_path = os.path.join(output_dir, "upscaled.png")
-            try:
-                from ai_upscale import apply_ai_upscale
+                decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
+                try:
+                    from vector_text_v2 import rebuild_fitted
 
-                enlarged = apply_ai_upscale(fitted_path, {
-                    "trim_w_mm": trim_w,
-                    "trim_h_mm": trim_h,
-                    "bleed_mm": 0,
-                    "output_path": upscaled_path,
-                })
-            except Exception as exc:
-                enlarged = {"used_original": True, "message": str(exc)[:160]}
-            if enlarged.get("enhanced_path") and os.path.exists(str(enlarged.get("enhanced_path"))) and not enlarged.get("used_original"):
-                work_path = str(enlarged["enhanced_path"])
-                provider = str(enlarged.get("provider") or "basic")
-                if provider == "replicate":
-                    decisions.append("The picture was enlarged with Real-ESRGAN. The original lettering was kept.")
+                    vector_built = rebuild_fitted(
+                        raster, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
+                    )
+                except Exception as exc:
+                    vector_built = {
+                        "ok": False,
+                        "amber": True,
+                        "reason": f"Vector type failed ({str(exc)[:140]}). The original lettering was kept.",
+                        "decisions": [],
+                    }
+                if vector_built.get("ok"):
+                    work_path = os.path.join(output_dir, "press.pdf")
+                    lettering_note = "The lettering was set as vector type."
+                    for line in vector_built.get("decisions") or []:
+                        decisions.append(str(line))
+                    if vector_built.get("amber"):
+                        lettering_note = vector_built.get("reason") or lettering_note
                 else:
-                    decisions.append("The picture was enlarged with Lanczos on this computer. The original lettering was kept.")
+                    lettering_note = str(vector_built.get("reason") or "The vector check failed, so the original lettering was kept.")
+                    decisions.append(lettering_note)
             else:
-                decisions.append("The original picture was kept and will be placed at 300 DPI. The lettering was not retyped.")
-            if upscale >= 1.15:
+                decisions.append("This was not treated as AI artwork. The original lettering is kept.")
+            if not (vector_built and vector_built.get("ok")):
+                _mark("enlarging", lettering_note)
+                upscaled_path = os.path.join(output_dir, "upscaled.png")
+                try:
+                    from ai_upscale import apply_ai_upscale
+
+                    enlarged = apply_ai_upscale(fitted_path, {
+                        "trim_w_mm": trim_w,
+                        "trim_h_mm": trim_h,
+                        "bleed_mm": 0,
+                        "output_path": upscaled_path,
+                    })
+                except Exception as exc:
+                    enlarged = {"used_original": True, "message": str(exc)[:160]}
+                if enlarged.get("enhanced_path") and os.path.exists(str(enlarged.get("enhanced_path"))) and not enlarged.get("used_original"):
+                    work_path = str(enlarged["enhanced_path"])
+                    provider = str(enlarged.get("provider") or "basic")
+                    if provider == "replicate":
+                        decisions.append("The picture was enlarged with Real-ESRGAN. The original lettering was kept.")
+                    else:
+                        decisions.append("The picture was enlarged with Lanczos on this computer. The original lettering was kept.")
+                else:
+                    decisions.append("The original picture was kept and will be placed at 300 DPI. The original lettering was kept.")
+            if vector_built and vector_built.get("ok"):
+                if upscale >= 1.15:
+                    decisions.append(
+                        f"The original picture needs about {upscale:.1f}× to reach print size. The press picture is at least 400 PPI."
+                    )
+                else:
+                    decisions.append("The original picture is already sharp enough. The press picture is at least 400 PPI.")
+            elif upscale >= 1.15:
                 decisions.append(f"The original picture needs about {upscale:.1f}× to reach 300 DPI at this size. The press file is built at 300 DPI.")
             else:
                 decisions.append("The original picture is already sharp enough for 300 DPI at this size.")
@@ -667,15 +705,30 @@ def make_print_ready(
         return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
 
     press_path = os.path.join(output_dir, "press.pdf")
-    _mark("press", "Original lettering is kept. Text is not retyped.")
-    compiled = _compile(work_path, press_path, trim_w, trim_h)
-    engine = compiled.get("pressEngine") or {}
-    press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
-    if isinstance(engine, dict) and engine.get("existingBleed"):
-        existing_kept = True
-        decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
-    elif press_ok:
-        decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
+    _mark("press", lettering_note)
+    vector_ok = bool(vector_built and vector_built.get("ok") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
+    if vector_ok:
+        compiled = {
+            "success": True,
+            "pressEngine": {
+                "passed": True,
+                "headline": "Vector type",
+                "reason": "",
+                "existingBleed": False,
+            },
+        }
+        engine = compiled["pressEngine"]
+        press_ok = True
+        decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
+    else:
+        compiled = _compile(work_path, press_path, trim_w, trim_h)
+        engine = compiled.get("pressEngine") or {}
+        press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
+        if isinstance(engine, dict) and engine.get("existingBleed"):
+            existing_kept = True
+            decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
+        elif press_ok:
+            decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
     if isinstance(engine, dict) and engine.get("headline"):
         decisions.append(f"Press engine: {engine.get('headline')}.")
 
@@ -694,6 +747,8 @@ def make_print_ready(
         "aspectDelta": aspect_delta,
         "enginePassed": bool(engine.get("passed")) if press_ok else False,
         "engineReason": (engine.get("reason") if isinstance(engine, dict) else "") or "",
+        "vectorAmber": bool(vector_built and vector_built.get("amber")),
+        "vectorAmberReason": str((vector_built or {}).get("reason") or ""),
     }
     info = decide_light(facts)
     result = _blank(info, decisions, product, quantity, notes)
@@ -708,7 +763,7 @@ def make_print_ready(
             result.update(boxes)
         except Exception:
             pass
-        _mark("proof", "Original lettering is kept. Text is not retyped.")
+        _mark("proof", lettering_note)
         proof_png = os.path.join(output_dir, "proof.png")
         proof_pdf = os.path.join(output_dir, "proof.pdf")
         try:
@@ -726,6 +781,19 @@ def make_print_ready(
     elif not press_ok:
         result["pressPath"] = ""
     result["decisions"] = decisions
+    result["letteringNote"] = lettering_note
+    if vector_built:
+        result["vectorText"] = {
+            "ok": bool(vector_built.get("ok")),
+            "amber": bool(vector_built.get("amber")),
+            "elapsed_s": vector_built.get("elapsed_s"),
+            "timings": vector_built.get("timings") or {},
+            "provider": vector_built.get("provider") or "",
+            "vectorLines": vector_built.get("vector_lines") or 0,
+            "rasterLines": vector_built.get("raster_lines") or 0,
+            "qa": vector_built.get("qa") or {},
+            "lines": vector_built.get("lines") or [],
+        }
     return _finish(result, output_dir)
 
 
@@ -739,7 +807,7 @@ def _mark(stage: str, note: str = "") -> None:
 
 
 def _finish(result: dict, output_dir: str) -> dict:
-    _mark("done", "Original lettering is kept. Text is not retyped.")
+    _mark("done", str(result.get("letteringNote") or "Finished."))
     result_path = os.path.join(output_dir, "result.json")
     with open(result_path, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
@@ -773,7 +841,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.progress_file:
         os.environ["JOB_PROGRESS_FILE"] = args.progress_file
-        _mark("fitting", "Original lettering is kept. Text is not retyped.")
+        _mark("fitting", "Fitting the picture to the product.")
     if args.product_id and args.product_id != "auto":
         chosen = _product_by_id(args.product_id)
         if chosen:
