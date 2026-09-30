@@ -608,6 +608,125 @@ def test_press_pdf_shows_the_words() -> None:
         reset_providers()
 
 
+def test_doubtful_marks_are_not_retyped() -> None:
+    """Single letters, huge blobs, faint reads, and junk stay out of the retype list."""
+    from ai_rebuild import keep_word_blocks
+
+    sale = {"text": "SALE", "bbox": [0.08, 0.28, 0.7, 0.28], "score": 1}
+    offer = {"text": "50% OFF PRINTS", "bbox": [0.1, 0.6, 0.5, 0.05], "score": 0.97}
+    when = {"text": "SATURDAY 9AM", "bbox": [0.1, 0.8, 0.4, 0.05], "score": 1}
+    circle = {"text": "O", "bbox": [0.08, 0.0, 0.66, 0.60], "score": 0.87}
+    huge = {"text": "HELLO", "bbox": [0.1, 0.1, 0.5, 0.5], "score": 0.99}
+    faint = {"text": "MARKET DAY", "bbox": [0.1, 0.7, 0.4, 0.06], "score": 0.4}
+    junk = {"text": "###", "bbox": [0.1, 0.1, 0.2, 0.05], "score": 0.9}
+    letter = {"text": "A", "bbox": [0.77, 0.21, 0.12, 0.14], "score": 1}
+    kept, dropped = keep_word_blocks([sale, offer, when, circle, huge, faint, junk, letter])
+    check("keeps-real-words", [item["text"] for item in kept] == ["SALE", "50% OFF PRINTS", "SATURDAY 9AM"], str([item["text"] for item in kept]))
+    check(
+        "drops-doubtful",
+        [item["text"] for item in dropped] == ["O", "HELLO", "MARKET DAY", "###", "A"],
+        str([item["text"] for item in dropped]),
+    )
+
+
+def _draw_shape_flyer(path: str) -> None:
+    """Big circle, a badge, one large letter, and two real lines. The circle is what OCR calls O."""
+    from PIL import ImageDraw, ImageFont
+
+    canvas = Image.new("RGB", (1024, 1024), (24, 72, 140))
+    draw = ImageDraw.Draw(canvas)
+    font_path = os.path.join(os.path.dirname(__file__), "fonts", "LiberationSans-Bold.ttf")
+    draw.ellipse((160, 20, 640, 500), fill=(240, 120, 20))
+    draw.ellipse((780, 560, 980, 760), fill=(212, 168, 42))
+    draw.regular_polygon((880, 660, 70), 5, rotation=0, fill=(120, 28, 18))
+    draw.text((800, 200), "A", font=ImageFont.truetype(font_path, 160), fill=(255, 255, 255))
+    draw.text((160, 780), "MARKET DAY", font=ImageFont.truetype(font_path, 64), fill=(255, 236, 180))
+    draw.text((160, 900), "SATURDAY 9AM", font=ImageFont.truetype(font_path, 48), fill=(255, 255, 255))
+    canvas.save(path, format="PNG")
+
+
+def _orange_disc(bgr: np.ndarray):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+    mask = (rgb[:, :, 0] > 190) & (rgb[:, :, 1] > 70) & (rgb[:, :, 1] < 190) & (rgb[:, :, 2] < 90)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    best = None
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if best is None or area > best[0]:
+            width = int(stats[index, cv2.CC_STAT_WIDTH])
+            height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            best = (area, width / float(max(height, 1)), area / float(max(width * height, 1)))
+    return best
+
+
+def _region_delta(source_bgr: np.ndarray, rendered_bgr: np.ndarray, box: tuple) -> float:
+    from ai_rebuild import _cover
+
+    fitted, _scale, _x0, _y0 = _cover(source_bgr, rendered_bgr.shape[1], rendered_bgr.shape[0], sharpen=False)
+
+    def crop(img: np.ndarray) -> np.ndarray:
+        height, width = img.shape[:2]
+        x0, y0, x1, y1 = box
+        return img[int(y0 * height):int(y1 * height), int(x0 * width):int(x1 * width)]
+
+    left = crop(fitted).astype(np.float32)
+    right = crop(rendered_bgr).astype(np.float32)
+    if left.size == 0 or right.size == 0:
+        return 999.0
+    if left.shape != right.shape:
+        right = cv2.resize(right, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_AREA)
+    return float(np.mean(np.abs(left - right)))
+
+
+def test_circle_stays_a_circle() -> None:
+    """A circle, a badge, and a lone letter stay pixels. Real words are still retyped."""
+    from ai_rebuild import DOUBTFUL_REASON
+
+    reset_providers()
+    saved = os.environ.pop("REPLICATE_API_TOKEN", None)
+    folder = tempfile.mkdtemp()
+    try:
+        src = os.path.join(folder, "shapes.png")
+        rebuilt = os.path.join(folder, "shapes.pdf")
+        _draw_shape_flyer(src)
+        result = rebuild(src, {"trim_w_mm": 148, "trim_h_mm": 148, "output_pdf": rebuilt, "force": True})
+        check("shape-built", result.get("success") is True and os.path.exists(rebuilt), result.get("message", ""))
+        texts = [str(block.get("text") or "") for block in result.get("blocks") or []]
+        check("shape-words", texts == ["MARKET DAY", "SATURDAY 9AM"], str(texts))
+        check("shape-no-letter-block", "O" not in texts and "A" not in texts, str(texts))
+        check("shape-doubtful", result.get("doubtful") is True and result.get("doubtfulReason") == DOUBTFUL_REASON, str(result.get("doubtfulReason")))
+        import pymupdf as fitz
+        doc = fitz.open(rebuilt)
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        rendered = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        rendered = cv2.cvtColor(rendered[:, :, :3], cv2.COLOR_RGB2BGR)
+        vector = page.get_text("text") or ""
+        doc.close()
+        check("shape-vector-market", "MARKET DAY" in vector and "SATURDAY 9AM" in vector, vector.replace("\n", " | "))
+        lines = [line.strip() for line in vector.splitlines() if line.strip()]
+        check("shape-vector-no-o", "O" not in lines and "A" not in lines, str(lines))
+        disc = _orange_disc(rendered)
+        check("shape-circle-found", disc is not None, "" if disc else "no orange disc")
+        if disc is not None:
+            area, aspect, fill = disc
+            check("shape-circle-round", 0.85 <= aspect <= 1.18 and fill >= 0.68 and area > 8000, f"area {area} aspect {aspect:.2f} fill {fill:.2f}")
+        source = cv2.imread(src, cv2.IMREAD_COLOR)
+        # Circle, badge, and the lone letter. Words sit lower and are allowed to be retyped.
+        regions = {
+            "circle": (0.16, 0.02, 0.62, 0.48),
+            "badge": (0.76, 0.55, 0.96, 0.74),
+            "letter": (0.77, 0.21, 0.90, 0.36),
+        }
+        for name, box in regions.items():
+            delta = _region_delta(source, rendered, box)
+            check(f"shape-pixels-{name}", delta < 22, f"{delta:.1f}")
+    finally:
+        if saved is not None:
+            os.environ["REPLICATE_API_TOKEN"] = saved
+        reset_providers()
+
+
 if __name__ == "__main__":
     test_detection()
     test_no_credit()
@@ -616,5 +735,7 @@ if __name__ == "__main__":
     test_real_local_ocr()
     test_restore_spaces_from_gaps()
     test_inpaint_removes_the_letters()
+    test_doubtful_marks_are_not_retyped()
+    test_circle_stays_a_circle()
     test_press_pdf_shows_the_words()
     print("AI rebuild checks passed")

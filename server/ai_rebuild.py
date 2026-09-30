@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -33,6 +34,14 @@ from PIL import Image
 BLEED_MM = 5.0
 SAFE_ZONE_MM = 3.0
 TARGET_DPI = 300
+# Same bar as the quick-mode spelling glance. Below this, the word is left alone.
+MIN_WORD_SCORE = 0.55
+# A line of type is wide. A circle or badge is large in both directions.
+BLOB_MIN_SIDE = 0.12
+BLOB_MAX_ASPECT = 2.0
+DOUBTFUL_REASON = (
+    "Some marks did not look like real words, so they were left unchanged. Glance at the picture."
+)
 MAX_LONG_EDGE = 4500
 MM_TO_PT = 72.0 / 25.4
 
@@ -452,6 +461,86 @@ def _space_blocks(blocks: list, bgr: np.ndarray) -> list:
     return spaced
 
 
+def _alnum(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", str(text or ""))
+
+
+def _single_character(text: str) -> bool:
+    return len(_alnum(text)) <= 1
+
+
+def _word_like(text: str) -> bool:
+    """A word or a short line, including prices and times such as 50% and 9AM."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return False
+    if re.fullmatch(r"[A-Za-z0-9%'.,!?&/\-:# ]+", raw) is None:
+        return False
+    core = _alnum(raw)
+    letters = sum(1 for ch in core if ch.isalpha())
+    if letters < 2 or len(core) < 2:
+        return False
+    if len(set(core.upper())) == 1:
+        return False
+    return True
+
+
+def _very_large(block: dict) -> bool:
+    box = block.get("bbox") or [0, 0, 0, 0]
+    if len(box) < 4:
+        return False
+    width, height = float(box[2]), float(box[3])
+    shorter = min(width, height)
+    longer = max(width, height)
+    if shorter <= 0:
+        return False
+    return shorter >= BLOB_MIN_SIDE and (longer / shorter) < BLOB_MAX_ASPECT
+
+
+def _low_confidence(block: dict) -> bool:
+    if "score" not in block or block.get("score") is None:
+        return False
+    try:
+        score = float(block.get("score"))
+    except (TypeError, ValueError):
+        return False
+    return score < MIN_WORD_SCORE
+
+
+def block_is_doubtful(block: dict) -> bool:
+    """True when this OCR box must stay as the original pixels."""
+    text = str((block or {}).get("text") or "").strip()
+    if not text:
+        return True
+    return (
+        _single_character(text)
+        or _very_large(block)
+        or _low_confidence(block)
+        or not _word_like(text)
+    )
+
+
+def keep_word_blocks(blocks: list) -> tuple[list, list]:
+    """Split OCR into words we may retype, and marks we must leave alone."""
+    kept: list = []
+    dropped: list = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        if block_is_doubtful(block):
+            dropped.append(block)
+        else:
+            kept.append(block)
+    return kept, dropped
+
+
+def _keep_only_words(blocks: list, note: str) -> tuple[list, str]:
+    kept, dropped = keep_word_blocks(blocks)
+    if dropped:
+        note = f"{note} {DOUBTFUL_REASON}".strip()
+    return kept, note
+
+
 def _looks_bold(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
     roi = bgr[y:y + h, x:x + w]
     if roi.size == 0 or h < 8:
@@ -523,20 +612,23 @@ def read_text_blocks(bgr: np.ndarray) -> tuple[list, str, str]:
         try:
             blocks = _OCR(bgr) or []
             made = [_normalise_hook_block(b, i, bgr) for i, b in enumerate(blocks)]
-            return _space_blocks(made, bgr), "hook", "OCR used the supplied reader."
+            kept, note = _keep_only_words(_space_blocks(made, bgr), "OCR used the supplied reader.")
+            return kept, "hook", note
         except Exception as exc:
             return [], "none", f"OCR reader failed: {str(exc)[:160]}"
     try:
         blocks = _rapid_blocks(bgr)
         if blocks:
-            return blocks, "local", "OCR used RapidOCR on this computer."
+            kept, note = _keep_only_words(blocks, "OCR used RapidOCR on this computer.")
+            return kept, "local", note
     except Exception as exc:
         rapid_err = str(exc)[:160]
     else:
         rapid_err = ""
     blocks, gem_err = _gemini_blocks(bgr)
     if blocks:
-        return _space_blocks(blocks, bgr), "gemini", "OCR used Gemini because local RapidOCR found no text."
+        kept, note = _keep_only_words(_space_blocks(blocks, bgr), "OCR used Gemini because local RapidOCR found no text.")
+        return kept, "gemini", note
     note = "No text was read."
     if rapid_err:
         note = f"Local OCR was not available ({rapid_err})."
@@ -1091,8 +1183,10 @@ def _rebuild(path: str, options: dict) -> dict:
         del fitted
         up_engine = "review"
         steps.append({"name": "Upscale", "engine": "review", "ok": True, "note": "Print-size background kept from the last rebuild."})
+        doubtful = False
     else:
         blocks, ocr_engine, ocr_note = read_text_blocks(source)
+        doubtful = DOUBTFUL_REASON in (ocr_note or "")
         blocks = _apply_edits(blocks, edits or [])
         steps.append({"name": "OCR", "engine": "local" if ocr_engine in ("local", "hook") else ocr_engine, "ok": True, "note": ocr_note})
         mask = _mask_from_blocks(source, blocks)
@@ -1138,6 +1232,8 @@ def _rebuild(path: str, options: dict) -> dict:
         "replicate": credit,
         "message": f"AI Rebuild finished. {engines}.",
         "note": f"AI Rebuild. {engines}. Text: {ocr_text or '(none)'}.",
+        "doubtful": doubtful,
+        "doubtfulReason": DOUBTFUL_REASON if doubtful else "",
     }
 
 

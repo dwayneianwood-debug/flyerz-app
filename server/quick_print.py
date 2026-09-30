@@ -102,6 +102,11 @@ def decide_light(facts: dict) -> dict:
         }
 
     reasons = []
+    if facts.get("ocrDoubtful"):
+        reasons.append(
+            str(facts.get("ocrDoubtfulReason") or "").strip()
+            or "Some marks did not look like real words, so they were left unchanged. Glance at the picture."
+        )
     if facts.get("ocrLow"):
         reasons.append("The rebuilt text was hard to read, so check the spelling before it is printed.")
     if facts.get("textNearTrim"):
@@ -463,6 +468,8 @@ def make_print_ready(
     upscale = 1.0
     existing_kept = False
     ocr_low = False
+    ocr_doubtful = False
+    ocr_doubtful_reason = ""
 
     try:
         if ext in (".ai", ".eps"):
@@ -538,8 +545,11 @@ def make_print_ready(
                         if str(block.get("text") or "").strip()
                     ]
                     ocr_low = bool(scores) and min(scores) < OCR_AMBER
+                    ocr_doubtful = bool(rebuilt.get("doubtful"))
+                    ocr_doubtful_reason = str(rebuilt.get("doubtfulReason") or "")
                 else:
                     ocr_low = False
+                    ocr_doubtful = False
                     decisions.append("AI Rebuild did not change the file, so the picture continued to the press engine.")
             else:
                 decisions.append("This was not treated as AI artwork, so AI Rebuild stayed off.")
@@ -571,6 +581,8 @@ def make_print_ready(
         "compiled": press_ok,
         "compileError": str(compiled.get("error") or "")[:180],
         "ocrLow": ocr_low,
+        "ocrDoubtful": ocr_doubtful,
+        "ocrDoubtfulReason": ocr_doubtful_reason,
         "textNearTrim": _text_near_trim(engine if isinstance(engine, dict) else {}),
         "upscale": upscale,
         "aspectExtended": aspect_extended,

@@ -118,6 +118,14 @@ def test_rules() -> None:
     check("amber-rule", amber["light"] == "amber" and any("extended" in line for line in amber["reasons"]))
     quiet = decide_light({"compiled": True, "enginePassed": True, "aspectExtended": True, "aspectDelta": 0.03, "upscale": 1.4})
     check("small-aspect-stays-green", quiet["light"] == "green", str(quiet))
+    doubtful = decide_light({
+        "compiled": True,
+        "enginePassed": True,
+        "upscale": 1,
+        "ocrDoubtful": True,
+        "ocrDoubtfulReason": "Some marks did not look like real words, so they were left unchanged. Glance at the picture.",
+    })
+    check("doubtful-amber", doubtful["light"] == "amber" and any("left unchanged" in line for line in doubtful["reasons"]), str(doubtful))
     check("a5-80px-too-small", too_small(80, 80, 148, 210))
     check("a5-1024-not-too-small", not too_small(1024, 1024, 148, 210))
     check("bleed-constant", BLEED_MM == 5)
@@ -220,6 +228,30 @@ def test_flyer(root: str) -> None:
     check("flyer-records-decisions", "5 mm" in joined and "AI Rebuild" in joined, joined[:400])
 
 
+def test_shapes(root: str) -> None:
+    """Square flyer: OCR calls the circle O. Quick mode must leave it and flag amber."""
+    from ai_rebuild_check import _draw_shape_flyer, _orange_disc
+
+    path = os.path.join(root, "shapes.png")
+    _draw_shape_flyer(path)
+    out = tempfile.mkdtemp(prefix="quick-shapes-")
+    result = make_print_ready(path, out, 148, 148, "custom", "148 × 148 mm", filename="shapes.png")
+    check("shapes-amber", result["light"] == "amber", f"{result['light']} {result.get('reasons')}")
+    check("shapes-reason", any("left unchanged" in line for line in result.get("reasons") or []), str(result.get("reasons")))
+    check("shapes-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
+    rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-shape-circle.png"))
+    disc = _orange_disc(rendered)
+    check("shapes-circle", disc is not None, "" if disc else "no orange disc")
+    if disc is not None:
+        area, aspect, fill = disc
+        check("shapes-circle-round", 0.8 <= aspect <= 1.25 and fill >= 0.6 and area > 2000, f"area {area} aspect {aspect:.2f} fill {fill:.2f}")
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    text = doc[0].get_text("text") or ""
+    doc.close()
+    check("shapes-words", "MARKET DAY" in text and "SATURDAY 9AM" in text, text.replace("\n", " | ")[:180])
+
+
 def main() -> None:
     test_rules()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
@@ -230,6 +262,7 @@ def main() -> None:
         test_existing(root)
         test_wide(root)
         test_flyer(root)
+        test_shapes(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("ALL QUICK PRINT CHECKS PASSED")
