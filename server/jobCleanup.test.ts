@@ -164,6 +164,29 @@ test("yesterday is removed, today and a processing job stay, and outside paths a
   });
   assert.equal(again.backupCreated, false);
   assert.equal(backups, 1);
+  const raced = await runJobCleanup({
+    now: NOW,
+    enabled: true,
+    jobs: [{
+      id: 8,
+      filename: "raced.png",
+      status: "complete",
+      uploadedAt: "2026-09-28 08:00:00",
+      originalPath: path.join(uploads, "today.png"),
+    }],
+    uploadsRoot: uploads,
+    jobsRoot,
+    backupDir,
+    databasePath,
+    backupDatabase: () => {},
+    deleteJob: () => {
+      throw new Error("a processing job must not be deleted");
+    },
+    stillProcessing: () => true,
+  });
+  assert.equal(raced.removedJobs, 0);
+  assert.equal(raced.keptProcessing, 1);
+  assert.equal(fs.readFileSync(path.join(uploads, "today.png"), "utf8"), "today-artwork");
   assert.match(logs.join("\n"), /Removed job 1/);
   assert.match(logs.join("\n"), /still processing/);
   assert.ok(report.bytesRemoved > 0);

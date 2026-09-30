@@ -237,6 +237,8 @@ export interface CleanupDeps {
   reason?: "startup" | "midnight" | "hourly";
   backupDatabase: (dest: string) => void;
   deleteJob: (id: number) => void | Promise<void>;
+  /** Recheck just before the row is removed, in case the job started while files were being listed. */
+  stillProcessing?: (id: number) => boolean | Promise<boolean>;
   log?: (line: string) => void;
 }
 
@@ -289,6 +291,11 @@ export async function runJobCleanup(deps: CleanupDeps): Promise<CleanupReport> {
   }
 
   for (const job of plan.remove) {
+    if (deps.stillProcessing && await deps.stillProcessing(job.id)) {
+      report.keptProcessing += 1;
+      log(`[Job cleanup] Kept job ${job.id} (${job.filename}) because it is still processing.`);
+      continue;
+    }
     const skipped: string[] = [];
     const seen = new Set<string>();
     const files: string[] = [];
@@ -425,5 +432,6 @@ export async function runStoredJobCleanup(reason: "startup" | "midnight" | "hour
       backupDatabaseTo(dest);
     },
     deleteJob: (id) => storage.deleteJob(id),
+    stillProcessing: async (id) => (await storage.getJobStatus(id))?.status === "processing",
   });
 }
