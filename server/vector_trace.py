@@ -3481,25 +3481,37 @@ def _glyph_letter(text: str) -> str:
     return cleaned
 
 
+def _letters_confusable(left: str, right: str) -> bool:
+    """True when a tiny glyph reader swaps shapes it cannot tell apart.
+
+    An e read as a c is a different letter. An I read as a 1 is the same stroke.
+    """
+    groups = ("Il1|", "O0oQ", "S5s", "B8", "G6", "Z2z")
+    pair = {left, right}
+    return any(pair <= set(group) for group in groups)
+
+
 def _small_reads_differ(readings: list) -> list:
     """Indexes whose trace letter is not the picture's letter.
 
     ``readings`` is (source text, source score, trace text, trace score) per glyph.
-    A pair the reader cannot see does not fail the line. Two different letters do.
+    A pair the reader cannot see does not fail the line. Two confident, different
+    letters do. A case flip, or an I read as a 1, is the reader, not a new letter.
     """
     bad = []
     for index, item in enumerate(readings):
         source_text, source_score, render_text, render_score = item
         source_letter = _glyph_letter(source_text)
         render_letter = _glyph_letter(render_text)
-        if source_score < 0.55 and render_score < 0.55:
+        if source_score < 0.70 or render_score < 0.70:
             continue
-        if not source_letter and not render_letter:
+        if not source_letter or not render_letter:
             continue
-        if source_letter != render_letter and source_score >= 0.55 and render_score >= 0.55:
-            bad.append(index)
-        elif source_letter and not render_letter and source_score >= 0.55:
-            bad.append(index)
+        if source_letter.lower() == render_letter.lower():
+            continue
+        if _letters_confusable(source_letter, render_letter):
+            continue
+        bad.append(index)
     return bad
 
 
@@ -4119,8 +4131,12 @@ def _apply_text_gate(
         stroke = _small_glyph_fails(row["_source"], row["_render"])
         judged["glyphIou"] = round(float(glyph_iou), 3)
         judged["haloFail"] = bool(halo or ghost or doubled)
+        letter_h = _letter_height(row["_source"])
         judged["strokeFail"] = bool(stroke)
-        judged["smallText"] = 4.0 <= _letter_height(row["_source"]) < 16.0
+        judged["smallText"] = 4.0 <= letter_h < 16.0
+        # Body type only. A heading the stroke check kept is already large
+        # enough that a per-letter read just disagrees with itself.
+        judged["glyphOcr"] = 4.0 <= letter_h < 10.0
         judged["glyphFail"] = bool(
             glyph_iou < 0.85 or halo or ghost or doubled or faint or stroke
         )
@@ -4152,6 +4168,8 @@ def _apply_text_gate(
             row["_strokeFail"] = True
         if judged.get("smallText"):
             row["_smallText"] = True
+        if judged.get("glyphOcr"):
+            row["_glyphOcr"] = True
         if judged.get("lineOnly"):
             row["_lineOnly"] = True
     # A line the mask already accepted does not need a second read. Copying
@@ -4185,7 +4203,7 @@ def _apply_text_gate(
         row["mismatch"] = not _reads_match(row["text"], reading)
     # Short lines the stroke check kept are read one letter at a time. The
     # trace letter has to be the picture's letter. One batch covers the page.
-    small_rows = [row for row in accepted if row.get("_smallText")]
+    small_rows = [row for row in accepted if row.get("_glyphOcr")]
     if small_rows:
         paired = []
         owners = []
@@ -4339,7 +4357,7 @@ def _apply_text_gate(
         item.pop("_ink", None)
         item.pop("core", None)
     for row in report:
-        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_smallText"):
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_smallText", "_glyphOcr"):
             row.pop(key, None)
     return report, kept, qa, source_guard
 

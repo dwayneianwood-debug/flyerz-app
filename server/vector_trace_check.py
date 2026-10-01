@@ -668,7 +668,9 @@ def test_descenders_and_counters() -> None:
     check("small-read-mismatch", _small_reads_differ([("e", 0.99, "c", 0.80)]) == [0])
     check("small-read-same", _small_reads_differ([("e", 0.99, "e", 0.91)]) == [])
     check("small-read-unsure", _small_reads_differ([("K", 0.40, "N", 0.40)]) == [])
-    check("small-read-blank", _small_reads_differ([("e", 0.90, "", 0.0)]) == [0])
+    check("small-read-blank", _small_reads_differ([("e", 0.90, "", 0.0)]) == [])
+    check("small-read-stem", _small_reads_differ([("I", 0.99, "1", 0.95)]) == [])
+    check("small-read-case", _small_reads_differ([("e", 0.99, "E", 0.92)]) == [])
 
     wide = np.full((1000, 1700, 3), (230, 226, 220), np.uint8)
     wide[400:460, 200:260] = (16, 14, 12)
@@ -1018,7 +1020,9 @@ def test_card_back_body_is_traced() -> None:
             print(f"IOU {text} {line.get('match')}")
     bad = _vector_reads_match(gate)
     check("card-back-letters", not bad, str(bad)[:400])
-    check("card-back-count", int(result.get("vector_lines") or 0) >= 40, str(result.get("vector_lines")))
+    # Broken small type goes back to the picture, so the old floor of 40
+    # counted damaged letters. The lines that still trace are intact.
+    check("card-back-count", int(result.get("vector_lines") or 0) >= 6, str(result.get("vector_lines")))
     check("card-back-source", result.get("source_guard") is True, str(result.get("source_guard")))
     rasters = [line.get("text") for line in result.get("lines") or [] if line.get("mode") == "raster"]
     check("card-back-icons", {"+", "中", "♡"} <= set(rasters), str(rasters))
@@ -1336,7 +1340,13 @@ def test_medella_coverage_and_gate_speed() -> None:
     check("card-front-source", card.get("source_guard") is True, str(card.get("source_guard")))
     _check_medella_swash(card)
     back = _trace_side("card_back", 90, 50)
-    check("card-back-still", int(back.get("vector_lines") or 0) >= 40, str(back.get("vector_lines")))
+    check("card-back-still", int(back.get("vector_lines") or 0) >= 6, str(back.get("vector_lines")))
+    ident = [row for row in (back.get("textGate") or []) if "Identifies triggers" in str(row.get("text") or "")]
+    check(
+        "identifies-triggers-raster",
+        len(ident) == 1 and ident[0].get("mode") == "raster",
+        str(ident)[:240],
+    )
     back_pred = _predicted(back.get("timings") or {})
     print("PREDICTED card_back", back_pred)
     check("card-back-gate", float(back_pred.get("gate_s") or 99) <= 4.0, str(back_pred))
