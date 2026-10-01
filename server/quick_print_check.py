@@ -635,6 +635,7 @@ def _save_church_line(press_path: str, gate: list) -> None:
     check(
         "catch-top-church-complete",
         top.get("ok") is True
+        and top.get("mode") == "vector"
         and render == "GREATER HARVEST FAMILY CHURCH"
         and float(top.get("ssim") or 0) >= 0.85
         and top.get("whiteBlock") is False
@@ -660,6 +661,8 @@ def _save_church_line(press_path: str, gate: list) -> None:
     crop = trim[y0:y1, x0:x1]
     Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "church_600.png"), dpi=(600, 600))
     print(f"CHURCH CROP {crop.shape[1]}x{crop.shape[0]} boxMm {box} render {render!r}")
+    _check_church_glyphs(crop)
+    _save_footer_crop(trim, gate, ppm)
     lines = ["ok mode ssim white clip y text => render"]
     for row in sorted(gate, key=lambda item: (float(item.get("y") or 0), str(item.get("text") or ""))):
         lines.append(
@@ -672,6 +675,146 @@ def _save_church_line(press_path: str, gate: list) -> None:
     with open(os.path.join(ART, "catch_fire", "gate_table.txt"), "w", encoding="utf-8") as handle:
         handle.write(table)
     print(table)
+
+
+def _line_glyphs(rgb: np.ndarray):
+    """White glyphs on the brightest text row of a crop."""
+    import cv2
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    # Solid vector ink only. A logo's midtones must not glue onto the last letter.
+    bright = (gray >= 230).astype(np.uint8)
+    rows = bright.sum(axis=1)
+    if int(rows.max()) < 8:
+        return [], gray
+    peak = int(np.argmax(rows))
+    limit = max(8, int(rows[peak] * 0.20))
+    y0 = peak
+    while y0 > 0 and int(rows[y0 - 1]) >= limit:
+        y0 -= 1
+    y1 = peak
+    while y1 < len(rows) - 1 and int(rows[y1 + 1]) >= limit:
+        y1 += 1
+    band = np.zeros_like(bright)
+    band[y0:y1 + 1] = bright[y0:y1 + 1]
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(band, 8)
+    parts = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 30:
+            continue
+        parts.append({
+            "x": int(stats[index, cv2.CC_STAT_LEFT]),
+            "y": int(stats[index, cv2.CC_STAT_TOP]),
+            "w": int(stats[index, cv2.CC_STAT_WIDTH]),
+            "h": int(stats[index, cv2.CC_STAT_HEIGHT]),
+            "area": area,
+            "pixels": labels == index,
+        })
+    parts.sort(key=lambda part: part["x"])
+    if len(parts) >= 4:
+        median_h = float(np.median([part["h"] for part in parts]))
+        parts = [part for part in parts if 0.55 * median_h <= part["h"] <= 1.45 * median_h]
+    return parts, gray
+
+
+def _glyph_hardness(gray: np.ndarray, part: dict) -> float:
+    values = gray[part["pixels"]]
+    return float((values > 240).sum()) / max(1.0, float((values > 180).sum()))
+
+
+def _glyph_stroke(part: dict) -> float:
+    import cv2
+
+    dist = cv2.distanceTransform(part["pixels"].astype(np.uint8), cv2.DIST_L2, 3)
+    return float(np.median(dist[part["pixels"]]))
+
+
+def _glyph_sharpness(gray: np.ndarray, part: dict) -> float:
+    """Edge gradient where the stroke meets the picture, not another bright mark.
+
+    The flame beside the last H is bright, so that shared edge is not a soft letter.
+    """
+    import cv2
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    ink = part["pixels"].astype(np.uint8)
+    edge = (cv2.dilate(ink, np.ones((3, 3), np.uint8)) > 0) & ~(cv2.erode(ink, np.ones((3, 3), np.uint8)) > 0)
+    if int(edge.sum()) < 4:
+        return 0.0
+    ring = (cv2.dilate(ink, np.ones((7, 7), np.uint8)) > 0) & ~part["pixels"]
+    if int(ring.sum()) < 4:
+        return 0.0
+    contrast = abs(float(np.median(gray[part["pixels"]])) - float(np.median(gray[ring])))
+    if contrast < 20.0:
+        return 0.0
+    # Divide by the local contrast so a letter on the flame's glow is not called soft.
+    return float(np.median(np.hypot(gx, gy)[edge])) / contrast
+
+
+def _check_church_glyphs(rgb: np.ndarray) -> None:
+    """Every letter in the church name matches the others. The final H is solid."""
+    from vector_trace import _glyph_iou
+
+    parts, gray = _line_glyphs(rgb)
+    check("church-glyph-count", len(parts) == 26, str(len(parts)))
+    if len(parts) != 26:
+        return
+    letters = "GREATERHARVESTFAMILYCHURCH"
+    hard = [_glyph_hardness(gray, part) for part in parts]
+    sharp = [_glyph_sharpness(gray, part) for part in parts]
+    stroke = [_glyph_stroke(part) for part in parts]
+    median_hard = float(np.median(hard))
+    median_sharp = float(np.median(sharp))
+    t_iou = _glyph_iou(parts[4]["pixels"], parts[13]["pixels"])
+    print(
+        f"GLYPHS T-iou {t_iou:.3f} T-h {parts[4]['h']}/{parts[13]['h']} "
+        f"T-stroke {stroke[4]:.2f}/{stroke[13]:.2f} "
+        f"H-hard {hard[25]:.3f} med {median_hard:.3f} "
+        f"H-sharp {sharp[25]:.1f} med {median_sharp:.1f}"
+    )
+    check("church-t-matches", t_iou >= 0.75, f"{t_iou:.3f}")
+    check(
+        "church-t-height",
+        abs(parts[4]["h"] - parts[13]["h"]) <= max(2, int(0.15 * parts[4]["h"])),
+        f"{parts[4]['h']} {parts[13]['h']}",
+    )
+    check("church-t-stroke", stroke[13] >= 0.75 * stroke[4], f"{stroke[13]:.2f} vs {stroke[4]:.2f}")
+    check("church-h-hard", hard[25] >= 0.82 and hard[25] >= 0.85 * median_hard, f"{hard[25]:.3f} med {median_hard:.3f}")
+    check("church-h-sharp", sharp[25] >= 0.75 * median_sharp, f"{sharp[25]:.1f} med {median_sharp:.1f}")
+    median_w = float(np.median([part["w"] for part in parts]))
+    words = [[0]]
+    for index in range(1, len(parts)):
+        gap = parts[index]["x"] - (parts[index - 1]["x"] + parts[index - 1]["w"])
+        if gap > 0.90 * median_w:
+            words.append([index])
+        else:
+            words[-1].append(index)
+    for group in words:
+        word = "".join(letters[index] for index in group)
+        lowest = min(hard[index] for index in group)
+        check("church-word-" + word, lowest >= 0.80, f"{lowest:.3f}")
+
+
+def _save_footer_crop(trim: np.ndarray, gate: list, ppm: float) -> None:
+    """600 dpi crop from the footer church name through the address."""
+    from PIL import Image
+
+    rows = [row for row in gate if float(row.get("y") or 0) >= 0.90 and row.get("boxMm")]
+    check("catch-footer-rows", len(rows) >= 3, str(len(rows)))
+    if len(rows) < 3:
+        return
+    boxes = [row["boxMm"] for row in rows]
+    pad_x = int(round(2.0 * ppm))
+    pad_y = int(round(2.5 * ppm))
+    x0 = max(0, int(np.floor(min(float(box[0]) for box in boxes) * ppm)) - pad_x)
+    y0 = max(0, int(np.floor(min(float(box[1]) for box in boxes) * ppm)) - pad_y)
+    x1 = min(trim.shape[1], int(np.ceil(max(float(box[0]) + float(box[2]) for box in boxes) * ppm)) + pad_x)
+    y1 = min(trim.shape[0], int(np.ceil(max(float(box[1]) + float(box[3]) for box in boxes) * ppm)) + pad_y)
+    crop = trim[y0:y1, x0:x1]
+    Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "footer_600.png"), dpi=(600, 600))
+    print(f"FOOTER CROP {crop.shape[1]}x{crop.shape[0]}")
 
 
 def test_large_block_join_is_soft() -> None:
@@ -801,6 +944,25 @@ def test_catch_fire_raster_is_traced() -> None:
     check("catch-vector-lines-match", bool(gate) and not vector_bad, str(vector_bad)[:500])
     stray = [row for row in gate if str(row.get("text") or "").strip() == "f" and row.get("mode") == "vector"]
     check("catch-small-glyph-stays-raster", not stray, str(stray)[:300])
+    # These rows disagree with OCR and must still be the untouched source pixels.
+    for label, key in (
+        ("f", "f"),
+        ("catch-fre", "CATCH-FRE"),
+        ("guest", "PGuest Spesker"),
+        ("hosts", "our Hosts"),
+    ):
+        hit = [row for row in gate if row.get("text") == key]
+        detail = str(hit)[:400]
+        check(
+            "catch-source-raster-" + label,
+            len(hit) == 1 and hit[0].get("mode") == "raster" and float(hit[0].get("ssim") or 0) >= 0.90,
+            detail,
+        )
+        if hit:
+            print(
+                f"SOURCE {key!r} mode={hit[0].get('mode')} ssim={float(hit[0].get('ssim') or 0):.3f} "
+                f"render={hit[0].get('render')!r}"
+            )
     # A closed counter or a fragment stays raster, and the render must still read the real letters.
     for phrase in ("9AM", "6PM", "11AM", "SANDILE", "GREATER HARVEST FAMILY CHURCH"):
         hit = [row for row in gate if row.get("text") == phrase]

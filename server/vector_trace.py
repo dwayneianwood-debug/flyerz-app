@@ -159,14 +159,29 @@ SOLID_HEIGHT_RATIO = 1.6
 SOLID_MIN = 0.72
 
 
-def drop_solid_blobs(mask: np.ndarray) -> np.ndarray:
+def drop_solid_blobs(mask: np.ndarray, gray: np.ndarray | None = None) -> np.ndarray:
     """Keep a near-solid blob that towers over the letters out of the trace.
 
-    The blob stays in the picture. The letters around it are still traced.
-    A line of similar letters is left unchanged.
+    A letter stuck to that blob, such as the H against the flame, stays in
+    the mask when it sits in the letter band and is about one letter wide.
+    The rest of the blob stays in the picture. A line of similar letters is
+    left unchanged.
     """
+    cleaned, _halo = split_solid_blobs(mask, gray)
+    return cleaned
+
+
+def split_solid_blobs(mask: np.ndarray, gray: np.ndarray | None = None):
+    """Drop a tall solid blob. Return the letter mask and a halo to inpaint.
+
+    The halo is only the letter that was cut off the blob, plus a few pixels,
+    so the flame itself stays in the picture.
+    """
+    empty = np.zeros((1, 1), np.uint8) if mask is None else np.zeros(mask.shape[:2], np.uint8)
     if mask is None or int(mask.max()) == 0:
-        return mask
+        return mask, empty
+    if gray is not None and gray.shape[:2] != mask.shape[:2]:
+        gray = None
     binary = (mask > 0).astype(np.uint8)
     count, labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
     parts = []
@@ -176,25 +191,361 @@ def drop_solid_blobs(mask: np.ndarray) -> np.ndarray:
             continue
         width = int(stats[index, cv2.CC_STAT_WIDTH])
         height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        top = int(stats[index, cv2.CC_STAT_TOP])
         solidity = area / float(max(1, width * height))
-        parts.append((index, height, solidity))
+        parts.append((index, height, width, top, solidity))
     if len(parts) < 4:
-        return mask
-    median = float(np.median([height for _index, height, _solidity in parts]))
-    if median < 8.0:
-        return mask
+        return mask, empty
+    median = float(np.median([height for _index, height, _width, _top, _solidity in parts]))
+    median_w = float(np.median([width for _index, _height, width, _top, _solidity in parts]))
+    if median < 8.0 or median_w < 4.0:
+        return mask, empty
     drop = [
-        index for index, height, solidity in parts
+        index for index, height, _width, _top, solidity in parts
         if height >= SOLID_HEIGHT_RATIO * median and solidity >= SOLID_MIN
     ]
     if not drop:
-        return mask
+        return mask, empty
+    band_parts = [item for item in parts if item[0] not in drop and item[1] <= 1.35 * median]
+    if band_parts:
+        y0 = int(np.percentile([item[3] for item in band_parts], 25)) - 1
+        y1 = int(np.percentile([item[3] + item[1] for item in band_parts], 75)) + 1
+    else:
+        y0, y1 = 0, mask.shape[0]
+    light = True
+    if gray is not None and band_parts:
+        kept = np.zeros(mask.shape[:2], np.bool_)
+        for index, _height, _width, _top, _solidity in band_parts:
+            kept |= labels == index
+        if int(kept.sum()) > 20:
+            light = float(np.median(gray[kept])) >= float(np.median(gray))
     cleaned = mask.copy()
+    salvaged = np.zeros(mask.shape[:2], np.uint8)
     for index in drop:
-        cleaned[labels == index] = 0
+        component = labels == index
+        cleaned[component] = 0
+        band = np.zeros(mask.shape[:2], np.uint8)
+        y_lo = max(0, y0)
+        y_hi = min(mask.shape[0], y1)
+        if y_hi - y_lo < 4:
+            continue
+        band[y_lo:y_hi][component[y_lo:y_hi]] = 255
+        sub_count, sub_labels, sub_stats, _sub = cv2.connectedComponentsWithStats(band, 8)
+        kept_slice = False
+        for sub in range(1, sub_count):
+            area = int(sub_stats[sub, cv2.CC_STAT_AREA])
+            width = int(sub_stats[sub, cv2.CC_STAT_WIDTH])
+            height = int(sub_stats[sub, cv2.CC_STAT_HEIGHT])
+            if not _letter_sized(area, width, height, median, median_w):
+                continue
+            cleaned[sub_labels == sub] = 255
+            salvaged[sub_labels == sub] = 255
+            kept_slice = True
+        if kept_slice or gray is None:
+            continue
+        core = _bright_core(gray, component, y_lo, y_hi, median, median_w, light)
+        # Only a core that matches another letter. A bright piece of the logo does not.
+        if core is None or not _matches_letter(core, cleaned, median, median_w):
+            continue
+        cleaned[core > 0] = 255
+        salvaged[core > 0] = 255
     if int(cleaned.max()) == 0:
-        return mask
-    return cleaned
+        return mask, empty
+    halo = _halo_of(salvaged, cleaned)
+    return cleaned, halo
+
+
+def _letter_sized(area: int, width: int, height: int, median_h: float, median_w: float) -> bool:
+    if area < 20:
+        return False
+    if height < 0.65 * median_h or height > 1.35 * median_h:
+        return False
+    if width < 0.22 * median_w or width > 1.7 * median_w:
+        return False
+    return True
+
+
+def _bright_core(gray, blob, y0, y1, median_h, median_w, light: bool):
+    """The letter welded to a logo is the bright (or dark) core of that blob.
+
+    The join is dimmer than the stroke, so a local threshold splits them.
+    The core whose area is closest to a normal letter is the one kept.
+    """
+    band = np.zeros(blob.shape, np.bool_)
+    band[y0:y1] = blob[y0:y1]
+    if int(band.sum()) < 30:
+        return None
+    tones = gray[band]
+    lo = float(np.percentile(tones, 15))
+    hi = float(np.percentile(tones, 90))
+    if hi - lo < 28.0:
+        return None
+    target = 0.62 * median_h * median_w
+    best_score = -1e9
+    best = None
+    if light:
+        levels = range(int(min(248, round(hi))), int(lo + 0.40 * (hi - lo)), -4)
+        def selected(level):
+            return gray >= level
+    else:
+        levels = range(int(max(8, round(lo))), int(hi - 0.40 * (hi - lo)), 4)
+        def selected(level):
+            return gray <= level
+    for level in levels:
+        binary = (selected(level) & band).astype(np.uint8) * 255
+        sub_count, sub_labels, sub_stats, _sub = cv2.connectedComponentsWithStats(binary, 8)
+        for sub in range(1, sub_count):
+            area = int(sub_stats[sub, cv2.CC_STAT_AREA])
+            width = int(sub_stats[sub, cv2.CC_STAT_WIDTH])
+            height = int(sub_stats[sub, cv2.CC_STAT_HEIGHT])
+            if not _letter_sized(area, width, height, median_h, median_w):
+                continue
+            solidity = area / float(max(1, width * height))
+            if solidity < 0.35:
+                continue
+            score = -abs(area - target) / max(1.0, target) + 0.2 * solidity - 0.6 * _sparse_rows(sub_labels == sub)
+            if score > best_score:
+                best_score = score
+                best = sub_labels == sub
+    if best is None:
+        return None
+    out = np.zeros(gray.shape[:2], np.uint8)
+    out[best] = 255
+    return out
+
+
+def _matches_letter(core: np.ndarray, cleaned: np.ndarray, median_h: float, median_w: float) -> bool:
+    """True when the recovered core is the same shape as a letter already on the line."""
+    pieces = _components(core, 20)
+    others = [
+        part for part in _components(cleaned, 20)
+        if _letter_sized(part["area"], part["w"], part["h"], median_h, median_w)
+    ]
+    if not pieces or not others:
+        return False
+    for piece in pieces:
+        for other in others:
+            if _glyph_iou(piece["pixels"], other["pixels"]) >= 0.70:
+                return True
+    return False
+
+
+def _sparse_rows(pixels) -> float:
+    ys, xs = np.where(pixels)
+    if ys.size < 8:
+        return 1.0
+    crop = pixels[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1]
+    widths = crop.sum(axis=1).astype(np.float32)
+    wide = float(widths.max())
+    if wide < 1.0:
+        return 1.0
+    return float((widths < 0.25 * wide).mean())
+
+
+def _halo_of(salvaged: np.ndarray, cleaned: np.ndarray) -> np.ndarray:
+    """A few pixels around a recovered letter, without swallowing its neighbours."""
+    if salvaged is None or int(salvaged.max()) == 0:
+        return np.zeros(cleaned.shape[:2], np.uint8)
+    halo = cv2.dilate(salvaged, np.ones((7, 7), np.uint8))
+    other = (cleaned > 0) & (salvaged == 0)
+    if int(other.sum()) > 0:
+        near = cv2.dilate(other.astype(np.uint8), np.ones((3, 3), np.uint8))
+        halo[near > 0] = 0
+        halo[salvaged > 0] = 255
+    return halo
+
+
+# A repeated letter that does not match its sibling, and is taller or shorter
+# than the line, is rebuilt from that sibling. Below this, body copy is left
+# alone: its glyphs are too small for a shape compare to be meaningful.
+GLYPH_MIN_H = 16.0
+GLYPH_IOU_MIN = 0.72
+
+
+def harmonise_pending(pending: list) -> None:
+    """Make every glyph in a display line match the other copies of that letter.
+
+    A spur on one T is replaced with the clean T from the same line, or from
+    another line of the same artwork. A word that still contains a broken
+    glyph and has no sibling is left entirely as pixels.
+    """
+    prepared = []
+    donors = {}
+    for item in pending:
+        rec = _line_glyphs(item)
+        prepared.append(rec)
+        if rec is None:
+            continue
+        halo = item.get("clear")
+        for index, part in enumerate(rec["parts"]):
+            # A letter cut off a logo is not a donor. Its counter can still hold the logo.
+            if _halo_hit(part, halo):
+                continue
+            if not _glyph_clean(part, rec["median_h"], rec["median_top"]):
+                continue
+            donors.setdefault(rec["letters"][index], []).append((rec, part))
+    for item, rec in zip(pending, prepared):
+        if rec is None:
+            continue
+        halo = item.get("clear")
+        replacements = {}
+        for index, part in enumerate(rec["parts"]):
+            welded = _halo_hit(part, halo)
+            # A spurred letter is only a little taller than the line. A component
+            # twice as tall is a different object and must not be rebuilt.
+            modest = (
+                not _glyph_clean(part, rec["median_h"], rec["median_top"])
+                and 0.70 * rec["median_h"] <= part["h"] <= 1.35 * rec["median_h"]
+            )
+            if not welded and not modest:
+                continue
+            donor = _sibling_donor(donors.get(rec["letters"][index], []), rec, part)
+            if donor is None:
+                continue
+            limit = 0.94 if welded else GLYPH_IOU_MIN
+            if _glyph_iou(part["pixels"], donor["pixels"]) >= limit:
+                continue
+            replacements[index] = donor
+        severe = []
+        for index, part in enumerate(rec["parts"]):
+            if index in replacements:
+                continue
+            if part["h"] > 1.45 * rec["median_h"] or part["w"] > 2.2 * rec["median_w"]:
+                severe.append(index)
+        cleared = set()
+        if severe:
+            for group in _word_groups(rec["parts"], rec["median_w"]):
+                if any(index in severe for index in group):
+                    cleared.update(group)
+        if not replacements and not cleared:
+            continue
+        updated = np.zeros(item["mask"].shape[:2], np.uint8)
+        clear = item.get("clear")
+        if clear is None or clear.shape[:2] != item["mask"].shape[:2]:
+            clear = np.zeros(item["mask"].shape[:2], np.uint8)
+        else:
+            clear = clear.copy()
+        for index, part in enumerate(rec["parts"]):
+            if index in cleared:
+                continue
+            if index in replacements:
+                stamped = _place_glyph(
+                    replacements[index]["pixels"], part, rec["median_h"], rec["median_top"], updated.shape,
+                )
+                updated[stamped] = 255
+                clear[cv2.dilate(part["pixels"].astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = 255
+                continue
+            updated[part["pixels"]] = 255
+        if int(updated.max()) == 0:
+            # The whole line was unusable. Leave the picture untouched.
+            item["mask"] = np.zeros(item["mask"].shape[:2], np.uint8)
+            item["clear"] = np.zeros(item["mask"].shape[:2], np.uint8)
+            continue
+        item["mask"] = updated
+        item["clear"] = clear
+
+
+def _line_glyphs(item: dict):
+    parts = _components(item.get("mask"), 20)
+    if len(parts) < 4:
+        return None
+    median_h = float(np.median([part["h"] for part in parts]))
+    median_w = float(np.median([part["w"] for part in parts]))
+    if median_h < GLYPH_MIN_H or median_w < 4.0:
+        return None
+    letters = [ch for ch in str(item.get("text") or "").upper() if ch.isalnum()]
+    if len(letters) != len(parts):
+        return None
+    return {
+        "parts": parts,
+        "letters": letters,
+        "median_h": median_h,
+        "median_w": median_w,
+        "median_top": float(np.median([part["y"] for part in parts])),
+    }
+
+
+def _glyph_clean(part: dict, median_h: float, median_top: float) -> bool:
+    return (
+        abs(part["h"] - median_h) <= max(2.0, 0.08 * median_h)
+        and abs(part["y"] - median_top) <= 2.0
+    )
+
+
+def _halo_hit(part: dict, halo) -> bool:
+    """True when this glyph is one that was cut out of a tall logo."""
+    if halo is None or getattr(halo, "shape", None) is None:
+        return False
+    if halo.shape[:2] != part["pixels"].shape[:2] or int(halo.max()) == 0:
+        return False
+    overlap = int(np.count_nonzero(part["pixels"] & (halo > 0)))
+    return overlap >= max(8, int(0.50 * part["area"]))
+
+
+def _sibling_donor(candidates, rec, part):
+    """The cleanest copy of this letter. The same line wins a tie, then the footer."""
+    pool = []
+    for owner, donor in candidates:
+        if donor["pixels"] is part["pixels"]:
+            continue
+        pool.append((owner is rec, donor))
+    if not pool:
+        return None
+    return min(
+        pool,
+        key=lambda item: (_sparse_rows(item[1]["pixels"]), 0 if item[0] else 1, abs(item[1]["h"] - rec["median_h"])),
+    )[1]
+
+
+def _word_groups(parts: list, median_w: float) -> list:
+    groups = [[0]]
+    for index in range(1, len(parts)):
+        gap = parts[index]["x"] - (parts[index - 1]["x"] + parts[index - 1]["w"])
+        if gap > 0.90 * median_w:
+            groups.append([index])
+        else:
+            groups[-1].append(index)
+    return groups
+
+
+def _glyph_iou(left, right) -> float:
+    """IoU after the two glyphs are scaled to the same box."""
+    def tight(pixels):
+        ys, xs = np.where(pixels)
+        if ys.size == 0:
+            return None
+        return pixels[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1]
+
+    a = tight(left)
+    b = tight(right)
+    if a is None or b is None:
+        return 0.0
+    b = cv2.resize(b.astype(np.uint8), (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
+    inter = np.count_nonzero(a & (b > 0))
+    union = np.count_nonzero(a | (b > 0))
+    if union == 0:
+        return 1.0
+    return float(inter) / float(union)
+
+
+def _place_glyph(donor_pixels, target: dict, median_h: float, median_top: float, shape) -> np.ndarray:
+    """Stamp a clean sibling on the line's cap-height, centred on the bad glyph."""
+    ys, xs = np.where(donor_pixels)
+    canvas = np.zeros(shape[:2], np.bool_)
+    if ys.size == 0:
+        return canvas
+    tight = donor_pixels[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1].astype(np.uint8)
+    new_h = max(1, int(round(median_h)))
+    new_w = max(1, int(round(tight.shape[1] * (new_h / float(max(1, tight.shape[0]))))))
+    scaled = cv2.resize(tight, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    left = int(round(target["x"] + target["w"] * 0.5 - new_w / 2.0))
+    top = int(round(median_top))
+    y0, x0 = max(0, top), max(0, left)
+    y1, x1 = min(shape[0], top + new_h), min(shape[1], left + new_w)
+    if y1 <= y0 or x1 <= x0:
+        return canvas
+    canvas[y0:y1, x0:x1] = scaled[y0 - top:y0 - top + (y1 - y0), x0 - left:x0 - left + (x1 - x0)] > 0
+    return canvas
 
 
 def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
@@ -548,6 +899,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     drawn = []
     raster_lines = []
     choke = np.zeros(plate.shape[:2], np.uint8)
+    clear = np.zeros(plate.shape[:2], np.uint8)
     height, width = plate.shape[:2]
     pending = []
     for block in blocks or []:
@@ -585,8 +937,9 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
             continue
-        # A logo in the same box is not a letter. Leave it as pixels.
-        mask = drop_solid_blobs(mask)
+        # A logo in the same box is not a letter. A letter touching it stays.
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        mask, halo = split_solid_blobs(mask, gray)
         mask, colour = refine_ink(crop, mask)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
@@ -601,7 +954,9 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "bottom": bottom,
             "crop": crop,
             "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
+            "clear": halo,
         })
+    harmonise_pending(pending)
     traced = _trace_many([item["mask"] for item in pending])
     for item, paths in zip(pending, traced):
         text = item["text"]
@@ -628,7 +983,14 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "rect": (left, top, right - left, bottom - top),
         })
         choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
+        extra = item.get("clear")
+        if extra is not None and extra.shape[:2] == mask.shape[:2] and int(extra.max()) > 0:
+            clear[top:bottom, left:right] = cv2.bitwise_or(clear[top:bottom, left:right], extra)
     pristine = plate.copy() if drawn else None
+    if int(clear.max()) > 0:
+        # The old spur or the soft letter under a rebuilt glyph is removed
+        # outright. A 1px choke would leave that shape sitting beside the vector.
+        plate[:] = cv2.inpaint(plate, clear, 3, cv2.INPAINT_TELEA)
     if int(choke.max()) > 0:
         plate[:] = sharpen_background(plate, choke)
         choke_ink(plate, choke, CHOKE_PX)
@@ -1080,6 +1442,129 @@ def _readings_for_boxes(texts: list, boxes: list, rows, width: int, height: int)
     ]
 
 
+def _vector_glyphs_disagree(render_bgr: np.ndarray, text: str) -> bool:
+    """True when one vector glyph does not belong with the others in its line.
+
+    A soft letter beside hard ones is still the photograph. A letter that is
+    taller than the same character elsewhere in the line is a bad trace.
+    Small body copy is not judged this way.
+    """
+    if render_bgr is None or getattr(render_bgr, "ndim", 0) != 3:
+        return False
+    if render_bgr.shape[0] < 8 or render_bgr.shape[1] < 8:
+        return False
+    gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+    ink = _display_ink(gray)
+    if ink is None:
+        return False
+    ink = _text_band(ink)
+    parts = [part for part in _components(ink, 12) if part["h"] >= 8]
+    if len(parts) < 4:
+        return False
+    median_h = float(np.median([part["h"] for part in parts]))
+    if median_h < GLYPH_MIN_H:
+        return False
+    # A logo in the same crop is taller than the letters. It is not a glyph.
+    sig = [part for part in parts if 0.62 * median_h <= part["h"] <= 1.35 * median_h]
+    if len(sig) < 4:
+        return False
+    hard = [_glyph_hardness(gray, part) for part in sig]
+    median_hard = float(np.median(hard))
+    if median_hard >= 0.85 and any(value < 0.75 for value in hard):
+        return True
+    sharp = [_glyph_sharpness(gray, part) for part in sig]
+    median_sharp = float(np.median(sharp))
+    # Sharpness only confirms a soft stroke. Dark body copy is not judged on it.
+    if median_hard >= 0.85 and median_sharp >= 40.0:
+        for value, hardness in zip(sharp, hard):
+            if value < 0.55 * median_sharp and hardness < 0.80:
+                return True
+    letters = [ch for ch in str(text or "").upper() if ch.isalnum()]
+    if len(letters) != len(sig):
+        return False
+    groups = {}
+    for index, ch in enumerate(letters):
+        groups.setdefault(ch, []).append(sig[index])
+    median_top = float(np.median([part["y"] for part in sig]))
+    for glyphs in groups.values():
+        if len(glyphs) < 2:
+            continue
+        donor = min(glyphs, key=lambda part: (abs(part["h"] - median_h), abs(part["y"] - median_top)))
+        for glyph in glyphs:
+            if glyph is donor:
+                continue
+            if abs(glyph["h"] - donor["h"]) <= max(2.0, 0.10 * median_h):
+                continue
+            if _glyph_iou(glyph["pixels"], donor["pixels"]) < 0.70:
+                return True
+    return False
+
+
+def _text_band(ink: np.ndarray) -> np.ndarray:
+    """Keep the row the letters sit on. A face or logo outside that row is not a glyph."""
+    rows = (ink > 0).sum(axis=1)
+    if int(rows.max()) < 4:
+        return ink
+    peak = int(np.argmax(rows))
+    limit = max(3, int(rows[peak] * 0.25))
+    y0 = peak
+    while y0 > 0 and int(rows[y0 - 1]) >= limit:
+        y0 -= 1
+    y1 = peak + 1
+    while y1 < len(rows) and int(rows[y1]) >= limit:
+        y1 += 1
+    y0 = max(0, y0 - 1)
+    y1 = min(len(rows), y1 + 1)
+    band = np.zeros_like(ink)
+    band[y0:y1] = ink[y0:y1]
+    return band
+
+
+def _display_ink(gray: np.ndarray):
+    """Ink mask for a rendered line. None when the crop is not a text line."""
+    _threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink = binary > 0
+    border = np.zeros(ink.shape, np.bool_)
+    border[:2, :] = True
+    border[-2:, :] = True
+    border[:, :2] = True
+    border[:, -2:] = True
+    if int(border.sum()) > 0 and float(ink[border].mean()) > 0.5:
+        ink = ~ink
+    # A light letter is the solid core. Midtones belong to a logo or a blur
+    # and would glue that logo onto the last glyph.
+    if int(ink.sum()) > 20 and float(np.median(gray[ink])) >= 160.0:
+        ink = ink & (gray >= 220)
+    fraction = float(ink.mean())
+    if fraction < 0.02 or fraction > 0.55:
+        return None
+    return ink.astype(np.uint8) * 255
+
+
+def _glyph_hardness(gray: np.ndarray, part: dict) -> float:
+    """Share of the stroke that is as solid as the ink, not a soft fringe."""
+    values = gray[part["pixels"]]
+    if values.size < 4:
+        return 0.0
+    if float(np.median(values)) >= 140.0:
+        solid = float((values > 240).sum())
+        body = float((values > 180).sum())
+    else:
+        solid = float((values < 20).sum())
+        body = float((values < 80).sum())
+    return solid / max(1.0, body)
+
+
+def _glyph_sharpness(gray: np.ndarray, part: dict) -> float:
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.dilate(part["pixels"].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    edge &= ~(cv2.erode(part["pixels"].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
+    if int(edge.sum()) < 4:
+        return 0.0
+    return float(np.median(np.hypot(gx, gy)[edge]))
+
+
 def _score_pair(source_bgr: np.ndarray, render_bgr: np.ndarray, source_text: str, render_text: str) -> dict:
     source_bgr = _match_scale(source_bgr, render_bgr)
     ssim = _ssim_luma(source_bgr, render_bgr)
@@ -1124,6 +1609,12 @@ def _measure_boxes(blocks, drawn, trim, plate_image, plate_shape, source_shape, 
         render = trim[:0, :0] if box is None else trim[box[1]:box[3], box[0]:box[2]]
         source = _plate_crop(plate_image, rect)
         score = _score_pair(source, render, text, render_text)
+        # A vector line whose glyphs do not match each other is put back.
+        # The check is not applied to raster, so the source pixels can still pass.
+        glyph_fail = bool(vector and _vector_glyphs_disagree(render, text))
+        if glyph_fail:
+            score["pixelFail"] = True
+            score["ok"] = False
         # 9AM traced as 8AM is the same length and a different word. A merged
         # neighbour (OCT OCT) is not: that string is longer, and it is split above.
         same_length = bool(

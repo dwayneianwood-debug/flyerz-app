@@ -16,6 +16,7 @@ from vector_trace import (
     choke_ink,
     drop_solid_blobs,
     glyphs_agree,
+    harmonise_pending,
     ink_colour,
     is_lettering,
     mask_iou,
@@ -26,11 +27,14 @@ from vector_trace import (
     sharpen_background,
     trace_fitted,
     trace_mask,
+    _components,
     _edge_clipped,
+    _glyph_iou,
     _novel_white_block,
     _readings_for_boxes,
     _ssim_luma,
     _texts_equal,
+    _vector_glyphs_disagree,
     _trace_fill,
 )
 
@@ -258,6 +262,80 @@ def test_solid_logo_is_not_traced() -> None:
     check("letters-pass-shape", shape_gate(crop, letters, letters, (0, 0, 320, 90)) == "")
 
 
+def test_letter_welded_to_a_logo_is_kept() -> None:
+    """The H touching the flame stays. The flame does not."""
+    mask = np.zeros((90, 420), np.uint8)
+    gray = np.full((90, 420), 30, np.uint8)
+    for x in range(8, 280, 26):
+        mask[30:58, x:x + 14] = 255
+        gray[30:58, x:x + 14] = 245
+    mask[4:86, 340:400] = 255
+    gray[4:86, 340:400] = 140
+    mask[30:58, 328:342] = 255
+    gray[30:58, 328:342] = 245
+    cleaned = drop_solid_blobs(mask, gray)
+    check("flame-stays-out", int(cleaned[4:22, 360:398].max()) == 0, str(int(cleaned[4:22, 360:398].sum())))
+    check("welded-letter-kept", int(cleaned[34:54, 328:340].max()) == 255)
+
+
+def _paint_t(mask: np.ndarray, x: int, y: int, spur: bool = False) -> None:
+    mask[y:y + 6, x:x + 18] = 255
+    mask[y:y + 28, x + 7:x + 11] = 255
+    if spur:
+        mask[y - 6:y + 1, x + 8:x + 10] = 255
+        mask[y + 4:y + 16, x + 16:x + 22] = 255
+
+
+def test_a_bad_glyph_is_rebuilt_from_its_sibling() -> None:
+    """A spurred T becomes the clean T. A word that cannot be repaired is all raster."""
+    mask = np.zeros((52, 240), np.uint8)
+    _paint_t(mask, 6, 12)
+    mask[12:40, 40:46] = 255
+    mask[12:40, 56:62] = 255
+    mask[24:30, 40:62] = 255
+    mask[12:40, 78:96] = 255
+    mask[12:18, 78:94] = 255
+    mask[24:30, 78:92] = 255
+    mask[34:40, 78:94] = 255
+    _paint_t(mask, 120, 8, spur=True)
+    item = {"text": "THET", "mask": mask, "clear": np.zeros_like(mask)}
+    harmonise_pending([item])
+    parts = _components(item["mask"], 20)
+    check("sibling-count", len(parts) == 4, str(len(parts)))
+    if len(parts) == 4:
+        check("sibling-t", _glyph_iou(parts[0]["pixels"], parts[3]["pixels"]) >= 0.9, f"{_glyph_iou(parts[0]['pixels'], parts[3]['pixels']):.3f}")
+        check("sibling-height", abs(parts[0]["h"] - parts[3]["h"]) <= 2, f"{parts[0]['h']} {parts[3]['h']}")
+    check("spur-cleared", int(item["clear"].max()) > 0)
+
+    broken = np.zeros((80, 280), np.uint8)
+    for x in (4, 18, 32, 46, 100, 114, 142):
+        broken[20:44, x:x + 12] = 255
+    broken[2:70, 128:140] = 255
+    word = {"text": "ABCDEFGH", "mask": broken, "clear": np.zeros_like(broken)}
+    harmonise_pending([word])
+    kept = _components(word["mask"], 20)
+    check("broken-word-dropped", len(kept) == 4, str([(part["x"], part["h"]) for part in kept]))
+    check("other-word-kept", kept and kept[0]["x"] < 30 and kept[-1]["x"] < 90, str([part["x"] for part in kept]))
+
+
+def test_vector_line_flags_a_soft_glyph() -> None:
+    """A blurred letter beside solid ones fails. Matching letters, and small type, do not."""
+    solid = np.full((48, 230, 3), 24, np.uint8)
+    for x in range(8, 190, 36):
+        solid[8:36, x:x + 18] = 250
+    check("even-glyphs", _vector_glyphs_disagree(solid, "AAAAA") is False)
+    mixed = solid.copy()
+    soft = np.full_like(solid, 24)
+    soft[8:36, 188:206] = 250
+    soft = cv2.GaussianBlur(soft, (0, 0), 2.8)
+    mixed[:, 180:] = soft[:, 180:]
+    check("soft-glyph", _vector_glyphs_disagree(mixed, "AAAAAA") is True)
+    tiny = np.full((16, 90, 3), 24, np.uint8)
+    for x in range(2, 80, 16):
+        tiny[4:12, x:x + 8] = 250
+    check("small-type-skipped", _vector_glyphs_disagree(tiny, "AAAAA") is False)
+
+
 def test_gate_is_exact_and_sees_a_white_block() -> None:
     """CHURC is not CHURCH. A new white rectangle is a failed box. A halo is not."""
     full = "GREATER HARVEST FAMILY CHURCH"
@@ -408,6 +486,9 @@ def main() -> None:
     test_rebuild_defaults_to_trace()
     test_closed_counter_stays_raster()
     test_solid_logo_is_not_traced()
+    test_letter_welded_to_a_logo_is_kept()
+    test_a_bad_glyph_is_rebuilt_from_its_sibling()
+    test_vector_line_flags_a_soft_glyph()
     test_gate_is_exact_and_sees_a_white_block()
     test_glyphs_reject_a_changed_letter()
     test_paths_and_local_plate()
