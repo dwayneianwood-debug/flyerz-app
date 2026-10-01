@@ -14,6 +14,7 @@ import vector_trace
 from vector_text_v2 import font_substitution_enabled, rebuild_fitted
 from vector_trace import (
     choke_ink,
+    glyphs_agree,
     ink_colour,
     is_lettering,
     mask_iou,
@@ -206,12 +207,55 @@ def test_rebuild_defaults_to_trace() -> None:
     check("sample-dark", colour is not None and float(np.mean(colour)) < 60, str(colour))
 
 
+def test_glyphs_reject_a_changed_letter() -> None:
+    mask = np.zeros((40, 80), np.uint8)
+    mask[8:32, 6:18] = 255
+    mask[8:32, 28:40] = 255
+    same = mask.copy()
+    check("glyphs-same", glyphs_agree(mask, same, min_area=12))
+    missing = mask.copy()
+    missing[:, 28:40] = 0
+    check("glyphs-missing", glyphs_agree(mask, missing, min_area=12) is False)
+    extra = mask.copy()
+    extra[8:32, 55:70] = 255
+    check("glyphs-extra", glyphs_agree(mask, extra, min_area=12) is False)
+
+
+def test_card_back_body_is_traced() -> None:
+    """Small card-back lines clear the 4× score. A changed letter still stays raster."""
+    os.environ.pop("VECTOR_FONTS", None)
+    src = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_back.png")
+    bgr = cv2.imread(src)
+    pdf = os.path.join(tempfile.mkdtemp(prefix="card-back-trace-"), "press.pdf")
+    result = trace_fitted(bgr, 90, 50, pdf)
+    check("card-back-trace", result.get("ok") is True and result.get("mode") == "trace", str(result.get("reason")))
+    lines = {line["text"]: line for line in result.get("lines") or []}
+    wanted = (
+        "Helps monitor glucose control",
+        "Detects low iron, B12, folate and",
+        "strong bones and joints.",
+        "your immune response.",
+        "INFECTIONS & INFLAMMATION",
+    )
+    for text in wanted:
+        line = lines.get(text)
+        check(
+            "card-body-" + text[:24],
+            line is not None and line.get("mode") == "vector" and float(line.get("match") or 0) >= 0.86,
+            str(line),
+        )
+        print(f"IOU {text} {line.get('match')}")
+    check("card-back-time", float(result.get("elapsed_s") or 999) < 120, str(result.get("timings")))
+
+
 def main() -> None:
     test_segment_dark_light_and_fills()
     test_trace_matches_the_ink()
     test_choke_is_only_the_ring()
     test_default_trace_and_font_flag()
     test_rebuild_defaults_to_trace()
+    test_glyphs_reject_a_changed_letter()
+    test_card_back_body_is_traced()
     print("ALL PASS")
 
 

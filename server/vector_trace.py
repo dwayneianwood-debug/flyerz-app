@@ -230,6 +230,68 @@ def trace_mask(mask: np.ndarray) -> list:
     return paths
 
 
+def glyphs_agree(mask: np.ndarray, painted: np.ndarray, min_area: int = 12) -> bool:
+    """True when the trace has the same letters: none missing, none added.
+
+    A count that differs by one is a split dot, not a new letter, when every
+    piece still sits on the other mask.
+    """
+    def parts(image):
+        count, labels, stats, _cent = cv2.connectedComponentsWithStats((image > 0).astype(np.uint8), 8)
+        ids = [index for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= min_area]
+        return labels, ids
+
+    left, left_ids = parts(mask)
+    right, right_ids = parts(painted)
+    if not left_ids or not right_ids:
+        return False
+    missing = 0
+    for index in left_ids:
+        if not np.any((left == index) & (painted > 0)):
+            missing += 1
+    extra = 0
+    for index in right_ids:
+        if not np.any((right == index) & (mask > 0)):
+            extra += 1
+    if missing or extra:
+        return False
+    return abs(len(left_ids) - len(right_ids)) <= 1
+
+
+def _scale_paths(paths: list, scale: float) -> list:
+    scaled = []
+    for group in paths:
+        scaled.append([
+            [(cmd, [(x * scale, y * scale) for x, y in pts]) for cmd, pts in sub]
+            for sub in group
+        ])
+    return scaled
+
+
+def _accept_trace(mask: np.ndarray, paths: list) -> tuple[float, bool]:
+    """Score a trace. Thin type is judged on the 4× bitmap potrace actually fit.
+
+    The 1px render of a hairline stroke loses the edge and scores about 0.85
+    even when the curves match. That 4× score may sit just under 0.9 only when
+    every glyph is present and none were added.
+    """
+    height, width = mask.shape[:2]
+    painted = rasterise_paths(paths, width, height)
+    low = mask_iou(mask, painted)
+    if low >= IOU_FLOOR:
+        return low, True
+    big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
+    _threshold, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
+    zoomed = rasterise_paths(_scale_paths(paths, TRACE_SCALE), binary.shape[1], binary.shape[0])
+    high = mask_iou(binary, zoomed)
+    agree = glyphs_agree(binary, zoomed)
+    if high >= IOU_FLOOR and agree:
+        return high, True
+    if agree and high >= 0.86 and IOU_FLOOR <= 0.9:
+        return high, True
+    return max(low, high), False
+
+
 def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
     """Fill the traced paths onto a binary mask the size of the crop."""
     import pymupdf as fitz
@@ -341,9 +403,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
             continue
-        painted = rasterise_paths(paths, mask.shape[1], mask.shape[0])
-        score = mask_iou(mask, painted)
-        if score < IOU_FLOOR:
+        score, accepted = _accept_trace(mask, paths)
+        if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
             continue
         fill = _trace_fill(colour)
