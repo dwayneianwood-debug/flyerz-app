@@ -622,6 +622,9 @@ def test_a_line_is_not_half_traced() -> None:
     kept_column = _keep_uniform(column, [], unread)
     column_texts = [item["text"] for item in kept_column]
     check("unread-keeps-the-row-above", column_texts == ["9"], str(column_texts))
+    from vector_trace import _same_line
+    check("tall-word-not-the-column", _same_line((281, 332, 566, 227), (1008, 380, 294, 50)) is False)
+    check("words-on-one-line", _same_line((10, 40, 80, 20), (100, 40, 110, 20)) is True)
 
 
 def test_card_back_body_is_traced() -> None:

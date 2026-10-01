@@ -1320,7 +1320,9 @@ def _same_line(left, right) -> bool:
     overlap = _vertical_overlap(left, right)
     if overlap < 0.55 * min(left[3], right[3]):
         return False
-    return _horizontal_gap(left, right) < 1.4 * max(left[3], right[3])
+    # The gap is judged against the shorter line. A tall word must not swallow
+    # the column sitting beside it.
+    return _horizontal_gap(left, right) < 1.4 * min(left[3], right[3])
 
 
 def _same_paragraph(above, below) -> bool:
@@ -2820,8 +2822,74 @@ def _pack_render_strip_column(crops: list, slot_h: int, max_edge: int) -> tuple[
     return _trim_strip(canvas, rects)
 
 
+def _slot_reading(parsed, rect) -> str:
+    if rect is None:
+        return ""
+    x0, y0, x1, y1 = rect
+    hits = []
+    for rx0, ry0, rx1, ry1, text in parsed:
+        cx = (rx0 + rx1) * 0.5
+        cy = (ry0 + ry1) * 0.5
+        if not (x0 <= cx <= x1 and y0 <= cy <= y1):
+            continue
+        area = max(1.0, (rx1 - rx0) * (ry1 - ry0))
+        overlap = max(0.0, min(x1, rx1) - max(x0, rx0)) * max(0.0, min(y1, ry1) - max(y0, ry0))
+        # A detection that spills into the next slot is not this line.
+        if overlap / area < 0.55:
+            continue
+        hits.append((rx0, text))
+    hits.sort(key=lambda item: item[0])
+    return _norm_text(" ".join(text for _x, text in hits))
+
+
+def _reread_empty_slots(strip: np.ndarray, rects: list, readings: list) -> None:
+    """A line the strip skipped is read on its own. A still-empty read is not a match."""
+    from vector_text_v2 import read_blocks
+
+    blanks = [index for index, text in enumerate(readings) if text == "" and rects[index] is not None]
+    if not blanks:
+        return
+    pieces = []
+    for index in blanks:
+        x0, y0, x1, y1 = rects[index]
+        slot = strip[y0:y1, x0:x1]
+        if slot.size == 0:
+            pieces.append(None)
+            continue
+        pieces.append(cv2.copyMakeBorder(slot, 18, 18, 18, 18, cv2.BORDER_CONSTANT, value=(255, 255, 255)))
+    usable = [piece for piece in pieces if piece is not None]
+    if not usable:
+        return
+    gap = 32
+    width = max(piece.shape[1] for piece in usable)
+    height = sum(piece.shape[0] for piece in usable) + gap * (len(usable) - 1)
+    canvas = np.full((max(1, height), max(1, width), 3), 255, np.uint8)
+    y = 0
+    boxes = []
+    for piece in pieces:
+        if piece is None:
+            boxes.append(None)
+            continue
+        canvas[y:y + piece.shape[0], 0:piece.shape[1]] = piece
+        boxes.append((0, y, piece.shape[1], y + piece.shape[0]))
+        y += piece.shape[0] + gap
+    long_edge = max(canvas.shape[0], canvas.shape[1])
+    if long_edge > 1280:
+        scale = 1280.0 / float(long_edge)
+        canvas = cv2.resize(
+            canvas,
+            (max(1, int(round(canvas.shape[1] * scale))), max(1, int(round(canvas.shape[0] * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        boxes = [None if box is None else tuple(int(round(value * scale)) for value in box) for box in boxes]
+    rows = read_blocks(canvas, extra=False)
+    parsed = _parse_reads(rows, canvas.shape[1], canvas.shape[0])
+    for index, box in zip(blanks, boxes):
+        readings[index] = _slot_reading(parsed, box)
+
+
 def _read_render_strip(crops: list, sources: list) -> list:
-    """One OCR pass. Empty slots are not a match."""
+    """One OCR pass, then a second pass for any slot the strip left blank."""
     from vector_text_v2 import read_blocks
 
     if not crops:
@@ -2830,26 +2898,8 @@ def _read_render_strip(crops: list, sources: list) -> list:
     strip, rects = _pack_render_strip(crops)
     rows = read_blocks(strip, extra=False)
     parsed = _parse_reads(rows, strip.shape[1], strip.shape[0])
-    readings = []
-    for rect in rects:
-        if rect is None:
-            readings.append("")
-            continue
-        x0, y0, x1, y1 = rect
-        hits = []
-        for rx0, ry0, rx1, ry1, text in parsed:
-            cx = (rx0 + rx1) * 0.5
-            cy = (ry0 + ry1) * 0.5
-            if not (x0 <= cx <= x1 and y0 <= cy <= y1):
-                continue
-            area = max(1.0, (rx1 - rx0) * (ry1 - ry0))
-            overlap = max(0.0, min(x1, rx1) - max(x0, rx0)) * max(0.0, min(y1, ry1) - max(y0, ry0))
-            # A detection that spills into the next slot is not this line.
-            if overlap / area < 0.55:
-                continue
-            hits.append((rx0, text))
-        hits.sort(key=lambda item: item[0])
-        readings.append(_norm_text(" ".join(text for _x, text in hits)))
+    readings = [_slot_reading(parsed, rect) for rect in rects]
+    _reread_empty_slots(strip, rects, readings)
     return readings
 
 
