@@ -128,6 +128,9 @@ def rebuild_fitted(
 
 
 def _fail(started: float, reason: str, **extra) -> dict:
+    lines = extra.get("lines")
+    if isinstance(lines, list):
+        extra["lines"] = [_jsonable_line(line) for line in lines]
     payload = {
         "ok": False,
         "amber": True,
@@ -140,6 +143,13 @@ def _fail(started: float, reason: str, **extra) -> dict:
     }
     payload.update(extra)
     return payload
+
+
+def _jsonable_line(line: dict) -> dict:
+    """Drop pixel masks. A failed job is still written out as JSON."""
+    if not isinstance(line, dict):
+        return line
+    return {key: value for key, value in line.items() if not isinstance(value, np.ndarray)}
 
 
 def _note(progress, stage: str, note: str) -> None:
@@ -232,17 +242,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
 
     clean, chosen, skipped = erase_text(bgr, chosen, marks)
     raster_lines.extend(skipped)
-    kept_clear = []
-    for line in chosen:
-        if _ink_remains(clean, bgr, line):
-            _paste_original(clean, bgr, line)
-            record = dict(line)
-            record.update(mode="raster", font="")
-            record["reason"] = "Original letters were still in this line, so it was not set again."
-            raster_lines.append(record)
-            continue
-        kept_clear.append(line)
-    chosen = kept_clear
+    chosen = _drop_residual(clean, bgr, chosen, raster_lines, marks)
     paint_s = time.perf_counter() - paint_started
     if not chosen:
         return _fail(
@@ -298,7 +298,38 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
                 lines=raster_lines,
                 provider=provider,
             )
+    coverage_raster = _restore_coverage_failures(
+        bgr, clean, chosen, raster_lines, output_pdf, placed,
+    )
+    if coverage_raster:
+        if not chosen:
+            _discard(output_pdf)
+            return _fail(
+                started,
+                "Original ink was still under the type, so the original lettering was kept.",
+                lines=raster_lines,
+                timings={"ocr_s": round(ocr_s, 3), "paint_s": round(paint_s, 3)},
+            )
+        rewrite = time.perf_counter()
+        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+        provider = placed["provider"]
+        for line in chosen:
+            line["media_box"] = map_rect(line["ink"], placed, placed["image"].shape)
+        bullets = _map_bullets(marks, placed)
+        qa = _write_pdf(placed["image"], chosen, bullets, output_pdf, trim_w, trim_h, bleed_mm)
+        type_s += time.perf_counter() - rewrite
+        if not qa.get("wrote"):
+            return _fail(started, qa.get("reason") or "The vector press file could not be written.", provider=provider)
+        if reocr is None and _repeat_failures(bgr, chosen, output_pdf, placed):
+            _discard(output_pdf)
+            return _fail(
+                started,
+                "Repeated words were still on the page, so the original lettering was kept.",
+                lines=raster_lines,
+                provider=provider,
+            )
     qa["spacing_raster"] = len(spacing_raster)
+    qa["coverage_raster"] = len(coverage_raster)
 
     qa_started = time.perf_counter()
     proof_text = reocr(output_pdf) if reocr else _reocr_pdf(output_pdf)
@@ -504,12 +535,16 @@ def _qa_box(line: dict, placed: dict | None) -> tuple:
 
 
 def _paste_original(clean: np.ndarray, source: np.ndarray, line: dict) -> None:
-    """Put this line's original pixels back, including the ink just outside the letters."""
+    """Put back every pixel this line's erase changed. A fallback is never half-cleared."""
+    halo = line.get("cleared_halo")
+    if isinstance(halo, np.ndarray) and halo.shape[:2] == clean.shape[:2] and int(halo.max()) > 0:
+        clean[halo > 0] = source[halo > 0]
+        return
     window = _line_window(line)
     if window is None:
         return
     x0, y0, x1, y1, _height = window
-    pad = 6
+    pad = 14
     height, width = clean.shape[:2]
     x0 = max(0, x0 - pad)
     y0 = max(0, y0 - pad)
@@ -517,6 +552,71 @@ def _paste_original(clean: np.ndarray, source: np.ndarray, line: dict) -> None:
     y1 = min(height, y1 + pad)
     if x1 > x0 and y1 > y0:
         clean[y0:y1, x0:x1] = source[y0:y1, x0:x1]
+
+
+INK_EXCESS_LIMIT = 0.15
+
+
+def excess_holds(ratio: float, limit: float = INK_EXCESS_LIMIT) -> bool:
+    """True when composited ink is not more than about 15% above the vector ink."""
+    return float(ratio) <= float(limit) + 1.0e-6
+
+
+def ink_excess(composite: np.ndarray, vector: np.ndarray) -> float:
+    """Extra ink beside the vector glyphs, as a fraction of the vector ink.
+
+    The vector render is the type on white. Ink on the composite that sits
+    outside a 1-pixel halo of those glyphs is leftover picture ink.
+    """
+    if composite is None or vector is None or composite.size == 0 or vector.size == 0:
+        return 0.0
+    if composite.shape[:2] != vector.shape[:2]:
+        vector = cv2.resize(vector, (composite.shape[1], composite.shape[0]), interpolation=cv2.INTER_AREA)
+    if composite.ndim != 3 or vector.ndim != 3:
+        return 0.0
+    distance = np.linalg.norm(vector.astype(np.float32) - 255.0, axis=2)
+    vec_ink = distance > 12.0
+    count = int(vec_ink.sum())
+    if count < 20:
+        return 0.0
+    covered = cv2.dilate(vec_ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    rad = max(3, int(round(composite.shape[0] * 0.45)))
+    if rad % 2 == 0:
+        rad += 1
+    rad = min(rad, 31)
+    band = cv2.dilate(vec_ink.astype(np.uint8), np.ones((rad, rad), np.uint8)) > 0
+    ring = band & ~covered
+    if int(ring.sum()) < 15:
+        return 0.0
+    paper = np.median(composite[ring].astype(np.float32), axis=0)
+    comp_dist = np.linalg.norm(composite.astype(np.float32) - paper, axis=2)
+    extra = band & (comp_dist > 18.0) & ~covered
+    # A rule or the next panel often sits on the crop edge. That is not leftover letters.
+    height, width = extra.shape[:2]
+    margin = max(2, int(round(min(height, width) * 0.08)))
+    if margin * 2 < height and margin * 2 < width:
+        extra = extra.copy()
+        extra[:margin, :] = False
+        extra[-margin:, :] = False
+        extra[:, :margin] = False
+        extra[:, -margin:] = False
+    if int(extra.sum()) == 0:
+        return 0.0
+    # Keep a component only when it is tall enough to be a letter, not a 2px rule.
+    ys, xs = np.where(vec_ink)
+    glyph_h = max(4, int(ys.max() - ys.min()) + 1) if ys.size else height
+    count_cc, labels, stats, _cent = cv2.connectedComponentsWithStats(extra.astype(np.uint8), 8)
+    kept = np.zeros(extra.shape, np.uint8)
+    for index in range(1, count_cc):
+        comp_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        # A 1–2px rule is a panel edge. A leftover letter is taller than that.
+        if comp_h <= 2 or area < 6:
+            continue
+        if comp_h < max(4, int(glyph_h * 0.18)):
+            continue
+        kept[labels == index] = 255
+    return float(int((kept > 0).sum())) / float(count)
 
 
 def _restore_spacing_failures(source, clean, chosen, raster_lines, pdf_path, placed, check_tokens: bool) -> list:
@@ -535,6 +635,80 @@ def _restore_spacing_failures(source, clean, chosen, raster_lines, pdf_path, pla
         raster_lines.append(line)
     chosen[:] = [line for line in chosen if line not in failed]
     return failed
+
+
+def _restore_coverage_failures(source, clean, chosen, raster_lines, pdf_path, placed) -> list:
+    """A line whose composite carries extra ink falls back onto its original pixels."""
+    failed = _coverage_failures(chosen, pdf_path, placed)
+    if not failed:
+        return []
+    for line in failed:
+        _paste_original(clean, source, line)
+        line["mode"] = "raster"
+        line["font"] = ""
+        line["reason"] = "Ink was still under this line, so it stayed in the picture."
+        raster_lines.append(line)
+    chosen[:] = [line for line in chosen if line not in failed]
+    return failed
+
+
+def _coverage_failures(lines, pdf_path, placed) -> list:
+    comp, vec = _render_ink_pair(pdf_path)
+    if comp is None or vec is None:
+        return []
+    img_h, img_w = placed["image"].shape[:2]
+    render_h, render_w = comp.shape[:2]
+    if img_w < 1 or img_h < 1:
+        return []
+    sx = render_w / float(img_w)
+    sy = render_h / float(img_h)
+    failed = []
+    for line in lines:
+        if line.get("mode") != "vector":
+            continue
+        box = line.get("media_box")
+        if not box or len(box) < 4:
+            continue
+        x, y, bw, bh = [float(v) for v in box[:4]]
+        pad_x = max(2.0, bh * 0.25)
+        pad_y = max(2.0, bh * 0.35)
+        x0 = max(0, int(np.floor((x - pad_x) * sx)))
+        y0 = max(0, int(np.floor((y - pad_y) * sy)))
+        x1 = min(render_w, int(np.ceil((x + bw + pad_x) * sx)))
+        y1 = min(render_h, int(np.ceil((y + bh + pad_y) * sy)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        ratio = ink_excess(comp[y0:y1, x0:x1], vec[y0:y1, x0:x1])
+        line["ink_excess"] = round(ratio, 3)
+        if not excess_holds(ratio):
+            failed.append(line)
+    return failed
+
+
+def _render_ink_pair(pdf_path: str, dpi: int = 120):
+    """The press page, and the same page with the picture removed so only the type remains."""
+    import pymupdf as fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[0]
+        comp = _pixmap_bgr(page, dpi)
+        for info in list(page.get_images() or []):
+            page.delete_image(info[0])
+        vec = _pixmap_bgr(page, dpi)
+    finally:
+        doc.close()
+    if comp.shape[:2] != vec.shape[:2]:
+        vec = cv2.resize(vec, (comp.shape[1], comp.shape[0]), interpolation=cv2.INTER_AREA)
+    return comp, vec
+
+
+def _pixmap_bgr(page, dpi: int) -> np.ndarray:
+    import pymupdf as fitz
+
+    pix = page.get_pixmap(dpi=int(dpi), alpha=False, colorspace=fitz.csRGB)
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
 
 
 def _spacing_failures(source, lines, pdf_path, placed, check_tokens: bool) -> list:
@@ -1107,6 +1281,174 @@ def _share_block_weight(lines: list) -> None:
             item["knockout"] = knock
             if knock:
                 item["stroke"] = 0.0
+
+
+def _drop_residual(clean, source, chosen, raster_lines, marks) -> list:
+    """After the erase and before any type is drawn, leftover ink sends the line back.
+
+    A wider mask gets one chance. If dark pixels are still above the local
+    paper, the line is put back exactly as it was and left as pixels.
+    """
+    from vector_plate import _badge_protect
+
+    protect = _badge_protect(marks, clean.shape[0], clean.shape[1])
+    pending = list(chosen)
+    for round_index in range(4):
+        nxt = []
+        restored = False
+        for line in pending:
+            avoid = [other for other in pending if other is not line]
+            dirty = residue_remains(clean, line, avoid, protect) or _ink_remains(clean, source, line)
+            if not dirty:
+                nxt.append(line)
+                continue
+            if round_index == 0 and _widen_erase(clean, source, line, avoid, protect):
+                if not (residue_remains(clean, line, avoid, protect) or _ink_remains(clean, source, line)):
+                    nxt.append(line)
+                    continue
+            _paste_original(clean, source, line)
+            record = dict(line)
+            record.update(mode="raster", font="")
+            record["reason"] = "Original ink was still under this line, so it stayed in the picture."
+            raster_lines.append(record)
+            restored = True
+        pending = nxt
+        if not restored:
+            break
+    return pending
+
+
+def residue_remains(clean: np.ndarray, line: dict, avoid=None, protect=None) -> bool:
+    """True when this erased line still holds ink that is darker than the local paper."""
+    pixels = _residue_pixels(clean, line, avoid, protect)
+    return pixels is not None and int(pixels.max()) > 0
+
+
+def _residue_pixels(clean: np.ndarray, line: dict, avoid=None, protect=None):
+    """Residual ink inside the erased box: pixels that still differ from the local paper."""
+    window = _line_window(line)
+    if window is None:
+        return None
+    height_img, width_img = clean.shape[:2]
+    x0, y0, x1, y1, height = window
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(width_img, x1), min(height_img, y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    k = int(round(max(height, y1 - y0) * 0.55))
+    if k % 2 == 0:
+        k += 1
+    k = max(9, k)
+    pad = max(4, k // 2 + 2)
+    rx0, ry0 = max(0, x0 - pad), max(0, y0 - pad)
+    rx1, ry1 = min(width_img, x1 + pad), min(height_img, y1 + pad)
+    roi = clean[ry0:ry1, rx0:rx1]
+    rh, rw = roi.shape[:2]
+    k = min(k, rh if rh % 2 else rh - 1, rw if rw % 2 else rw - 1)
+    if k < 3:
+        return None
+    paper = cv2.medianBlur(roi, k)
+    dist = np.linalg.norm(
+        cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+        - cv2.cvtColor(paper, cv2.COLOR_BGR2LAB).astype(np.float32),
+        axis=2,
+    )
+    odd = dist > 16.0
+    iy0, iy1 = y0 - ry0, y1 - ry0
+    ix0, ix1 = x0 - rx0, x1 - rx0
+    gate = np.zeros((rh, rw), np.bool_)
+    gate[iy0:iy1, ix0:ix1] = True
+    odd &= gate
+    ornament = line.get("kept_ornament")
+    if isinstance(ornament, np.ndarray) and ornament.shape[:2] == clean.shape[:2]:
+        grown = cv2.dilate(ornament, np.ones((9, 9), np.uint8))
+        odd &= grown[ry0:ry1, rx0:rx1] == 0
+    if protect is not None and int(protect.max()) > 0:
+        odd &= protect[ry0:ry1, rx0:rx1] == 0
+    if avoid:
+        for other in avoid:
+            if other is line:
+                continue
+            other_window = _line_window(other)
+            if other_window is None:
+                continue
+            ox0, oy0, ox1, oy1, _other_h = other_window
+            ax0, ay0 = max(0, ox0 - rx0), max(0, oy0 - ry0)
+            ax1, ay1 = min(rw, ox1 - rx0), min(rh, oy1 - ry0)
+            if ax1 > ax0 and ay1 > ay0:
+                odd[ay0:ay1, ax0:ax1] = False
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(odd.astype(np.uint8), 8)
+    keep = np.zeros((rh, rw), np.uint8)
+    window_area = max(1, (y1 - y0) * (x1 - x0))
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        comp_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        comp_w = int(stats[index, cv2.CC_STAT_WIDTH])
+        if area < 8 or comp_w < 2:
+            continue
+        fill = area / float(max(1, comp_h * comp_w))
+        if fill > 0.85 and comp_w > (x1 - x0) * 0.7 and comp_h > (y1 - y0) * 0.7:
+            continue
+        if area > window_area * 0.55:
+            continue
+        if comp_h >= height * 0.22 or area >= max(12, int(window_area * 0.03)):
+            keep[labels == index] = 255
+    if int(keep.max()) == 0:
+        return None
+    full = np.zeros((height_img, width_img), np.uint8)
+    full[ry0:ry1, rx0:rx1] = keep
+    return full
+
+
+def _widen_erase(clean, source, line, avoid, protect) -> bool:
+    """Inpaint the leftover ink again, on a wider mask that stays inside this line."""
+    pixels = _residue_pixels(clean, line, avoid, protect)
+    if pixels is None or int(pixels.max()) == 0:
+        return False
+    wide = cv2.dilate(pixels, np.ones((5, 7), np.uint8))
+    window = _line_window(line)
+    if window is None:
+        return False
+    height, width = clean.shape[:2]
+    x0, y0, x1, y1, _height = window
+    pad = 6
+    gate = np.zeros((height, width), np.uint8)
+    gate[max(0, y0 - pad):min(height, y1 + pad), max(0, x0 - pad):min(width, x1 + pad)] = 255
+    wide = cv2.bitwise_and(wide, gate)
+    for other in avoid or []:
+        other_window = _line_window(other)
+        if other_window is None:
+            continue
+        ox0, oy0, ox1, oy1, _other_h = other_window
+        wide[max(0, oy0):min(height, oy1), max(0, ox0):min(width, ox1)] = 0
+    ornament = line.get("kept_ornament")
+    if isinstance(ornament, np.ndarray) and int(ornament.max()) > 0:
+        wide[cv2.dilate(ornament, np.ones((9, 9), np.uint8)) > 0] = 0
+    if protect is not None and int(protect.max()) > 0:
+        wide[protect > 0] = 0
+    if int(wide.max()) == 0:
+        return False
+    clean[:] = cv2.inpaint(clean, wide, 5, cv2.INPAINT_TELEA)
+    mask = line.get("cleared_mask")
+    if isinstance(mask, np.ndarray):
+        line["cleared_mask"] = cv2.bitwise_or(mask, wide)
+    else:
+        line["cleared_mask"] = wide
+    _grow_halo(clean, source, line, wide)
+    return True
+
+
+def _grow_halo(clean, source, line, wide) -> None:
+    delta = np.abs(clean.astype(np.int16) - source.astype(np.int16)).sum(axis=2) > 15
+    near = cv2.dilate(wide, np.ones((15, 15), np.uint8)) > 0
+    extra = np.zeros(clean.shape[:2], np.uint8)
+    extra[delta & near] = 255
+    extra = cv2.bitwise_or(extra, wide)
+    halo = line.get("cleared_halo")
+    if isinstance(halo, np.ndarray):
+        line["cleared_halo"] = cv2.bitwise_or(halo, extra)
+    else:
+        line["cleared_halo"] = extra
 
 
 def _ink_remains(clean: np.ndarray, source: np.ndarray, line: dict) -> bool:

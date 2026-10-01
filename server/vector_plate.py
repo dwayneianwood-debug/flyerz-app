@@ -98,10 +98,14 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
         line["ink"] = ink_box
         line["ink_hex"] = _bgr_hex(colour)
         line["color"] = line["ink_hex"]
-        kept.append(line)
-        meta.append({"line": line, "ink": ink_box, "glyph": glyph, "tight": tight, "quad": quad})
         if ornament is not None and int(ornament.max()) > 0:
+            line["kept_ornament"] = ornament
             spare = cv2.bitwise_or(spare, ornament)
+        kept.append(line)
+        meta.append({
+            "line": line, "ink": ink_box, "glyph": glyph, "tight": tight,
+            "quad": quad, "ornament": ornament,
+        })
     if meta:
         _disentangle(meta)
         for item in meta:
@@ -110,31 +114,130 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
             item["line"]["ink"] = item["ink"]
             erase |= item["tight"]
     marks = list(marks or [])
+    bullets = np.zeros((height, width), np.uint8)
     for mark in marks:
         if mark.get("kind") != "bullet":
             continue
         cx, cy = int(round(mark["cx"])), int(round(mark["cy"]))
         radius = max(2, int(round(float(mark["radius"]))) + 1)
+        cv2.circle(bullets, (cx, cy), radius, 255, -1)
         cv2.circle(erase, (cx, cy), radius, 255, -1)
     if int(erase.max()) == 0:
         return bgr.copy(), [], skipped
-    mask = cv2.dilate(erase, np.ones((3, 5), np.uint8))
-    if int(spare.max()) > 0:
-        # Inpaint reaches past the mask. A heart or tick just beside the words stays.
-        halo = cv2.dilate(spare, np.ones((13, 13), np.uint8))
-        mask[halo > 0] = 0
     protect = _badge_protect(marks, height, width)
-    if int(protect.max()) > 0:
-        mask[protect > 0] = 0
-    for item in meta:
-        if is_short_numeral(item["line"].get("text")):
-            tight = item["tight"].copy()
-            tight[protect > 0] = 0
-            mask |= tight
+    spare_halo = cv2.dilate(spare, np.ones((13, 13), np.uint8)) if int(spare.max()) > 0 else None
+    # A 1- or 2-digit line is not dilated: a wider mask eats the circle around a step number.
+    owned = _owned_masks(meta, height, width, protect, spare_halo)
+    mask = np.zeros((height, width), np.uint8)
+    for part in owned:
+        mask |= part
+    mask |= bullets
+    guard = _foreign_ink(bgr, mask, meta, bullets, protect, spare_halo)
+    if int(guard.max()) > 0:
+        mask[guard > 0] = 0
+        for part in owned:
+            part[guard > 0] = 0
+    if int(mask.max()) == 0:
+        return bgr.copy(), [], skipped
     painted = _inpaint(bgr, mask, meta, protect)
     if int(spare.max()) > 0:
         painted[spare > 0] = bgr[spare > 0]
+    _stamp_halos(bgr, painted, meta, owned, bullets, spare_halo)
     return painted, kept, skipped
+
+
+def _owned_masks(meta: list, height: int, width: int, protect: np.ndarray, spare_halo: np.ndarray | None) -> list:
+    """The pixels each line asked to clear, after the small dilate and the keeps."""
+    kernel = np.ones((3, 5), np.uint8)
+    owned = []
+    for item in meta:
+        if is_short_numeral(item["line"].get("text")):
+            part = item["tight"].copy()
+        else:
+            part = cv2.dilate(item["tight"], kernel)
+        if spare_halo is not None:
+            part[spare_halo > 0] = 0
+        if int(protect.max()) > 0:
+            part[protect > 0] = 0
+        owned.append(part)
+    return owned
+
+
+def _foreign_ink(bgr, mask, meta, bullets, protect, spare_halo) -> np.ndarray:
+    """Lettering that belongs to no erased line. The mask must not eat it.
+
+    A neighbour's inpaint used to smear a script line the reader never saw.
+    Those pixels stay. The fringe of a line we did mean to erase does not.
+    """
+    guard = np.zeros(mask.shape, np.uint8)
+    if int(mask.max()) == 0 or not meta:
+        return guard
+    height, width = mask.shape
+    zone = np.zeros((height, width), np.uint8)
+    for item in meta:
+        x0, y0, x1, y1 = [int(v) for v in item["ink"]]
+        zone[max(0, y0):min(height, y1), max(0, x0):min(width, x1)] = 255
+        rect = item["line"].get("rect")
+        if rect and len(rect) >= 4:
+            x, y, bw, bh = [int(round(float(v))) for v in rect[:4]]
+            zone[max(0, y):min(height, y + max(1, bh)), max(0, x):min(width, x + max(1, bw))] = 255
+    expanded = cv2.dilate(zone, np.ones((9, 9), np.uint8))
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    k = 21 if min(height, width) > 40 else 9
+    bg = cv2.medianBlur(gray, k)
+    ink = cv2.absdiff(gray, bg) > 18
+    ink[expanded > 0] = False
+    ink[mask == 0] = False
+    if int(bullets.max()) > 0:
+        ink[bullets > 0] = False
+    if protect is not None and int(protect.max()) > 0:
+        ink[protect > 0] = False
+    if spare_halo is not None:
+        ink[spare_halo > 0] = False
+    if int(ink.sum()) < 8:
+        return guard
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        comp_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        comp_w = int(stats[index, cv2.CC_STAT_WIDTH])
+        if area < 8 or comp_h < 6 or comp_w < 2:
+            continue
+        if comp_h > height * 0.45 and comp_w > width * 0.45:
+            continue
+        guard[labels == index] = 255
+    if int(guard.max()) == 0:
+        return guard
+    return cv2.dilate(guard, np.ones((3, 3), np.uint8))
+
+
+def _stamp_halos(source, painted, meta, owned, bullets, spare_halo) -> None:
+    """Remember every pixel this line's erase changed, so a fallback can put it all back."""
+    delta = np.abs(painted.astype(np.int16) - source.astype(np.int16)).sum(axis=2)
+    changed = delta > 15
+    if int(bullets.max()) > 0:
+        changed[cv2.dilate(bullets, np.ones((5, 5), np.uint8)) > 0] = False
+    if spare_halo is not None:
+        changed[spare_halo > 0] = False
+    height, width = changed.shape
+    owner = np.full((height, width), -1, np.int16)
+    best = np.full((height, width), 1.0e6, np.float32)
+    reach = 16.0
+    for index, part in enumerate(owned):
+        if int(part.max()) == 0:
+            continue
+        inv = np.where(part > 0, np.uint8(0), np.uint8(255))
+        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+        take = changed & (dist <= reach) & (dist < best)
+        best = np.where(take, dist, best)
+        owner = np.where(take, index, owner)
+    for index, item in enumerate(meta):
+        part = owned[index]
+        halo = ((owner == index) | (part > 0))
+        if spare_halo is not None:
+            halo = halo & (spare_halo == 0)
+        item["line"]["cleared_mask"] = part
+        item["line"]["cleared_halo"] = halo.astype(np.uint8) * 255
 
 
 def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bleed_mm: float, ppi: int = MIN_PPI) -> dict:

@@ -558,6 +558,57 @@ def test_repeated_tokens_fail() -> None:
         os.environ.pop("VECTOR_REBUILD", None)
 
 
+def test_residue_detector_sees_a_ghost() -> None:
+    """Flat paper is clean. A grey word still sitting in the erased box is not."""
+    from vector_text_v2 import residue_remains
+
+    plate = np.full((96, 360, 3), (214, 226, 230), np.uint8)
+    line = {"text": "only", "rect": (24, 22, 180, 52), "ink_hex": "#222222"}
+    check("flat-plate-clean", residue_remains(plate, line) is False)
+    ghost = plate.copy()
+    cv2.putText(ghost, "only", (36, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 90, 90), 2, cv2.LINE_AA)
+    check("ghost-ink-detected", residue_remains(ghost, line) is True)
+
+
+def test_raster_fallback_restores_the_whole_line() -> None:
+    """A line sent back to pixels matches the source on every pixel the erase touched."""
+    from vector_plate import erase_text
+    from vector_text_v2 import _paste_original
+
+    image = Image.new("RGB", (420, 180), (228, 236, 240))
+    draw = ImageDraw.Draw(image)
+    draw.text((36, 48), "Through", font=ImageFont.truetype(font_path("crimson"), 52), fill=(20, 30, 20))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    line = {"text": "Through", "rect": (24, 36, 320, 100), "font": "crimson", "role": "body", "mode": "vector"}
+    clean, kept, skipped = erase_text(bgr, [line], [])
+    check("restore-erased", len(kept) == 1 and not skipped, str(skipped))
+    halo = kept[0].get("cleared_halo")
+    delta = np.abs(clean.astype(np.int16) - bgr.astype(np.int16)).sum(axis=2) > 15
+    covered = isinstance(halo, np.ndarray) and not bool(np.any(delta & (halo == 0)))
+    check("halo-covers-the-erase", covered, f"halo {None if halo is None else int((halo > 0).sum())}")
+    _paste_original(clean, bgr, kept[0])
+    if isinstance(halo, np.ndarray) and int(halo.max()) > 0:
+        gap = int(np.abs(clean.astype(np.int16) - bgr.astype(np.int16))[halo > 0].max())
+    else:
+        gap = 999
+    check("restore-exact", gap == 0, f"max delta {gap}")
+
+
+def test_excess_ink_over_fifteen_percent_fails() -> None:
+    """Leftover ink beside the vector glyphs fails. A matching plate does not."""
+    from vector_text_v2 import excess_holds, ink_excess
+
+    canvas = np.full((80, 360, 3), 255, np.uint8)
+    cv2.putText(canvas, "vitamin D", (16, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20, 20, 20), 2, cv2.LINE_AA)
+    clean_ratio = ink_excess(canvas, canvas)
+    check("clean-coverage", excess_holds(clean_ratio), f"ratio {clean_ratio:.3f}")
+    # The same word drawn again a few pixels aside. That is the ghost under the type.
+    doubled = canvas.copy()
+    cv2.putText(doubled, "vitamin D", (21, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (45, 45, 45), 2, cv2.LINE_AA)
+    dirty_ratio = ink_excess(doubled, canvas)
+    check("ghost-coverage", excess_holds(dirty_ratio) is False and dirty_ratio > 0.15, f"ratio {dirty_ratio:.3f}")
+
+
 def test_body_tracking_does_not_shrink_the_face() -> None:
     """A body line's own sidebearings are not added again, so the face is not tiny."""
     from ai_rebuild import measure_rhythm
@@ -1022,6 +1073,9 @@ def main() -> None:
     test_tracked_caps_keep_letter_and_word_gaps()
     test_symbol_beside_the_words_stays()
     test_repeated_tokens_fail()
+    test_residue_detector_sees_a_ghost()
+    test_raster_fallback_restores_the_whole_line()
+    test_excess_ink_over_fifteen_percent_fails()
     test_body_tracking_does_not_shrink_the_face()
     test_icon_region_stays()
     test_spacing_assert_catches_a_joined_word()
