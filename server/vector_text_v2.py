@@ -234,6 +234,29 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     if not qa.get("wrote"):
         return _fail(started, qa.get("reason") or "The vector press file could not be written.", provider=provider)
 
+    spacing_raster = _restore_spacing_failures(
+        bgr, clean, chosen, raster_lines, output_pdf, placed, check_tokens=(reocr is None),
+    )
+    if spacing_raster:
+        if not chosen:
+            return _fail(
+                started,
+                "The spacing could not be matched, so the original lettering was kept.",
+                lines=raster_lines,
+                timings={"ocr_s": round(ocr_s, 3), "paint_s": round(paint_s, 3)},
+            )
+        rewrite = time.perf_counter()
+        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+        provider = placed["provider"]
+        for line in chosen:
+            line["media_box"] = map_rect(line["ink"], placed, placed["image"].shape)
+        bullets = _map_bullets(marks, placed)
+        qa = _write_pdf(placed["image"], chosen, bullets, output_pdf, trim_w, trim_h, bleed_mm)
+        type_s += time.perf_counter() - rewrite
+        if not qa.get("wrote"):
+            return _fail(started, qa.get("reason") or "The vector press file could not be written.", provider=provider)
+    qa["spacing_raster"] = len(spacing_raster)
+
     qa_started = time.perf_counter()
     proof_text = reocr(output_pdf) if reocr else _reocr_pdf(output_pdf)
     expected = " ".join(line["text"] for line in chosen)
@@ -290,6 +313,184 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         "vector_lines": len(chosen),
         "raster_lines": len(raster_lines),
     }
+
+
+def gaps_hold(original: list, rebuild: list, slack: float = 0.30) -> bool:
+    """Each word-gap fraction stays within ``slack`` of the original."""
+    if not original:
+        return True
+    if len(original) != len(list(rebuild or [])):
+        return False
+    low, high = 1.0 - slack, 1.0 + slack
+    for src, out in zip(original, rebuild):
+        src = float(src)
+        if src <= 0.004:
+            continue
+        ratio = float(out) / src
+        if ratio < low or ratio > high:
+            return False
+    return True
+
+
+def gap_ems_hold(original: dict, rebuild: dict, slack: float = 0.30) -> bool:
+    """Each word gap, as a fraction of the line, stays within ``slack``.
+
+    Both sides have to measure the same kind of gap. A crop that did not
+    resolve the gaps is left for the token check.
+    """
+    if (original or {}).get("grain") != (rebuild or {}).get("grain"):
+        return True
+    src = list((original or {}).get("gaps") or [])
+    out = list((rebuild or {}).get("gaps") or [])
+    if not src or not out or len(src) != len(out):
+        return True
+    # A tight line moves by a pixel when it is redrawn. That is not a lost word space.
+    kept_src = []
+    kept_out = []
+    for src_gap, out_gap in zip(src, out):
+        if abs(float(src_gap) - float(out_gap)) <= 0.012:
+            continue
+        kept_src.append(src_gap)
+        kept_out.append(out_gap)
+    if not kept_src:
+        return True
+    return gaps_hold(kept_src, kept_out, slack)
+
+
+def tokens_hold(source: str, read: str, score: float = 1.0) -> bool:
+    """Same letters with a different word count means the spaces were lost or invented.
+
+    An empty read, or a read that changed the letters, is not a spacing failure.
+    """
+    found = " ".join(str(read or "").split())
+    if not found or float(score or 0) < 0.5:
+        return True
+    source_words = re.findall(r"[A-Za-z0-9]+", str(source or ""))
+    read_words = re.findall(r"[A-Za-z0-9]+", found)
+    if not source_words or not read_words:
+        return True
+    source_core = re.sub(r"[^A-Za-z0-9]", "", str(source or "")).upper()
+    read_core = re.sub(r"[^A-Za-z0-9]", "", found).upper()
+    if source_core != read_core:
+        return True
+    return len(source_words) == len(read_words)
+
+
+def _paste_original(clean: np.ndarray, source: np.ndarray, line: dict) -> None:
+    """Put this line's original pixels back, including the ink just outside the letters."""
+    box = line.get("ink") or None
+    if box and len(box) >= 4:
+        x0, y0, x1, y1 = [int(v) for v in box[:4]]
+    else:
+        rect = line.get("rect")
+        if not rect:
+            return
+        x, y, bw, bh = [int(v) for v in rect[:4]]
+        x0, y0, x1, y1 = x, y, x + bw, y + bh
+    pad = 6
+    height, width = clean.shape[:2]
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(width, x1 + pad)
+    y1 = min(height, y1 + pad)
+    if x1 > x0 and y1 > y0:
+        clean[y0:y1, x0:x1] = source[y0:y1, x0:x1]
+
+
+def _restore_spacing_failures(source, clean, chosen, raster_lines, pdf_path, placed, check_tokens: bool) -> list:
+    """Re-read every vector line. A bad word count or word gap is put back as pixels."""
+    try:
+        failed = _spacing_failures(source, chosen, pdf_path, placed, check_tokens)
+    except Exception:
+        return []
+    if not failed:
+        return []
+    for line in failed:
+        _paste_original(clean, source, line)
+        line["mode"] = "raster"
+        line["font"] = ""
+        line["reason"] = "The spacing did not match the original, so this line stayed in the picture."
+        raster_lines.append(line)
+    chosen[:] = [line for line in chosen if line not in failed]
+    return failed
+
+
+def _spacing_failures(source, lines, pdf_path, placed, check_tokens: bool) -> list:
+    import pymupdf as fitz
+
+    from ai_rebuild import measure_rhythm
+
+    vector = [line for line in lines if line.get("mode") == "vector" and line.get("media_box")]
+    if not vector:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[0]
+        pix = page.get_pixmap(dpi=144, alpha=False, colorspace=fitz.csRGB)
+        frame = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        page_w = float(page.rect.width) or 1.0
+        page_h = float(page.rect.height) or 1.0
+        scale_x = pix.width / page_w
+        scale_y = pix.height / page_h
+    finally:
+        doc.close()
+    img_h, img_w = placed["image"].shape[:2]
+    sx = page_w / float(img_w)
+    sy = page_h / float(img_h)
+    crops = []
+    originals = []
+    for line in vector:
+        x, y, bw, bh = [float(v) for v in line["media_box"][:4]]
+        x0 = max(0, int((x * sx) * scale_x) - 2)
+        y0 = max(0, int((y * sy) * scale_y) - 2)
+        x1 = min(frame.shape[1], int(((x + bw) * sx) * scale_x) + 3)
+        y1 = min(frame.shape[0], int(((y + bh) * sy) * scale_y) + 3)
+        crop = frame[y0:y1, x0:x1] if x1 - x0 >= 4 and y1 - y0 >= 4 else None
+        crops.append(crop)
+        bbox = line.get("bbox") or [0, 0, 1, 0.1]
+        originals.append(measure_rhythm(source, bbox, line.get("text") or ""))
+    reads = [(" ", 0.0)] * len(vector)
+    if check_tokens:
+        reads = _ocr_crops(frame, vector, img_w, img_h, sx, sy, scale_x, scale_y)
+    failed = []
+    for line, crop, original, read in zip(vector, crops, originals, reads):
+        text = str(line.get("text") or "")
+        rebuild = {"measured": False, "gaps": [], "span": 0, "line_h": 0}
+        if crop is not None and crop.size:
+            rebuild = measure_rhythm(crop, [0, 0, 1, 1], text)
+        if not gap_ems_hold(original, rebuild):
+            line["spacing_why"] = "gap src=%s out=%s" % (
+                [round(v, 3) for v in (original.get("gaps") or [])],
+                [round(v, 3) for v in (rebuild.get("gaps") or [])],
+            )
+            failed.append(line)
+            continue
+        if check_tokens and not tokens_hold(text, read[0], read[1]):
+            line["spacing_why"] = f"tokens:{read[0][:40]}"
+            failed.append(line)
+    return failed
+
+
+def _ocr_crops(frame, lines, img_w, img_h, sx, sy, scale_x, scale_y) -> list:
+    from ocr_reader import local_rows
+
+    height, width = frame.shape[:2]
+    blocks = []
+    for line in lines:
+        x, y, bw, bh = [float(v) for v in line["media_box"][:4]]
+        x0 = max(0, (x * sx) * scale_x - 2)
+        y0 = max(0, (y * sy) * scale_y - 2)
+        bw_px = max(2.0, bw * sx * scale_x)
+        bh_px = max(2.0, bh * sy * scale_y)
+        blocks.append({
+            "text": line.get("text") or "",
+            "bbox": [x0 / width, y0 / height, bw_px / width, bh_px / height],
+        })
+    try:
+        return _reread_many(frame, blocks, local_rows)
+    except Exception:
+        return [("", 0.0) for _ in lines]
 
 
 def _public_line(line: dict) -> dict:
@@ -923,25 +1124,45 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
 
 
 def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarray]) -> dict:
-    """Word-gap widths and a stroke matched to this line's own ink."""
+    """Word gaps, letter-spacing, and a stroke matched to this line's own ink."""
     record["gaps"] = []
+    record["track"] = 0.0
     record["stroke"] = 0.0
     if record.get("mode") != "vector":
         return record
-    from ai_rebuild import word_gap_fractions
+    from ai_rebuild import measure_rhythm
 
-    record["gaps"] = word_gap_fractions(bgr, block.get("bbox") or [0, 0, 1, 0.1], record.get("text") or "")
+    rhythm = measure_rhythm(bgr, block.get("bbox") or [0, 0, 1, 0.1], record.get("text") or "")
+    record["gaps"] = list(rhythm.get("gaps") or [])
+    record["track"] = float(rhythm.get("track") or 0.0)
+    key = str(record.get("font") or "")
+    # Widely tracked caps are a lighter cut. Cinzel SemiBold reads as a heavy word.
+    if key == "cinzel-600" and record["track"] >= 0.035 and ink is not None:
+        rendered = _render_ink(
+            str(record.get("text") or ""),
+            _FONT_FILES.get("cinzel-600") or "",
+            max(int(ink.shape[1]), 80),
+            max(int(ink.shape[0]), 24),
+            "spaced",
+        )
+        if rendered is not None and _rel_stroke(rendered) > _rel_stroke(ink) + 0.03:
+            record["font"] = "cinzel-500"
+            record["face_lock"] = True
+            key = "cinzel-500"
     red, green, blue = _hex_rgb(record.get("color") or "#222222")
     if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72:
         return record
-    key = str(record.get("font") or "")
     if ink is not None and key:
         record["stroke"] = _match_stroke(ink, str(record.get("text") or ""), key)
     return record
 
 
 def _rel_stroke(mask: np.ndarray) -> float:
-    """Median stroke width as a fraction of the ink height."""
+    """Stroke width at the 80th percentile, as a fraction of the ink height.
+
+    The median follows hairline serifs. The upper part of the stroke is the
+    weight a reader sees.
+    """
     if mask is None or mask.size == 0:
         return 0.0
     binary = (mask > 40).astype(np.uint8)
@@ -953,7 +1174,7 @@ def _rel_stroke(mask: np.ndarray) -> float:
     vals = dist[dist >= 0.5]
     if vals.size < 8 or tight.shape[0] < 2:
         return 0.0
-    return float(np.median(vals)) * 2.0 / float(tight.shape[0])
+    return float(np.percentile(vals, 80)) * 2.0 / float(tight.shape[0])
 
 
 def _match_stroke(ink: np.ndarray, text: str, key: str) -> float:
@@ -968,7 +1189,9 @@ def _match_stroke(ink: np.ndarray, text: str, key: str) -> float:
     extra = _rel_stroke(ink) - _rel_stroke(rendered)
     if extra <= 0.008:
         return 0.0
-    ratio = {"script": 0.62, "spaced": 0.70, "tagline": 0.78}.get(role, 0.82)
+    if role == "script":
+        return float(min(0.028, extra * 0.85))
+    ratio = {"spaced": 0.70, "tagline": 0.78}.get(role, 0.82)
     return float(min(0.014, extra * ratio))
 
 
@@ -1029,6 +1252,8 @@ def _harmonise(lines: list, style: str) -> list:
     """One face per role and size, and one weight inside a paragraph."""
     if style == "serif":
         for line in lines:
+            if line.get("face_lock"):
+                continue
             role = line.get("role") or "body"
             if role == "script":
                 continue
@@ -1051,6 +1276,8 @@ def _harmonise(lines: list, style: str) -> list:
             continue
         winner = ROLE_FONT.get(role, group[0].get("font") or "crimson")
         for item in group:
+            if item.get("face_lock"):
+                continue
             item["font"] = winner
     _normalise_paragraphs(lines, style)
     return lines
@@ -1821,34 +2048,39 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
         return
     role = _FONT_ROLE.get(line.get("font") or "", "body")
     gap_fracs = list(line.get("gaps") or [])
+    track = float(line.get("track") or 0.0)
     size, _tracking = _fit_width(font, text, box_w, box_h, role)
-    size = _size_for_gaps(font, text, size, box_w, gap_fracs)
+    size = _size_for_gaps(font, text, size, box_w, gap_fracs, track)
     asc = size * (0.70 if role != "script" else 0.62)
     desc = size * 0.22 if any(ch in "gjpqy" for ch in text) else 0.0
     ink = asc + desc
     top_pad = max(0.0, (box_h - ink) / 2.0)
     baseline = y * sy + top_pad + asc
     colour = _cmyk(_hex_rgb(line.get("color") or "#222222"))
-    advances = _char_advances(font, text, size, box_w, role, gap_fracs)
+    advances = _char_advances(font, text, size, box_w, role, gap_fracs, track)
     writer = fitz.TextWriter(page.rect)
     cursor = x * sx
     for index, ch in enumerate(text):
         writer.append((cursor, baseline), ch, font=font, fontsize=size)
         cursor += advances[index] if index < len(advances) else font.text_length(ch, fontsize=size)
-    stroke = _stroke_of(line)
+    stroke = _stroke_for(line, size, role)
     writer.write_text(page, color=colour, render_mode=2 if stroke else 0)
     if stroke:
         _restroke(page, size, stroke)
 
 
-def _size_for_gaps(font, text: str, size: float, box_w: float, gap_fracs: list) -> float:
-    """Shrink the face so the measured word gaps still fit. The gaps are not squeezed."""
+def _size_for_gaps(font, text: str, size: float, box_w: float, gap_fracs: list, track: float = 0.0) -> float:
+    """Shrink the face so the measured word gaps and letter-spacing still fit."""
     spaces = [index for index, ch in enumerate(text) if ch == " "]
-    if not spaces or len(gap_fracs) != len(spaces) or box_w <= 0:
+    boundaries = _letter_boundaries(text)
+    space_total = 0.0
+    if spaces and len(gap_fracs) == len(spaces) and box_w > 0:
+        space_total = sum(max(0.0, float(box_w) * float(frac)) for frac in gap_fracs)
+    track_total = len(boundaries) * float(box_w) * max(0.0, float(track or 0.0))
+    if space_total + track_total <= 0 or box_w <= 0:
         return size
-    space_total = sum(max(0.0, float(box_w) * float(frac)) for frac in gap_fracs)
-    room = float(box_w) - space_total
-    if room < float(box_w) * 0.40:
+    room = float(box_w) - space_total - track_total
+    if room < float(box_w) * 0.34:
         return size
     glyph = sum(float(font.text_length(ch, fontsize=size)) for ch in text if ch != " ")
     if glyph > room > 0:
@@ -1856,41 +2088,59 @@ def _size_for_gaps(font, text: str, size: float, box_w: float, gap_fracs: list) 
     return size
 
 
-def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fracs: list) -> list:
-    """Per-character advances. Word spaces use the measured pixel gaps, not letter tracking."""
-    widths = [float(font.text_length(ch, fontsize=size)) for ch in text]
-    spaces = [index for index, ch in enumerate(text) if ch == " "]
-    measured = len(gap_fracs) == len(spaces) and len(spaces) > 0
-    if measured:
-        for index, frac in zip(spaces, gap_fracs):
-            widths[index] = max(float(box_w) * float(frac), size * 0.18)
-    else:
-        for index in spaces:
-            widths[index] = max(widths[index], size * 0.32)
-    total = sum(widths)
-    if measured and total > box_w + 0.2:
-        glyphs = [index for index in range(len(text)) if index not in spaces]
-        glyph_total = sum(widths[index] for index in glyphs) or 1.0
-        room = float(box_w) - sum(widths[index] for index in spaces)
-        if room > 0:
-            scale = room / glyph_total
-            for index in glyphs:
-                widths[index] *= scale
-            total = sum(widths)
-    boundaries = [
+def _letter_boundaries(text: str) -> list:
+    return [
         index for index in range(len(text) - 1)
         if text[index] != " " and text[index + 1] != " "
     ]
+
+
+def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fracs: list, track: float = 0.0) -> list:
+    """Per-character advances. Word spaces and letter-spacing follow the original pixels.
+
+    Measured gaps are a fraction of the ink, not of an empty margin past the last letter.
+    """
+    widths = [float(font.text_length(ch, fontsize=size)) for ch in text]
+    spaces = [index for index, ch in enumerate(text) if ch == " "]
+    boundaries = _letter_boundaries(text)
+    measured = len(gap_fracs) == len(spaces) and len(spaces) > 0
+    tracked = float(track or 0.0) > 0 and bool(boundaries) and box_w > 0
     extra = [0.0] * len(text)
-    leftover = box_w - total
+    if measured or tracked:
+        glyphs = [index for index, ch in enumerate(text) if ch != " "]
+        glyph_total = sum(widths[index] for index in glyphs)
+        gap_share = sum(float(frac) for frac in gap_fracs) if measured else 0.0
+        track_share = len(boundaries) * float(track) if tracked else 0.0
+        share = gap_share + track_share
+        if glyph_total > 0 and 0 < share < 0.72:
+            span = glyph_total / (1.0 - share)
+        else:
+            span = float(box_w)
+        span = min(span, float(box_w))
+        if measured:
+            for index, frac in zip(spaces, gap_fracs):
+                widths[index] = max(span * float(frac), size * 0.18)
+        else:
+            for index in spaces:
+                widths[index] = max(widths[index], size * 0.32)
+        if tracked:
+            each = span * float(track)
+            for index in boundaries:
+                extra[index] = each
+        total = sum(widths) + sum(extra)
+        if total > box_w + 0.2 and total > 0:
+            scale = float(box_w) / total
+            widths = [width * scale for width in widths]
+            extra = [value * scale for value in extra]
+        return [widths[index] + extra[index] for index in range(len(text))]
+    for index in spaces:
+        widths[index] = max(widths[index], size * 0.32)
+    leftover = box_w - sum(widths)
     if leftover > 1.0 and boundaries:
         cap = {"spaced": 0.12, "script": 0.05, "tagline": 0.10}.get(role, 0.10) * size
-        if measured:
-            min_gap = min(widths[index] for index in spaces)
-            cap = min(cap, 0.06 * size, 0.40 * min_gap)
-        track = min(leftover / float(len(boundaries)), cap)
+        share = min(leftover / float(len(boundaries)), cap)
         for index in boundaries:
-            extra[index] = track
+            extra[index] = share
     return [widths[index] + extra[index] for index in range(len(text))]
 
 
@@ -1903,6 +2153,20 @@ def _stroke_of(line: dict) -> float:
         return max(0.0, float(line.get("stroke") or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _stroke_for(line: dict, size: float, role: str) -> float:
+    """Measured stroke, plus an outline on small script so it matches the original weight.
+
+    A large script name is left at the face weight. Chandré is already as heavy
+    as its ink, and an outline there goes black.
+    """
+    stroke = _stroke_of(line)
+    if role == "script" and 4.0 <= float(size) <= 16.5 and stroke >= 0:
+        red, green, blue = _hex_rgb(line.get("color") or "#222222")
+        if 0.2126 * red + 0.7152 * green + 0.0722 * blue <= 0.72:
+            stroke = max(stroke, 0.020)
+    return stroke
 
 
 def _restroke(page, size: float, factor: float) -> None:

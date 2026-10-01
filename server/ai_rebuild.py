@@ -562,18 +562,108 @@ def restore_spaces(text: str, bgr: np.ndarray, bbox: list) -> str:
     return candidate
 
 
+def _gap_ratios(fracs: list, span: float, runs: list) -> list:
+    """Each word gap divided by the median letter width. Scale cancels out."""
+    widths = [_run_width(run) for run in runs if _run_width(run) > 0]
+    unit = float(np.median(widths)) if widths else 0.0
+    if unit <= 0 or span <= 0:
+        return []
+    return [float(frac) * float(span) / unit for frac in fracs]
+
+
+def _run_width(run) -> int:
+    return int(run[1]) - int(run[0]) + 1
+
+
+def _strip_side_symbols(runs: list, gaps: list, line_h: int, text: str) -> tuple:
+    """Drop a compact mark at either end when the words do not mention it."""
+    if len(runs) < 2 or not gaps or line_h <= 0:
+        return runs, gaps
+    tail = str(text or "").rstrip()
+    head = str(text or "").lstrip()
+    mark = ".,;:!?·•∙⋅-–—\"'"
+
+    def symbol(run, gap) -> bool:
+        width = _run_width(run)
+        if gap < max(3.0, line_h * 0.22):
+            return False
+        return width <= line_h * 1.35
+
+    if not (tail and tail[-1] in mark) and symbol(runs[-1], gaps[-1]):
+        others = gaps[:-1]
+        typical = float(np.median(others)) if others else float(gaps[-1])
+        if gaps[-1] >= max(typical * 1.45, max(3.0, line_h * 0.22)):
+            runs = runs[:-1]
+            gaps = gaps[:-1]
+    if len(runs) >= 2 and gaps and not (head and head[0] in mark) and symbol(runs[0], gaps[0]):
+        others = gaps[1:]
+        typical = float(np.median(others)) if others else float(gaps[0])
+        if gaps[0] >= max(typical * 1.45, max(3.0, line_h * 0.22)):
+            runs = runs[1:]
+            gaps = gaps[1:]
+    return runs, gaps
+
+
+def measure_rhythm(bgr: np.ndarray, bbox: list, text: str) -> dict:
+    """Word-gap fractions and the letter-tracking fraction of the ink span.
+
+    A widely tracked line such as AND HEALTH keeps the gap between the words
+    and the smaller gap between the letters. ``sure`` is false when a real
+    word gap is visible but it cannot be lined up with the words.
+    """
+    raw = " ".join(str(text or "").split())
+    empty = {"gaps": [], "track": 0.0, "sure": True, "measured": False, "span": 0, "line_h": 0}
+    runs, gaps, line_h, span = _glyph_columns(bgr, bbox)
+    if len(runs) < 2 or not gaps or span <= 0:
+        return empty
+    runs, gaps = _strip_side_symbols(runs, gaps, line_h, raw)
+    if len(runs) < 2 or not gaps:
+        return empty
+    span = _run_width(runs[0])
+    for gap, run in zip(gaps, runs[1:]):
+        span += int(gap) + _run_width(run)
+    found = {"gaps": [], "track": 0.0, "sure": True, "measured": True, "span": int(span), "line_h": int(line_h)}
+    chars = [(index, ch) for index, ch in enumerate(raw) if ch != " "]
+    if len(runs) == len(chars) and len(chars) >= 2:
+        word = []
+        letter = []
+        for gap_index in range(len(gaps)):
+            left = chars[gap_index][0]
+            right = chars[gap_index + 1][0]
+            if any(raw[pos].isspace() for pos in range(left + 1, right)):
+                word.append(float(gaps[gap_index]) / float(span))
+            else:
+                letter.append(float(gaps[gap_index]))
+        track = float(np.median(letter)) / float(span) if letter else 0.0
+        if track * span < max(2.0, line_h * 0.08):
+            track = 0.0
+        found["gaps"] = word
+        found["track"] = track
+        found["grain"] = "letter"
+        found["ratios"] = _gap_ratios(word, span, runs)
+        return found
+    groups, group_span = _glyph_groups(bgr, bbox)
+    tokens = raw.split()
+    if group_span and len(groups) == len(tokens) and len(tokens) >= 2:
+        fracs = [float(gap) / float(group_span) for _width, gap in groups[1:]]
+        if raw.count(" ") == len(fracs) and all(frac > 0 for frac in fracs):
+            found["gaps"] = fracs
+            found["span"] = int(group_span)
+            found["grain"] = "word"
+            widths = [width for width, _gap in groups]
+            unit = float(np.median(widths)) if widths else 0.0
+            found["ratios"] = [float(frac) * float(group_span) / unit for frac in fracs] if unit > 0 else []
+            return found
+    visible = any(_word_gap(gap, gaps, line_h) for gap in gaps) if gaps else False
+    if " " in raw and visible:
+        found["sure"] = False
+        return found
+    return found
+
+
 def word_gap_fractions(bgr: np.ndarray, bbox: list, text: str) -> list:
     """How much of the ink width each word space should take, in order."""
-    groups, span = _glyph_groups(bgr, bbox)
-    tokens = str(text or "").split()
-    if span <= 0 or len(groups) != len(tokens) or len(tokens) < 2:
-        return []
-    fracs = [float(gap) / float(span) for _width, gap in groups[1:]]
-    if str(text or "").count(" ") != len(fracs):
-        return []
-    if any(frac <= 0 for frac in fracs):
-        return []
-    return fracs
+    return list(measure_rhythm(bgr, bbox, text).get("gaps") or [])
 
 
 def _space_blocks(blocks: list, bgr: np.ndarray) -> list:

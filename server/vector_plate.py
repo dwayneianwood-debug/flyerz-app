@@ -70,6 +70,7 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     gold = (hsv[:, :, 0] >= 10) & (hsv[:, :, 0] <= 38) & (hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 90)
     erase = np.zeros((height, width), np.uint8)
+    spare = np.zeros((height, width), np.uint8)
     kept = []
     skipped = []
     meta = []
@@ -93,12 +94,14 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
                 "reason": "The letters could not be separated from the picture.",
             })
             continue
-        ink_box, colour, glyph, tight = built
+        ink_box, colour, glyph, tight, ornament = built
         line["ink"] = ink_box
         line["ink_hex"] = _bgr_hex(colour)
         line["color"] = line["ink_hex"]
         kept.append(line)
         meta.append({"line": line, "ink": ink_box, "glyph": glyph, "tight": tight, "quad": quad})
+        if ornament is not None and int(ornament.max()) > 0:
+            spare = cv2.bitwise_or(spare, ornament)
     if meta:
         _disentangle(meta)
         for item in meta:
@@ -116,6 +119,10 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
     if int(erase.max()) == 0:
         return bgr.copy(), [], skipped
     mask = cv2.dilate(erase, np.ones((3, 3), np.uint8))
+    if int(spare.max()) > 0:
+        # Inpaint reaches past the mask. A heart or tick just beside the words stays.
+        halo = cv2.dilate(spare, np.ones((13, 13), np.uint8))
+        mask[halo > 0] = 0
     protect = _badge_protect(marks, height, width)
     if int(protect.max()) > 0:
         mask[protect > 0] = 0
@@ -125,6 +132,8 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
             tight[protect > 0] = 0
             mask |= tight
     painted = _inpaint(bgr, mask, meta, protect)
+    if int(spare.max()) > 0:
+        painted[spare > 0] = bgr[spare > 0]
     return painted, kept, skipped
 
 
@@ -248,6 +257,11 @@ def _line_mask(bgr, lab, gold, quad, text, height, width):
             keep |= component
     if int(keep.sum()) < 2:
         return None
+    ornament = _ornament_components(keep, text, line_h)
+    if int(ornament.max()) > 0:
+        keep = keep & (ornament == 0)
+        if int(keep.sum()) < 2:
+            return None
     colour = _core_bgr(bgr[y0:y1, x0:x1], keep)
     ys, xs = np.where(keep)
     gy0, gy1 = int(ys.min()), int(ys.max()) + 1
@@ -258,7 +272,52 @@ def _line_mask(bgr, lab, gold, quad, text, height, width):
     local = (local & poly[gy0:gy1, gx0:gx1]).astype(np.uint8) * 255
     full = np.zeros((height, width), np.uint8)
     full[y0 + gy0:y0 + gy1, x0 + gx0:x0 + gx1] = local
-    return (x0 + gx0, y0 + gy0, x0 + gx1, y0 + gy1), colour, glyph, full
+    page_ornament = np.zeros((height, width), np.uint8)
+    if int(ornament.max()) > 0:
+        page_ornament[y0:y1, x0:x1] = ornament
+        halo = cv2.dilate(ornament, np.ones((13, 13), np.uint8))
+        full[y0:y1, x0:x1][halo > 0] = 0
+    return (x0 + gx0, y0 + gy0, x0 + gx1, y0 + gy1), colour, glyph, full, page_ornament
+
+
+def _ornament_components(keep: np.ndarray, text: str, line_h: float) -> np.ndarray:
+    """A compact mark at the end of a line, such as a heart, stays in the picture.
+
+    Letter strokes and a dot the words already mention are not ornaments.
+    """
+    ornament = np.zeros(keep.shape, np.uint8)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats((keep > 0).astype(np.uint8), 8)
+    comps = []
+    for index in range(1, count):
+        x, _y, width, height, area = [int(v) for v in stats[index][:5]]
+        if area < 8 or width < 2 or height < 2:
+            continue
+        comps.append((index, x, width, height, area))
+    if len(comps) < 2 or line_h <= 0:
+        return ornament
+    comps.sort(key=lambda item: item[1])
+    gaps = [right[1] - (left[1] + left[2]) for left, right in zip(comps, comps[1:])]
+    mark = ".,;:!?·•∙⋅-–—\"'"
+
+    def symbol(comp, gap) -> bool:
+        _index, _x, width, height, _area = comp
+        if gap < max(3.0, line_h * 0.18):
+            return False
+        if width > line_h * 1.45 or height > line_h * 1.7:
+            return False
+        return max(width, height) / float(min(width, height)) <= 2.6
+
+    tail = str(text or "").rstrip()
+    if not (tail and tail[-1] in mark):
+        typical = float(np.median(gaps[:-1])) if len(gaps) > 1 else float(gaps[-1])
+        if symbol(comps[-1], gaps[-1]) and gaps[-1] >= max(typical * 1.35, max(3.0, line_h * 0.18)):
+            ornament[labels == comps[-1][0]] = 255
+    head = str(text or "").lstrip()
+    if not (head and head[0] in mark) and len(comps) >= 2:
+        typical = float(np.median(gaps[1:])) if len(gaps) > 1 else float(gaps[0])
+        if symbol(comps[0], gaps[0]) and gaps[0] >= max(typical * 1.35, max(3.0, line_h * 0.18)):
+            ornament[labels == comps[0][0]] = 255
+    return ornament
 
 
 def _bounds(quad: np.ndarray, pad: int, width: int, height: int) -> tuple[int, int, int, int]:

@@ -473,6 +473,83 @@ def test_long_script_is_not_a_serif() -> None:
     check("slant-is-script-or-raster-role", unsure_role in ("script", "unsure"), unsure_role)
 
 
+def test_tracked_caps_keep_letter_and_word_gaps() -> None:
+    """A wide gap between words stays a word space. The smaller gaps stay letter-spacing."""
+    from ai_rebuild import measure_rhythm
+    from vector_text_v2 import _char_advances, _fitz_font, _size_for_gaps
+
+    canvas = Image.new("RGB", (640, 80), (244, 240, 230))
+    draw = ImageDraw.Draw(canvas)
+    face = ImageFont.truetype(font_path("cinzel-500"), 22)
+    cursor = 30
+    for word in ("AND", "HEALTH"):
+        for index, ch in enumerate(word):
+            draw.text((cursor, 28), ch, font=face, fill=(70, 78, 64))
+            cursor += int(draw.textlength(ch, font=face)) + 8
+        if word == "AND":
+            cursor += 16
+    bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
+    rhythm = measure_rhythm(bgr, [0.02, 0.15, 0.94, 0.7], "AND HEALTH")
+    check("tracked-word-gap", len(rhythm["gaps"]) == 1 and rhythm["gaps"][0] > rhythm["track"] > 0, str(rhythm))
+    font = _fitz_font("cinzel-500")
+    text = "AND HEALTH"
+    box_w = 280.0
+    size = _size_for_gaps(font, text, 14.0, box_w, rhythm["gaps"], rhythm["track"])
+    advances = _char_advances(font, text, size, box_w, "spaced", rhythm["gaps"], rhythm["track"])
+    total = sum(advances) or 1.0
+    space = advances[text.index(" ")]
+    letter = advances[0] - float(font.text_length("A", fontsize=size))
+    check("tracked-space-held", space >= total * rhythm["gaps"][0] * 0.9, f"{space:.2f} of {total:.2f}")
+    check("tracked-letters-held", letter >= total * rhythm["track"] * 0.7, f"{letter:.2f} size {size:.2f}")
+
+
+def test_symbol_beside_the_words_stays() -> None:
+    """A heart or other mark in the line, which the words do not name, is not erased."""
+    from vector_plate import erase_text
+
+    image = Image.new("RGB", (520, 140), (236, 230, 214))
+    draw = ImageDraw.Draw(image)
+    face = ImageFont.truetype(font_path("parisienne"), 46)
+    draw.text((20, 40), "live your best life", font=face, fill=(36, 36, 38))
+    draw.ellipse((430, 52, 468, 90), outline=(36, 36, 38), width=3)
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    line = {
+        "text": "live your best life",
+        "mode": "vector",
+        "rect": (16, 36, 470, 80),
+        "quad": [[16, 36], [486, 36], [486, 116], [16, 116]],
+    }
+    before = bgr[50:94, 424:474].copy()
+    clean, kept, _skipped = erase_text(bgr, [line], [])
+    after = clean[50:94, 424:474]
+    changed = int(np.max(cv2.absdiff(before, after)))
+    check("symbol-pixels-stay", changed <= 8 and bool(kept), f"delta {changed} kept {len(kept)}")
+    words = cv2.absdiff(bgr[40:110, 20:400], clean[40:110, 20:400])
+    check("words-were-erased", int(words.max()) > 40, str(int(words.max())))
+
+
+def test_spacing_assert_catches_a_joined_word() -> None:
+    from vector_text_v2 import gaps_hold, tokens_hold
+
+    check("tokens-joined", tokens_hold("AND HEALTH", "ANDHEALTH", 0.95) is False)
+    check("tokens-same", tokens_hold("AND HEALTH", "AND HEALTH", 0.95) is True)
+    check("tokens-empty", tokens_hold("AND HEALTH", "", 0.0) is True)
+    check("gaps-within", gaps_hold([0.11], [0.14]) is True)
+    check("gaps-wide", gaps_hold([0.11], [0.16]) is False)
+    check("gaps-missing", gaps_hold([0.11], []) is False)
+    check("gaps-none", gaps_hold([], []) is True)
+
+
+def test_small_script_gets_an_outline() -> None:
+    from vector_text_v2 import _stroke_for
+
+    dark = {"color": "#242424", "stroke": 0.0}
+    check("script-outline", _stroke_for(dark, 10.0, "script") >= 0.020)
+    check("large-script-unchanged", _stroke_for(dark, 21.0, "script") == 0.0)
+    check("body-not-outlined", _stroke_for(dark, 10.0, "body") == 0.0)
+    check("light-script-unchanged", _stroke_for({"color": "#f4f1e4", "stroke": 0.0}, 10.0, "script") == 0.0)
+
+
 def test_stroke_follows_each_line() -> None:
     """A face that is already heavier than the ink gets no extra stroke."""
     from vector_text_v2 import _match_stroke, _render_ink
@@ -720,6 +797,10 @@ def main() -> None:
     test_badge_number_is_not_retyped()
     test_dotted_caps_keep_their_gaps()
     test_long_script_is_not_a_serif()
+    test_tracked_caps_keep_letter_and_word_gaps()
+    test_symbol_beside_the_words_stays()
+    test_spacing_assert_catches_a_joined_word()
+    test_small_script_gets_an_outline()
     test_stroke_follows_each_line()
     test_body_stroke_and_press_black()
     test_real_ocr_is_quick()
