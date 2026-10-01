@@ -613,11 +613,19 @@ def test_a_line_is_not_half_traced() -> None:
         {"text": "Delta", "rect": (10, 84, 120, 20), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 84), "iou": 0.95},
     ]
     two = [
-        {"text": "Beta", "rect": (10, 36, 120, 20), "anchor": "line"},
-        {"text": "Gamma", "rect": (10, 60, 120, 20), "anchor": "line"},
+        {"text": "Beta", "rect": (10, 36, 120, 20), "anchor": "paragraph"},
+        {"text": "Gamma", "rect": (10, 60, 120, 20), "anchor": "paragraph"},
     ]
     cleared = [item["text"] for item in _keep_uniform(column, [], two)]
     check("two-fallbacks-clear-the-paragraph", cleared == [], str(cleared))
+    # Ink that was never separated is not a rejected trace. Two such lines
+    # blank only themselves, so the traced neighbours stay vector.
+    separated = [
+        {"text": "Beta", "rect": (10, 36, 120, 20), "anchor": "line"},
+        {"text": "Gamma", "rect": (10, 60, 120, 20), "anchor": "line"},
+    ]
+    kept_separated = [item["text"] for item in _keep_uniform(column, [], separated)]
+    check("two-unseparated-keep-neighbours", kept_separated == ["Alpha", "Delta"], str(kept_separated))
 
     # A short title must not be blanked by the much taller word sitting under it.
     title = [

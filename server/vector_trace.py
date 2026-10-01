@@ -1564,7 +1564,7 @@ def _repair_source(plate, pristine, drawn, raster_lines, raster_boxes, art_box) 
                 "text": item.get("text") or "",
                 "rect": core,
                 "core": core,
-                "anchor": "line",
+                "anchor": "paragraph",
             })
     kept = _keep_uniform(kept, raster_lines, raster_boxes)
     for item in drawn:
@@ -1645,10 +1645,15 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
             if records[member]["mode"] == "vector" and records[member]["index"] is not None:
                 drop.add(records[member]["index"])
     for grouped in groups.values():
+        # A line whose ink was never separated only blanks its own line.
+        # Two lines whose traces were rejected blank the paragraph.
         fallback_lines = 0
         for line_id in grouped:
             members = lines[line_id]
-            if any(records[member]["mode"] == "raster" for member in members):
+            if any(
+                records[member]["mode"] == "raster" and records[member].get("scope") == "paragraph"
+                for member in members
+            ):
                 fallback_lines += 1
         if fallback_lines <= 1:
             continue
@@ -1809,11 +1814,11 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
-        mask, colour = refine_ink(crop, owned)
-        if mask is None or colour is None:
-            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
-            continue
+        refined_mask, refined_colour = refine_ink(crop, owned)
+        if refined_mask is not None and refined_colour is not None:
+            mask, colour = refined_mask, refined_colour
+        else:
+            mask = owned
         pending.append({
             "text": text,
             "mask": mask,
@@ -1856,7 +1861,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
                 text, "raster",
                 "A letter lost its tail or its counter, so this line stayed in the picture.",
             ))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
@@ -2878,11 +2883,17 @@ def _slot_reading(parsed, rect) -> str:
     return _norm_text(" ".join(text for _x, text in hits))
 
 
-def _reread_empty_slots(strip: np.ndarray, rects: list, readings: list) -> None:
-    """A line the strip skipped is read on its own. A still-empty read is not a match."""
+def _reread_empty_slots(strip: np.ndarray, rects: list, readings: list, sources: list) -> None:
+    """A skipped or mismatched slot is read on its own. A still-empty read is not a match."""
     from vector_text_v2 import read_blocks
 
-    blanks = [index for index, text in enumerate(readings) if text == "" and rects[index] is not None]
+    blanks = []
+    for index, text in enumerate(readings):
+        if rects[index] is None:
+            continue
+        source = sources[index] if index < len(sources) else ""
+        if text == "" or not _reads_match(source, text):
+            blanks.append(index)
     if not blanks:
         return
     pieces = []
@@ -2921,7 +2932,12 @@ def _reread_empty_slots(strip: np.ndarray, rects: list, readings: list) -> None:
     rows = read_blocks(canvas, extra=False)
     parsed = _parse_reads(rows, canvas.shape[1], canvas.shape[0])
     for index, box in zip(blanks, boxes):
-        readings[index] = _slot_reading(parsed, box)
+        fresh = _slot_reading(parsed, box)
+        if not fresh:
+            continue
+        source = sources[index] if index < len(sources) else ""
+        if readings[index] == "" or _reads_match(source, fresh):
+            readings[index] = fresh
 
 
 def _read_render_strip(crops: list, sources: list) -> list:
@@ -2935,7 +2951,7 @@ def _read_render_strip(crops: list, sources: list) -> list:
     rows = read_blocks(strip, extra=False)
     parsed = _parse_reads(rows, strip.shape[1], strip.shape[0])
     readings = [_slot_reading(parsed, rect) for rect in rects]
-    _reread_empty_slots(strip, rects, readings)
+    _reread_empty_slots(strip, rects, readings, sources)
     return readings
 
 
@@ -2956,6 +2972,13 @@ def _apply_text_gate(
     vector_slots = []
     letter_rects = _letter_rects(blocks, int(source_shape[1]), int(source_shape[0]))
     plate_ppi = float((placed or {}).get("ppi") or 400)
+    # Rejected traces (empty, shape, topology, a later gate miss) count toward
+    # the paragraph. Ink that was never separated does not: it only blanks its line.
+    paragraph_cores = [
+        box.get("core") or box.get("rect")
+        for box in (raster_boxes or [])
+        if box.get("anchor") is True or box.get("anchor") == "paragraph"
+    ]
     for block in blocks or []:
         if not isinstance(block, dict):
             continue
@@ -3010,6 +3033,9 @@ def _apply_text_gate(
             "_source": source,
             "_render": render,
             "_revert": False,
+            "_paragraph": (not vector) and any(
+                _rects_match(core, other) for other in paragraph_cores
+            ),
         }
         report.append(row)
         if vector:
@@ -3075,7 +3101,7 @@ def _apply_text_gate(
         fallback = 0
         for line_id in grouped:
             members = line_members[line_id]
-            if any((not report[i]["_vector"]) or report[i]["_revert"] for i in members):
+            if any(report[i]["_revert"] or report[i].get("_paragraph") for i in members):
                 fallback += 1
         if fallback <= 1:
             continue
@@ -3108,7 +3134,7 @@ def _apply_text_gate(
                     "text": item.get("text") or "",
                     "rect": core,
                     "core": core,
-                    "anchor": "line",
+                    "anchor": "paragraph",
                 })
             reverted = True
             row["mode"] = "raster"
@@ -3146,7 +3172,7 @@ def _apply_text_gate(
         item.pop("_ink", None)
         item.pop("core", None)
     for row in report:
-        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail"):
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph"):
             row.pop(key, None)
     return report, kept, qa, source_guard
 
