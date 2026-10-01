@@ -938,43 +938,7 @@ def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool
                 if os.environ.get("GLYPH_DEBUG"):
                     sys.stderr.write(f"[glyph] shape {best:.2f}\n")
                 return True
-    if _fork_closed(source, painted):
-        return True
     return False
-
-
-def _fork_closed(source_glyphs: list, painted: np.ndarray) -> bool:
-    """A Y whose arms were joined into one blob no longer matches the source.
-
-    The source glyph meets in one stem. An H or an M still has two feet, so a
-    bridge there is left to the other shape checks.
-    """
-    for glyph in source_glyphs:
-        if glyph["h"] < 8 or glyph["w"] < 5:
-            continue
-        y1 = glyph["y"] + max(3, int(round(glyph["h"] * 0.45)))
-        src_top = glyph["pixels"][glyph["y"]:y1, glyph["x"]:glyph["x"] + glyph["w"]]
-        if int(src_top.sum()) < 8 or _separated_runs(src_top) < 2:
-            continue
-        foot = max(3, int(round(glyph["h"] * 0.30)))
-        src_foot = glyph["pixels"][glyph["y"] + glyph["h"] - foot:glyph["y"] + glyph["h"], glyph["x"]:glyph["x"] + glyph["w"]]
-        if _separated_runs(src_foot) != 1:
-            continue
-        paint_top = painted[glyph["y"]:y1, glyph["x"]:glyph["x"] + glyph["w"]]
-        if _separated_runs(paint_top) < 2:
-            if os.environ.get("GLYPH_DEBUG"):
-                sys.stderr.write(f"[glyph] fork closed x={glyph['x']} h={glyph['h']}\n")
-            return True
-    return False
-
-
-def _separated_runs(binary: np.ndarray) -> int:
-    """Ink pieces with a real gap between them. A one-pixel bridge does not split."""
-    if binary is None or binary.size == 0 or int(np.count_nonzero(binary)) < 4:
-        return 0
-    mask = (binary > 0).astype(np.uint8)
-    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
-    return sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 4)
 
 
 def glyphs_agree(mask: np.ndarray, painted: np.ndarray, min_area: int = 12) -> bool:

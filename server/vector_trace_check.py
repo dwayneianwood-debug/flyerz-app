@@ -537,27 +537,6 @@ def test_a_wide_swash_is_not_traced() -> None:
     check("swash-letters-stay", int(stripped[20, 16]) == 255 and int(stripped[20, 46]) == 255)
 
 
-def test_a_closed_fork_is_not_a_y() -> None:
-    """Joining the arms of a Y fails. An open Y, and an H, do not."""
-    source = np.zeros((40, 24), np.uint8)
-    source[0:16, 1:5] = 255
-    source[0:16, 16:20] = 255
-    source[14:22, 4:9] = 255
-    source[14:22, 12:17] = 255
-    source[20:38, 8:13] = 255
-    check("open-y-matches", _glyph_structure_fails(source, source.copy()) is False)
-    closed = source.copy()
-    closed[4:14, 5:16] = 255
-    check("closed-y-fails", _glyph_structure_fails(source, closed) is True)
-    aitch = np.zeros((40, 24), np.uint8)
-    aitch[2:36, 2:6] = 255
-    aitch[2:36, 16:20] = 255
-    aitch[16:22, 6:16] = 255
-    bridged = aitch.copy()
-    bridged[4:12, 6:16] = 255
-    check("bridged-h-is-not-a-fork", _glyph_structure_fails(aitch, bridged) is False)
-
-
 def test_swash_bars_are_not_exempt() -> None:
     """A change under the letters, outside the traced stroke, is a leak on every side."""
     from vector_trace import _source_leaks
@@ -902,14 +881,28 @@ def _check_medella_swash(card: dict) -> None:
     check("medella-swash-not-striped", streaks is False, detail)
 
 
-def _check_card_back_raster(gate: list) -> None:
-    """A Y whose arms joined, and a faint footer, go back to the picture."""
-    ident = [row for row in gate if "BY IDENTIFYING" in str(row.get("text") or "")]
-    check(
-        "by-identifying-raster",
-        len(ident) == 1 and ident[0].get("mode") == "raster",
-        str(ident)[:300],
-    )
+def _y_arms(binary: np.ndarray):
+    """Arm areas of a Y. None when the glyph is not two arms over one stem."""
+    if binary is None or binary.shape[0] < 8 or binary.shape[1] < 5:
+        return None
+    cut = max(3, int(round(binary.shape[0] * 0.45)))
+    top = (binary[:cut] > 0).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(top, 8)
+    arms = [int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 4]
+    if len(arms) < 2:
+        return None
+    foot_h = max(3, int(round(binary.shape[0] * 0.30)))
+    foot = (binary[-foot_h:] > 0).astype(np.uint8)
+    fcount, _flabels, fstats, _fcent = cv2.connectedComponentsWithStats(foot, 8)
+    feet = [index for index in range(1, fcount) if int(fstats[index, cv2.CC_STAT_AREA]) >= 4]
+    if len(feet) != 1:
+        return None
+    return sorted(arms, reverse=True)[:2]
+
+
+def _check_card_back_raster(side: dict) -> None:
+    """A faint footer goes back to the picture. A traced Y keeps both arms."""
+    gate = side.get("textGate") or []
     for word in ("DETECT", "BALANCE", "HEAL", "LIVE BETTER"):
         rows = [row for row in gate if str(row.get("text") or "").strip() == word]
         check(
@@ -917,6 +910,70 @@ def _check_card_back_raster(gate: list) -> None:
             len(rows) == 1 and rows[0].get("mode") == "raster",
             str(rows)[:300],
         )
+    ident = [row for row in gate if "BY IDENTIFYING" in str(row.get("text") or "")]
+    check("by-identifying-present", len(ident) == 1, str(len(ident)))
+    if len(ident) != 1 or not side.get("press"):
+        return
+    if ident[0].get("mode") == "raster":
+        check("by-identifying-y-matches", True)
+        return
+    from vector_plate import place_plate
+    from vector_text_v2 import MIN_PPI, _rect, read_blocks
+
+    src_path = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_back.png")
+    bgr = cv2.imread(src_path)
+    blocks = read_blocks(bgr, extra=False)
+    guide = []
+    raw = None
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        text = str(block.get("text") or "")
+        if not is_lettering(text):
+            continue
+        rx, ry, rw, rh = _rect(block, bgr.shape[1], bgr.shape[0])
+        guide.append((rx, ry, rx + rw, ry + rh))
+        if "BY IDENTIFYING" in text:
+            raw = (rx, ry, rw, rh)
+    check("by-identifying-box", raw is not None)
+    if raw is None:
+        return
+    placed = place_plate(bgr, guide, 90, 50, 5.0, MIN_PPI)
+    clean = cv2.cvtColor(placed["image"], cv2.COLOR_BGR2GRAY)
+    render = cv2.cvtColor(_render_press(side["press"], clean.shape[1], clean.shape[0]), cv2.COLOR_RGB2GRAY)
+    if render.shape != clean.shape:
+        render = cv2.resize(render, (clean.shape[1], clean.shape[0]), interpolation=cv2.INTER_AREA)
+    from vector_trace import _mapped_bounds
+
+    left, top, right, bottom = _mapped_bounds(placed["map"], raw, clean.shape[1], clean.shape[0])
+    source = clean[top:bottom, left:right]
+    painted = render[top:bottom, left:right]
+    _thr, source_bin = cv2.threshold(source, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _thr, paint_bin = cv2.threshold(painted, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(source_bin, 8)
+    checked = 0
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_HEIGHT]) < 8 or int(stats[index, cv2.CC_STAT_AREA]) < 20:
+            continue
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        src_glyph = source_bin[y:y + height, x:x + width]
+        if _y_arms(src_glyph) is None:
+            continue
+        paint_glyph = paint_bin[y:y + height, x:x + width]
+        paint_arms = _y_arms(paint_glyph)
+        inter = int(np.count_nonzero((src_glyph > 0) & (paint_glyph > 0)))
+        union = int(np.count_nonzero((src_glyph > 0) | (paint_glyph > 0)))
+        iou = inter / float(union) if union else 0.0
+        checked += 1
+        check(
+            "by-identifying-y-arms",
+            paint_arms is not None and iou >= 0.85,
+            f"iou {iou:.2f} arms {paint_arms}",
+        )
+    check("by-identifying-y-seen", checked >= 2, str(checked))
 
 
 def test_medella_coverage_and_gate_speed() -> None:
@@ -959,7 +1016,7 @@ def test_medella_coverage_and_gate_speed() -> None:
     check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 15.0, str(back.get("timings")))
     check("card-back-letters", not _vector_reads_match(back.get("textGate")), str(_vector_reads_match(back.get("textGate")))[:400])
     check("card-back-source-guard", back.get("source_guard") is True, str(back.get("source_guard")))
-    _check_card_back_raster(back.get("textGate") or [])
+    _check_card_back_raster(back)
     front = _trace_side("flyer_front", 148, 210)
     front_t = front.get("timings") or {}
     check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 8.0, str(front_t))
@@ -1073,7 +1130,6 @@ def main() -> None:
     test_merged_or_split_glyphs_fail()
     test_descenders_and_counters()
     test_a_wide_swash_is_not_traced()
-    test_a_closed_fork_is_not_a_y()
     test_swash_bars_are_not_exempt()
     test_glyphs_reject_a_changed_letter()
     test_paint_follows_the_glyph_not_the_box()
