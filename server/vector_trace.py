@@ -3077,7 +3077,8 @@ def _apply_text_gate(
     for index, row in enumerate(report):
         if not row["_vector"]:
             continue
-        if row["mismatch"] or row["glyphFail"] or row["_pixelFail"]:
+        low_ssim = float(row["ssim"]) < SSIM_FLOOR
+        if row["mismatch"] or row["glyphFail"] or row["_pixelFail"] or low_ssim:
             root = find(index)
             for other in range(len(report)):
                 if find(other) == root and report[other]["_vector"]:
@@ -3125,6 +3126,8 @@ def _apply_text_gate(
                 why = "The render did not read back as this line, so the line stayed in the picture."
             elif row.get("_pixelFail"):
                 why = "The render covered or clipped this line, so the line stayed in the picture."
+            elif float(row.get("ssim") or 1) < SSIM_FLOOR:
+                why = "The render did not match this line's picture, so the line stayed in the picture."
             else:
                 why = "This line stayed in the picture so it would not be half traced."
             raster_lines.append(_line(item["text"], "raster", why))
