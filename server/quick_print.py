@@ -246,6 +246,11 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
 # check sits at row 40, so the reflected rim stays shallower than that.
 EDGE_SAMPLE_PX = 5
 MIRROR_RIM_PX = 28
+# Pads shorter than this (the 5 mm bleed, the orange-disc test) keep the shallow rim.
+# A tall gap mirrors a block as tall as the gap. A 28px rim smears into stripes.
+TALL_PAD_PX = 120
+TALL_BLUR_S0 = 25.0
+TALL_BLUR_SMAX = 80.0
 # Lettering stays this far inside the trim when a short page is lengthened.
 SAFE_ZONE_MM = 4.0
 EDGE_LOWPASS_FRACTION = 0.04
@@ -277,25 +282,47 @@ def _reflect_from_edge(edge_band, pad: int):
     return edge_band[src]
 
 
-def _progressive_blur(strip, smax: float, reach: float):
-    """Blur grows with distance from row 0. Far rows lose the repeated rim."""
+def _blur_level(image, sigma: float, strong: bool):
+    """Gaussian. A strong extension blurs a smaller copy so sigma 80 stays cheap."""
     import cv2
+
+    if sigma <= 0.05:
+        return image
+    if strong and sigma >= 12.0:
+        factor = min(8.0, max(2.0, float(sigma) / 8.0))
+        small_w = max(8, int(round(image.shape[1] / factor)))
+        small_h = max(8, int(round(image.shape[0] / factor)))
+        small = cv2.resize(image, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), float(sigma) / factor)
+        return cv2.resize(small, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return cv2.GaussianBlur(image, (0, 0), float(sigma))
+
+
+def _progressive_blur(strip, smax: float, reach: float, s0: float = 0.0, strong: bool = False):
+    """Blur grows with distance from row 0. Far rows lose the repeated rim."""
     import numpy as np
 
     count = int(strip.shape[0])
     base = np.ascontiguousarray(strip.astype(np.float32))
     if count == 0 or smax <= 0.05:
         return base
-    sigs = [0.0, 1.5, 3.0, 6.0, 12.0, 22.0, 36.0, 52.0]
-    sigs = [value for value in sigs if value < smax - 0.05]
-    sigs.append(float(smax))
-    levels = [base if sigma <= 0.05 else cv2.GaussianBlur(base, (0, 0), sigma) for sigma in sigs]
+    s0 = float(max(0.0, s0))
+    smax = float(max(float(smax), s0))
+    ladder = [0.0, 2.0, 5.0, 8.0, 12.0, 18.0, 25.0, 35.0, 50.0, 65.0, 80.0]
+    sigs = [value for value in ladder if s0 - 0.05 <= value <= smax + 0.05]
+    if not sigs or sigs[0] > s0 + 0.05:
+        sigs.insert(0, s0)
+    if sigs[-1] < smax - 0.05:
+        sigs.append(smax)
+    if len(sigs) < 2:
+        sigs.append(sigs[-1] + 1.0)
+    levels = [base if sigma <= 0.05 else _blur_level(base, sigma, strong) for sigma in sigs]
     if count == 1:
-        return base
+        return levels[-1]
     distance = np.arange(count, dtype=np.float32)
     span = max(float(reach), 1.0)
     amount = np.clip(distance / span, 0.0, 1.0) ** 1.05
-    target = amount * float(smax)
+    target = s0 + amount * (smax - s0)
     edges = np.asarray(sigs, np.float32)
     index = np.clip(np.searchsorted(edges, target, side="right") - 1, 0, len(sigs) - 2)
     lo = edges[index]
@@ -308,34 +335,140 @@ def _progressive_blur(strip, smax: float, reach: float):
             continue
         weight = alpha[chosen][:, None, None]
         out[chosen] = levels[step][chosen] * (1.0 - weight) + levels[step + 1][chosen] * weight
-    # The pixel against the picture is the real edge, not a blurred neighbour.
-    out[0] = base[0]
+    # A shallow pad keeps the real edge pixel. A tall pad is already blurred at s0.
+    if s0 <= 0.05:
+        out[0] = base[0]
     return out
 
 
-def _mirror_extend(band, pad: int, forward: bool):
+def _scrub_marks(band):
+    """Inpaint lettering and logos on a copy used only to grow the page.
+
+    The art itself is not changed. A flat field and a wide colour bar are left,
+    because those are the colour the extension is supposed to continue.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = band.shape[:2]
+    if height < 12 or width < 12:
+        return band
+    scale = 1.0
+    work = band
+    long_edge = max(height, width)
+    if long_edge > 900:
+        scale = 900.0 / float(long_edge)
+        work = cv2.resize(
+            band,
+            (max(8, int(round(width * scale))), max(8, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    short = min(work.shape[:2])
+    kernel_px = int(max(9, min(31, round(short * 0.04))))
+    if kernel_px % 2 == 0:
+        kernel_px += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_px, kernel_px))
+    black = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    white = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    marks = np.zeros(gray.shape, np.uint8)
+    marks[(black > 20) | (white > 20)] = 255
+    column_frac = (marks > 0).mean(axis=0)
+    marks[:, column_frac > 0.65] = 0
+    if int(marks.max()) == 0:
+        return band
+    marks = cv2.dilate(marks, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    keep = (marks == 0).astype(np.float32)
+    sigma = 18.0
+    num = cv2.GaussianBlur(work.astype(np.float32) * keep[..., None], (0, 0), sigma)
+    den = cv2.GaussianBlur(keep, (0, 0), sigma)[..., None]
+    filled = num / np.maximum(den, 1e-3)
+    out = work.astype(np.float32)
+    painted = marks > 0
+    out[painted] = filled[painted]
+    out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
+    if scale != 1.0:
+        out = cv2.resize(out, (width, height), interpolation=cv2.INTER_LINEAR)
+    return out
+
+
+def _feather_to_edge(pad, edge_row, at_end: bool, depth: int = 36):
+    """Blend the seam onto a horizontally blurred real edge so the join is not a line."""
+    import numpy as np
+
+    if pad.shape[0] < 4:
+        return pad
+    edge = _lowpass_along(np.asarray(edge_row, np.float32), fraction=0.08)
+    depth = min(int(depth), int(pad.shape[0]))
+    out = pad.astype(np.float32)
+    for dist in range(depth):
+        y = (out.shape[0] - 1 - dist) if at_end else dist
+        weight = (dist / float(depth)) ** 0.85
+        out[y] = edge * (1.0 - weight) + out[y] * weight
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def _mirror_extend(band, pad: int, forward: bool, strong: bool = False):
     """Reflect the rim and blur it more the further it sits from the picture.
 
-    No column is smeared on its own, and the picture pixels are not copied as a
-    repeated border. `band` is the rim. When forward is false, the first row is
-    the edge and the pad is built upward.
+    A short pad reflects the outer 28px. A tall pad reflects a block as tall as
+    the gap (tiled when the picture is shorter than the gap), with the lettering
+    painted out of that copy first. `band` row 0 is the edge when forward is false.
     """
     import numpy as np
 
     width = int(band.shape[1])
     if pad <= 0:
         return np.zeros((0, width, 3), np.uint8)
-    work = np.ascontiguousarray(band.astype(np.float32))
+    source = _scrub_marks(band) if strong else band
+    work = np.ascontiguousarray(source.astype(np.float32))
     if not forward:
         work = work[::-1]
     reflected = _reflect_from_edge(work, pad)
-    reach = float(min(max(pad - 1, 1), 110))
-    smax = float(min(56.0, max(7.0, pad * 0.14)))
-    blurred = _progressive_blur(reflected, smax, reach)
+    if strong:
+        reach = max(float(pad) * 0.70, 1.0)
+        blurred = _progressive_blur(reflected, TALL_BLUR_SMAX, reach, s0=TALL_BLUR_S0, strong=True)
+    else:
+        reach = float(min(max(pad - 1, 1), 110))
+        smax = float(min(56.0, max(7.0, pad * 0.14)))
+        blurred = _progressive_blur(reflected, smax, reach, s0=0.0, strong=False)
     out = np.clip(np.rint(blurred), 0, 255).astype(np.uint8)
     if not forward:
         out = out[::-1]
+    if strong:
+        edge_row = band[-1] if forward else band[0]
+        out = _feather_to_edge(out, edge_row, at_end=not forward, depth=36)
     return out
+
+
+def vertical_streaks_dominate(band) -> bool:
+    """True when an extension is vertical colour stripes.
+
+    Vertical streaks have strong horizontal gradient energy, almost no change
+    down a column, and column means that jump from one x to the next. A soft
+    wash, a flat field and a real gradient do not.
+    """
+    import cv2
+    import numpy as np
+
+    if band is None or getattr(band, "ndim", 0) != 3:
+        return False
+    if band.shape[0] < 24 or band.shape[1] < 24:
+        return False
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if gray.shape[0] > 80:
+        gray = gray[: gray.shape[0] - 36]
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    energy_x = float(np.mean(gx * gx))
+    energy_y = float(np.mean(gy * gy)) + 1e-6
+    ratio = energy_x / energy_y
+    var_y = float(np.mean(np.var(gray, axis=0)))
+    columns = gray.mean(axis=0)
+    sigma = max(8.0, 0.06 * float(columns.size))
+    slow = cv2.GaussianBlur(columns.reshape(1, -1), (0, 0), sigma).ravel()
+    var_x = float(np.var(columns - slow))
+    return bool(ratio >= 6.0 and var_y <= 30.0 and var_x >= 40.0)
 
 
 def _extend_vertical(img, top: int, bottom: int):
@@ -346,10 +479,18 @@ def _extend_vertical(img, top: int, bottom: int):
     rim = min(MIRROR_RIM_PX, height)
     core = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
     if top:
-        parts.append(_mirror_extend(core[:rim], top, forward=False))
+        if top >= TALL_PAD_PX:
+            block = min(top, height)
+            parts.append(_mirror_extend(core[:block], top, forward=False, strong=True))
+        else:
+            parts.append(_mirror_extend(core[:rim], top, forward=False, strong=False))
     parts.append(core)
     if bottom:
-        parts.append(_mirror_extend(core[-rim:], bottom, forward=True))
+        if bottom >= TALL_PAD_PX:
+            block = min(bottom, height)
+            parts.append(_mirror_extend(core[-block:], bottom, forward=True, strong=True))
+        else:
+            parts.append(_mirror_extend(core[-rim:], bottom, forward=True, strong=False))
     if len(parts) == 1:
         return parts[0]
     return np.concatenate(parts, axis=0)
@@ -1016,6 +1157,7 @@ def make_print_ready(
             "rasterLines": vector_built.get("raster_lines") or 0,
             "qa": vector_built.get("qa") or {},
             "lines": vector_built.get("lines") or [],
+            "textGate": vector_built.get("text_gate") or [],
         }
     return _finish(result, output_dir)
 

@@ -21,6 +21,7 @@ from vector_trace import (
     rasterise_paths,
     refine_ink,
     segment_ink,
+    shape_gate,
     sharpen_background,
     trace_fitted,
     trace_mask,
@@ -208,6 +209,26 @@ def test_rebuild_defaults_to_trace() -> None:
     check("sample-dark", colour is not None and float(np.mean(colour)) < 60, str(colour))
 
 
+def test_closed_counter_stays_raster() -> None:
+    """A 9 whose counter is filled, or a speck outside the line, is not a vector."""
+    crop = np.full((96, 96, 3), 235, np.uint8)
+    ring = np.zeros((96, 96), np.uint8)
+    # Thick ring: filling the counter still covers the stroke, so this is a hole change.
+    cv2.circle(ring, (48, 48), 30, 255, 18)
+    crop[ring > 0] = (16, 18, 20)
+    filled = np.zeros((96, 96), np.uint8)
+    cv2.circle(filled, (48, 48), 30, 255, -1)
+    inner = (12, 12, 84, 84)
+    closed = shape_gate(crop, ring, filled, inner)
+    check("counter-closed", "counter" in closed, closed)
+    kept = shape_gate(crop, ring, ring, inner)
+    check("counter-open", kept == "", kept)
+    fragment = ring.copy()
+    fragment[2:16, 2:22] = 255
+    outside = shape_gate(crop, ring, fragment, inner)
+    check("fragment-outside", "fragment" in outside or "background" in outside, outside)
+
+
 def test_glyphs_reject_a_changed_letter() -> None:
     mask = np.zeros((40, 80), np.uint8)
     mask[8:32, 6:18] = 255
@@ -316,6 +337,7 @@ def main() -> None:
     test_choke_is_only_the_ring()
     test_default_trace_and_font_flag()
     test_rebuild_defaults_to_trace()
+    test_closed_counter_stays_raster()
     test_glyphs_reject_a_changed_letter()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()

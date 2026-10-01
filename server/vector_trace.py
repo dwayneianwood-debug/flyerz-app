@@ -270,28 +270,148 @@ def _scale_paths(paths: list, scale: float) -> list:
     return scaled
 
 
-def _accept_trace(mask: np.ndarray, paths: list) -> tuple[float, bool]:
+def _accept_trace(mask: np.ndarray, paths: list) -> tuple[float, bool, np.ndarray]:
     """Score a trace. Thin type is judged on the 4× bitmap potrace actually fit.
 
     The 1px render of a hairline stroke loses the edge and scores about 0.85
     even when the curves match. That 4× score may sit just under 0.9 only when
-    every glyph is present and none were added.
+    every glyph is present and none were added. The 1× paint is returned so a
+    later gate can compare counters with the source pixels.
     """
     height, width = mask.shape[:2]
     painted = rasterise_paths(paths, width, height)
     low = mask_iou(mask, painted)
     if low >= IOU_FLOOR:
-        return low, True
+        return low, True, painted
     big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
     _threshold, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
     zoomed = rasterise_paths(_scale_paths(paths, TRACE_SCALE), binary.shape[1], binary.shape[0])
     high = mask_iou(binary, zoomed)
     agree = glyphs_agree(binary, zoomed)
     if high >= IOU_FLOOR and agree:
-        return high, True
+        return high, True, painted
     if agree and high >= 0.86 and IOU_FLOOR <= 0.9:
-        return high, True
-    return max(low, high), False
+        return high, True, painted
+    return max(low, high), False, painted
+
+
+def _source_ink(crop: np.ndarray, seg_mask: np.ndarray) -> np.ndarray | None:
+    """Re-threshold the crop so a paper-coloured counter stays a hole.
+
+    The segmentation mask can fill a 9 into an 8. The pixels still show the hole.
+    """
+    if crop is None or seg_mask is None or int(seg_mask.max()) == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    ink = seg_mask > 0
+    if int(ink.sum()) < 8:
+        return None
+    ink_tone = float(np.median(gray[ink]))
+    near = cv2.dilate(ink.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    paper_px = gray[near & ~ink]
+    if paper_px.size < 8:
+        paper_px = gray[~ink]
+    if paper_px.size < 8:
+        return ink.astype(np.uint8) * 255
+    paper_tone = float(np.median(paper_px))
+    if abs(ink_tone - paper_tone) < 16.0:
+        return ink.astype(np.uint8) * 255
+    mid = (ink_tone + paper_tone) * 0.5
+    binary = gray <= mid if ink_tone < paper_tone else gray >= mid
+    zone = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    return (binary & zone).astype(np.uint8) * 255
+
+
+def _components(mask: np.ndarray, min_area: int) -> list:
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    parts = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        parts.append({
+            "area": area,
+            "x": int(stats[index, cv2.CC_STAT_LEFT]),
+            "y": int(stats[index, cv2.CC_STAT_TOP]),
+            "w": int(stats[index, cv2.CC_STAT_WIDTH]),
+            "h": int(stats[index, cv2.CC_STAT_HEIGHT]),
+            "pixels": labels == index,
+        })
+    parts.sort(key=lambda item: item["x"])
+    return parts
+
+
+def _hole_count(component: np.ndarray) -> int:
+    """Enclosed holes. 9 has one, 8 has two, S has none, B has two. Specks do not count."""
+    ys, xs = np.where(component)
+    if ys.size < 12:
+        return 0
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    crop[component[y0:y1, x0:x1]] = 255
+    padded = cv2.copyMakeBorder(crop, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    inv = cv2.bitwise_not(padded)
+    flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(inv, flood_mask, (0, 0), 128)
+    holes = (inv == 255).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(holes, 8)
+    min_hole = max(8, int(round(float(ys.size) * 0.02)))
+    found = 0
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_AREA]) >= min_hole:
+            found += 1
+    return found
+
+
+def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner: tuple) -> str:
+    """Reject a box whose trace is not the same letters as the pixels.
+
+    A component that sits outside the original text line is a fragment. A glyph
+    whose hole count changed (a 9 closed into an 8, an S opened into a B) is a
+    wrong character. Either one keeps the raster.
+    """
+    if traced is None or int(np.max(traced)) == 0:
+        return "The trace was empty, so this box stayed in the picture."
+    source = _source_ink(crop, seg_mask)
+    if source is None:
+        return ""
+    height, width = traced.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in inner]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(width, max(x0 + 1, x1)), min(height, max(y0 + 1, y1))
+    zone = np.zeros((height, width), np.uint8)
+    zone[y0:y1, x0:x1] = 1
+    traced_bin = traced > 0
+    source_bin = source > 0
+    for part in _components(traced, 20):
+        pixels = part["pixels"]
+        area = part["area"]
+        inside = int(np.count_nonzero(pixels & (zone > 0)))
+        if inside < int(0.50 * area):
+            return "The trace added a fragment outside the letters, so this box stayed in the picture."
+        overlap = int(np.count_nonzero(pixels & source_bin))
+        if overlap < int(0.35 * area):
+            return "The trace picked up background that is not the letter, so this box stayed in the picture."
+    # Display type only. Hairline body copy is judged by IoU; a 1px render closes its counters.
+    for part in _components(source, 20):
+        if min(part["h"], part["w"]) < 32:
+            continue
+        pixels = part["pixels"]
+        best = None
+        best_overlap = 0
+        for other in _components(traced, 12):
+            overlap = int(np.count_nonzero(pixels & other["pixels"]))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = other
+        if best is None or best_overlap < int(0.35 * part["area"]):
+            if part["area"] >= max(48, int(0.12 * max(1, int(source_bin.sum())))):
+                return "The trace dropped part of a letter, so this box stayed in the picture."
+            continue
+        if _hole_count(pixels) != _hole_count(best["pixels"]):
+            return "The trace closed or opened a counter, so this box stayed in the picture."
+    return ""
 
 
 def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
@@ -413,6 +533,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "top": top,
             "right": right,
             "bottom": bottom,
+            "crop": crop,
+            "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
         })
     traced = _trace_many([item["mask"] for item in pending])
     for item, paths in zip(pending, traced):
@@ -422,9 +544,13 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
             continue
-        score, accepted = _accept_trace(mask, paths)
+        score, accepted, painted = _accept_trace(mask, paths)
         if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
+            continue
+        reason = shape_gate(item["crop"], mask, painted, item["inner"])
+        if reason:
+            raster_lines.append(_line(text, "raster", reason))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
@@ -436,6 +562,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "rect": (left, top, right - left, bottom - top),
         })
         choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
+    pristine = plate.copy() if drawn else None
     if int(choke.max()) > 0:
         plate[:] = sharpen_background(plate, choke)
         choke_ink(plate, choke, CHOKE_PX)
@@ -456,6 +583,16 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         elif not qa.get("ppi"):
             reason = "The picture was under 400 PPI, so the original lettering was kept."
         return _fail(started, reason, provider=provider, qa=qa)
+
+    gate_started = time.perf_counter()
+    text_gate, drawn, qa = _apply_text_gate(
+        blocks, drawn, raster_lines, plate, pristine, output_pdf, trim_w, trim_h, bleed_mm, placed, qa,
+    )
+    gate_s = time.perf_counter() - gate_started
+    if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
+        from vector_text_v2 import _discard, _fail
+        _discard(output_pdf)
+        return _fail(started, "The traced press file failed the check, so the original lettering was kept.", provider=provider, qa=qa)
 
     vector_lines = []
     for item in drawn:
@@ -481,21 +618,34 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         decisions.append(reason)
     colour_s = float(qa.get("colour_s") or 0)
     compose_s = float(qa.get("compose_s") or 0)
+    matched = sum(1 for row in text_gate if row.get("ok"))
+    if text_gate and matched == len(text_gate):
+        decisions.append(f"Text gate: {matched} source lines match the render.")
+    elif text_gate:
+        decisions.append(
+            f"Text gate: {matched} of {len(text_gate)} source lines match the render. "
+            "A line that did not match was put back as raster."
+        )
     timings = {
         "ocr_s": round(ocr_s, 3),
         "enlarge_s": round(enlarge_s, 3),
         "trace_s": round(trace_s, 3),
         "colour_s": round(colour_s, 3),
         "compose_s": round(compose_s, 3),
+        "gate_s": round(gate_s, 3),
         "total_s": round(time.perf_counter() - started, 3),
     }
     timing_line = (
         f"Timing: OCR {timings['ocr_s']:.2f}s, upscale {timings['enlarge_s']:.2f}s, "
         f"trace {timings['trace_s']:.2f}s, colour {timings['colour_s']:.2f}s, "
-        f"PDF {timings['compose_s']:.2f}s."
+        f"PDF {timings['compose_s']:.2f}s, gate {timings['gate_s']:.2f}s."
     )
     decisions.append(timing_line)
     sys.stderr.write("[vector-trace] " + timing_line + "\n")
+    sys.stderr.write("[vector-trace] text gate\n")
+    for row in text_gate:
+        flag = "OK" if row.get("ok") else "FAIL"
+        sys.stderr.write(f"  {flag} {row.get('mode')} {row.get('text')!r} -> {row.get('render')!r}\n")
     return {
         "ok": True,
         "amber": amber,
@@ -510,6 +660,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "vector_lines": len(vector_lines),
         "raster_lines": len(raster_lines),
         "mode": "trace",
+        "text_gate": text_gate,
     }
 
 
@@ -549,6 +700,194 @@ def _trace_fill(colour: np.ndarray):
 
 def _line(text: str, mode: str, reason: str) -> dict:
     return {"text": text, "mode": mode, "font": "", "reason": reason, "match": None, "pt": 0}
+
+
+def _norm_text(text: str) -> str:
+    """Character-exact compare with whitespace collapsed to single spaces."""
+    cleaned = str(text or "").replace("\u00a0", " ").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _line_matches(source: str, render_lines: list) -> tuple[bool, str]:
+    key = _norm_text(source)
+    if not key:
+        return True, ""
+    norms = [line for line in (_norm_text(line) for line in render_lines) if line]
+    for line in norms:
+        if line == key:
+            return True, line
+    for start in range(len(norms)):
+        joined = norms[start]
+        for index in range(start + 1, min(start + 3, len(norms))):
+            joined = joined + " " + norms[index]
+            if joined == key:
+                return True, joined
+    blob = " ".join(norms)
+    if len(key) <= 4:
+        if key in blob.split(" "):
+            return True, key
+        return False, ""
+    if key in blob:
+        return True, key
+    return False, ""
+
+
+def _trim_bgr(path: str, bleed_mm: float, dpi: int = 300) -> np.ndarray:
+    """Press trim at `dpi`. The gate reads this, not the bleed."""
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        zoom = float(dpi) / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+    finally:
+        doc.close()
+    inset = int(round(float(bleed_mm) / 25.4 * float(dpi)))
+    if rgb.shape[0] > inset * 2 + 8 and rgb.shape[1] > inset * 2 + 8:
+        rgb = rgb[inset:-inset, inset:-inset]
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
+def _ocr_crop(image: np.ndarray) -> str:
+    """Read one text box. A short crop is enlarged so a single figure is visible."""
+    from vector_text_v2 import read_blocks
+
+    if image is None or image.size == 0 or image.shape[0] < 6 or image.shape[1] < 6:
+        return ""
+    crop = image
+    if crop.shape[0] < 96:
+        scale = 96.0 / float(crop.shape[0])
+        crop = cv2.resize(
+            crop,
+            (max(8, int(round(crop.shape[1] * scale))), 96),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    rows = read_blocks(crop, extra=False)
+    return _norm_text(" ".join(str(row.get("text") or "") for row in rows))
+
+
+def _same_reading(left: str, right: str) -> bool:
+    """True when two reads are the same letters, or one of them could not be read."""
+    a = _norm_text(left)
+    b = _norm_text(right)
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    if len(a) >= 8 and len(b) >= 8 and abs(len(a) - len(b)) <= max(2, int(0.15 * max(len(a), len(b)))):
+        return a in b or b in a
+    return False
+
+
+def _plate_crop(image: np.ndarray, rect: tuple) -> np.ndarray:
+    left, top, width, height = [int(v) for v in rect]
+    bottom = min(image.shape[0], max(0, top) + max(1, height))
+    right = min(image.shape[1], max(0, left) + max(1, width))
+    top = max(0, top)
+    left = max(0, left)
+    return image[top:bottom, left:right]
+
+
+def _render_crop(trim: np.ndarray, plate_shape, rect, trim_w, trim_h, bleed_mm, dpi: int = 300) -> np.ndarray:
+    """The same box on the 300 dpi trim render."""
+    plate_h, plate_w = plate_shape[:2]
+    media_w = (float(trim_w) + 2.0 * float(bleed_mm)) / 25.4 * float(dpi)
+    media_h = (float(trim_h) + 2.0 * float(bleed_mm)) / 25.4 * float(dpi)
+    inset = float(bleed_mm) / 25.4 * float(dpi)
+    left, top, width, height = [float(v) for v in rect]
+    x0 = left / float(plate_w) * media_w - inset
+    y0 = top / float(plate_h) * media_h - inset
+    x1 = (left + width) / float(plate_w) * media_w - inset
+    y1 = (top + height) / float(plate_h) * media_h - inset
+    ix0 = max(0, int(np.floor(x0)))
+    iy0 = max(0, int(np.floor(y0)))
+    ix1 = min(trim.shape[1], int(np.ceil(x1)))
+    iy1 = min(trim.shape[0], int(np.ceil(y1)))
+    if ix1 - ix0 < 4 or iy1 - iy0 < 4:
+        return trim[:0, :0]
+    return trim[iy0:iy1, ix0:ix1]
+
+
+def _apply_text_gate(blocks, drawn, raster_lines, plate, pristine, output_pdf, trim_w, trim_h, bleed_mm, placed, qa):
+    """OCR the trim. A traced box whose letters changed goes back to raster.
+
+    A line the page reader missed is checked on its own crop, against the same
+    crop of the original pixels. 9AM read as 8AM is a change. A line both reads
+    agree on is kept, even when an earlier pass spelled it differently.
+    """
+    source_lines = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text") or "")
+        if is_lettering(text):
+            source_lines.append(text)
+    try:
+        trim = _trim_bgr(output_pdf, bleed_mm, 300)
+        from vector_text_v2 import read_blocks
+        render_lines = [str(row.get("text") or "") for row in read_blocks(trim, extra=False)]
+    except Exception as exc:
+        sys.stderr.write(f"[vector-trace] text gate skipped ({exc})\n")
+        report = [{"text": text, "ok": False, "render": "", "mode": "unread"} for text in source_lines]
+        return report, drawn, qa
+
+    plate_shape = plate.shape if pristine is None else pristine.shape
+    kept = []
+    reverted = False
+    for item in drawn:
+        matched, _shown = _line_matches(item["text"], render_lines)
+        changed = False
+        if not matched and pristine is not None:
+            original = _ocr_crop(_plate_crop(pristine, item["rect"]))
+            rendered = _ocr_crop(_render_crop(trim, plate_shape, item["rect"], trim_w, trim_h, bleed_mm))
+            # Only a proven change of letters (9AM read as 8AM). An unread crop is not proof.
+            changed = bool(original and rendered and not _same_reading(original, rendered))
+        if not changed:
+            kept.append(item)
+            continue
+        left, top, width, height = [int(v) for v in item["rect"]]
+        right = min(plate.shape[1], left + width)
+        bottom = min(plate.shape[0], top + height)
+        plate[max(0, top):bottom, max(0, left):right] = pristine[max(0, top):bottom, max(0, left):right]
+        raster_lines.append(_line(
+            item["text"],
+            "raster",
+            "The render did not match this line, so the box stayed in the picture.",
+        ))
+        reverted = True
+    if reverted:
+        first_colour = float(qa.get("colour_s") or 0)
+        first_compose = float(qa.get("compose_s") or 0)
+        qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
+        qa["colour_s"] = first_colour + float(qa.get("colour_s") or 0)
+        qa["compose_s"] = first_compose + float(qa.get("compose_s") or 0)
+        try:
+            trim = _trim_bgr(output_pdf, bleed_mm, 300)
+            from vector_text_v2 import read_blocks
+            render_lines = [str(row.get("text") or "") for row in read_blocks(trim, extra=False)]
+        except Exception:
+            pass
+    drawn = kept
+
+    modes = {_norm_text(item["text"]): "vector" for item in drawn}
+    boxes = {_norm_text(item["text"]): item for item in drawn}
+    report = []
+    for text in source_lines:
+        ok, shown = _line_matches(text, render_lines)
+        if not ok:
+            item = boxes.get(_norm_text(text))
+            if item is not None:
+                shown = _ocr_crop(_render_crop(trim, plate_shape, item["rect"], trim_w, trim_h, bleed_mm))
+                ok = bool(shown) and _same_reading(text, shown)
+        report.append({
+            "text": text,
+            "ok": bool(ok),
+            "render": shown if shown else "",
+            "mode": modes.get(_norm_text(text), "raster"),
+        })
+    return report, drawn, qa
 
 
 def _points(height_px: int, ppi: int) -> float:

@@ -539,6 +539,21 @@ def test_bottom_bar_stays_at_the_bottom() -> None:
     check("bar-keeps-core", core.shape == placed.shape and np.array_equal(core, placed))
 
 
+def test_tall_extension_is_not_striped() -> None:
+    """A 28px rim smeared down a tall gap is vertical stripes. A tall block is not."""
+    import cv2
+    from quick_print import MIRROR_RIM_PX, _extend_vertical, _mirror_extend, vertical_streaks_dominate
+
+    src = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "catch_fire", "src.jpg"))
+    picture = cv2.imread(src)
+    check("stripe-fixture", picture is not None and picture.shape[0] > 400, str(None if picture is None else picture.shape))
+    old = _mirror_extend(picture[:MIRROR_RIM_PX], 600, forward=False, strong=False)
+    check("old-rim-is-striped", vertical_streaks_dominate(old), "the thin rim should fail the stripe gate")
+    fitted = _extend_vertical(picture, 600, 0)
+    check("tall-not-striped", vertical_streaks_dominate(fitted[:600]) is False, "tall extension still has vertical streaks")
+    check("tall-keeps-picture", np.array_equal(fitted[600:], picture))
+
+
 def test_catch_fire_raster_is_traced() -> None:
     """A square social JPG is not an AI export size. Lettering still has to be traced."""
     from ai_rebuild import assess
@@ -586,6 +601,23 @@ def test_catch_fire_raster_is_traced() -> None:
     check("catch-footer-at-bottom", tail_delta < 18, f"{tail_delta:.1f}")
     address = trim[int(trim.shape[0] * 0.90):int(trim.shape[0] * 0.97)]
     check("catch-address-above-footer", float(address.std()) > float(tail.std()) + 5, f"addr {address.std():.1f} tail {tail.std():.1f}")
+    from quick_print import vertical_streaks_dominate
+    import cv2
+    top_band = cv2.cvtColor(trim[: max(24, int(trim.shape[0] * 0.22))], cv2.COLOR_RGB2BGR)
+    check("catch-no-stripes", vertical_streaks_dominate(top_band) is False, "top extension is vertical streaks")
+    gate = (result.get("vectorText") or {}).get("textGate") or []
+    vector_bad = [row for row in gate if row.get("mode") == "vector" and not row.get("ok")]
+    check("catch-vector-lines-match", bool(gate) and not vector_bad, str(vector_bad)[:500])
+    # A closed counter or a fragment stays raster, and the render must still read the real letters.
+    for phrase in ("9AM", "6PM", "11AM", "SANDILE", "GREATER HARVEST FAMILY CHURCH"):
+        hit = [row for row in gate if row.get("text") == phrase]
+        check(
+            "catch-line-" + phrase[:16],
+            bool(hit) and all(row.get("ok") and phrase in str(row.get("render") or "") for row in hit),
+            str(hit)[:300],
+        )
+    wrong = [row for row in gate if str(row.get("render") or "") in {"8AM", "BANDILE", "CHURC"}]
+    check("catch-no-wrong-character", not wrong, str(wrong)[:300])
 
 
 def main() -> None:
@@ -594,6 +626,7 @@ def main() -> None:
     test_nearby_object_does_not_enter_the_band()
     test_touching_object_stays_reasonable_and_amber()
     test_bottom_bar_stays_at_the_bottom()
+    test_tall_extension_is_not_striped()
     test_catch_fire_raster_is_traced()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
     try:
