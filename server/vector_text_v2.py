@@ -883,7 +883,7 @@ def read_blocks(bgr: np.ndarray, extra: bool = True, fast: bool = False) -> list
     small, back = _downscale(bgr, DETECT_LONG_EDGE)
     key = hashlib.sha256(small.tobytes()).hexdigest()[:32]
     if fast:
-        key += "-gate2"
+        key += "-gate5"
     os.makedirs(OCR_CACHE, exist_ok=True)
     cache_path = os.path.join(OCR_CACHE, key + ".json")
     rows = None

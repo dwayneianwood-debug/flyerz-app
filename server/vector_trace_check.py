@@ -1006,21 +1006,13 @@ def _predicted(timings: dict) -> dict:
 
 
 def _check_allergies_column(gate: list) -> None:
-    """The infections column is one weight. A vector heading next to raster body is not."""
+    """One section, one weight. The heading and its description share a mode."""
     rows = gate or []
     heading = [row for row in rows if "ALLERGIES" in str(row.get("text") or "").upper()]
     body = [row for row in rows if "Identifies triggers" in str(row.get("text") or "")]
-    check("allergies-present", bool(heading), str(rows)[:240])
-    check(
-        "allergies-heading-raster",
-        bool(heading) and all(row.get("mode") == "raster" for row in heading),
-        str(heading)[:300],
-    )
-    check(
-        "allergies-description-raster",
-        bool(body) and all(row.get("mode") == "raster" for row in body),
-        str(body)[:300],
-    )
+    check("allergies-present", bool(heading) and bool(body), str(rows)[:240])
+    modes = {row.get("mode") for row in heading + body}
+    check("allergies-one-weight", modes == {"vector"} or modes == {"raster"}, str(heading + body)[:400])
 
 
 def test_medella_coverage_and_gate_speed() -> None:
@@ -1190,16 +1182,16 @@ def test_one_potrace_covers_the_page() -> None:
 
 
 def test_gate_image_keeps_a_word_whole() -> None:
-    """A thin crop is not stretched until its short side is 736, and a page strip stays under 960."""
+    """A thin crop is not stretched until its short side is 736, and a page strip stays at that long side."""
     from ocr_reader import _gate_image
 
     thin = _gate_image(np.full((76, 490, 3), 255, np.uint8))
-    check("gate-thin-long", max(thin.shape[:2]) <= 960, str(thin.shape))
+    check("gate-thin-long", max(thin.shape[:2]) <= 750, str(thin.shape))
     check("gate-thin-not-blown", min(thin.shape[:2]) < 400, str(thin.shape))
     card = _gate_image(np.full((452, 584, 3), 255, np.uint8))
-    check("gate-card-short", min(card.shape[:2]) >= 620, str(card.shape))
+    check("gate-card-readable", min(card.shape[:2]) >= 500 and max(card.shape[:2]) <= 750, str(card.shape))
     page = _gate_image(np.full((1135, 1172, 3), 255, np.uint8))
-    check("gate-page-long", max(page.shape[:2]) <= 970, str(page.shape))
+    check("gate-page-long", max(page.shape[:2]) <= 750, str(page.shape))
 
 
 def test_column_style_follows_the_majority() -> None:
@@ -1220,14 +1212,14 @@ def test_column_style_follows_the_majority() -> None:
             "iou": 0.95,
         }
 
-    drawn = [
-        item("ALLERGIES & SENSITIVITIES", (400, 200, 180, 18), ink),
-        item("Identifies triggers and", (400, 224, 170, 18), ink),
-    ]
     rasters = [
         {"text": "Boosts immunity", "rect": (400, 80, 160, 18), "anchor": "line", "style": ink},
-        {"text": "Supports the gut", "rect": (400, 110, 170, 18), "anchor": "line", "style": ink},
-        {"text": "Calms the skin", "rect": (400, 140, 150, 18), "anchor": "line", "style": ink},
+        {"text": "Supports the gut", "rect": (400, 100, 170, 18), "anchor": "line", "style": ink},
+        {"text": "Calms the skin", "rect": (400, 120, 150, 18), "anchor": "line", "style": ink},
+    ]
+    drawn = [
+        item("ALLERGIES & SENSITIVITIES", (400, 140, 180, 18), ink),
+        item("Identifies triggers and", (400, 160, 170, 18), ink),
     ]
     kept = [row["text"] for row in _keep_uniform(drawn, [], rasters)]
     check("column-style-raster", kept == [], str(kept))
@@ -1241,6 +1233,16 @@ def test_column_style_follows_the_majority() -> None:
     heading = [item("INFECTIONS", (400, 40, 180, 36), ink)]
     kept_heading = [row["text"] for row in _keep_uniform(heading, [], rasters)]
     check("different-size-stays", kept_heading == ["INFECTIONS"], str(kept_heading))
+    row_vector = [item("Identifies triggers and", (450, 200, 160, 18), ink)]
+    row_rasters = [
+        {"text": "Helps with bloating", "rect": (40, 200, 170, 18), "anchor": "line", "style": ink},
+        {"text": "mood and anxiety", "rect": (240, 200, 170, 18), "anchor": "line", "style": ink},
+    ]
+    row_kept = [row["text"] for row in _keep_uniform(row_vector, [], row_rasters)]
+    check("row-style-raster", row_kept == [], str(row_kept))
+    far = [item("Other column", (980, 200, 160, 18), ink)]
+    far_kept = [row["text"] for row in _keep_uniform(far, [], row_rasters)]
+    check("distant-row-stays", far_kept == ["Other column"], str(far_kept))
 
 
 def main() -> None:

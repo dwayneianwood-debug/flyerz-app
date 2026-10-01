@@ -70,8 +70,9 @@ def _gate_image(bgr):
     if short < 1 or long < 1:
         return bgr
     scale = 640.0 / float(short) if short < 640 else 1.0
-    if long * scale > 960.0:
-        scale = 960.0 / float(long)
+    # 736 is the detector's own long-side limit, so recognition crops are not larger than detection.
+    if long * scale > 736.0:
+        scale = 736.0 / float(long)
     if abs(scale - 1.0) < 0.02:
         return bgr
     return cv2.resize(

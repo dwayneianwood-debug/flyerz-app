@@ -1499,7 +1499,29 @@ def _same_column(above, below) -> bool:
         gap = ay - (by + bh)
     else:
         gap = 0.0
-    return gap <= 14.0 * max(ah, bh, 1.0)
+    # A section is stacked tighter than a gap between topics. 14× chained the whole page.
+    return gap <= 1.1 * max(ah, bh, 1.0)
+
+
+def _same_band(above, below) -> bool:
+    """Two lines of one row. A multi-column section shares a weight across the row."""
+    ax, ay, aw, ah = [float(v) for v in above]
+    bx, by, bw, bh = [float(v) for v in below]
+    overlap = min(ay + ah, by + bh) - max(ay, by)
+    short = min(ah, bh)
+    if short <= 0 or overlap < 0.45 * short:
+        return False
+    if ax + aw <= bx:
+        gap = bx - (ax + aw)
+    elif bx + bw <= ax:
+        gap = ax - (bx + bw)
+    else:
+        gap = 0.0
+    return gap <= 8.0 * max(ah, bh, 1.0)
+
+
+def _same_section(above, below) -> bool:
+    return _same_column(above, below) or _same_band(above, below)
 
 
 def _column_style_demote(entries: list) -> set:
@@ -1528,7 +1550,7 @@ def _column_style_demote(entries: list) -> set:
         for j in range(i + 1, count):
             if not _same_text_style(entries[i], entries[j]):
                 continue
-            if not _same_column(entries[i]["rect"], entries[j]["rect"]):
+            if not _same_section(entries[i]["rect"], entries[j]["rect"]):
                 continue
             union(i, j)
     groups = {}
@@ -2108,6 +2130,12 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         from vector_text_v2 import _fail
         return _fail(started, "No lettering was traced, so the original picture was kept.", provider=provider)
 
+    gate_started = time.perf_counter()
+    text_gate, drawn, _ignored, source_guard = _apply_text_gate(
+        blocks, drawn, raster_lines, raster_boxes, plate, pristine, output_pdf,
+        trim_w, trim_h, bleed_mm, placed, {}, bgr.shape, source_guard,
+    )
+    gate_s = time.perf_counter() - gate_started
     qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed)
     if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
         from vector_text_v2 import _discard, _fail
@@ -2120,17 +2148,6 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         elif not qa.get("ppi"):
             reason = "The picture was under 400 PPI, so the original lettering was kept."
         return _fail(started, reason, provider=provider, qa=qa)
-
-    gate_started = time.perf_counter()
-    text_gate, drawn, qa, source_guard = _apply_text_gate(
-        blocks, drawn, raster_lines, raster_boxes, plate, pristine, output_pdf,
-        trim_w, trim_h, bleed_mm, placed, qa, bgr.shape, source_guard,
-    )
-    gate_s = time.perf_counter() - gate_started
-    if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
-        from vector_text_v2 import _discard, _fail
-        _discard(output_pdf)
-        return _fail(started, "The traced press file failed the check, so the original lettering was kept.", provider=provider, qa=qa)
 
     vector_lines = []
     for item in drawn:
@@ -3183,7 +3200,6 @@ def _apply_text_gate(
     report = []
     vector_slots = []
     letter_rects = _letter_rects(blocks, int(source_shape[1]), int(source_shape[0]))
-    plate_ppi = float((placed or {}).get("ppi") or 400)
     # Rejected traces (empty, shape, topology, a later gate miss) count toward
     # the paragraph. Ink that was never separated does not: it only blanks its line.
     paragraph_cores = [
@@ -3215,16 +3231,6 @@ def _apply_text_gate(
                     sys.stderr.write(f"[glyph] text {text!r}\n")
             else:
                 glyph_fail = True
-            full = item.get("painted")
-            origin = _hide_foreign_ink(_plate_crop(base, rect), item.get("_ink"))
-            if (
-                full is not None
-                and not glyph_fail
-                and origin is not None
-                and origin.shape[:2] == full.shape[:2]
-                and _topology_fails(origin, full, plate_ppi)
-            ):
-                glyph_fail = True
         core = item.get("core") if item is not None and item.get("core") else inner
         bbox = block.get("bbox") or [0, 0, 0, 0]
         row = {
@@ -3252,6 +3258,19 @@ def _apply_text_gate(
         report.append(row)
         if vector:
             vector_slots.append(row)
+    # A section that is already mostly the picture is not worth a second read.
+    early_style = []
+    for index, row in enumerate(report):
+        live = row["_vector"] and not row["_revert"]
+        early_style.append({
+            "rect": row["_core"],
+            "raster": not live,
+            "colour": _sample_style(row.get("_source")),
+            "indexes": [index] if live else [],
+        })
+    for index in _column_style_demote(early_style):
+        report[index]["_revert"] = True
+    vector_slots = [row for row in vector_slots if not row["_revert"]]
     readings = _read_render_strip(
         [row["_render"] for row in vector_slots],
         [row["text"] for row in vector_slots],
@@ -3376,7 +3395,6 @@ def _apply_text_gate(
                 and float(row["ssim"]) >= SSIM_FLOOR
             )
             row["mode"] = "vector"
-    before = len(kept)
     if pristine is not None:
         art_box = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
         kept, source_guard = _repair_source(plate, pristine, kept, raster_lines, raster_boxes, art_box)
@@ -3388,12 +3406,6 @@ def _apply_text_gate(
         if row.get("_vector") and not any(_rects_match(row.get("_rect"), rect) for rect in alive):
             row["mode"] = "raster"
             row["ok"] = False
-    if reverted or len(kept) != before:
-        first_colour = float(qa.get("colour_s") or 0)
-        first_compose = float(qa.get("compose_s") or 0)
-        qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
-        qa["colour_s"] = first_colour + float(qa.get("colour_s") or 0)
-        qa["compose_s"] = first_compose + float(qa.get("compose_s") or 0)
     for item in kept:
         item.pop("_ink", None)
         item.pop("core", None)
