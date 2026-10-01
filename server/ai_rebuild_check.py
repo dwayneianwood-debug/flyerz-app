@@ -460,6 +460,38 @@ def test_restore_spaces_from_gaps() -> None:
     check("gap-spaces", text == "50% OFF PRINTS", text)
 
 
+def test_phone_groups_and_dotted_caps() -> None:
+    """OCR spaces stay put, and a glued dot is split when the pixels have a gap."""
+    from PIL import Image, ImageDraw, ImageFont
+    from ai_rebuild import digit_groups, restore_spaces, spacing_matches
+
+    canvas = Image.new("RGB", (860, 120), (236, 232, 220))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.truetype(os.path.join(os.path.dirname(__file__), "fonts", "v2", "CrimsonText-Regular.ttf"), 42)
+    x = 30
+    for word, gap in (("073", 28), ("703", 10), ("0766", 0)):
+        draw.text((x, 34), word, font=font, fill=(20, 36, 24))
+        x += int(draw.textlength(word, font=font)) + gap
+    bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
+    kept = restore_spaces("073 703 0766", bgr, [0.0, 0.12, 0.96, 0.7])
+    check("phone-groups", digit_groups(kept) == ["073", "703", "0766"], kept)
+    check("phone-spacing", spacing_matches("073 703 0766", kept), kept)
+    check("merged-phone-rejected", spacing_matches("073 703 0766", "073 7030766") is False)
+
+    caps = Image.new("RGB", (980, 90), (20, 50, 36))
+    draw = ImageDraw.Draw(caps)
+    face = ImageFont.truetype(os.path.join(os.path.dirname(__file__), "fonts", "v2", "Cinzel-600.ttf"), 28)
+    cursor = 24
+    for word in ("HOLISTIC", "·", "NATURAL", "·", "PROFESSIONAL"):
+        draw.text((cursor, 28), word, font=face, fill=(230, 236, 228))
+        cursor += int(draw.textlength(word, font=face)) + (22 if word != "PROFESSIONAL" else 0)
+    dotted = cv2.cvtColor(np.array(caps), cv2.COLOR_RGB2BGR)
+    ocr = "HOLISTIC · NATURAL· PROFESSIONAL"
+    spaced = restore_spaces(ocr, dotted, [0.0, 0.08, 0.98, 0.8])
+    check("dot-spaces", spaced == "HOLISTIC · NATURAL · PROFESSIONAL", spaced)
+    check("dot-matches-ocr", spacing_matches(ocr, spaced), spaced)
+
+
 def test_press_pdf_shows_the_words() -> None:
     """The file that goes to press must show the words, in place, on an intact background."""
     from press_ready_engine import compile_vector_press
@@ -868,6 +900,7 @@ if __name__ == "__main__":
     test_provider_crash_falls_back()
     test_real_local_ocr()
     test_restore_spaces_from_gaps()
+    test_phone_groups_and_dotted_caps()
     test_inpaint_removes_the_letters()
     test_doubtful_marks_are_not_retyped()
     test_contacts_and_dashes_are_words()

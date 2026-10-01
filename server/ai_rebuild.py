@@ -365,8 +365,8 @@ def _text_hex(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
-def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
-    """Pixel widths of words inside one OCR line. Large gaps are the spaces OCR dropped."""
+def _glyph_columns(bgr: np.ndarray, bbox: list):
+    """Ink runs inside one line, in pixels. Returns runs, gaps, line height, span."""
     height, width = bgr.shape[:2]
     x, y, bw, bh = [float(v) for v in bbox[:4]]
     x0 = max(0, int(round(x * width)))
@@ -374,7 +374,7 @@ def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
     x1 = min(width, int(round((x + bw) * width)))
     y1 = min(height, int(round((y + bh) * height)))
     if x1 - x0 < 4 or y1 - y0 < 4:
-        return []
+        return [], [], 0, 0
     roi = bgr[y0:y1, x0:x1]
     border = np.concatenate([
         roi[0].reshape(-1, 3),
@@ -402,18 +402,48 @@ def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
         else:
             merged.append(run)
     if len(merged) < 2:
-        return []
+        return [], [], y1 - y0, 0
     gaps = [merged[i + 1][0] - merged[i][1] - 1 for i in range(len(merged) - 1)]
-    threshold = max(float(np.median(gaps)) * 2.4, (y1 - y0) * 0.32)
-    groups = [[merged[0][0], merged[0][1]]]
+    span = merged[-1][1] - merged[0][0] + 1
+    return merged, gaps, y1 - y0, span
+
+
+def _word_gap(gap: float, gaps: list, line_h: int) -> bool:
+    """A gap between glyph clusters, wider than the gaps inside a word."""
+    if not gaps or line_h <= 0:
+        return False
+    small = float(min(gaps))
+    if small >= line_h * 0.18:
+        return gap >= small * 0.72
+    return gap >= max(line_h * 0.20, 4.0) and gap >= small * 2.0
+
+
+def _glyph_groups(bgr: np.ndarray, bbox: list) -> tuple:
+    """Word groups as (width, gap before it) plus the full ink span in pixels."""
+    merged, gaps, line_h, span = _glyph_columns(bgr, bbox)
+    if len(merged) < 2 or not gaps:
+        return [], 0
+    groups = []
+    width = merged[0][1] - merged[0][0] + 1
+    gap_before = 0
     for gap, run in zip(gaps, merged[1:]):
-        if gap >= threshold:
-            groups.append([run[0], run[1]])
+        run_w = run[1] - run[0] + 1
+        if _word_gap(gap, gaps, line_h):
+            groups.append((width, gap_before))
+            width = run_w
+            gap_before = gap
         else:
-            groups[-1][1] = run[1]
+            width += gap + run_w
+    groups.append((width, gap_before))
     if len(groups) < 2:
-        return []
-    return [group[1] - group[0] + 1 for group in groups]
+        return [], 0
+    return groups, span
+
+
+def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
+    """Pixel widths of words inside one OCR line. Large gaps are the spaces OCR dropped."""
+    groups, _span = _glyph_groups(bgr, bbox)
+    return [width for width, _gap in groups]
 
 
 def _allocate_chars(count: int, weights: list) -> list:
@@ -443,23 +473,107 @@ def _allocate_chars(count: int, weights: list) -> list:
     return base
 
 
+def digit_groups(text: str) -> list:
+    """Digit runs in order. A phone keeps these groups exactly."""
+    return re.findall(r"\d+", str(text or ""))
+
+
+def spacing_matches(ocr_text: str, set_text: str) -> bool:
+    """The set line keeps the OCR characters, the OCR spaces, and the digit groups.
+
+    A space may be added, for example to pull a dot off the word beside it.
+    A space that OCR already read may not disappear, and 703 0766 may not
+    become 7030766.
+    """
+    ocr = " ".join(str(ocr_text or "").split())
+    out = " ".join(str(set_text or "").split())
+    if not ocr:
+        return out == ""
+    if digit_groups(ocr) != digit_groups(out):
+        return False
+    if re.sub(r"\s+", "", ocr) != re.sub(r"\s+", "", out):
+        return False
+    rest = out
+    for index, token in enumerate(ocr.split()):
+        pattern = r"\s*".join(re.escape(ch) for ch in token)
+        match = re.search(pattern, rest)
+        if not match:
+            return False
+        if index and not re.match(r"\s", rest):
+            return False
+        rest = rest[match.end():]
+    return True
+
+
+def keeps_grouping(old_text: str, new_text: str) -> bool:
+    """A second read may fix a letter. It may not merge a digit group or drop a word space."""
+    old = str(old_text or "")
+    new = str(new_text or "")
+    old_digits = "".join(re.findall(r"\d", old))
+    new_digits = "".join(re.findall(r"\d", new))
+    if old_digits and old_digits == new_digits and digit_groups(old) != digit_groups(new):
+        return False
+    old_core = re.sub(r"[^A-Za-z0-9]", "", old).upper()
+    new_core = re.sub(r"[^A-Za-z0-9]", "", new).upper()
+    if old_core and old_core == new_core and len(new.split()) < len(old.split()):
+        return False
+    return True
+
+
+def _mark_atoms(text: str) -> list:
+    """Split a bullet or middot off the word it was glued to. Digit groups stay whole."""
+    atoms = []
+    for token in str(text or "").split():
+        atoms.extend(part for part in re.findall(r"[·•∙]|[^·•∙\s]+", token) if part)
+    return atoms
+
+
 def restore_spaces(text: str, bgr: np.ndarray, bbox: list) -> str:
-    """Put back spaces OCR swallowed, using the gaps between glyphs."""
-    compact = "".join(str(text or "").split())
-    if len(compact) < 2:
-        return str(text or "").strip()
-    weights = _word_group_widths(bgr, bbox)
+    """Keep every space OCR already found, and add one where the pixels show a gap.
+
+    Digit groups are never rebuilt. 073 703 0766 stays three groups even when
+    the second gap is only a little wider than the gap inside a group.
+    """
+    original = " ".join(str(text or "").split())
+    if len(original) < 2:
+        return original
+    groups, _span = _glyph_groups(bgr, bbox)
+    if " " in original or any(mark in original for mark in "·•∙"):
+        atoms = _mark_atoms(original)
+        if len(groups) == len(atoms) and len(atoms) >= 2:
+            candidate = " ".join(atoms)
+            if spacing_matches(original, candidate):
+                return candidate
+        return original
+    weights = [width for width, _gap in groups] if groups else []
     if len(weights) < 2:
-        return str(text or "").strip()
-    counts = _allocate_chars(len(compact), weights)
-    if sum(counts) != len(compact) or any(count <= 0 for count in counts):
-        return str(text or "").strip()
+        return original
+    counts = _allocate_chars(len(original), weights)
+    if sum(counts) != len(original) or any(count <= 0 for count in counts):
+        return original
     parts = []
     cursor = 0
     for count in counts:
-        parts.append(compact[cursor:cursor + count])
+        parts.append(original[cursor:cursor + count])
         cursor += count
-    return " ".join(parts)
+    candidate = " ".join(parts)
+    if not spacing_matches(original, candidate):
+        return original
+    return candidate
+
+
+def word_gap_fractions(bgr: np.ndarray, bbox: list, text: str) -> list:
+    """How much of the ink width each word space should take, in order."""
+    groups, span = _glyph_groups(bgr, bbox)
+    tokens = str(text or "").split()
+    if span <= 0 or len(groups) != len(tokens) or len(tokens) < 2:
+        return []
+    fracs = [float(gap) / float(span) for _width, gap in groups[1:]]
+    if str(text or "").count(" ") != len(fracs):
+        return []
+    if any(frac <= 0 for frac in fracs):
+        return []
+    return fracs
 
 
 def _space_blocks(blocks: list, bgr: np.ndarray) -> list:

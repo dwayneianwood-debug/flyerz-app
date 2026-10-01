@@ -17,6 +17,7 @@ from vector_text_v2 import (
     MIN_PPI,
     SANS_KEYS,
     SCRIPT_KEYS,
+    _assign_role,
     _is_phone,
     _rescue_kind,
     _script_allowed,
@@ -406,14 +407,41 @@ def test_badge_number_is_not_retyped() -> None:
     check("step-not-in-pdf", "4" not in text and "plan" in text.lower(), text[:200])
 
 
+def test_long_script_is_not_a_serif() -> None:
+    """A joined script sentence is Parisienne or it stays in the picture. Never a serif."""
+    ink = np.zeros((48, 460), np.uint8)
+    for start in (8, 120, 230, 340):
+        cv2.line(ink, (start, 36), (start + 90, 10), 255, 4)
+    text = "See your health, live your best life"
+    role, key, _score = _assign_role(text, ink, "serif", "")
+    check("long-script-face", role == "script" and key == "parisienne", f"{role} {key} {_score}")
+    italic = np.zeros((40, 280), np.uint8)
+    cv2.line(italic, (8, 30), (260, 8), 255, 3)
+    unsure_role, _key, _score = _assign_role("When you know better,", italic, "serif", "")
+    check("slant-is-script-or-raster-role", unsure_role in ("script", "unsure"), unsure_role)
+
+
+def test_stroke_follows_each_line() -> None:
+    """A face that is already heavier than the ink gets no extra stroke."""
+    from vector_text_v2 import _match_stroke, _render_ink
+
+    rendered = _render_ink("medella.lba@gmail.com", font_path("crimson"), 420, 48, "body")
+    check("email-weight-stroke", rendered is not None and _match_stroke(rendered, "medella.lba@gmail.com", "crimson") == 0.0)
+    heavy = cv2.dilate(rendered, np.ones((5, 5), np.uint8))
+    factor = _match_stroke(heavy, "medella.lba@gmail.com", "crimson")
+    check("heavier-ink-gets-a-stroke", 0 < factor <= 0.014, f"{factor}")
+
+
 def test_body_stroke_and_press_black() -> None:
-    """Body type is stroked at about 1.3% of the size, and a dark green plate keeps black ink."""
+    """Neutral dark type is solid K. A dark green name keeps its colour. Stroke stays under 5%."""
     from vector_text_v2 import _cmyk
 
     black = _cmyk((12 / 255, 11 / 255, 12 / 255))
     check("near-black-is-k", black[3] > 0.95 and max(black[:3]) < 0.05, str(black))
     green = _cmyk((15 / 255, 42 / 255, 27 / 255))
     check("green-heading-keeps-chroma", green[1] > 0.05 or green[3] < 0.95, str(green))
+    name = _cmyk((12 / 255, 32 / 255, 24 / 255))
+    check("green-name-not-k", name[3] < 0.98 or name[1] > 0.04, str(name))
     image = Image.new("RGB", (720, 240), (246, 241, 228))
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 160, 719, 239), fill=(24, 70, 48))
@@ -434,9 +462,7 @@ def test_body_stroke_and_press_black() -> None:
     images = doc[0].get_images()
     info = doc.extract_image(images[0][0]) if images else {}
     doc.close()
-    check("stroke-render-mode", "2 Tr" in raw, raw[-400:])
-    widths = [float(item) for item in re.findall(r"([0-9]*\.?[0-9]+) w", raw)]
-    check("stroke-not-five-percent", bool(widths) and min(widths) < 0.4, str(widths))
+    check("stroke-not-five-percent", "2 Tr" not in raw, raw[-400:])
     check("plate-is-cmyk", info.get("colorspace") == 4, str(info.get("colorspace")))
 
 
@@ -640,6 +666,8 @@ def main() -> None:
     test_core_ink_ignores_the_green_edge()
     test_step_circles_are_the_only_badges()
     test_badge_number_is_not_retyped()
+    test_long_script_is_not_a_serif()
+    test_stroke_follows_each_line()
     test_body_stroke_and_press_black()
     test_real_ocr_is_quick()
     test_medella_matches_approved_text()

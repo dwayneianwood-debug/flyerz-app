@@ -524,19 +524,15 @@ def _badge_protect(marks: list | None, height: int, width: int) -> np.ndarray:
 
 
 def _core_bgr(image: np.ndarray, keep: np.ndarray) -> np.ndarray:
-    """Median of the stroke core. Anti-aliased edges are the ground bleeding in."""
+    """Median of the stroke body. The fringe against the ground is left out."""
     pixels = image[keep]
     if pixels.shape[0] < 4:
         return np.array([0, 0, 0], np.float32)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    ink = gray[keep].astype(np.float32)
-    # Dark lettering: the darkest quarter of the ink. Light lettering: the brightest quarter.
-    if float(np.median(ink)) <= float(np.percentile(gray, 75)):
-        cut = float(np.percentile(ink, 25))
-        core = keep & (gray <= cut)
-    else:
-        cut = float(np.percentile(ink, 75))
-        core = keep & (gray >= cut)
+    dist = cv2.distanceTransform((keep > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    peak = float(dist.max()) if dist.size else 0.0
+    if peak < 0.8:
+        return np.median(pixels, axis=0)
+    core = (keep > 0) & (dist >= peak * 0.45)
     if int(np.count_nonzero(core)) < 4:
         return np.median(pixels, axis=0)
     return np.median(image[core], axis=0)

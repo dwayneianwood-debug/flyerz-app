@@ -438,6 +438,8 @@ def _repair_short(bgr: np.ndarray, blocks: list) -> list:
             old_score = 0.0
         old_core = re.sub(r"[^A-Za-z0-9]", "", old_text)
         new_core = re.sub(r"[^A-Za-z0-9]", "", new_text or "")
+        from ai_rebuild import keeps_grouping
+
         if (
             new_text
             and new_score >= 0.97
@@ -447,6 +449,7 @@ def _repair_short(bgr: np.ndarray, blocks: list) -> list:
             and len(new_core) >= max(4, int(len(old_core) * 0.8))
             and " ".join(new_text.split()).upper() != " ".join(old_text.split()).upper()
             and _close_reread(old_text, new_text, old_score)
+            and keeps_grouping(old_text, new_text)
         ):
             block["text"] = new_text
             block["score"] = round(float(new_score), 3)
@@ -526,6 +529,8 @@ def _refine_blocks(bgr: np.ndarray, blocks: list) -> list:
         new_core = re.sub(r"[^A-Za-z0-9]", "", new_text)
         old_spaced = " ".join(old_text.split()).upper()
         new_spaced = " ".join(new_text.split()).upper()
+        from ai_rebuild import keeps_grouping
+
         if (
             new_text
             and new_score >= 0.9
@@ -534,6 +539,7 @@ def _refine_blocks(bgr: np.ndarray, blocks: list) -> list:
             and new_spaced != old_spaced
             and (len(new_text.split()) >= len(old_text.split()) or new_score >= 0.99)
             and _close_reread(old_text, new_text, old_score)
+            and keeps_grouping(old_text, new_text)
         ):
             block["text"] = new_text
             block["score"] = round(new_score, 3)
@@ -819,9 +825,9 @@ def _is_wordmark(block: dict, blocks: list) -> bool:
 
 def _script_allowed(text: str, ink: np.ndarray) -> bool:
     words = str(text or "").split()
-    if not words or len(words) > 3 or _is_phone(text):
+    if not words or _is_phone(text) or _is_email(text):
         return False
-    if len(words) >= 3 and any(word.lower() in {"and", "with", "for", "your"} for word in words):
+    if _upper_ratio(text) >= 0.72 and len(_letters(text)) >= 3:
         return False
     return _scripty(ink, text)
 
@@ -861,48 +867,102 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         "color": block.get("color_hex") or "#222222",
         "quad": block.get("quad"),
     }
+    ink = _ink_mask(crop, record["color"]) if crop is not None else None
     if _is_numeral(text) or rescued == "numeral":
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="numeral", match=0.5)
-        return record
+        return _decorate(record, bgr, block, ink)
     if _is_email(text):
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="phone", match=0.8)
-        return record
+        return _decorate(record, bgr, block, ink)
     if _is_phone(text) or rescued == "phone":
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="phone", match=0.5)
-        return record
+        return _decorate(record, bgr, block, ink)
     try:
         ocr_score = float(block.get("score") or 0)
     except (TypeError, ValueError):
         ocr_score = 0.0
-    ink = _ink_mask(crop, record["color"]) if crop is not None else None
     if ink is None:
         record["reason"] = "The letters could not be separated from the picture."
         return record
-    if _is_phone(text) or rescued == "phone":
-        key = "poppins-regular" if style == "sans" else "crimson"
-        record.update(mode="vector", font=key, role="phone", match=0.5)
-        return record
-    if _scripty(ink, text) and ocr_score < SCRIPT_OCR_FLOOR and rescued != "name":
-        record["reason"] = "Script lettering was hard to read, so it stayed in the picture."
-        return record
+    connected, _slanted = _script_signals(ink, text)
     role, key, score = _assign_role(text, ink, style, rescued)
     record["match"] = round(float(score), 3)
     record["role"] = role
+    if role == "unsure":
+        # A confident read of a script tagline is set in Parisienne. A weak read stays ink.
+        if _tagline_hint(text) and ocr_score >= 0.9:
+            record.update(mode="vector", font="parisienne", role="script", match=0.12)
+            return _decorate(record, bgr, block, ink)
+        record["reason"] = "This looked like script, so it stayed in the picture."
+        return record
     confident = ocr_score >= 0.8 or rescued in ("name", "phone", "letters")
-    if role == "script" and ocr_score < SCRIPT_OCR_FLOOR and rescued != "name":
+    # A joined script line with a confident read is set in the script face.
+    # A weak read of script stays in the picture. It is not set in a serif.
+    script_sure = score >= 0.12 or (connected and ocr_score >= 0.9)
+    if role == "script" and not script_sure and ocr_score < SCRIPT_OCR_FLOOR and rescued != "name":
         record["reason"] = "Script lettering was hard to read, so it stayed in the picture."
         return record
-    script_ok = role == "script" and score >= 0.12 and (confident or ocr_score >= SCRIPT_OCR_FLOOR)
+    script_ok = role == "script" and script_sure and (confident or ocr_score >= 0.55 or rescued == "name")
     plain_ok = role != "script" and confident and score > -0.05
     if score < MATCH_FLOOR and rescued not in ("name", "phone", "letters") and not script_ok and not plain_ok:
         record["reason"] = "No font matched this line closely enough."
         return record
     record["mode"] = "vector"
     record["font"] = key
+    return _decorate(record, bgr, block, ink)
+
+
+def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarray]) -> dict:
+    """Word-gap widths and a stroke matched to this line's own ink."""
+    record["gaps"] = []
+    record["stroke"] = 0.0
+    if record.get("mode") != "vector":
+        return record
+    from ai_rebuild import word_gap_fractions
+
+    record["gaps"] = word_gap_fractions(bgr, block.get("bbox") or [0, 0, 1, 0.1], record.get("text") or "")
+    red, green, blue = _hex_rgb(record.get("color") or "#222222")
+    if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72:
+        return record
+    key = str(record.get("font") or "")
+    if ink is not None and key:
+        record["stroke"] = _match_stroke(ink, str(record.get("text") or ""), key)
     return record
+
+
+def _rel_stroke(mask: np.ndarray) -> float:
+    """Median stroke width as a fraction of the ink height."""
+    if mask is None or mask.size == 0:
+        return 0.0
+    binary = (mask > 40).astype(np.uint8)
+    ys, xs = np.where(binary > 0)
+    if len(xs) < 8:
+        return 0.0
+    tight = binary[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    dist = cv2.distanceTransform(tight, cv2.DIST_L2, 3)
+    vals = dist[dist >= 0.5]
+    if vals.size < 8 or tight.shape[0] < 2:
+        return 0.0
+    return float(np.median(vals)) * 2.0 / float(tight.shape[0])
+
+
+def _match_stroke(ink: np.ndarray, text: str, key: str) -> float:
+    """Extra stroke so this face matches the original ink. Zero when the face is already heavier."""
+    path = _FONT_FILES.get(key)
+    if not path or ink is None:
+        return 0.0
+    role = _FONT_ROLE.get(key, "body")
+    rendered = _render_ink(text, path, max(int(ink.shape[1]), 80), max(int(ink.shape[0]), 24), role)
+    if rendered is None:
+        return 0.0
+    extra = _rel_stroke(ink) - _rel_stroke(rendered)
+    if extra <= 0.008:
+        return 0.0
+    ratio = {"script": 0.62, "spaced": 0.70, "tagline": 0.78}.get(role, 0.82)
+    return float(min(0.014, extra * ratio))
 
 
 def _assign_role(text: str, ink: np.ndarray, style: str, rescued: str) -> tuple[str, str, float]:
@@ -917,36 +977,38 @@ def _assign_role(text: str, ink: np.ndarray, style: str, rescued: str) -> tuple[
         # when the read itself is confident.
         score = _score_key(ink, text, "cinzel-600")
         return "caps", "cinzel-600", score
-    words = text.split()
-    if len(words) <= 2 and _upper_ratio(text) < 0.72 and not _is_phone(text):
-        body = _score_key(ink, text, "crimson")
-        best_key, best = _best_script(ink, text)
-        # A real script word beats the body serif. A list item does not.
-        if best >= body + 0.07 and best >= 0.12:
-            return "script", best_key, best
-    if _script_allowed(text, ink) or (rescued == "name" and _scripty(ink, text)):
-        body = _score_key(ink, text, "crimson")
-        best_key, best = _best_script(ink, text)
-        if best >= body + 0.07 and best >= 0.12:
-            return "script", best_key, best
-    if _tagline_hint(text) or (rescued == "name" and not _scripty(ink, text)):
-        italic = _score_key(ink, text, "eb-italic")
-        body = _score_key(ink, text, "crimson")
-        if italic + 0.02 >= body:
+    if _is_phone(text) or _is_email(text):
+        return "phone", "crimson", _score_key(ink, text, "crimson")
+    connected, slanted = _script_signals(ink, text)
+    script_key, script_score = _best_script(ink, text)
+    body = _score_key(ink, text, "crimson")
+    italic = _score_key(ink, text, "eb-italic")
+    best_serif = max(body, italic)
+    # Joined or clearly script-shaped letters stay script. They are never
+    # swapped for a serif or an italic.
+    # Joined strokes or a real lean. The scorer alone has to win by a wide
+    # margin, or a noisy mask turns a body line into script.
+    if connected or slanted or (script_score >= 0.22 and script_score >= best_serif + 0.15):
+        return "script", script_key, script_score
+    if _tagline_hint(text) or (rescued == "name" and not connected):
+        if script_score >= 0.10 and script_score + 0.03 >= best_serif:
+            return "script", script_key, script_score
+        # A clear italic match can stay italic. A weak match is not set in a serif:
+        # the original script ink stays in the picture.
+        if _tagline_hint(text) and best_serif < 0.12 and script_score < 0.12:
+            return "unsure", "", max(script_score, italic)
+        if italic >= 0.12 and italic + 0.02 >= body:
+            return "tagline", "eb-italic", italic
+        if italic + 0.02 >= body and not _tagline_hint(text):
             return "tagline", "eb-italic", italic
         return "body", "crimson", body
     # Body copy stays one weight. Short list lines are not promoted to a bold head.
-    score = _score_key(ink, text, "crimson")
-    return "body", "crimson", score
+    return "body", "crimson", body
 
 
 def _best_script(ink: np.ndarray, text: str) -> tuple[str, float]:
-    scores = {key: _score_key(ink, text, key) for key in SCRIPT_KEYS}
-    best_key = max(scores, key=lambda key: scores[key])
-    # Parisienne is the house script. Another face has to win clearly.
-    if best_key != "parisienne" and scores[best_key] < scores.get("parisienne", 0) + 0.08:
-        best_key = "parisienne"
-    return best_key, scores[best_key]
+    # Parisienne is the house script. A script line is not set in another face.
+    return "parisienne", _score_key(ink, text, "parisienne")
 
 
 def _score_key(ink: np.ndarray, text: str, key: str) -> float:
@@ -966,13 +1028,9 @@ def _harmonise(lines: list, style: str) -> list:
             if line.get("font") in SANS_KEYS or role in ROLE_FONT:
                 line["font"] = ROLE_FONT.get(role, "crimson")
     scripts = [line for line in lines if line.get("role") == "script"]
-    if len(scripts) >= 2:
-        winner = max(
-            set(item.get("font") or "parisienne" for item in scripts),
-            key=lambda font: sum(1 for item in scripts if item.get("font") == font),
-        )
+    if style == "serif":
         for item in scripts:
-            item["font"] = winner
+            item["font"] = "parisienne"
     bands: dict = {}
     for line in lines:
         height = max(8, int(line["rect"][3]))
@@ -1101,23 +1159,35 @@ def _near_colour(crop: np.ndarray, colour_hex: str) -> Optional[np.ndarray]:
     return mask
 
 
-def _scripty(ink: np.ndarray, text: str) -> bool:
-    chars = max(1, sum(1 for ch in text if ch.isalnum()))
+def _script_signals(ink: np.ndarray, text: str) -> tuple[bool, bool]:
+    """Joined strokes, or a consistent lean measured on each letter. A solid bar is neither."""
+    chars = sum(1 for ch in str(text or "") if ch.isalnum())
+    if ink is None or ink.size == 0 or chars < 4:
+        return False, False
     binary = (ink > 0).astype(np.uint8)
-    count, _labels, _stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
+    if float(binary.mean()) > 0.55:
+        return False, False
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
     components = max(0, count - 1)
-    if chars >= 4 and components <= max(2, int(chars * 0.45)):
-        return True
-    ys, xs = np.where(binary > 0)
-    if len(xs) < 30:
-        return False
-    height = ink.shape[0]
-    top = xs[ys < np.percentile(ys, 30)]
-    bottom = xs[ys > np.percentile(ys, 70)]
-    if top.size == 0 or bottom.size == 0:
-        return False
-    slant = abs(float(top.mean()) - float(bottom.mean())) / float(max(1, height))
-    return slant > 0.22 and chars >= 4
+    connected = components <= max(2, int(chars * 0.45))
+    leans = []
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_HEIGHT]) < 8 or int(stats[index, cv2.CC_STAT_AREA]) < 10:
+            continue
+        ys, xs = np.where(labels == index)
+        height = max(1, int(stats[index, cv2.CC_STAT_HEIGHT]))
+        top = xs[ys <= np.percentile(ys, 30)]
+        bottom = xs[ys >= np.percentile(ys, 70)]
+        if top.size < 2 or bottom.size < 2:
+            continue
+        leans.append((float(top.mean()) - float(bottom.mean())) / float(height))
+    slanted = len(leans) >= 3 and abs(float(np.median(leans))) > 0.18
+    return connected, slanted
+
+
+def _scripty(ink: np.ndarray, text: str) -> bool:
+    connected, slanted = _script_signals(ink, text)
+    return connected or slanted
 
 
 def _score_font(ink: np.ndarray, text: str, path: str, role: str) -> float:
@@ -1743,40 +1813,70 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
     if not text or box_w < 1 or box_h < 1:
         return
     role = _FONT_ROLE.get(line.get("font") or "", "body")
-    size, tracking = _fit_width(font, text, box_w, box_h, role)
+    size, _tracking = _fit_width(font, text, box_w, box_h, role)
     asc = size * (0.70 if role != "script" else 0.62)
     desc = size * 0.22 if any(ch in "gjpqy" for ch in text) else 0.0
     ink = asc + desc
     top_pad = max(0.0, (box_h - ink) / 2.0)
     baseline = y * sy + top_pad + asc
     colour = _cmyk(_hex_rgb(line.get("color") or "#222222"))
+    advances = _char_advances(font, text, size, box_w, role, list(line.get("gaps") or []))
     writer = fitz.TextWriter(page.rect)
     cursor = x * sx
     for index, ch in enumerate(text):
         writer.append((cursor, baseline), ch, font=font, fontsize=size)
-        cursor += font.text_length(ch, fontsize=size)
-        if index < len(text) - 1:
-            cursor += tracking
+        cursor += advances[index] if index < len(advances) else font.text_length(ch, fontsize=size)
     stroke = _stroke_of(line)
     writer.write_text(page, color=colour, render_mode=2 if stroke else 0)
     if stroke:
         _restroke(page, size, stroke)
 
 
+def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fracs: list) -> list:
+    """Per-character advances. Word spaces use the measured pixel gaps, not letter tracking."""
+    widths = [float(font.text_length(ch, fontsize=size)) for ch in text]
+    spaces = [index for index, ch in enumerate(text) if ch == " "]
+    measured = len(gap_fracs) == len(spaces) and len(spaces) > 0
+    if measured:
+        for index, frac in zip(spaces, gap_fracs):
+            widths[index] = max(float(box_w) * float(frac), size * 0.18)
+    else:
+        for index in spaces:
+            widths[index] = max(widths[index], size * 0.32)
+    total = sum(widths)
+    if measured and total > box_w:
+        space_total = sum(widths[index] for index in spaces) or 1.0
+        overflow = total - box_w
+        if space_total > overflow:
+            scale = (space_total - overflow) / space_total
+            for index in spaces:
+                widths[index] *= scale
+            total = sum(widths)
+    boundaries = [
+        index for index in range(len(text) - 1)
+        if text[index] != " " and text[index + 1] != " "
+    ]
+    extra = [0.0] * len(text)
+    leftover = box_w - total
+    if leftover > 1.0 and boundaries:
+        cap = {"spaced": 0.12, "script": 0.05, "tagline": 0.10}.get(role, 0.10) * size
+        if measured:
+            cap = min(cap, 0.06 * size)
+        track = min(leftover / float(len(boundaries)), cap)
+        for index in boundaries:
+            extra[index] = track
+    return [widths[index] + extra[index] for index in range(len(text))]
+
+
 def _stroke_of(line: dict) -> float:
-    """Extra stroke for body and script. Caps and light ink stay at the file weight."""
-    font = str(line.get("font") or "")
-    role = str(line.get("role") or "")
+    """The stroke measured for this line. Light ink stays at the file weight."""
     red, green, blue = _hex_rgb(line.get("color") or "#222222")
     if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72:
         return 0.0
-    if "bold" in font or "semibold" in font:
+    try:
+        return max(0.0, float(line.get("stroke") or 0.0))
+    except (TypeError, ValueError):
         return 0.0
-    if role == "script" or font in SCRIPT_KEYS:
-        return SCRIPT_STROKE
-    if font in THICKEN or (role in ("body", "phone", "numeral") and font.startswith("crimson")):
-        return BODY_STROKE
-    return 0.0
 
 
 def _restroke(page, size: float, factor: float) -> None:
@@ -1866,9 +1966,10 @@ def _cmyk(rgb: tuple[float, float, float]) -> tuple[float, float, float, float]:
     red, green, blue = rgb
     # Dark neutral type is solid black. A grey K prints light on the press.
     lum = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-    if max(red, green, blue) - min(red, green, blue) < 0.08 and lum < 0.35:
+    # Only a neutral dark snaps to solid K. A dark green, such as a script name, keeps its colour.
+    if max(red, green, blue) - min(red, green, blue) < 0.045 and lum < 0.35:
         return (0.0, 0.0, 0.0, 1.0)
-    if max(red, green, blue) < 0.12 and max(red, green, blue) - min(red, green, blue) < 0.06:
+    if max(red, green, blue) < 0.12 and max(red, green, blue) - min(red, green, blue) < 0.04:
         return (0.0, 0.0, 0.0, 1.0)
     if min(red, green, blue) >= 0.96:
         return (0.0, 0.0, 0.0, 0.0)
