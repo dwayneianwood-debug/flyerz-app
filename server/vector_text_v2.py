@@ -347,13 +347,46 @@ def read_blocks(bgr: np.ndarray) -> list:
     return _repair_short(bgr, _refine_blocks(bgr, _space_blocks(blocks, bgr)))
 
 
+def _prefer_same_line(old_text: str, new_text: str) -> str:
+    """Keep the sentence that matches the line. A tall box can include the line above."""
+    new_text = " ".join(str(new_text or "").split())
+    old_text = " ".join(str(old_text or "").split())
+    if not new_text or not old_text or new_text.lower() == old_text.lower():
+        return new_text
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", new_text) if part.strip()]
+    if len(parts) < 2:
+        return new_text
+    best = new_text
+    best_ratio = _line_ratio(old_text, new_text)
+    for part in parts:
+        ratio = _line_ratio(old_text, part)
+        if ratio > best_ratio:
+            best = part
+            best_ratio = ratio
+    return best
+
+
+def _line_ratio(left: str, right: str) -> float:
+    left = re.sub(r"[^a-z0-9]", "", left.lower())
+    right = re.sub(r"[^a-z0-9]", "", right.lower())
+    if not left or not right:
+        return 0.0
+    # Shared prefix length, so a restored letter still counts as the same line.
+    shared = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        shared += 1
+    return shared / float(max(len(left), len(right)))
+
+
 def _repair_short(bgr: np.ndarray, blocks: list) -> list:
     """A second read of short lines. Page OCR misreads script such as The Surface."""
     from ocr_reader import local_rows
 
     indexes = [
         index for index, block in enumerate(blocks)
-        if 1 <= len(str(block.get("text") or "").split()) <= 3
+        if 1 <= len(str(block.get("text") or "").split()) <= 8
     ]
     if not indexes:
         return blocks
@@ -361,6 +394,10 @@ def _repair_short(bgr: np.ndarray, blocks: list) -> list:
     for index, (new_text, new_score) in zip(indexes, reads):
         block = blocks[index]
         old_text = str(block.get("text") or "")
+        if not new_text:
+            solo = _reread_many(bgr, [block], local_rows)
+            new_text, new_score = solo[0]
+        new_text = _prefer_same_line(old_text, new_text)
         try:
             old_score = float(block.get("score") or 0)
         except (TypeError, ValueError):
@@ -372,6 +409,7 @@ def _repair_short(bgr: np.ndarray, blocks: list) -> list:
             and new_score >= 0.97
             and new_score >= old_score
             and len(new_text.split()) >= len(old_text.split())
+            and len(new_core) >= len(old_core)
             and len(new_core) >= max(4, int(len(old_core) * 0.8))
             and " ".join(new_text.split()).upper() != " ".join(old_text.split()).upper()
         ):

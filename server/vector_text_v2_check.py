@@ -363,6 +363,110 @@ def test_numeral_mask_spares_the_circle() -> None:
     check("circle-survives", kept_green > int(green_before.sum()) * 0.72, f"kept {kept_green} of {int(green_before.sum())}")
 
 
+def _line_ssim(ours: np.ndarray, approved: np.ndarray, lines: list, mapper) -> float:
+    """Mean structural similarity over the approved OCR line boxes."""
+    scores = []
+    gray_ours = cv2.cvtColor(ours, cv2.COLOR_BGR2GRAY)
+    gray_approved = cv2.cvtColor(approved, cv2.COLOR_BGR2GRAY)
+    for line in lines:
+        text = str(line.get("text") or "").strip()
+        if len(text) <= 1:
+            continue
+        x0, y0, x1, y1 = line["box"]
+        ax, ay = mapper(x0, y0)
+        bx, by = mapper(x1, y1)
+        pad = 3
+        xa = max(0, int(min(ax, bx)) - pad)
+        ya = max(0, int(min(ay, by)) - pad)
+        xb = min(gray_ours.shape[1], int(max(ax, bx)) + pad)
+        yb = min(gray_ours.shape[0], int(max(ay, by)) + pad)
+        if xb - xa < 8 or yb - ya < 8:
+            continue
+        left = gray_ours[ya:yb, xa:xb].astype(np.float64)
+        right = gray_approved[ya:yb, xa:xb].astype(np.float64)
+        if left.shape != right.shape or min(left.shape) < 6:
+            continue
+        c1 = (0.01 * 255) ** 2
+        c2 = (0.03 * 255) ** 2
+        kernel = (7, 7)
+        mu_left = cv2.GaussianBlur(left, kernel, 1.2)
+        mu_right = cv2.GaussianBlur(right, kernel, 1.2)
+        var_left = cv2.GaussianBlur(left * left, kernel, 1.2) - mu_left * mu_left
+        var_right = cv2.GaussianBlur(right * right, kernel, 1.2) - mu_right * mu_right
+        cov = cv2.GaussianBlur(left * right, kernel, 1.2) - mu_left * mu_right
+        score = ((2 * mu_left * mu_right + c1) * (2 * cov + c2)) / (
+            (mu_left ** 2 + mu_right ** 2 + c1) * (var_left + var_right + c2)
+        )
+        scores.append(float(score.mean()))
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
+def _render_trim(pdf: str, dest: str) -> np.ndarray:
+    import subprocess
+
+    media = dest + ".media.png"
+    subprocess.check_call([
+        "gs", "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m", "-r300",
+        "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
+        f"-sOutputFile={media}", pdf,
+    ])
+    image = cv2.imread(media)
+    inset = int(round(5 / 25.4 * 300))
+    return image[inset:image.shape[0] - inset, inset:image.shape[1] - inset]
+
+
+def test_medella_matches_approved_text() -> None:
+    """The three approved sides stay close. A ghosted page scores far below this."""
+    import json
+
+    from vector_plate import fit_placement
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    ocr = json.load(open(os.path.join(root, "tools/reference_vector_rebuild/run_data/ocr.json"), encoding="utf-8"))
+    sides = (
+        ("flyer_front", 148, 210, 0.58),
+        ("flyer_back", 148, 210, 0.58),
+        ("card_front", 90, 50, 0.55),
+    )
+    for name, trim_w, trim_h, floor in sides:
+        src = os.path.join(root, "tests/fixtures/medella", f"{name}.png")
+        bgr = cv2.imread(src)
+        folder = tempfile.mkdtemp(prefix=f"medella-{name}-")
+        pdf = os.path.join(folder, "press.pdf")
+        result = rebuild_fitted(bgr, trim_w, trim_h, pdf)
+        check(f"{name}-ok", result.get("ok") is True, str(result.get("reason")))
+        check(f"{name}-time", float(result.get("elapsed_s") or 999) < 120, str(result.get("timings")))
+        lines = ocr[name]["lines"]
+        boxes = [tuple(line["box"]) for line in lines]
+        scale, off_x, off_y = fit_placement(bgr.shape[1], bgr.shape[0], trim_w, trim_h, 5, boxes)
+
+        def mapper(x, y, scale=scale, off_x=off_x, off_y=off_y):
+            return (off_x + x * scale - 5) / 25.4 * 300, (off_y + y * scale - 5) / 25.4 * 300
+
+        rendered = _render_trim(pdf, os.path.join(folder, "trim"))
+        approved = cv2.imread(os.path.join(root, "tests/fixtures/medella/approved", f"{name}_300dpi_trim.png"))
+        check(f"{name}-size", rendered.shape == approved.shape, f"{rendered.shape} vs {approved.shape}")
+        score = _line_ssim(rendered, approved, lines, mapper)
+        print(f"SSIM {name} {score:.3f}")
+        check(f"{name}-ssim", score >= floor, f"{score:.3f} < {floor}")
+
+    src = os.path.join(root, "tests/fixtures/medella/card_back.png")
+    bgr = cv2.imread(src)
+    folder = tempfile.mkdtemp(prefix="medella-card-back-")
+    pdf = os.path.join(folder, "press.pdf")
+    result = rebuild_fitted(bgr, 90, 50, pdf)
+    check("card-back-ok", result.get("ok") is True, str(result.get("reason")))
+    check("card-back-time", float(result.get("elapsed_s") or 999) < 120, str(result.get("timings")))
+    check("card-back-vector", int(result.get("vector_lines") or 0) >= 40, str(result.get("vector_lines")))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    text = " ".join((doc[0].get_text("text") or "").split()).upper()
+    doc.close()
+    check("card-back-words", "LIVE" in text and "BLOOD" in text and "IMMUNE" in text, text[:240])
+
+
 def image_bgr(image: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
@@ -440,6 +544,7 @@ def main() -> None:
     test_erase_clears_the_original()
     test_numeral_mask_spares_the_circle()
     test_real_ocr_is_quick()
+    test_medella_matches_approved_text()
     print("ALL PASS")
 
 
