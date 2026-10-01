@@ -3259,6 +3259,274 @@ def _short_faint_fails(source_bgr: np.ndarray, ssim: float) -> bool:
     return 4.0 <= median_h < 12.0
 
 
+def _letter_height(source_bgr: np.ndarray) -> float:
+    """Median height of the letter-sized ink, in source pixels. 0 when there is none."""
+    pair = _gray_pair(source_bgr, source_bgr)
+    if pair is None:
+        return 0.0
+    found = _paper_ink(pair[0])
+    if found is None:
+        return 0.0
+    ink = found[0]
+    parts = _components(ink.astype(np.uint8) * 255, 8)
+    heights = [part["h"] for part in parts if part["area"] >= 8 and part["h"] >= 4]
+    if len(heights) < 2:
+        return 0.0
+    return float(np.median(heights))
+
+
+def _upscaled_ink(image_bgr: np.ndarray, scale: int, nearest: bool):
+    """Ink on a larger copy. Nearest keeps a hard trace from growing a bar it never drew."""
+    if image_bgr is None or image_bgr.ndim != 3:
+        return None
+    interpolation = cv2.INTER_NEAREST if nearest else cv2.INTER_CUBIC
+    big = cv2.resize(
+        image_bgr,
+        (max(1, image_bgr.shape[1] * scale), max(1, image_bgr.shape[0] * scale)),
+        interpolation=interpolation,
+    )
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    border = np.concatenate([
+        gray[:2, :].ravel(), gray[-2:, :].ravel(),
+        gray[:, :2].ravel(), gray[:, -2:].ravel(),
+    ])
+    if border.size < 8:
+        return None
+    paper = float(np.median(border))
+    # The stroke is a small share of a wide line, so a page percentile is the paper.
+    if paper >= 150.0:
+        dark = gray[gray <= paper - 16.0]
+        if dark.size < 12:
+            return None
+        tone = float(np.percentile(dark, 30))
+        span = paper - tone
+        if span < 18.0:
+            return None
+        ink = gray < (paper - 0.42 * span)
+    else:
+        light = gray[gray >= paper + 16.0]
+        if light.size < 12:
+            return None
+        tone = float(np.percentile(light, 70))
+        span = tone - paper
+        if span < 18.0:
+            return None
+        ink = gray > (paper + 0.42 * span)
+    return ink
+
+
+def _enclosed_holes(component: np.ndarray, min_hole: int) -> int:
+    """Counters fully inside the glyph. A speck smaller than ``min_hole`` is not one."""
+    ys, xs = np.where(component)
+    if ys.size < 12:
+        return 0
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop = np.zeros((y1 - y0 + 2, x1 - x0 + 2), np.uint8)
+    crop[1:-1, 1:-1][component[y0:y1, x0:x1]] = 255
+    inv = cv2.bitwise_not(crop)
+    filled = inv.copy()
+    flood = np.zeros((filled.shape[0] + 2, filled.shape[1] + 2), np.uint8)
+    cv2.floodFill(filled, flood, (0, 0), 128)
+    holes = (filled == 255).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(holes, 8)
+    return sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= min_hole)
+
+
+def _small_glyph_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
+    """True when a short letter lost a counter, a crossbar, or a stroke.
+
+    Letters under 16px are not scored by the 1× overlap check: one pixel is a
+    fifth of the stroke, so that check skips them. The picture is enlarged so
+    a thin bar still closes its counter, and the trace is enlarged without
+    smoothing so a missing bar stays missing. One such letter sends the line
+    back to the picture.
+    """
+    height = _letter_height(source_bgr)
+    # Taller type is already scored glyph by glyph. A speck is not a letter.
+    if height < 4.0 or height >= 16.0:
+        return False
+    if render_bgr is None or render_bgr.shape[:2] != source_bgr.shape[:2]:
+        source_bgr = _match_scale(source_bgr, render_bgr)
+    scale = 4
+    source_ink = _upscaled_ink(source_bgr, scale, nearest=False)
+    render_ink = _upscaled_ink(render_bgr, scale, nearest=True)
+    if source_ink is None or render_ink is None:
+        return False
+    if source_ink.shape != render_ink.shape:
+        return False
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(source_ink.astype(np.uint8), 8)
+    parts = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 24:
+            continue
+        parts.append((
+            area,
+            int(stats[index, cv2.CC_STAT_LEFT]),
+            int(stats[index, cv2.CC_STAT_TOP]),
+            int(stats[index, cv2.CC_STAT_WIDTH]),
+            int(stats[index, cv2.CC_STAT_HEIGHT]),
+            index,
+        ))
+    if len(parts) < 2:
+        return False
+    median_area = float(np.median([part[0] for part in parts]))
+    median_h = float(np.median([part[4] for part in parts]))
+    floor = max(24, int(round(0.18 * median_area)))
+    for area, x, y, width, glyph_h, index in parts:
+        if area < floor or glyph_h < 0.62 * median_h or glyph_h < 10:
+            continue
+        y0 = max(0, y - 2)
+        x0 = max(0, x - 2)
+        y1 = min(source_ink.shape[0], y + glyph_h + 2)
+        x1 = min(source_ink.shape[1], x + width + 2)
+        window = labels[y0:y1, x0:x1] == index
+        # A one-pixel shift still belongs to this letter. The neighbour does not.
+        zone = cv2.dilate(window.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        drawn = render_ink[y0:y1, x0:x1] & zone
+        # A broken arm can sit a couple of pixels off the stroke and still inside
+        # the letter's own box. The next letter is outside that box.
+        drawn_box = render_ink[y0:y1, x0:x1]
+        min_hole = max(16, int(round(0.025 * area)))
+        source_holes = _enclosed_holes(window, min_hole)
+        render_holes = _enclosed_holes(drawn, max(8, min_hole // 2))
+        if source_holes > 0 and render_holes < source_holes:
+            if os.environ.get("SMALL_GLYPH_DEBUG"):
+                sys.stderr.write(f"[small] holes {source_holes}->{render_holes} h={glyph_h}\n")
+            return True
+        # A stroke that breaks into a second piece. A one-pixel nick is not a gap.
+        spec = max(16, int(round(0.12 * area)))
+        pieces, piece_labels, piece_stats, _piece_cent = cv2.connectedComponentsWithStats(
+            drawn_box.astype(np.uint8), 8,
+        )
+        substantial = []
+        for piece in range(1, pieces):
+            if int(piece_stats[piece, cv2.CC_STAT_AREA]) >= spec:
+                substantial.append(piece_labels == piece)
+        source_pieces, _source_labels, source_stats, _source_cent = cv2.connectedComponentsWithStats(
+            window.astype(np.uint8), 8,
+        )
+        source_n = sum(1 for piece in range(1, source_pieces) if int(source_stats[piece, cv2.CC_STAT_AREA]) >= spec)
+        if len(substantial) > source_n and len(substantial) >= 2:
+            substantial.sort(key=lambda mask: int(mask.sum()), reverse=True)
+            gap = cv2.distanceTransform((~substantial[0]).astype(np.uint8), cv2.DIST_L2, 3)
+            gap_px = float(gap[substantial[1]].min()) if int(substantial[1].sum()) else 0.0
+            # Four pixels at this scale is one pixel on the page: a broken arm
+            # or a foot that no longer meets the stem.
+            if gap_px >= 4.0 and int(substantial[1].sum()) >= spec:
+                if os.environ.get("SMALL_GLYPH_DEBUG"):
+                    sys.stderr.write(f"[small] split gap {gap_px:.1f} h={glyph_h}\n")
+                return True
+    return False
+
+
+def _glyph_tiles(source_bgr: np.ndarray, render_bgr: np.ndarray) -> list:
+    """Enlarged source/trace pairs for each short letter, left to right.
+
+    Empty when the line is not the small type this re-read is for.
+    """
+    height = _letter_height(source_bgr)
+    if height < 4.0 or height >= 16.0:
+        return []
+    if render_bgr.shape[:2] != source_bgr.shape[:2]:
+        source_bgr = _match_scale(source_bgr, render_bgr)
+    source_ink = _upscaled_ink(source_bgr, 1, nearest=True)
+    render_ink = _upscaled_ink(render_bgr, 1, nearest=True)
+    if source_ink is None or render_ink is None or source_ink.shape != render_ink.shape:
+        return []
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(source_ink.astype(np.uint8), 8)
+    parts = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        glyph_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if area < 8 or glyph_h < max(4.0, 0.55 * height):
+            continue
+        parts.append((
+            int(stats[index, cv2.CC_STAT_LEFT]),
+            int(stats[index, cv2.CC_STAT_TOP]),
+            int(stats[index, cv2.CC_STAT_WIDTH]),
+            glyph_h,
+            index,
+        ))
+    if len(parts) < 2:
+        return []
+    tiles = []
+    for x, y, width, glyph_h, index in parts:
+        y0 = max(0, y - 1)
+        x0 = max(0, x - 1)
+        y1 = min(source_ink.shape[0], y + glyph_h + 1)
+        x1 = min(source_ink.shape[1], x + width + 1)
+        window = labels[y0:y1, x0:x1] == index
+        zone = cv2.dilate(window.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        drawn = render_ink[y0:y1, x0:x1] & zone
+
+        def tile(mask: np.ndarray) -> np.ndarray:
+            canvas = np.full(mask.shape, 255, np.uint8)
+            canvas[mask] = 20
+            target_h = 48
+            target_w = max(8, int(round(canvas.shape[1] * target_h / float(max(1, canvas.shape[0])))))
+            big = cv2.resize(canvas, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+            return cv2.cvtColor(big, cv2.COLOR_GRAY2BGR)
+
+        tiles.append((tile(window), tile(drawn)))
+    return tiles
+
+
+def _glyph_letter(text: str) -> str:
+    """One letter, case kept. Punctuation and a blank read are not a letter."""
+    cleaned = re.sub(r"[^0-9A-Za-zÀ-ÿıİ]", "", str(text or ""))
+    if len(cleaned) != 1:
+        return ""
+    return cleaned
+
+
+def _small_reads_differ(readings: list) -> list:
+    """Indexes whose trace letter is not the picture's letter.
+
+    ``readings`` is (source text, source score, trace text, trace score) per glyph.
+    A pair the reader cannot see does not fail the line. Two different letters do.
+    """
+    bad = []
+    for index, item in enumerate(readings):
+        source_text, source_score, render_text, render_score = item
+        source_letter = _glyph_letter(source_text)
+        render_letter = _glyph_letter(render_text)
+        if source_score < 0.55 and render_score < 0.55:
+            continue
+        if not source_letter and not render_letter:
+            continue
+        if source_letter != render_letter and source_score >= 0.55 and render_score >= 0.55:
+            bad.append(index)
+        elif source_letter and not render_letter and source_score >= 0.55:
+            bad.append(index)
+    return bad
+
+
+def _recognize_glyphs(images: list) -> list:
+    """Read each glyph. One batch, no second detection pass over the page."""
+    if not images:
+        return []
+    from ocr_reader import _load
+
+    engine, _name = _load()
+    recognizer = engine.text_rec
+    saved = recognizer.rec_batch_num
+    recognizer.rec_batch_num = max(int(saved or 1), 32)
+    try:
+        result = engine.recognize_txt(images)
+    finally:
+        recognizer.rec_batch_num = saved
+    texts = list(getattr(result, "txts", None) or [])
+    scores = list(getattr(result, "scores", None) or [])
+    found = []
+    for index in range(len(images)):
+        text = str(texts[index] if index < len(texts) else "")
+        score = float(scores[index] if index < len(scores) else 0.0)
+        found.append((text, score))
+    return found
+
+
 def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     """Lowest IoU of one source glyph against the render in that same place.
 
@@ -3846,13 +4114,22 @@ def _apply_text_gate(
         # A second edge, or a short line the glyph check does not judge.
         doubled = _double_edge_fails(row["_source"], row["_render"])
         faint = _short_faint_fails(row["_source"], float(score["ssim"]))
+        # Short letters skip the 1× overlap. A lost counter or a broken stroke
+        # still sends the line back. That decision does not need a second read.
+        stroke = _small_glyph_fails(row["_source"], row["_render"])
         judged["glyphIou"] = round(float(glyph_iou), 3)
         judged["haloFail"] = bool(halo or ghost or doubled)
-        judged["glyphFail"] = bool(glyph_iou < 0.85 or halo or ghost or doubled or faint)
+        judged["strokeFail"] = bool(stroke)
+        judged["smallText"] = 4.0 <= _letter_height(row["_source"]) < 16.0
+        judged["glyphFail"] = bool(
+            glyph_iou < 0.85 or halo or ghost or doubled or faint or stroke
+        )
         # A doubled small line goes back to the picture on its own. It does not
         # pull the rest of the paragraph, or one blotchy line blanks the column.
+        # A broken letter does pull its paragraph: the heading and the line
+        # under it have to be the same weight.
         judged["lineOnly"] = bool(
-            doubled and glyph_iou >= 0.85 and not halo and not ghost and not faint
+            doubled and glyph_iou >= 0.85 and not halo and not ghost and not faint and not stroke
         )
         return judged
 
@@ -3871,6 +4148,10 @@ def _apply_text_gate(
             continue
         if judged.get("glyphFail"):
             row["glyphFail"] = True
+        if judged.get("strokeFail"):
+            row["_strokeFail"] = True
+        if judged.get("smallText"):
+            row["_smallText"] = True
         if judged.get("lineOnly"):
             row["_lineOnly"] = True
     # A line the mask already accepted does not need a second read. Copying
@@ -3883,7 +4164,7 @@ def _apply_text_gate(
     quiet = []
     for row in vector_slots:
         low_ssim = float(row["ssim"]) < SSIM_FLOOR
-        if row.get("_lineOnly"):
+        if row.get("_lineOnly") or row.get("_strokeFail"):
             quiet.append(row)
         elif row["glyphFail"] or row["_pixelFail"] or low_ssim:
             rejected.append(row)
@@ -3902,6 +4183,35 @@ def _apply_text_gate(
     for row, reading in zip(rejected, readings):
         row["render"] = reading
         row["mismatch"] = not _reads_match(row["text"], reading)
+    # Short lines the stroke check kept are read one letter at a time. The
+    # trace letter has to be the picture's letter. One batch covers the page.
+    small_rows = [row for row in accepted if row.get("_smallText")]
+    if small_rows:
+        paired = []
+        owners = []
+        for row_index, row in enumerate(small_rows):
+            tiles = _glyph_tiles(row["_source"], row["_render"])
+            for source_tile, render_tile in tiles:
+                paired.append(source_tile)
+                paired.append(render_tile)
+                owners.append(row_index)
+        if paired:
+            seen = _recognize_glyphs(paired)
+            grouped = {}
+            for owner, offset in zip(owners, range(0, len(seen), 2)):
+                source_text, source_score = seen[offset] if offset < len(seen) else ("", 0.0)
+                render_text, render_score = seen[offset + 1] if offset + 1 < len(seen) else ("", 0.0)
+                grouped.setdefault(owner, []).append((source_text, source_score, render_text, render_score))
+            for owner, row_readings in grouped.items():
+                if not _small_reads_differ(row_readings):
+                    continue
+                row = small_rows[owner]
+                row["glyphFail"] = True
+                letters = "".join(_glyph_letter(item[2]) or "?" for item in row_readings)
+                row["render"] = letters
+                row["mismatch"] = True
+                if os.environ.get("SMALL_GLYPH_DEBUG"):
+                    sys.stderr.write(f"[small] ocr {row.get('text')!r} -> {letters!r}\n")
     for row in report:
         if row["_vector"] and not row.get("render"):
             row["render"] = _norm_text(row["text"])
@@ -4029,7 +4339,7 @@ def _apply_text_gate(
         item.pop("_ink", None)
         item.pop("core", None)
     for row in report:
-        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly"):
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_smallText"):
             row.pop(key, None)
     return report, kept, qa, source_guard
 

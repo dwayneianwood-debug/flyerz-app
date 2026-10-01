@@ -48,6 +48,8 @@ from vector_trace import (
     _ghost_double_fails,
     _double_edge_fails,
     _short_faint_fails,
+    _small_glyph_fails,
+    _small_reads_differ,
     ABOVE_FRAC,
     BELOW_FRAC,
 )
@@ -618,6 +620,55 @@ def test_descenders_and_counters() -> None:
         tall_line[8:36, x:x + 6] = (30, 28, 26)
         tall_line[8:14, x:x + 16] = (30, 28, 26)
     check("short-faint-tall", _short_faint_fails(tall_line, 0.89) is False)
+    # A short e is under the 12px overlap skip. Losing its bar, or breaking a
+    # stroke into two pieces, still has to send the line back. A harder edge
+    # that keeps the counter does not.
+    def _draw_e(image, x, y, bar=True):
+        image[y:y + 12, x:x + 2] = (20, 18, 16)
+        image[y:y + 2, x:x + 10] = (20, 18, 16)
+        image[y:y + 7, x + 8:x + 10] = (20, 18, 16)
+        image[y + 10:y + 12, x:x + 10] = (20, 18, 16)
+        if bar:
+            image[y + 5:y + 7, x:x + 10] = (20, 18, 16)
+
+    short = np.full((28, 80, 3), (236, 232, 226), np.uint8)
+    _draw_e(short, 8, 8, True)
+    _draw_e(short, 28, 8, True)
+    check("small-e-kept", _small_glyph_fails(short, short.copy()) is False)
+    opened = short.copy()
+    opened[13:15, 8:36] = (236, 232, 226)
+    check("small-e-lost-bar", _small_glyph_fails(short, opened) is True)
+    bold_e = short.copy()
+    e_ink = np.any(short.astype(int) < 80, axis=2)
+    # One pixel outside the stroke, the counter left open.
+    fringe = cv2.distanceTransform((~e_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    bold_e[(fringe > 0) & (fringe < 1.15) & (fringe > 0)] = (20, 18, 16)
+    # The counter sits at rows 10:13. Keep it paper so the harder edge is not a filled bowl.
+    bold_e[10:13, 12:16] = (236, 232, 226)
+    bold_e[10:13, 32:36] = (236, 232, 226)
+    check("small-e-hard-edge", _small_glyph_fails(short, bold_e) is False)
+    broken_r = np.full((28, 90, 3), (236, 232, 226), np.uint8)
+    broken_r[8:20, 8:10] = (20, 18, 16)
+    broken_r[8:20, 20:22] = (20, 18, 16)
+    broken_r[8:20, 52:54] = (20, 18, 16)
+    broken_r[8:11, 52:60] = (20, 18, 16)
+    split_r = broken_r.copy()
+    split_r[8:11, 54:60] = (236, 232, 226)
+    split_r[14:17, 56:62] = (20, 18, 16)
+    check("small-r-split", _small_glyph_fails(broken_r, split_r) is True)
+    check("small-r-kept", _small_glyph_fails(broken_r, broken_r.copy()) is False)
+    tall_e = np.full((48, 80, 3), (236, 232, 226), np.uint8)
+    tall_e[8:36, 8:12] = (20, 18, 16)
+    tall_e[8:36, 24:28] = (20, 18, 16)
+    tall_e[8:14, 8:28] = (20, 18, 16)
+    tall_e[20:26, 8:28] = (20, 18, 16)
+    tall_open = tall_e.copy()
+    tall_open[20:26, 8:28] = (236, 232, 226)
+    check("small-skip-tall", _small_glyph_fails(tall_e, tall_open) is False)
+    check("small-read-mismatch", _small_reads_differ([("e", 0.99, "c", 0.80)]) == [0])
+    check("small-read-same", _small_reads_differ([("e", 0.99, "e", 0.91)]) == [])
+    check("small-read-unsure", _small_reads_differ([("K", 0.40, "N", 0.40)]) == [])
+    check("small-read-blank", _small_reads_differ([("e", 0.90, "", 0.0)]) == [0])
 
     wide = np.full((1000, 1700, 3), (230, 226, 220), np.uint8)
     wide[400:460, 200:260] = (16, 14, 12)
