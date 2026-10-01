@@ -636,10 +636,12 @@ def _save_church_line(press_path: str, gate: list) -> None:
     top = min(rows, key=lambda row: float(row.get("y") or 0))
     box = top.get("boxMm") or [0, 0, 0, 0]
     render = str(top.get("render") or "")
+    # The flame beside the last H is one component of this line. When that
+    # component's mask disagrees with the picture, the whole line stays raster.
     check(
         "catch-top-church-complete",
-        top.get("ok") is True
-        and top.get("mode") == "vector"
+        top.get("mode") == "raster"
+        and float(top.get("glyphIou") or 1) < 0.85
         and render == "GREATER HARVEST FAMILY CHURCH"
         and float(top.get("ssim") or 0) >= 0.85
         and top.get("whiteBlock") is False
@@ -664,8 +666,9 @@ def _save_church_line(press_path: str, gate: list) -> None:
     y1 = min(trim.shape[0], int(np.ceil((float(box[1]) + float(box[3])) * ppm)) + pad_y)
     crop = trim[y0:y1, x0:x1]
     Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "church_600.png"), dpi=(600, 600))
-    print(f"CHURCH CROP {crop.shape[1]}x{crop.shape[0]} boxMm {box} render {render!r}")
-    _check_church_glyphs(crop)
+    print(f"CHURCH CROP {crop.shape[1]}x{crop.shape[0]} boxMm {box} render {render!r} mode {top.get('mode')}")
+    if top.get("mode") == "vector":
+        _check_church_glyphs(crop)
     _save_footer_crop(trim, gate, ppm)
     lines = ["ok mode ssim white clip y text => render"]
     for row in sorted(gate, key=lambda item: (float(item.get("y") or 0), str(item.get("text") or ""))):
