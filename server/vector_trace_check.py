@@ -519,6 +519,65 @@ def test_descenders_and_counters() -> None:
     check("gray-gap-passes", _topology_fails(gap, filled, 400) is False)
 
 
+def test_a_wide_swash_is_not_traced() -> None:
+    """A flourish wider than the letters stays in the picture. A descender does not."""
+    from vector_trace import _strip_flourish
+
+    letters = np.zeros((80, 200), np.uint8)
+    for x in (10, 40, 70, 100):
+        letters[10:40, x:x + 18] = 255
+    descender = letters.copy()
+    descender[40:58, 44:52] = 255
+    kept = _strip_flourish(descender)
+    check("descender-stays", int(kept[50, 46]) == 255 and int(kept[20, 16]) == 255)
+    swash = letters.copy()
+    swash[48:70, 15:130] = 255
+    stripped = _strip_flourish(swash)
+    check("swash-not-traced", int(stripped[55, 40]) == 0, str(int(stripped[48:].max())))
+    check("swash-letters-stay", int(stripped[20, 16]) == 255 and int(stripped[20, 46]) == 255)
+
+
+def test_a_closed_fork_is_not_a_y() -> None:
+    """Joining the arms of a Y fails. An open Y, and an H, do not."""
+    source = np.zeros((40, 24), np.uint8)
+    source[0:16, 1:5] = 255
+    source[0:16, 16:20] = 255
+    source[14:22, 4:9] = 255
+    source[14:22, 12:17] = 255
+    source[20:38, 8:13] = 255
+    check("open-y-matches", _glyph_structure_fails(source, source.copy()) is False)
+    closed = source.copy()
+    closed[4:14, 5:16] = 255
+    check("closed-y-fails", _glyph_structure_fails(source, closed) is True)
+    aitch = np.zeros((40, 24), np.uint8)
+    aitch[2:36, 2:6] = 255
+    aitch[2:36, 16:20] = 255
+    aitch[16:22, 6:16] = 255
+    bridged = aitch.copy()
+    bridged[4:12, 6:16] = 255
+    check("bridged-h-is-not-a-fork", _glyph_structure_fails(aitch, bridged) is False)
+
+
+def test_swash_bars_are_not_exempt() -> None:
+    """A change under the letters, outside the traced stroke, is a leak on every side."""
+    from vector_trace import _source_leaks
+
+    ink = np.zeros((70, 80), np.uint8)
+    ink[8:28, 8:60] = 255
+    plate = np.full((70, 80, 3), 230, np.uint8)
+    plate[8:28, 8:60] = (20, 24, 18)
+    plate[40:58, 12:68] = (30, 36, 28)
+    pristine = plate.copy()
+    plate[40:58, 12:68:4] = 250
+    item = {"_ink": ink, "origin": (0, 0)}
+    leaks = _source_leaks(plate, pristine, [item], (0, 0, 80, 70))
+    check("swash-bars-leak", int(leaks[44:54, 12:68].sum()) > 20, str(int(leaks.sum())))
+    stroke = pristine.copy()
+    stroke[12:24, 12:56] = (80, 80, 80)
+    quiet = _source_leaks(stroke, pristine, [item], (0, 0, 80, 70))
+    check("stroke-fringe-is-the-only-exemption", int(quiet.sum()) == 0, str(int(quiet.sum())))
+
+
 def test_glyphs_reject_a_changed_letter() -> None:
     mask = np.zeros((40, 80), np.uint8)
     mask[8:32, 6:18] = 255
@@ -647,6 +706,23 @@ def test_a_line_is_not_half_traced() -> None:
     from vector_trace import _same_line
     check("tall-word-not-the-column", _same_line((281, 332, 566, 227), (1008, 380, 294, 50)) is False)
     check("words-on-one-line", _same_line((10, 40, 80, 20), (100, 40, 110, 20)) is True)
+    # Footer words are short, with a bullet's worth of gap. They are one line,
+    # so one rejected trace puts the whole footer back in the picture.
+    detect = (579, 779, 67, 18)
+    balance = (689, 780, 75, 16)
+    heal = (807, 779, 47, 17)
+    live = (891, 780, 105, 16)
+    check(
+        "footer-words-one-line",
+        _same_line(detect, balance) and _same_line(balance, heal) and _same_line(heal, live),
+    )
+    footer = [
+        {"text": "DETECT", "rect": detect, "paths": [[]], "fill": (0, 0, 0, 1), "origin": detect[:2], "iou": 0.95},
+        {"text": "BALANCE", "rect": balance, "paths": [[]], "fill": (0, 0, 0, 1), "origin": balance[:2], "iou": 0.95},
+        {"text": "LIVE BETTER", "rect": live, "paths": [[]], "fill": (0, 0, 0, 1), "origin": live[:2], "iou": 0.95},
+    ]
+    dropped = [item["text"] for item in _keep_uniform(footer, [], [{"text": "HEAL", "rect": heal, "anchor": "paragraph"}])]
+    check("footer-raster-together", dropped == [], str(dropped))
 
 
 def test_card_back_body_is_traced() -> None:
@@ -704,6 +780,7 @@ def _trace_side(name: str, trim_w: float, trim_h: float, workers: str = "2") -> 
         "textGate": built.get("textGate") or [],
         "source_guard": built.get("sourceGuard"),
         "light": result.get("light"),
+        "press": result.get("pressPath") or "",
     }
 
 
@@ -716,6 +793,130 @@ def _vector_reads_match(gate: list) -> list:
         if row.get("glyphFail") or not _reads_match(str(row.get("text") or ""), str(row.get("render") or "")):
             bad.append(row)
     return bad
+
+
+def _media_box(box_mm, shape, trim_w: float, trim_h: float, bleed: float = 5.0):
+    height, width = shape[:2]
+    media_w = float(trim_w) + 2.0 * bleed
+    media_h = float(trim_h) + 2.0 * bleed
+    x = (float(box_mm[0]) + bleed) / media_w * width
+    y = (float(box_mm[1]) + bleed) / media_h * height
+    w = float(box_mm[2]) / media_w * width
+    h = float(box_mm[3]) / media_h * height
+    return x, y, w, h
+
+
+def _render_press(path: str, width: int, height: int) -> np.ndarray:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        zoom_x = float(width) / float(page.rect.width)
+        zoom_y = float(height) / float(page.rect.height)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom_x, zoom_y), alpha=False, colorspace=fitz.csRGB)
+        return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+    finally:
+        doc.close()
+
+
+def _ink_rows(gray: np.ndarray) -> np.ndarray:
+    if gray.size == 0:
+        return np.zeros(0, np.int32)
+    _thr, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return (binary > 0).sum(axis=1)
+
+
+def _check_medella_swash(card: dict) -> None:
+    """The gap under Medella matches the upscale. The stripe detector runs on it."""
+    from vector_plate import place_plate
+    from vector_text_v2 import MIN_PPI, _rect, read_blocks
+    from quick_print import vertical_streaks_dominate
+
+    gate = card.get("textGate") or []
+    medella = next((row for row in gate if str(row.get("text") or "").strip() == "Medella"), None)
+    live = next((row for row in gate if "LIVE BLOOD" in str(row.get("text") or "")), None)
+    check("medella-boxes", medella is not None and live is not None and bool(card.get("press")), str(medella)[:180])
+    if medella is None or live is None or not card.get("press"):
+        return
+    src = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_front.png")
+    bgr = cv2.imread(src)
+    blocks = read_blocks(bgr, extra=False)
+    guide = []
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        if not is_lettering(str(block.get("text") or "")):
+            continue
+        rx, ry, rw, rh = _rect(block, bgr.shape[1], bgr.shape[0])
+        guide.append((rx, ry, rx + rw, ry + rh))
+    placed = place_plate(bgr, guide, 90, 50, 5.0, MIN_PPI)
+    clean = placed["image"]
+    render = _render_press(card["press"], clean.shape[1], clean.shape[0])
+    if render.shape[0] != clean.shape[0] or render.shape[1] != clean.shape[1]:
+        render = cv2.resize(render, (clean.shape[1], clean.shape[0]), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+    mx, my, mw, mh = _media_box(medella.get("boxMm") or [0, 0, 0, 0], clean.shape, 90, 50)
+    lx, ly, lw, lh = _media_box(live.get("boxMm") or [0, 0, 0, 0], clean.shape, 90, 50)
+    x0 = max(0, int(np.floor(mx)))
+    x1 = min(clean.shape[1], int(np.ceil(mx + mw)))
+    live_y0 = max(0, int(np.floor(ly)))
+    live_y1 = min(gray.shape[0], int(np.ceil(ly + lh)))
+    live_x0 = max(0, int(np.floor(lx)))
+    live_x1 = min(gray.shape[1], int(np.ceil(lx + lw)))
+    live_rows = _ink_rows(gray[live_y0:live_y1, live_x0:live_x1])
+    strong = int(live_rows.max()) if live_rows.size else 0
+    cap_off = 0
+    for index, count in enumerate(live_rows):
+        if strong and int(count) >= 0.35 * strong:
+            cap_off = int(index)
+            break
+    cap = live_y0 + cap_off
+    body_top = max(0, int(np.floor(my)))
+    body = _ink_rows(gray[body_top:cap, x0:x1])
+    peak = int(body.max()) if body.size else 0
+    baseline = body_top
+    if peak >= 8:
+        heavy = body >= 0.45 * peak
+        y = int(np.argmax(body))
+        while y + 1 < heavy.size and heavy[y + 1]:
+            y += 1
+        baseline = min(cap, body_top + y + 4)
+    y0 = min(cap, baseline)
+    y1 = cap
+    detail = f"band {x0}:{x1},{y0}:{y1} cap {cap} baseline {baseline}"
+    band_h = y1 - y0
+    band_w = x1 - x0
+    check("medella-band-size", band_h >= 24 and band_w >= 24, detail)
+    if band_h < 8 or band_w < 8:
+        return
+    clean_rgb = cv2.cvtColor(clean[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
+    rendered = render[y0:y1, x0:x1]
+    delta = np.abs(clean_rgb.astype(np.int16) - rendered.astype(np.int16))
+    mean = float(delta.mean())
+    hot = float((delta.max(axis=2) > 12).mean())
+    streaks = vertical_streaks_dominate(cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR))
+    detail = f"{detail} mean {mean:.2f} hot {hot:.4f} streaks {streaks}"
+    print("SWASH", detail)
+    check("medella-swash-matches", mean <= 6.0 and hot <= 0.02, detail)
+    check("medella-swash-not-striped", streaks is False, detail)
+
+
+def _check_card_back_raster(gate: list) -> None:
+    """A Y whose arms joined, and a faint footer, go back to the picture."""
+    ident = [row for row in gate if "BY IDENTIFYING" in str(row.get("text") or "")]
+    check(
+        "by-identifying-raster",
+        len(ident) == 1 and ident[0].get("mode") == "raster",
+        str(ident)[:300],
+    )
+    for word in ("DETECT", "BALANCE", "HEAL", "LIVE BETTER"):
+        rows = [row for row in gate if str(row.get("text") or "").strip() == word]
+        check(
+            "footer-" + word.lower().replace(" ", "-") + "-raster",
+            len(rows) == 1 and rows[0].get("mode") == "raster",
+            str(rows)[:300],
+        )
 
 
 def test_medella_coverage_and_gate_speed() -> None:
@@ -751,12 +952,14 @@ def test_medella_coverage_and_gate_speed() -> None:
     check("card-front-total", float(timings.get("total_s") or 99) <= 15.0, str(timings))
     check("card-front-letters", not _vector_reads_match(card.get("textGate")), str(_vector_reads_match(card.get("textGate")))[:400])
     check("card-front-source", card.get("source_guard") is True, str(card.get("source_guard")))
+    _check_medella_swash(card)
     back = _trace_side("card_back", 90, 50)
     check("card-back-still", int(back.get("vector_lines") or 0) >= 40, str(back.get("vector_lines")))
     check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 6.0, str(back.get("timings")))
     check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 15.0, str(back.get("timings")))
     check("card-back-letters", not _vector_reads_match(back.get("textGate")), str(_vector_reads_match(back.get("textGate")))[:400])
     check("card-back-source-guard", back.get("source_guard") is True, str(back.get("source_guard")))
+    _check_card_back_raster(back.get("textGate") or [])
     front = _trace_side("flyer_front", 148, 210)
     front_t = front.get("timings") or {}
     check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 8.0, str(front_t))
@@ -869,6 +1072,9 @@ def main() -> None:
     test_gate_is_exact_and_sees_a_white_block()
     test_merged_or_split_glyphs_fail()
     test_descenders_and_counters()
+    test_a_wide_swash_is_not_traced()
+    test_a_closed_fork_is_not_a_y()
+    test_swash_bars_are_not_exempt()
     test_glyphs_reject_a_changed_letter()
     test_paint_follows_the_glyph_not_the_box()
     test_a_line_is_not_half_traced()

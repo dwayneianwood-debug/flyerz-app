@@ -773,6 +773,63 @@ def _letter_erase_mask(mask: np.ndarray) -> np.ndarray:
     return erase.astype(np.uint8) * 255
 
 
+def _strip_flourish(mask: np.ndarray) -> np.ndarray:
+    """Leave a word-wide swash in the picture.
+
+    The letter body is traced. A flourish wider than the letters, hanging below
+    that body, is not erased and not traced: a vector of it turns into bars,
+    and those bars sit inside the source-ink fringe so the page guard misses
+    them. A normal descender is about one letter wide and stays in the mask.
+    """
+    if mask is None or int(mask.max()) == 0:
+        return mask
+    parts = _components(mask, 20)
+    letterlike = [part for part in parts if part["h"] >= 8 and part["w"] <= 2.5 * max(1, part["h"])]
+    baseline = None
+    median_w = 0.0
+    if len(letterlike) >= 2:
+        median_w = float(np.median([part["w"] for part in letterlike]))
+        baseline = int(np.median([part["y"] + part["h"] for part in letterlike])) + 2
+    else:
+        rows = (mask > 0).sum(axis=1)
+        peak = int(rows.max()) if rows.size else 0
+        if peak < 8:
+            return mask
+        heavy = rows >= 0.45 * peak
+        y = int(np.argmax(heavy))
+        while y + 1 < heavy.size and heavy[y + 1]:
+            y += 1
+        baseline = min(mask.shape[0], y + 3)
+        upper = np.zeros(mask.shape, np.uint8)
+        upper[:baseline] = mask[:baseline]
+        upper_parts = _components(upper, 20)
+        upper_letters = [part for part in upper_parts if part["w"] <= 2.5 * max(1, part["h"])]
+        if len(upper_letters) < 2:
+            return mask
+        median_w = float(np.median([part["w"] for part in upper_letters]))
+    if baseline is None or median_w <= 0 or baseline >= mask.shape[0] - 2:
+        return mask
+    if int((mask[baseline:] > 0).sum()) < 40:
+        return mask
+    tail = np.zeros(mask.shape, np.uint8)
+    tail[baseline:] = mask[baseline:]
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats((tail > 0).astype(np.uint8), 8)
+    wide = False
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_AREA]) < 80:
+            continue
+        if int(stats[index, cv2.CC_STAT_WIDTH]) > 1.6 * median_w:
+            wide = True
+            break
+    if not wide:
+        return mask
+    out = mask.copy()
+    out[baseline:] = 0
+    if int(out.max()) == 0 or int((out > 0).sum()) < 0.45 * int((mask > 0).sum()):
+        return mask
+    return out
+
+
 def _fill_from_paper(plate: np.ndarray, erase: np.ndarray) -> np.ndarray:
     """Replace the raster letter with the paper around it. The vector is drawn on top."""
     if erase is None or int(erase.max()) == 0:
@@ -881,7 +938,43 @@ def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool
                 if os.environ.get("GLYPH_DEBUG"):
                     sys.stderr.write(f"[glyph] shape {best:.2f}\n")
                 return True
+    if _fork_closed(source, painted):
+        return True
     return False
+
+
+def _fork_closed(source_glyphs: list, painted: np.ndarray) -> bool:
+    """A Y whose arms were joined into one blob no longer matches the source.
+
+    The source glyph meets in one stem. An H or an M still has two feet, so a
+    bridge there is left to the other shape checks.
+    """
+    for glyph in source_glyphs:
+        if glyph["h"] < 8 or glyph["w"] < 5:
+            continue
+        y1 = glyph["y"] + max(3, int(round(glyph["h"] * 0.45)))
+        src_top = glyph["pixels"][glyph["y"]:y1, glyph["x"]:glyph["x"] + glyph["w"]]
+        if int(src_top.sum()) < 8 or _separated_runs(src_top) < 2:
+            continue
+        foot = max(3, int(round(glyph["h"] * 0.30)))
+        src_foot = glyph["pixels"][glyph["y"] + glyph["h"] - foot:glyph["y"] + glyph["h"], glyph["x"]:glyph["x"] + glyph["w"]]
+        if _separated_runs(src_foot) != 1:
+            continue
+        paint_top = painted[glyph["y"]:y1, glyph["x"]:glyph["x"] + glyph["w"]]
+        if _separated_runs(paint_top) < 2:
+            if os.environ.get("GLYPH_DEBUG"):
+                sys.stderr.write(f"[glyph] fork closed x={glyph['x']} h={glyph['h']}\n")
+            return True
+    return False
+
+
+def _separated_runs(binary: np.ndarray) -> int:
+    """Ink pieces with a real gap between them. A one-pixel bridge does not split."""
+    if binary is None or binary.size == 0 or int(np.count_nonzero(binary)) < 4:
+        return 0
+    mask = (binary > 0).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
+    return sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 4)
 
 
 def glyphs_agree(mask: np.ndarray, painted: np.ndarray, min_area: int = 12) -> bool:
@@ -1356,8 +1449,13 @@ def _same_line(left, right) -> bool:
     if overlap < 0.55 * min(left[3], right[3]):
         return False
     # The gap is judged against the shorter line. A tall word must not swallow
-    # the column sitting beside it.
-    return _horizontal_gap(left, right) < 1.4 * min(left[3], right[3])
+    # the column sitting beside it. Two short words with a bullet between them
+    # are still one line.
+    shorter = min(left[3], right[3])
+    limit = 1.4 * shorter
+    if max(left[3], right[3]) <= 28:
+        limit = 3.2 * shorter
+    return _horizontal_gap(left, right) < limit
 
 
 def _same_paragraph(above, below) -> bool:
@@ -1505,7 +1603,12 @@ def _stamp_fringe(canvas: np.ndarray, item: dict) -> None:
 
 
 def _source_leaks(plate: np.ndarray, pristine: np.ndarray, items: list, art_box: tuple) -> np.ndarray:
-    """Pixels of the original art that paint-out changed outside the glyph fringe."""
+    """Pixels of the original art that paint-out changed outside the glyph fringe.
+
+    The fringe is only the traced stroke plus 2px. It is the same rule on every
+    side. Ink that was not traced, including a swash left in the picture, is
+    not exempt: a change there is a leak.
+    """
     allowed = np.zeros(plate.shape[:2], np.uint8)
     for item in items:
         _stamp_fringe(allowed, item)
@@ -1819,6 +1922,10 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             mask, colour = refined_mask, refined_colour
         else:
             mask = owned
+        # A word-wide swash stays in the picture. Tracing it, or painting it
+        # out, leaves bars, and the source-ink fringe would hide those bars
+        # from the page guard.
+        mask = _strip_flourish(mask)
         pending.append({
             "text": text,
             "mask": mask,
