@@ -657,6 +657,16 @@ def test_descenders_and_counters() -> None:
     split_r[14:17, 56:62] = (20, 18, 16)
     check("small-r-split", _small_glyph_fails(broken_r, split_r) is True)
     check("small-r-kept", _small_glyph_fails(broken_r, broken_r.copy()) is False)
+    # The empty corner of a wide letter is not a broken stroke. A neighbour
+    # that clips that corner, about one pixel off the stroke, stays out.
+    corner = np.full((32, 90, 3), (236, 232, 226), np.uint8)
+    corner[8:22, 8:12] = (20, 18, 16)
+    corner[8:12, 8:32] = (20, 18, 16)
+    corner[8:22, 48:52] = (20, 18, 16)
+    corner[8:12, 48:70] = (20, 18, 16)
+    clipped = corner.copy()
+    clipped[13:17, 18:26] = (20, 18, 16)
+    check("small-corner-neighbour", _small_glyph_fails(corner, clipped) is False)
     tall_e = np.full((48, 80, 3), (236, 232, 226), np.uint8)
     tall_e[8:36, 8:12] = (20, 18, 16)
     tall_e[8:36, 24:28] = (20, 18, 16)

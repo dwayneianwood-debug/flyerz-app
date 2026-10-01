@@ -3412,12 +3412,20 @@ def _small_glyph_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
             substantial.sort(key=lambda mask: int(mask.sum()), reverse=True)
             gap = cv2.distanceTransform((~substantial[0]).astype(np.uint8), cv2.DIST_L2, 3)
             gap_px = float(gap[substantial[1]].min()) if int(substantial[1].sum()) else 0.0
-            # Four pixels at this scale is one pixel on the page: a broken arm
-            # or a foot that no longer meets the stem.
-            if gap_px >= 4.0 and int(substantial[1].sum()) >= spec:
-                if os.environ.get("SMALL_GLYPH_DEBUG"):
-                    sys.stderr.write(f"[small] split gap {gap_px:.1f} h={glyph_h}\n")
-                return True
+            # Four pixels at this scale is one pixel on the page.
+            # A neighbour that only clips the empty corner of the box does not
+            # overlap this letter. A broken stroke is still on the letter, is a
+            # large piece of it, or has moved a full two pixels away.
+            piece = int(substantial[1].sum())
+            if gap_px >= 4.0 and piece >= spec:
+                overlap = int(np.count_nonzero(substantial[1] & window))
+                on_letter = overlap >= 0.35 * piece
+                large = piece >= 0.25 * area
+                clear = gap_px >= 8.0
+                if on_letter or large or clear:
+                    if os.environ.get("SMALL_GLYPH_DEBUG"):
+                        sys.stderr.write(f"[small] split gap {gap_px:.1f} h={glyph_h}\n")
+                    return True
     return False
 
 
