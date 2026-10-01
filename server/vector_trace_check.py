@@ -1159,6 +1159,53 @@ def test_paths_and_local_plate() -> None:
     check("sharpen-paper", int(np.abs(out.astype(np.int16) - plate.astype(np.int16)).sum()) > 0)
 
 
+def test_comma_decimal_matches_the_dot_trace() -> None:
+    """Windows en-ZA prints potrace %f with a comma. The letters must stay the same size."""
+    import re
+
+    import vector_trace as vt
+
+    mask = np.zeros((36, 48), np.uint8)
+    mask[4:10, 6:40] = 255
+    mask[4:32, 20:28] = 255
+    mask[10:22, 22:26] = 0
+    binary = vt._trace_binary(mask)
+    svg = vt._potrace_svg(binary)
+    check("potrace-svg", "scale(" in svg, svg[:180])
+    comma = re.sub(r'(?<=\d)\.(?=\d)', ",", svg)
+    check("comma-has-no-dot-scale", "scale(0," in comma or "scale(0." not in comma, comma[comma.find("scale"):comma.find("scale") + 40])
+    dot_paths = vt._paths_from_svg(svg, binary.shape[0])
+    comma_paths = vt._paths_from_svg(comma, binary.shape[0])
+    painted = vt.rasterise_paths(dot_paths, binary.shape[1], binary.shape[0])
+    other = vt.rasterise_paths(comma_paths, binary.shape[1], binary.shape[0])
+    check("comma-same-ink", vt.mask_iou(painted, other) >= 0.99, f"{vt.mask_iou(painted, other):.3f}")
+    env = __import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env({"LC_ALL": "en_ZA.UTF-8", "LC_NUMERIC": "en_ZA.UTF-8", "PATH": "x"})
+    check("locale-drops-all", "LC_ALL" not in env and env.get("LC_NUMERIC") == "C", str(env))
+
+
+def test_env_report_names_the_stack() -> None:
+    """Startup can say which OCR and whether scipy is installed."""
+    import os
+    import re
+
+    from env_report import describe
+
+    line = describe()
+    print("ENV", line)
+    check("env-ocr", "ocr=rapidocr" in line and "PP-OCRv6_det_small.onnx" in line, line)
+    check("env-numpy", "numpy=" in line and "opencv=" in line, line)
+    check("env-scipy", "scipy=" in line and "skimage=" in line, line)
+    root = os.path.dirname(__file__)
+    bad = []
+    for name in os.listdir(root):
+        if not name.endswith(".py"):
+            continue
+        text = open(os.path.join(root, name), encoding="utf-8").read()
+        if re.search(r"^\s*(?:import|from)\s+(?:scipy|skimage)\b", text, re.M):
+            bad.append(name)
+    check("no-scipy-import", not bad, str(bad))
+
+
 def test_one_potrace_covers_the_page() -> None:
     """Two lines are one process, and a counter in the first line stays open."""
     import vector_trace as vt
@@ -1264,6 +1311,8 @@ def main() -> None:
     test_glyphs_reject_a_changed_letter()
     test_paint_follows_the_glyph_not_the_box()
     test_a_line_is_not_half_traced()
+    test_comma_decimal_matches_the_dot_trace()
+    test_env_report_names_the_stack()
     test_one_potrace_covers_the_page()
     test_gate_image_keeps_a_word_whole()
     test_column_style_follows_the_majority()

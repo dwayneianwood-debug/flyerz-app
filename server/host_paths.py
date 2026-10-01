@@ -131,3 +131,17 @@ def overlay_fonts(bold: bool) -> list:
 def bundled_sans(bold: bool = True) -> str:
     name = "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf"
     return os.path.join(FONT_DIR, name)
+
+
+def c_numeric_env(base: dict | None = None) -> dict:
+    """Environment for potrace and Ghostscript.
+
+    LC_ALL wins over LC_NUMERIC, so a parent locale of en-ZA (decimal comma on
+    Windows) would make printf and strtod disagree with the dotted arguments we
+    pass. Dropping LC_ALL and pinning LC_NUMERIC to C keeps SVG and PDF numbers
+    on a dot. PYTHONUTF8 on the parent still covers file names.
+    """
+    env = dict(os.environ if base is None else base)
+    env.pop("LC_ALL", None)
+    env["LC_NUMERIC"] = "C"
+    return env

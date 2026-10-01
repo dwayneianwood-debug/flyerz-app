@@ -263,6 +263,23 @@ const listenHost = flyerzResolveListenHost();
     async () => {
       log(`Server listening on ${listenHost}:${port}`);
       flyerzPrintTeamSharingBanner(port, listenHost);
+      try {
+        const envReport = path.join(process.cwd(), "server", "env_report.py");
+        const envLine = execSync(`"${PYTHON_BIN}" "${envReport}"`, {
+          encoding: "utf-8",
+          timeout: 60_000,
+          env: {
+            ...process.env,
+            PYTHONIOENCODING: "utf-8",
+            PYTHONUTF8: "1",
+          },
+        });
+        for (const line of envLine.split(/\r?\n/)) {
+          if (line.trim()) console.log(line.trim());
+        }
+      } catch (err: any) {
+        console.log(`[env] python env check failed: ${err?.message || err}`);
+      }
 
       const gatekeeperScript = path.join(process.cwd(), "server", "pre_deploy_check.py");
 

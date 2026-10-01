@@ -35,6 +35,9 @@ BELOW_FRAC = 0.35
 
 _NUM = r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"
 _TOKEN = re.compile(rf"[MmLlHhVvCcZz]|{_NUM}")
+# potrace %f is six digits. A decimal comma looks like 0,100000 and must not
+# be read as two integers. Path data is integers, so this only touches %f.
+_POTRACE_FLOAT = re.compile(r"(\d),(\d{6})(?!\d)")
 # Potrace starts once per bitmap. The timing test adds the Windows cost of that start.
 _spawn_count = 0
 
@@ -3694,6 +3697,10 @@ def _paths_from_svg(svg: str, height: int) -> list:
     if not svg:
         return []
     transform = _svg_transform(svg, height)
+    # A missing scale used to fall back to 1 instead of potrace's 0.1, which
+    # draws the letters about ten times too big. No transform means no paths.
+    if transform is None:
+        return []
     paths = []
     for raw in re.findall(r'<path\b[^>]*\bd="([^"]+)"', svg, flags=re.I | re.S):
         subpaths = _parse_path(raw, transform)
@@ -3798,6 +3805,12 @@ def _potrace_chunk(bitmaps: list, indexes: list, results: list) -> None:
             results[index].append(subs)
 
 
+def _dot_number(value: float) -> str:
+    """A number strtod accepts when the decimal mark is a dot."""
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def _potrace_svg(binary: np.ndarray) -> str:
     global _spawn_count
     height, width = binary.shape[:2]
@@ -3808,15 +3821,31 @@ def _potrace_svg(binary: np.ndarray) -> str:
     packed = np.packbits(bits, axis=1)
     # Potrace traces black. PBM 1-bits are black, and those are our ink pixels.
     payload = f"P4\n{width} {height}\n".encode() + packed.tobytes()
-    from host_paths import find_potrace
+    from host_paths import c_numeric_env, find_potrace
 
+    program = find_potrace()
+    env = c_numeric_env()
+    # 1 is the same as 1.0, and it parses when the decimal mark is a comma.
+    alpha = _dot_number(ALPHAMAX)
+    opt = _dot_number(OPTTOLERANCE)
+    result = _run_potrace(program, payload, alpha, opt, env)
+    if result.returncode != 0 and ("," not in alpha or "," not in opt):
+        # Windows en-ZA: strtod stops at the dot, so 0.2 is rejected. Retry with a comma.
+        result = _run_potrace(program, payload, alpha.replace(".", ","), opt.replace(".", ","), env)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _run_potrace(program: str, payload: bytes, alpha: str, opt: str, env: dict):
+    global _spawn_count
     _spawn_count += 1
-    result = subprocess.run(
+    return subprocess.run(
         [
-            find_potrace(), "-s", "--flat",
+            program, "-s", "--flat",
             "-t", str(TURDSIZE),
-            "-a", str(ALPHAMAX),
-            "-O", str(OPTTOLERANCE),
+            "-a", alpha,
+            "-O", opt,
             "-u", "10",
             "-o", "-",
         ],
@@ -3824,19 +3853,25 @@ def _potrace_svg(binary: np.ndarray) -> str:
         check=False,
         capture_output=True,
         timeout=30,
+        env=env,
     )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _dots_in_transform(svg: str) -> str:
+    """Turn potrace's %f decimal commas back into dots. Path data is untouched."""
+    def fix(match):
+        return _POTRACE_FLOAT.sub(r"\1.\2", match.group(0))
+
+    return re.sub(r'transform="[^"]*"', fix, svg, count=1, flags=re.I)
 
 
 def _svg_transform(svg: str, height: int):
     found = re.search(
         r"translate\(\s*(" + _NUM + r")\s*,\s*(" + _NUM + r")\s*\)\s*scale\(\s*(" + _NUM + r")\s*,\s*(" + _NUM + r")\s*\)",
-        svg,
+        _dots_in_transform(svg),
     )
     if not found:
-        return 0.0, float(height), 1.0, -1.0
+        return None
     return tuple(float(found.group(index)) for index in range(1, 5))
 
 
