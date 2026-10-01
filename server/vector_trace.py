@@ -3321,7 +3321,10 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
             & ~source_ink[y0:y1, x0:x1]
             & (outside[y0:y1, x0:x1] < 2.2)
         )
-        if int(np.count_nonzero(rim)) > 0.45 * part["area"]:
+        rim_n = int(np.count_nonzero(rim))
+        # 0.64 keeps a small card letter (the email, about 0.63) and still
+        # rejects the heavy rim on the E of APOSTLE (about 0.66).
+        if rim_n > 0.64 * part["area"]:
             worst = min(worst, 0.40)
     letter_h = float(np.median([part["h"] for part in letters]))
     for part in render_parts:
