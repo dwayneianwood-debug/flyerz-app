@@ -2248,18 +2248,18 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         core = item.get("core")
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
             continue
         score, accepted, painted = _accept_trace(mask, paths)
         if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
             continue
         check_crop = _hide_foreign_ink(item["crop"], mask)
         reason = shape_gate(check_crop, mask, painted, item["inner"])
         if reason:
             raster_lines.append(_line(text, "raster", reason))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
             continue
         if _topology_fails(check_crop, painted, plate_ppi):
             if os.environ.get("TOPO_DEBUG"):
@@ -2268,7 +2268,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
                 text, "raster",
                 "A letter lost its tail or its counter, so this line stayed in the picture.",
             ))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
