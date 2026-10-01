@@ -573,6 +573,20 @@ def test_paint_follows_the_glyph_not_the_box() -> None:
     leaks = _source_leaks(plate, pristine, kept, (0, 0, 120, 100))
     check("source-guard-repairs", bool(ok) and not bool(leaks.any()), f"ok={ok} leaks={int(leaks.sum())}")
     check("neighbour-ink-restored", np.array_equal(plate[48, 64], pristine[48, 64]), str(plate[48, 64]))
+    from vector_trace import _hide_foreign_ink
+    paper = (248, 246, 242)
+    src = np.full((70, 50, 3), paper, np.uint8)
+    src[12:40, 10:22] = (16, 14, 12)
+    src[12:18, 10:36] = (16, 14, 12)
+    src[34:40, 10:36] = (16, 14, 12)
+    src[18:34, 30:36] = (16, 14, 12)
+    src[52:66, 14:28] = (16, 14, 12)
+    owned = np.zeros((70, 50), np.uint8)
+    owned[:40][src[:40, :, 0] < 40] = 255
+    cleaned = _hide_foreign_ink(src, owned)
+    check("foreign-stroke-cleared", int(cleaned[58, 20, 0]) > 200)
+    check("own-counter-stays", int(cleaned[26, 24, 0]) > 200)
+    check("own-stroke-stays", int(cleaned[15, 14, 0]) < 40)
 
 
 def test_a_line_is_not_half_traced() -> None:

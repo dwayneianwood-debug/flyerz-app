@@ -1144,6 +1144,41 @@ def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner
     return ""
 
 
+def _hide_foreign_ink(crop: np.ndarray, owned: np.ndarray | None) -> np.ndarray:
+    """Paper over another line's strokes. This line's counters stay as they are."""
+    if crop is None or owned is None or crop.ndim != 3 or owned.shape[:2] != crop.shape[:2]:
+        return crop
+    ink = owned > 0
+    if int(ink.sum()) < 8:
+        return crop
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    paper_px = gray[~ink]
+    if paper_px.size < 8:
+        return crop
+    ink_tone = float(np.median(gray[ink]))
+    paper_tone = float(np.median(paper_px))
+    span = abs(ink_tone - paper_tone)
+    if span < 16.0:
+        return crop
+    if ink_tone < paper_tone:
+        foreign_ink = gray <= paper_tone - 0.55 * span
+    else:
+        foreign_ink = gray >= paper_tone + 0.55 * span
+    foreign_ink &= ~ink
+    count, labels, stats, _cents = cv2.connectedComponentsWithStats(foreign_ink.astype(np.uint8), 8)
+    drop = np.zeros(gray.shape, np.bool_)
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_AREA]) < 8:
+            continue
+        drop[labels == index] = True
+    if not bool(drop.any()):
+        return crop
+    out = crop.copy()
+    tone = int(round(paper_tone))
+    out[drop] = tone
+    return out
+
+
 def _topology_fails(crop: np.ndarray, painted: np.ndarray, ppi: float = 400.0) -> bool:
     """True when a traced glyph lost its tail or its counter.
 
@@ -1808,12 +1843,13 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
-        reason = shape_gate(item["crop"], mask, painted, item["inner"])
+        check_crop = _hide_foreign_ink(item["crop"], mask)
+        reason = shape_gate(check_crop, mask, painted, item["inner"])
         if reason:
             raster_lines.append(_line(text, "raster", reason))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
-        if _topology_fails(item["crop"], painted, plate_ppi):
+        if _topology_fails(check_crop, painted, plate_ppi):
             if os.environ.get("TOPO_DEBUG"):
                 sys.stderr.write(f"[topo] line {text!r}\n")
             raster_lines.append(_line(
@@ -2945,7 +2981,7 @@ def _apply_text_gate(
             else:
                 glyph_fail = True
             full = item.get("painted")
-            origin = _plate_crop(base, rect)
+            origin = _hide_foreign_ink(_plate_crop(base, rect), item.get("_ink"))
             if (
                 full is not None
                 and not glyph_fail
