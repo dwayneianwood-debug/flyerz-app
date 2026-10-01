@@ -649,8 +649,8 @@ def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = 
 
     The join step is the mean absolute change across the seam, ±3 rows.
     It fails when that step is more than twice the larger of the median step
-    inside the picture and inside the extension. A one-row light or dark
-    band fails the row-mean deviation check.
+    inside the picture and inside the extension, or when the join/reference
+    ratio is above 0.4. A one-row light or dark band fails the row-mean check.
     """
     import numpy as np
 
@@ -677,7 +677,14 @@ def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = 
     ext_step = median_step(seam - gap - slab, seam - gap)
     reference = max(art_step, ext_step)
     step_limit = 2.0 * reference
+    ratio = join_step / max(reference, 1e-6)
     ok_step = bool(join_step <= step_limit + 0.05)
+    # A smeared pad can stay under 2× and still show a hard line. 0.4 is the
+    # accepted join (0.165) with room, and it rejects the 0.899 colour pad.
+    # A smooth gradient has a reference step of about 0, so join/reference
+    # explodes on a 0.02 step the 2× rule already accepts. The cap applies
+    # once the picture has real texture, as on the poster.
+    ok_ratio = True if reference < 0.5 else bool(ratio <= 0.4 + 1e-9)
 
     means = luma.mean(axis=1)
     band_dev = float(max(
@@ -695,12 +702,13 @@ def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = 
         "artStep": round(art_step, 3),
         "extStep": round(ext_step, 3),
         "stepLimit": round(step_limit, 3),
-        "stepRatio": round(join_step / max(reference, 1e-6), 3),
+        "stepRatio": round(ratio, 3),
         "bandDev": round(band_dev, 3),
         "bandLimit": round(band_limit, 3),
         "okStep": ok_step,
+        "okRatio": ok_ratio,
         "okBand": ok_band,
-        "ok": bool(ok_step and ok_band),
+        "ok": bool(ok_step and ok_band and ok_ratio),
     }
 
 
@@ -770,25 +778,44 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
     height = img.shape[0]
     core = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
     art = core
+    ramp = _mm_px(TALL_RAMP_MM, ppm, 8)
     match_depth = _mm_px(6.0, ppm, 4)
     sample = min(5, height)
 
-    def colour_pad(forward: bool, pad: int):
+    def strong_pad(forward: bool, pad: int, block: int):
+        """The accepted tall join: blur starts near sigma 3 and feathers into the art."""
         nonlocal art
-        source = core[-sample:] if forward else core[:sample]
-        built = _colour_pad(source, pad, forward=forward)
-        if pad < TALL_PAD_PX:
-            return built
+        source = core[-block:] if forward else core[:block]
+        protect = _protect_rows(core, ppm, from_end=forward)
         overlap = _join_overlap(core, ppm, from_end=forward)
         if art is core:
             art = np.ascontiguousarray(core)
+        built = _mirror_extend(
+            source, pad, forward=forward, strong=True, ramp_px=ramp, protect_px=protect,
+        )
+        # The pad's first row touches the picture when the pad is below it.
         at_end = not forward
         built = _match_join_colour(built, art, at_end=at_end, depth=max(match_depth, overlap))
         art = _feather_into_art(built, art, overlap, at_end=at_end)
         return built
 
-    top_part = colour_pad(False, top) if top else None
-    bottom_part = colour_pad(True, bottom) if bottom else None
+    def short_pad(forward: bool, pad: int):
+        """A short side stays a flat continuation. A mirrored 28px rim becomes stripes."""
+        source = core[-sample:] if forward else core[:sample]
+        return _colour_pad(source, pad, forward=forward)
+
+    top_part = None
+    bottom_part = None
+    if top:
+        if top >= TALL_PAD_PX:
+            top_part = strong_pad(False, top, min(top, height))
+        else:
+            top_part = short_pad(False, top)
+    if bottom:
+        if bottom >= TALL_PAD_PX:
+            bottom_part = strong_pad(True, bottom, min(bottom, height))
+        else:
+            bottom_part = short_pad(True, bottom)
     if top_part is not None:
         parts.append(top_part)
     parts.append(art)

@@ -641,6 +641,136 @@ def trace_mask(mask: np.ndarray) -> list:
     return paths
 
 
+def _letter_erase_mask(mask: np.ndarray) -> np.ndarray:
+    """The stroke plus a 2px fringe outside it. A counter stays, so the hole is the paper."""
+    ink = mask > 0
+    if not bool(ink.any()):
+        return np.zeros(mask.shape[:2], np.uint8)
+    background = (~ink).astype(np.uint8)
+    count, labels = cv2.connectedComponents(background, 4)
+    border = np.zeros(count, np.bool_)
+    border[labels[0, :]] = True
+    border[labels[-1, :]] = True
+    border[labels[:, 0]] = True
+    border[labels[:, -1]] = True
+    border[0] = False
+    exterior = border[labels]
+    fringe = cv2.dilate(ink.astype(np.uint8) * 255, np.ones((5, 5), np.uint8)) > 0
+    erase = ink | (fringe & exterior)
+    return erase.astype(np.uint8) * 255
+
+
+def _fill_from_paper(plate: np.ndarray, erase: np.ndarray) -> np.ndarray:
+    """Replace the raster letter with the paper around it. The vector is drawn on top."""
+    if erase is None or int(erase.max()) == 0:
+        return plate
+    keep = (erase == 0).astype(np.float32)
+    colour = plate.astype(np.float32) * keep[..., None]
+    num = cv2.GaussianBlur(colour, (0, 0), 14.0)
+    den = cv2.GaussianBlur(keep, (0, 0), 14.0)
+    filled = num / np.maximum(den[..., None], 1e-3)
+    weak = (erase > 0) & (den < 0.08)
+    if bool(weak.any()):
+        num_wide = cv2.GaussianBlur(colour, (0, 0), 36.0)
+        den_wide = cv2.GaussianBlur(keep, (0, 0), 36.0)
+        wide = num_wide / np.maximum(den_wide[..., None], 1e-3)
+        filled[weak] = wide[weak]
+    out = plate.copy()
+    out[erase > 0] = np.clip(np.rint(filled[erase > 0]), 0, 255).astype(np.uint8)
+    return out
+
+
+def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool:
+    """True when the trace merged two letters, split one, or changed a letter's shape.
+
+    A count that differs by one is an i-dot. A gap that is not in the source
+    ('inflam mation') and a blob that covers two letters ('oı') are not.
+    """
+    if source_mask is None or painted is None:
+        return False
+    if source_mask.shape[:2] != painted.shape[:2]:
+        return True
+
+    def significant(mask: np.ndarray) -> list:
+        parts = _components(mask, 8)
+        if len(parts) < 2:
+            return parts
+        median = float(np.median([part["area"] for part in parts]))
+        floor = max(12, int(round(0.12 * median)))
+        return [part for part in parts if part["area"] >= floor]
+
+    source = significant(source_mask)
+    drawn = significant(painted)
+    if not source or not drawn:
+        return bool(source) or bool(drawn)
+    # A thin stroke breaks into a few extra pieces. A whole extra word does not.
+    count_limit = max(4, int(round(0.40 * max(len(source), len(drawn)))))
+    if abs(len(source) - len(drawn)) > count_limit:
+        if os.environ.get("GLYPH_DEBUG"):
+            sys.stderr.write(f"[glyph] count {len(source)} vs {len(drawn)}\n")
+        return True
+    for part in drawn:
+        covered = []
+        for glyph in source:
+            shared = int(np.count_nonzero(part["pixels"] & glyph["pixels"]))
+            if shared >= 0.45 * glyph["area"] and shared >= 0.15 * part["area"]:
+                covered.append(glyph)
+        if len(covered) < 2:
+            continue
+        covered.sort(key=lambda glyph: glyph["x"])
+        for left, right in zip(covered, covered[1:]):
+            if right["x"] - (left["x"] + left["w"]) >= 2:
+                if os.environ.get("GLYPH_DEBUG"):
+                    sys.stderr.write(f"[glyph] merge gap {right['x'] - (left['x'] + left['w'])}\n")
+                return True
+    for glyph in source:
+        hits = []
+        for part in drawn:
+            shared = int(np.count_nonzero(part["pixels"] & glyph["pixels"]))
+            if shared >= 0.25 * part["area"] and shared >= 0.20 * glyph["area"]:
+                hits.append((part, shared))
+        if len(hits) < 2:
+            continue
+        hits.sort(key=lambda item: item[0]["x"])
+        for (left, _left_shared), (right, _right_shared) in zip(hits, hits[1:]):
+            gap = right["x"] - (left["x"] + left["w"])
+            if gap >= 2:
+                if os.environ.get("GLYPH_DEBUG"):
+                    sys.stderr.write(f"[glyph] split gap {gap} h {glyph['h']}\n")
+                return True
+    if len(source) == len(drawn):
+        ordered_source = sorted(source, key=lambda part: part["x"])
+        ordered_drawn = sorted(drawn, key=lambda part: part["x"])
+        median_w = float(np.median([part["w"] for part in ordered_source]))
+        for index, (left, right) in enumerate(zip(ordered_source, ordered_source[1:])):
+            source_gap = right["x"] - (left["x"] + left["w"])
+            drawn_left = ordered_drawn[index]
+            drawn_right = ordered_drawn[index + 1]
+            drawn_gap = drawn_right["x"] - (drawn_left["x"] + drawn_left["w"])
+            if drawn_gap > source_gap + max(6.0, 0.85 * median_w) and drawn_gap > max(4.0, 2.0 * max(source_gap, 1)):
+                if os.environ.get("GLYPH_DEBUG"):
+                    sys.stderr.write(f"[glyph] gap {source_gap:.1f} -> {drawn_gap:.1f}\n")
+                return True
+        for glyph in ordered_source:
+            best = 0.0
+            for part in ordered_drawn:
+                shared = int(np.count_nonzero(glyph["pixels"] & part["pixels"]))
+                if shared <= 0:
+                    continue
+                x0 = max(0, min(glyph["x"], part["x"]))
+                y0 = max(0, min(glyph["y"], part["y"]))
+                x1 = min(source_mask.shape[1], max(glyph["x"] + glyph["w"], part["x"] + part["w"]))
+                y1 = min(source_mask.shape[0], max(glyph["y"] + glyph["h"], part["y"] + part["h"]))
+                union = int(np.count_nonzero(glyph["pixels"][y0:y1, x0:x1] | part["pixels"][y0:y1, x0:x1]))
+                if union:
+                    best = max(best, shared / float(union))
+            if best < 0.25:
+                if os.environ.get("GLYPH_DEBUG"):
+                    sys.stderr.write(f"[glyph] shape {best:.2f}\n")
+                return True
+    return False
+
+
 def glyphs_agree(mask: np.ndarray, painted: np.ndarray, min_area: int = 12) -> bool:
     """True when the trace has the same letters: none missing, none added.
 
@@ -1193,19 +1323,19 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         left, top, width_px, height_px = item["rect"]
         right, bottom = left + width_px, top + height_px
         mask = item.pop("_mask")
-        item.pop("core", None)
         extra = item.pop("_clear", None)
+        item["_ink"] = mask
         choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
         if extra is not None and extra.shape[:2] == mask.shape[:2] and int(extra.max()) > 0:
             clear[top:bottom, left:right] = cv2.bitwise_or(clear[top:bottom, left:right], extra)
     pristine = plate.copy() if drawn else None
-    if int(clear.max()) > 0:
-        # The old spur or the soft letter under a rebuilt glyph is removed
-        # outright. A 1px choke would leave that shape sitting beside the vector.
-        plate[:] = cv2.inpaint(plate, clear, 3, cv2.INPAINT_TELEA)
-    if int(choke.max()) > 0:
-        plate[:] = sharpen_background(plate, choke)
-        choke_ink(plate, choke, CHOKE_PX)
+    if int(choke.max()) > 0 or int(clear.max()) > 0:
+        # The raster letter, and the soft fringe just outside it, is painted out.
+        # A 1px choke leaves the stroke under the vector, which prints as a halo.
+        erase = _letter_erase_mask(choke) if int(choke.max()) > 0 else np.zeros(choke.shape, np.uint8)
+        if int(clear.max()) > 0:
+            erase = cv2.bitwise_or(erase, (clear > 0).astype(np.uint8) * 255)
+        plate[:] = _fill_from_paper(plate, erase)
     trace_s = time.perf_counter() - trace_started
     if not drawn and not raster_lines:
         from vector_text_v2 import _fail
@@ -1251,7 +1381,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         reason = "Some lettering stayed in the picture because its trace did not match. Glance at it before printing."
     decisions = [
         f"The lettering was traced as vector shapes ({len(vector_lines)} boxes).",
-        "The original letters were not removed. A 1px edge under each trace was pulled in.",
+        "The original raster letter under each trace was painted out, so the vector edge is what prints.",
         f"The picture was enlarged with {provider}.",
         "The press file is CMYK at 400 PPI or more, with the trim 5 mm inside the bleed.",
     ]
@@ -1289,6 +1419,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         sys.stderr.write(
             f"  {flag} {row.get('mode')} ssim={float(row.get('ssim') or 0):.3f} "
             f"white={bool(row.get('whiteBlock'))} clip={bool(row.get('clipped'))} "
+            f"glyph={bool(row.get('glyphFail'))} mismatch={bool(row.get('mismatch'))} "
             f"{row.get('text')!r} -> {row.get('render')!r}\n"
         )
     return {
@@ -1357,6 +1488,22 @@ def _texts_equal(left: str, right: str) -> bool:
     """Exact compare after whitespace is collapsed. No ratio, no substring."""
     a = _norm_text(left)
     b = _norm_text(right)
+    return bool(a) and a == b
+
+
+def _reads_match(left: str, right: str) -> bool:
+    """Case-sensitive letters and spaces. Punctuation is not a different word.
+
+    'A small drop' is not 'a small drop'. 'inflam mation' is not
+    'inflammation'. A comma read as a full stop is still the same line.
+    """
+    def key(text: str) -> str:
+        cleaned = _norm_text(text)
+        cleaned = re.sub(r"[^0-9A-Za-zÀ-ÿıİ ]+", "", cleaned)
+        return re.sub(r" +", " ", cleaned).strip()
+
+    a = key(left)
+    b = key(right)
     return bool(a) and a == b
 
 
@@ -1968,25 +2115,183 @@ def _score_modest(source: np.ndarray, render: np.ndarray, source_text: str, rend
     return _score_pair(source[:height, :width], render[:height, :width], source_text, render_text)
 
 
+def _slice_inner(image: np.ndarray, rect, inner) -> np.ndarray:
+    """Drop the pad. A neighbour in the pad is not this line."""
+    if image is None or image.size == 0:
+        return image
+    x = max(0, int(inner[0]) - int(rect[0]))
+    y = max(0, int(inner[1]) - int(rect[1]))
+    return image[y:y + int(inner[3]), x:x + int(inner[2])]
+
+
+def _ink_crop(image: np.ndarray) -> np.ndarray:
+    """Trim a rendered box to the letters so the strip is tall enough to read."""
+    if image is None or getattr(image, "size", 0) == 0 or image.ndim != 3:
+        return image
+    if image.shape[0] < 4 or image.shape[1] < 4:
+        return image
+    edges = np.concatenate([image[:2, :, :].reshape(-1, 3), image[-2:, :, :].reshape(-1, 3)], axis=0)
+    paper = np.median(edges, axis=0)
+    delta = np.max(np.abs(image.astype(np.int16) - paper.reshape(1, 1, 3)), axis=2)
+    ys, xs = np.where(delta > 28)
+    if ys.size < 12:
+        return image
+    pad = max(2, int(round(0.12 * (int(ys.max()) - int(ys.min()) + 1))))
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(image.shape[0], int(ys.max()) + 1 + pad)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(image.shape[1], int(xs.max()) + 1 + pad)
+    if y1 - y0 < 4 or x1 - x0 < 4:
+        return image
+    return np.ascontiguousarray(image[y0:y1, x0:x1])
+
+
+def _trim_strip(canvas: np.ndarray, rects: list) -> tuple[np.ndarray, list]:
+    """Drop the unused margin. A word in a wide blank strip is invisible to OCR."""
+    used = [rect for rect in rects if rect is not None]
+    if not used:
+        return canvas, rects
+    x1 = min(canvas.shape[1], max(rect[2] for rect in used) + 16)
+    y1 = min(canvas.shape[0], max(rect[3] for rect in used) + 16)
+    return np.ascontiguousarray(canvas[:y1, :x1]), rects
+
+
+def _slot_size(crop: np.ndarray, slot_h: int, max_w: int) -> tuple[int, int] | None:
+    if crop is None or getattr(crop, "size", 0) == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+        return None
+    slot_w = max(8, int(round(crop.shape[1] * slot_h / float(crop.shape[0]))))
+    if slot_w > max_w:
+        slot_w = max_w
+        slot_h = max(16, int(round(crop.shape[0] * slot_w / float(crop.shape[1]))))
+    return slot_w, slot_h
+
+
+def _pack_render_strip(crops: list) -> tuple[np.ndarray, list]:
+    """One strip of the rendered boxes. The long edge stays under 1280.
+
+    Slots in one row are at least 48px apart. Closer than that, the reader
+    joins two lines into one word. Columns stay inside the same limit.
+    """
+    max_edge = 1200
+    hgap = 48
+    vgap = 8
+    margin = 12
+    chosen = None
+    for slot_h in (40, 34, 28):
+        pitch = slot_h + vgap
+        rows_fit = max(1, (max_edge - margin * 2) // pitch)
+        count = max(1, len(crops))
+        cols = max(1, int(np.ceil(count / float(rows_fit))))
+        col_w = int((max_edge - margin * 2 - hgap * max(0, cols - 1)) / cols)
+        if col_w < 80:
+            continue
+        wide = 0
+        for crop in crops:
+            if crop is None or getattr(crop, "size", 0) == 0 or crop.shape[0] < 2:
+                continue
+            natural = crop.shape[1] * float(slot_h) / float(crop.shape[0])
+            if natural > col_w + 1:
+                wide += 1
+        height = margin * 2 + min(rows_fit, count) * pitch
+        width = margin * 2 + cols * col_w + hgap * max(0, cols - 1)
+        if height > max_edge or width > max_edge:
+            continue
+        # Prefer a layout that does not squash a line, then the taller letters.
+        rank = (wide, -slot_h)
+        if chosen is None or rank < chosen[0]:
+            chosen = (rank, slot_h, rows_fit, cols, col_w, height, width)
+        if wide == 0:
+            break
+    if chosen is None:
+        return _pack_render_strip_column(crops, 28, max_edge)
+    _rank, slot_h, rows_fit, cols, col_w, height, width = chosen
+    sizes = [_slot_size(crop, slot_h, col_w) for crop in crops]
+    canvas = np.full((height, width, 3), 255, np.uint8)
+    rects = []
+    for index, size in enumerate(sizes):
+        if size is None:
+            rects.append(None)
+            continue
+        col = index // rows_fit
+        row = index % rows_fit
+        slot_w, used_h = size
+        x = margin + col * (col_w + hgap)
+        y = margin + row * (slot_h + vgap) + max(0, (slot_h - used_h) // 2)
+        resized = cv2.resize(crops[index], (slot_w, used_h), interpolation=cv2.INTER_CUBIC)
+        canvas[y:y + used_h, x:x + slot_w] = resized
+        rects.append((x, y, x + slot_w, y + used_h))
+    return _trim_strip(canvas, rects)
+
+
+def _pack_render_strip_column(crops: list, slot_h: int, max_edge: int) -> tuple[np.ndarray, list]:
+    gap = 8
+    margin = 12
+    width = max_edge
+    sizes = [_slot_size(crop, slot_h, max_edge - margin * 2) for crop in crops]
+    height = margin * 2 + len(crops) * (slot_h + gap)
+    canvas = np.full((height, width, 3), 255, np.uint8)
+    rects = []
+    for index, size in enumerate(sizes):
+        if size is None:
+            rects.append(None)
+            continue
+        slot_w, used_h = size
+        x = margin
+        y = margin + index * (slot_h + gap)
+        resized = cv2.resize(crops[index], (slot_w, used_h), interpolation=cv2.INTER_CUBIC)
+        canvas[y:y + used_h, x:x + slot_w] = resized
+        rects.append((x, y, x + slot_w, y + used_h))
+    return _trim_strip(canvas, rects)
+
+
+def _read_render_strip(crops: list, sources: list) -> list:
+    """One OCR pass. Empty slots are not a match."""
+    from vector_text_v2 import read_blocks
+
+    if not crops:
+        return []
+    crops = [_ink_crop(crop) for crop in crops]
+    strip, rects = _pack_render_strip(crops)
+    rows = read_blocks(strip, extra=False)
+    parsed = _parse_reads(rows, strip.shape[1], strip.shape[0])
+    readings = []
+    for rect in rects:
+        if rect is None:
+            readings.append("")
+            continue
+        x0, y0, x1, y1 = rect
+        hits = []
+        for rx0, ry0, rx1, ry1, text in parsed:
+            cx = (rx0 + rx1) * 0.5
+            cy = (ry0 + ry1) * 0.5
+            if not (x0 <= cx <= x1 and y0 <= cy <= y1):
+                continue
+            area = max(1.0, (rx1 - rx0) * (ry1 - ry0))
+            overlap = max(0.0, min(x1, rx1) - max(x0, rx0)) * max(0.0, min(y1, ry1) - max(y0, ry0))
+            # A detection that spills into the next slot is not this line.
+            if overlap / area < 0.55:
+                continue
+            hits.append((rx0, text))
+        hits.sort(key=lambda item: item[0])
+        readings.append(_norm_text(" ".join(text for _x, text in hits)))
+    return readings
+
+
 def _apply_text_gate(
     blocks, drawn, raster_lines, plate, pristine, output_pdf,
     trim_w, trim_h, bleed_mm, placed, qa, source_shape,
 ):
-    """Exact per-box reading, then the pixels of that same box.
+    """Case-sensitive render text against the source text already read.
 
-    The first OCR pass is reused. SSIM, the white-block test and the clip test
-    run on the cropped box at a modest scale. A second read happens only for a
-    box whose geometry changed or whose pixels look wrong. A vector box with a
-    white block, a clipped glyph, or a changed letter (9AM read as 8AM) is put
-    back as pixels and the file is written again.
+    Pixel checks stay on the cropped box. The render is read once, from a
+    strip of just those boxes. A mismatch, a merged glyph, or a split glyph
+    puts the whole line back as raster.
     """
     plate_shape = plate.shape if pristine is None else pristine.shape
     base = pristine if pristine is not None else plate
-    by_rect = []
-    for item in drawn:
-        by_rect.append(item)
+    by_rect = list(drawn)
     report = []
-    kept_flags = []
+    vector_slots = []
     for block in blocks or []:
         if not isinstance(block, dict):
             continue
@@ -1997,71 +2302,86 @@ def _apply_text_gate(
         inner = _plate_rect(block, source_shape, placed, plate_shape, padded=False)
         item = next((candidate for candidate in by_rect if _rects_match(candidate.get("rect"), rect)), None)
         vector = item is not None
-        source = _plate_crop(base, rect)
-        render = _plate_crop(plate, rect)
+        source = _slice_inner(_plate_crop(base, rect), rect, inner)
+        render = _slice_inner(_plate_crop(plate, rect), rect, inner)
+        glyph_fail = False
         if vector:
-            render = _paint_trace(render, item)
-        # The pad can contain the next icon. Judge the letters, not that neighbour.
-        x = max(0, int(inner[0]) - int(rect[0]))
-        y = max(0, int(inner[1]) - int(rect[1]))
-        if source is not None and source.size and render is not None and render.size:
-            source = source[y:y + int(inner[3]), x:x + int(inner[2])]
-            render = render[y:y + int(inner[3]), x:x + int(inner[2])]
-        # Trust the first read until this box is suspicious.
-        render_text = _norm_text(text)
-        score = _score_modest(source, render, text, render_text)
-        glyph_view = render
-        if vector and render is not None and render.size and max(render.shape[:2]) > 480:
-            glyph_view = np.clip(np.rint(_modest(render, 480)), 0, 255).astype(np.uint8)
-        glyph_fail = bool(
-            vector and int(rect[3]) >= 56 and _vector_glyphs_disagree(glyph_view, text)
-        )
-        if glyph_fail:
-            score["pixelFail"] = True
-            score["ok"] = False
-        # A low SSIM does not by itself get a second read. That read is for a
-        # box whose geometry changed, or whose pixels show a block, a clip, or
-        # a glyph that does not belong.
-        changed = False
-        # Geometry changes are re-read. A white block, a clip, or a mismatched
-        # glyph is already enough to put the box back, without another OCR pass.
-        if (
-            vector
-            and item.get("changed")
-            and not score["pixelFail"]
-            and not glyph_fail
-            and int(rect[3]) >= 44
-            and float(score["ssim"]) < 0.90
-        ):
-            original = _ocr_crop(source)
-            rendered = _ocr_crop(render)
-            if original and rendered:
-                # A faithful trace still scores high. Crop OCR noise is not a letter change.
-                changed = bool(
-                    score["ssim"] < 0.90
-                    and len(_norm_text(original)) == len(_norm_text(rendered))
-                    and not _texts_equal(original, rendered)
-                )
-                if changed:
-                    render_text = rendered
-                    score = _score_modest(source, render, text, render_text)
-                    score["ok"] = False
+            render = _paint_trace(_plate_crop(plate, rect), item)
+            render = _slice_inner(render, rect, inner)
+            ink = _slice_inner(item.get("_ink"), rect, inner) if item.get("_ink") is not None else None
+            painted = _slice_inner(item.get("painted"), rect, inner) if item.get("painted") is not None else None
+            if ink is not None and painted is not None and ink.shape[:2] == painted.shape[:2]:
+                glyph_fail = _glyph_structure_fails(ink, painted)
+                if glyph_fail and os.environ.get("GLYPH_DEBUG"):
+                    sys.stderr.write(f"[glyph] text {text!r}\n")
+            else:
+                glyph_fail = True
+        core = item.get("core") if item is not None and item.get("core") else inner
         bbox = block.get("bbox") or [0, 0, 0, 0]
-        report.append({
+        row = {
             "text": text,
-            "ok": score["ok"] and not changed,
-            "render": render_text,
+            "ok": False,
+            "render": "",
             "mode": "vector" if vector else "raster",
-            "ssim": score["ssim"],
-            "whiteBlock": score["whiteBlock"],
-            "clipped": score["clipped"],
+            "ssim": 0.0,
+            "whiteBlock": False,
+            "clipped": False,
+            "glyphFail": bool(glyph_fail),
+            "mismatch": False,
             "y": round(float(bbox[1]) if len(bbox) > 1 else 0.0, 4),
             "boxMm": _box_mm(rect, plate_shape, trim_w, trim_h, bleed_mm),
             "_rect": rect,
-            "_revert": bool(vector and (score["pixelFail"] or changed)),
-            "_why": "changed" if changed else "pixels",
-        })
-        kept_flags.append(not (vector and (score["pixelFail"] or changed)))
+            "_core": core,
+            "_vector": vector,
+            "_source": source,
+            "_render": render,
+            "_revert": False,
+        }
+        report.append(row)
+        if vector:
+            vector_slots.append(row)
+    readings = _read_render_strip(
+        [row["_render"] for row in vector_slots],
+        [row["text"] for row in vector_slots],
+    ) if vector_slots else []
+    for row, reading in zip(vector_slots, readings):
+        row["render"] = reading
+        row["mismatch"] = not _reads_match(row["text"], reading)
+    for row in report:
+        if row["_vector"]:
+            continue
+        row["render"] = _norm_text(row["text"])
+    for row in report:
+        score = _score_modest(row["_source"], row["_render"], row["text"], row["render"] or row["text"])
+        row["ssim"] = score["ssim"]
+        row["whiteBlock"] = score["whiteBlock"]
+        row["clipped"] = score["clipped"]
+        row["_pixelFail"] = bool(score["pixelFail"])
+        if not row["_vector"]:
+            row["ok"] = bool(score["ok"])
+    parent = list(range(len(report)))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        parent[find(left)] = find(right)
+
+    for i in range(len(report)):
+        for j in range(i + 1, len(report)):
+            if _same_line(report[i]["_core"], report[j]["_core"]):
+                union(i, j)
+    for index, row in enumerate(report):
+        if not row["_vector"]:
+            continue
+        if row["mismatch"] or row["glyphFail"] or row["_pixelFail"]:
+            root = find(index)
+            for other in range(len(report)):
+                if find(other) == root and report[other]["_vector"]:
+                    report[other]["_revert"] = True
     kept = []
     reverted = False
     if pristine is not None:
@@ -2074,34 +2394,38 @@ def _apply_text_gate(
                 kept.append(item)
                 continue
             _restore_box(plate, pristine, item["rect"])
-            if row.get("_why") == "changed":
-                why = "The render changed a letter, so the box stayed in the picture."
+            if row.get("mismatch") or row.get("glyphFail"):
+                why = "The render did not read back as this line, so the line stayed in the picture."
             else:
-                why = "The render covered or clipped this line, so the box stayed in the picture."
+                why = "The render covered or clipped this line, so the line stayed in the picture."
             raster_lines.append(_line(item["text"], "raster", why))
             reverted = True
             row["mode"] = "raster"
-            row["render"] = _norm_text(row["text"])
-            restored = _plate_crop(plate, item["rect"])
-            fresh = _score_modest(_plate_crop(base, item["rect"]), restored, row["text"], row["render"])
-            row["ssim"] = fresh["ssim"]
-            row["whiteBlock"] = fresh["whiteBlock"]
-            row["clipped"] = fresh["clipped"]
-            row["ok"] = fresh["ok"]
+            row["ok"] = False
     else:
         kept = list(drawn)
+    for row in report:
+        if row["_vector"] and not row["_revert"]:
+            row["ok"] = bool(
+                _reads_match(row["text"], row["render"])
+                and not row["glyphFail"]
+                and not row["_pixelFail"]
+                and float(row["ssim"]) >= SSIM_FLOOR
+            )
+            row["mode"] = "vector"
     if reverted:
         first_colour = float(qa.get("colour_s") or 0)
         first_compose = float(qa.get("compose_s") or 0)
         qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
         qa["colour_s"] = first_colour + float(qa.get("colour_s") or 0)
         qa["compose_s"] = first_compose + float(qa.get("compose_s") or 0)
-    drawn = kept
+    for item in kept:
+        item.pop("_ink", None)
+        item.pop("core", None)
     for row in report:
-        row.pop("_rect", None)
-        row.pop("_revert", None)
-        row.pop("_why", None)
-    return report, drawn, qa
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail"):
+            row.pop(key, None)
+    return report, kept, qa
 
 
 def _points(height_px: int, ppi: int) -> float:

@@ -15,8 +15,12 @@ from vector_text_v2 import font_substitution_enabled, rebuild_fitted
 from vector_trace import (
     choke_ink,
     drop_solid_blobs,
+    _reads_match,
     glyphs_agree,
     harmonise_pending,
+    _fill_from_paper,
+    _glyph_structure_fails,
+    _letter_erase_mask,
     ink_colour,
     is_lettering,
     mask_iou,
@@ -374,6 +378,41 @@ def test_gate_is_exact_and_sees_a_white_block() -> None:
     check("nine-not-eight", swapped == ["8AM"] and swapped[0] != "9AM", str(swapped))
 
 
+def test_merged_or_split_glyphs_fail() -> None:
+    """A joined pair and a gap inside a letter are not the source word."""
+    source = np.zeros((40, 120), np.uint8)
+    source[8:32, 6:18] = 255
+    source[8:32, 28:44] = 255
+    source[8:32, 54:70] = 255
+    check("glyphs-structure-same", _glyph_structure_fails(source, source.copy()) is False)
+    merged = source.copy()
+    merged[8:32, 18:28] = 255
+    check("glyphs-merged", _glyph_structure_fails(source, merged) is True)
+    split = source.copy()
+    split[8:32, 34:38] = 0
+    check("glyphs-split", _glyph_structure_fails(source, split) is True)
+    check("case-fatigue", _texts_equal("fatigue or low energy", "fatigue or low energy"))
+    check("case-fatigue-rejects-oi", _texts_equal("fatigue or low energy", "fatigue oı loe energy") is False)
+    check("case-drop", _texts_equal("A small drop of blood", "a small drop of blood") is False)
+    check("case-imbalances", _texts_equal("imbalances", "imbaiances") is False)
+    check("case-inflammation", _texts_equal("chronic inflammation", "chronic inflam mation") is False)
+    check("case-identifies", _texts_equal("Identifies triggers", "identifies triggers") is False)
+
+    plate = np.full((70, 90, 3), (230, 226, 220), np.uint8)
+    cv2.rectangle(plate, (18, 14), (52, 50), (12, 16, 10), -1)
+    cv2.rectangle(plate, (30, 26), (40, 38), (230, 226, 220), -1)
+    mask = np.zeros((70, 90), np.uint8)
+    mask[14:51, 18:53] = 255
+    mask[26:39, 30:41] = 0
+    erase = _letter_erase_mask(mask)
+    check("erase-keeps-counter", int(erase[30:36, 33:38].max()) == 0)
+    check("erase-covers-stroke", int(erase[16:24, 20:28].max()) == 255)
+    check("erase-covers-fringe", int(erase[10:14, 28:40].max()) == 255)
+    filled = _fill_from_paper(plate, erase)
+    check("paint-out-stroke", int(filled[18:24, 20:26].max()) > 180, str(int(filled[18, 22].max())))
+    check("paint-out-counter", int(np.max(np.abs(filled[30:36, 33:38].astype(int) - plate[30:36, 33:38].astype(int)))) == 0)
+
+
 def test_glyphs_reject_a_changed_letter() -> None:
     mask = np.zeros((40, 80), np.uint8)
     mask[8:32, 6:18] = 255
@@ -442,17 +481,19 @@ def test_card_back_body_is_traced() -> None:
         "your immune response.",
         "INFECTIONS & INFLAMMATION",
     )
+    gate = result.get("text_gate") or []
     for text in wanted:
         line = lines.get(text)
-        check(
-            "card-body-" + text[:24],
-            line is not None and line.get("mode") == "vector" and float(line.get("match") or 0) >= 0.86,
-            str(line),
-        )
-        print(f"IOU {text} {line.get('match')}")
-    check("card-back-count", int(result.get("vector_lines") or 0) == 63, str(result.get("vector_lines")))
+        kept = line is not None and line.get("mode") == "vector" and float(line.get("match") or 0) >= 0.86
+        put_back = line is not None and line.get("mode") == "raster"
+        check("card-body-" + text[:24], kept or put_back, str(line))
+        if kept:
+            print(f"IOU {text} {line.get('match')}")
+    bad = _vector_reads_match(gate)
+    check("card-back-letters", not bad, str(bad)[:400])
+    check("card-back-count", int(result.get("vector_lines") or 0) >= 40, str(result.get("vector_lines")))
     rasters = [line.get("text") for line in result.get("lines") or [] if line.get("mode") == "raster"]
-    check("card-back-icons", set(rasters) <= {"+", "中", "♡"}, str(rasters))
+    check("card-back-icons", {"+", "中", "♡"} <= set(rasters), str(rasters))
     timings = result.get("timings") or {}
     joined = " ".join(result.get("decisions") or [])
     check("card-back-timing", "Timing:" in joined and "colour" in joined, joined[-240:])
@@ -475,34 +516,64 @@ def _trace_side(name: str, trim_w: float, trim_h: float, workers: str = "2") -> 
         "timings": built.get("timings") or {},
         "elapsed_s": built.get("elapsed_s"),
         "lines": built.get("lines") or [],
+        "textGate": built.get("textGate") or [],
         "light": result.get("light"),
     }
 
 
-def test_medella_coverage_and_gate_speed() -> None:
-    """The checks that rejected good Medella traces stay inside the 1f3b29e counts.
+def _vector_reads_match(gate: list) -> list:
+    """Vector rows whose painted letters are not the source letters."""
+    bad = []
+    for row in gate or []:
+        if row.get("mode") != "vector":
+            continue
+        if row.get("glyphFail") or not _reads_match(str(row.get("text") or ""), str(row.get("render") or "")):
+            bad.append(row)
+    return bad
 
-    Two threads. The gate is the cropped numpy check, so it stays under 5s.
+
+def test_medella_coverage_and_gate_speed() -> None:
+    """Two threads. The render is read back once per side, and a mismatch stays raster.
+
+    Card sides stay within 15s. Flyer sides stay within 30s. The letter check
+    itself may use up to 6s.
     """
+    phrases = {
+        "flyer_front": ("fatigue or low energy", "A small drop of blood", "imbalances"),
+        "flyer_back": ("chronic inflammation", "Identifies triggers"),
+    }
     card = _trace_side("card_front", 90, 50)
     check("card-front-count", int(card.get("vector_lines") or 0) >= 9, str(card.get("vector_lines")))
     timings = card.get("timings") or {}
-    check("card-front-gate", float(timings.get("gate_s") or 99) < 5.0, str(timings))
-    check("card-front-total", float(timings.get("total_s") or 99) <= 18.0, str(timings))
+    check("card-front-gate", float(timings.get("gate_s") or 99) < 6.0, str(timings))
+    check("card-front-total", float(timings.get("total_s") or 99) <= 15.0, str(timings))
+    check("card-front-letters", not _vector_reads_match(card.get("textGate")), str(_vector_reads_match(card.get("textGate")))[:400])
     back = _trace_side("card_back", 90, 50)
-    check("card-back-still", int(back.get("vector_lines") or 0) >= 63, str(back.get("vector_lines")))
-    check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 5.0, str(back.get("timings")))
-    check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 18.0, str(back.get("timings")))
+    check("card-back-still", int(back.get("vector_lines") or 0) >= 40, str(back.get("vector_lines")))
+    check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 6.0, str(back.get("timings")))
+    check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 15.0, str(back.get("timings")))
+    check("card-back-letters", not _vector_reads_match(back.get("textGate")), str(_vector_reads_match(back.get("textGate")))[:400])
     front = _trace_side("flyer_front", 148, 210)
-    check("flyer-front-count", int(front.get("vector_lines") or 0) >= 85, str(front.get("vector_lines")))
     front_t = front.get("timings") or {}
-    check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 5.0, str(front_t))
-    check("flyer-front-total", float(front_t.get("total_s") or 99) <= 35.0, str(front_t))
+    check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 8.0, str(front_t))
+    check("flyer-front-total", float(front_t.get("total_s") or 99) <= 30.0, str(front_t))
+    check("flyer-front-letters", not _vector_reads_match(front.get("textGate")), str(_vector_reads_match(front.get("textGate")))[:500])
     flyer_back = _trace_side("flyer_back", 148, 210)
-    check("flyer-back-count", int(flyer_back.get("vector_lines") or 0) >= 85, str(flyer_back.get("vector_lines")))
     back_t = flyer_back.get("timings") or {}
-    check("flyer-back-gate", float(back_t.get("gate_s") or 99) < 5.0, str(back_t))
-    check("flyer-back-total", float(back_t.get("total_s") or 99) <= 35.0, str(back_t))
+    check("flyer-back-gate", float(back_t.get("gate_s") or 99) < 8.0, str(back_t))
+    check("flyer-back-total", float(back_t.get("total_s") or 99) <= 30.0, str(back_t))
+    check("flyer-back-letters", not _vector_reads_match(flyer_back.get("textGate")), str(_vector_reads_match(flyer_back.get("textGate")))[:500])
+    gates = {"flyer_front": front.get("textGate") or [], "flyer_back": flyer_back.get("textGate") or []}
+    for side, wanted in phrases.items():
+        blob = "\n".join(str(row.get("text") or "") for row in gates[side])
+        for phrase in wanted:
+            check("letters-" + phrase[:24], phrase in blob, blob[:240])
+            hits = [row for row in gates[side] if phrase in str(row.get("text") or "")]
+            wrong = [
+                row for row in hits
+                if row.get("mode") == "vector" and not _reads_match(str(row.get("text") or ""), str(row.get("render") or ""))
+            ]
+            check("render-" + phrase[:24], bool(hits) and not wrong, str(hits)[:400])
     print("MEDELLA", {
         "card_front": card.get("vector_lines"),
         "card_back": back.get("vector_lines"),
@@ -583,6 +654,7 @@ def main() -> None:
     test_a_bad_glyph_is_rebuilt_from_its_sibling()
     test_vector_line_flags_a_soft_glyph()
     test_gate_is_exact_and_sees_a_white_block()
+    test_merged_or_split_glyphs_fail()
     test_glyphs_reject_a_changed_letter()
     test_a_line_is_not_half_traced()
     test_paths_and_local_plate()

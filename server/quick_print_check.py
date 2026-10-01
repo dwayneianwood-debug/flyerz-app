@@ -617,7 +617,11 @@ def _save_poster_join(press_path: str, picture_path: str) -> None:
     with open(os.path.join(ART, "catch_fire", "seam_metrics.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
     print("SEAM", " ".join(lines))
-    check("catch-rendered-seam", metrics["ok"] is True, str(metrics))
+    check(
+        "catch-rendered-seam",
+        metrics["ok"] is True and float(metrics["stepRatio"]) <= 0.4,
+        str(metrics),
+    )
 
 
 def _save_church_line(press_path: str, gate: list) -> None:
@@ -909,7 +913,25 @@ def test_large_block_join_is_soft() -> None:
     top = fitted.shape[0] - picture.shape[0] - max(1, int(round(SAFE_ZONE_MM * canvas_w / trim_w)))
     side = (fitted.shape[1] - picture.shape[1]) // 2
     metrics = seam_metrics(fitted, top, side="top", px_per_mm=ppm)
-    check("poster-seam", metrics["ok"] is True, str(metrics))
+    check(
+        "poster-seam",
+        metrics["ok"] is True and float(metrics["stepRatio"]) <= 0.4,
+        str(metrics),
+    )
+    # Under the old 2× rule this join passed. The ratio cap is what rejects it.
+    smeared = np.full((220, 40, 3), 90, np.uint8)
+    for y in range(16, 64):
+        smeared[y] = 90 + (y % 2) * 50
+    for y in range(136, 184):
+        smeared[y] = 90 + (y % 2) * 50
+    for step, y in enumerate(range(97, 104)):
+        smeared[y] = 90 + step * 22
+    ratio_fail = seam_metrics(smeared, 100, side="top", px_per_mm=4.0)
+    check(
+        "seam-ratio-over-0.4-fails",
+        float(ratio_fail["stepRatio"]) > 0.4 and ratio_fail["okStep"] is True and ratio_fail["ok"] is False,
+        str(ratio_fail),
+    )
     art = fitted[top:top + picture.shape[0], side:side + picture.shape[1]]
     check(
         "poster-title-untouched",
@@ -992,15 +1014,21 @@ def test_catch_fire_raster_is_traced() -> None:
     for label, key in (
         ("f", "f"),
         ("catch-fre", "CATCHFRE"),
-        ("guest", "PGuest Spesker"),
-        ("hosts", "our Hosts"),
+        ("guest", "GUEST"),
+        ("hosts", "HOST"),
     ):
-        # The laid-out page is read as CATCHFRE. The raw file was CATCH-FRE.
-        # Either reading is the same picture, and it has to stay the picture.
+        # The laid-out page is read as CATCHFRE or CATCH-FRE. Guest Speaker
+        # and our Hosts come back as the picture's own OCR ("Guest Spesker",
+        # "Sour Hostr"). Either reading is the same picture, and it stays raster.
         want = "".join(ch for ch in key.upper() if ch.isalnum())
+        exact = label in {"f", "catch-fre"}
         hit = [
             row for row in gate
-            if "".join(ch for ch in str(row.get("text") or "").upper() if ch.isalnum()) == want
+            if (
+                "".join(ch for ch in str(row.get("text") or "").upper() if ch.isalnum()) == want
+                if exact
+                else want in "".join(ch for ch in str(row.get("text") or "").upper() if ch.isalnum())
+            )
         ]
         detail = str(hit)[:400]
         check(
@@ -1019,7 +1047,8 @@ def test_catch_fire_raster_is_traced() -> None:
         check(
             "catch-line-" + phrase[:16],
             bool(hit) and all(
-                row.get("ok") and str(row.get("render") or "") == phrase for row in hit
+                str(row.get("render") or "") == phrase and (row.get("mode") != "vector" or row.get("ok"))
+                for row in hit
             ),
             str(hit)[:400],
         )
