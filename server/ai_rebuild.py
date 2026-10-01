@@ -594,8 +594,8 @@ def _single_character(text: str) -> bool:
     return len(_alnum(text)) <= 1
 
 
-# Dashes, quotes, a bullet, and @ are ordinary lettering, not junk.
-_WORD_EXTRA = "\u2010\u2011\u2012\u2013\u2014\u2018\u2019\u2022@"
+# Dashes, quotes, a bullet, a middot, and @ are ordinary lettering, not junk.
+_WORD_EXTRA = "\u2010\u2011\u2012\u2013\u2014\u2018\u2019\u2022\u00b7\u2219\u22c5@"
 
 
 def _word_like(text: str) -> bool:

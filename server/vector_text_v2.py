@@ -651,12 +651,14 @@ def _rescue_lines(bgr: np.ndarray, dropped: list) -> tuple[list, list]:
         pending.append((block, kind, text))
     if not pending:
         return rescued, still
+    from ai_rebuild import keeps_grouping
+
     reads = _reread_many(bgr, [block for block, _kind, _text in pending], local_rows)
     for (block, kind, text), found in zip(pending, reads):
         new_text, new_score = found
         if kind == "phone":
             chosen = text
-            if new_text and _is_phone(new_text) and new_score >= 0.5:
+            if new_text and _is_phone(new_text) and new_score >= 0.5 and keeps_grouping(text, new_text):
                 chosen = new_text
             block = dict(block)
             block["text"] = chosen
@@ -666,14 +668,19 @@ def _rescue_lines(bgr: np.ndarray, dropped: list) -> tuple[list, list]:
             continue
         if kind == "name":
             block = dict(block)
-            if new_text and new_score >= 0.55 and 1 <= len(new_text.split()) <= 4:
+            if (
+                new_text
+                and new_score >= 0.55
+                and 1 <= len(new_text.split()) <= 4
+                and keeps_grouping(text, new_text)
+            ):
                 block["text"] = new_text
                 block["score"] = new_score
             block["score"] = max(float(block.get("score") or 0), 0.72)
             block["rescued"] = "name"
             rescued.append(block)
             continue
-        if new_text and new_score >= 0.88 and len(_letters(new_text)) >= 6:
+        if new_text and new_score >= 0.88 and len(_letters(new_text)) >= 6 and keeps_grouping(text, new_text):
             block = dict(block)
             block["text"] = new_text
             block["score"] = new_score
@@ -1813,14 +1820,16 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
     if not text or box_w < 1 or box_h < 1:
         return
     role = _FONT_ROLE.get(line.get("font") or "", "body")
+    gap_fracs = list(line.get("gaps") or [])
     size, _tracking = _fit_width(font, text, box_w, box_h, role)
+    size = _size_for_gaps(font, text, size, box_w, gap_fracs)
     asc = size * (0.70 if role != "script" else 0.62)
     desc = size * 0.22 if any(ch in "gjpqy" for ch in text) else 0.0
     ink = asc + desc
     top_pad = max(0.0, (box_h - ink) / 2.0)
     baseline = y * sy + top_pad + asc
     colour = _cmyk(_hex_rgb(line.get("color") or "#222222"))
-    advances = _char_advances(font, text, size, box_w, role, list(line.get("gaps") or []))
+    advances = _char_advances(font, text, size, box_w, role, gap_fracs)
     writer = fitz.TextWriter(page.rect)
     cursor = x * sx
     for index, ch in enumerate(text):
@@ -1830,6 +1839,21 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
     writer.write_text(page, color=colour, render_mode=2 if stroke else 0)
     if stroke:
         _restroke(page, size, stroke)
+
+
+def _size_for_gaps(font, text: str, size: float, box_w: float, gap_fracs: list) -> float:
+    """Shrink the face so the measured word gaps still fit. The gaps are not squeezed."""
+    spaces = [index for index, ch in enumerate(text) if ch == " "]
+    if not spaces or len(gap_fracs) != len(spaces) or box_w <= 0:
+        return size
+    space_total = sum(max(0.0, float(box_w) * float(frac)) for frac in gap_fracs)
+    room = float(box_w) - space_total
+    if room < float(box_w) * 0.40:
+        return size
+    glyph = sum(float(font.text_length(ch, fontsize=size)) for ch in text if ch != " ")
+    if glyph > room > 0:
+        size = max(3.5, size * room / glyph)
+    return size
 
 
 def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fracs: list) -> list:
@@ -1844,12 +1868,13 @@ def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fr
         for index in spaces:
             widths[index] = max(widths[index], size * 0.32)
     total = sum(widths)
-    if measured and total > box_w:
-        space_total = sum(widths[index] for index in spaces) or 1.0
-        overflow = total - box_w
-        if space_total > overflow:
-            scale = (space_total - overflow) / space_total
-            for index in spaces:
+    if measured and total > box_w + 0.2:
+        glyphs = [index for index in range(len(text)) if index not in spaces]
+        glyph_total = sum(widths[index] for index in glyphs) or 1.0
+        room = float(box_w) - sum(widths[index] for index in spaces)
+        if room > 0:
+            scale = room / glyph_total
+            for index in glyphs:
                 widths[index] *= scale
             total = sum(widths)
     boundaries = [
@@ -1861,7 +1886,8 @@ def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fr
     if leftover > 1.0 and boundaries:
         cap = {"spaced": 0.12, "script": 0.05, "tagline": 0.10}.get(role, 0.10) * size
         if measured:
-            cap = min(cap, 0.06 * size)
+            min_gap = min(widths[index] for index in spaces)
+            cap = min(cap, 0.06 * size, 0.40 * min_gap)
         track = min(leftover / float(len(boundaries)), cap)
         for index in boundaries:
             extra[index] = track

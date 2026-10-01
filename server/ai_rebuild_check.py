@@ -492,6 +492,19 @@ def test_phone_groups_and_dotted_caps() -> None:
     check("dot-matches-ocr", spacing_matches(ocr, spaced), spaced)
 
 
+def test_dotted_caps_are_words() -> None:
+    """A middot is lettering. A second read may not drop it or the spaces around it."""
+    from ai_rebuild import _word_like, keep_word_blocks, keeps_grouping
+
+    text = "HOLISTIC · NATURAL · PROFESSIONAL"
+    glued = "HOLISTIC · NATURAL· PROFESSIONAL"
+    check("middot-word", _word_like(text) and _word_like(glued))
+    kept, dropped = keep_word_blocks([{"text": text, "bbox": [0.1, 0.2, 0.7, 0.04], "score": 0.97}])
+    check("middot-kept", [item["text"] for item in kept] == [text], str([item["text"] for item in dropped]))
+    check("middot-grouping", keeps_grouping(text, "HOLISTIC NATURAL PROFESSIONAL") is False)
+    check("phone-grouping", keeps_grouping("073 703 0766", "073 7030766") is False)
+
+
 def test_press_pdf_shows_the_words() -> None:
     """The file that goes to press must show the words, in place, on an intact background."""
     from press_ready_engine import compile_vector_press
@@ -901,6 +914,7 @@ if __name__ == "__main__":
     test_real_local_ocr()
     test_restore_spaces_from_gaps()
     test_phone_groups_and_dotted_caps()
+    test_dotted_caps_are_words()
     test_inpaint_removes_the_letters()
     test_doubtful_marks_are_not_retyped()
     test_contacts_and_dashes_are_words()

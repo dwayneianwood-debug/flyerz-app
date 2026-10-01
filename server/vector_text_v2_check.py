@@ -407,6 +407,58 @@ def test_badge_number_is_not_retyped() -> None:
     check("step-not-in-pdf", "4" not in text and "plan" in text.lower(), text[:200])
 
 
+def test_dotted_caps_keep_their_gaps() -> None:
+    """Spaced caps keep the middot and the pixel gaps. The gaps are not letter-spacing."""
+    from vector_text_v2 import _char_advances, _fit_width, _fitz_font, _size_for_gaps
+
+    text = "HOLISTIC · NATURAL · PROFESSIONAL"
+    font = _fitz_font("cinzel-600")
+    box_w, box_h = 186.0, 11.0
+    fracs = [0.038, 0.040, 0.036, 0.040]
+    size, _track = _fit_width(font, text, box_w, box_h, "spaced")
+    size = _size_for_gaps(font, text, size, box_w, fracs)
+    advances = _char_advances(font, text, size, box_w, "spaced", fracs)
+    spaces = [advance for ch, advance in zip(text, advances) if ch == " "]
+    floors = [box_w * frac * 0.9 for frac in fracs]
+    check("dot-gaps-held", len(spaces) == 4 and all(space >= floor for space, floor in zip(spaces, floors)), str([round(s, 2) for s in spaces]))
+
+    image = Image.new("RGB", (980, 160), (18, 48, 34))
+    draw = ImageDraw.Draw(image)
+    face = ImageFont.truetype(font_path("cinzel-600"), 36)
+    cursor = 40
+    for word in ("HOLISTIC", "·", "NATURAL", "·", "PROFESSIONAL"):
+        draw.text((cursor, 58), word, font=face, fill=(236, 242, 232))
+        cursor += int(draw.textlength(word, font=face)) + 28
+    out = tempfile.mkdtemp(prefix="vector-dots-")
+    pdf = os.path.join(out, "press.pdf")
+    block = {
+        "text": text,
+        "bbox": [0.03, 0.28, 0.92, 0.38],
+        "score": 0.98,
+        "color_hex": "#ecf2e8",
+    }
+    result = rebuild_fitted(
+        cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR),
+        148, 40, pdf, blocks=[block], reocr=lambda _path: text,
+    )
+    check("dot-job", result.get("ok") is True, str(result.get("reason")))
+    line = next(item for item in result.get("lines") or [] if "HOLISTIC" in item.get("text", ""))
+    check("dot-vector-text", line.get("mode") == "vector" and "·" in line.get("text", ""), str(line.get("text")))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    raw = doc[0].get_text("rawdict")
+    doc.close()
+    found = ""
+    for block_item in raw["blocks"]:
+        if block_item.get("type") != 0:
+            continue
+        for row in block_item.get("lines") or []:
+            chars = "".join(ch["c"] for span in row["spans"] for ch in span.get("chars") or [])
+            if "HOLISTIC" in chars:
+                found = chars
+    check("dot-in-pdf", "·" in found and found.count(" ") >= 4, repr(found))
+
+
 def test_long_script_is_not_a_serif() -> None:
     """A joined script sentence is Parisienne or it stays in the picture. Never a serif."""
     ink = np.zeros((48, 460), np.uint8)
@@ -666,6 +718,7 @@ def main() -> None:
     test_core_ink_ignores_the_green_edge()
     test_step_circles_are_the_only_badges()
     test_badge_number_is_not_retyped()
+    test_dotted_caps_keep_their_gaps()
     test_long_script_is_not_a_serif()
     test_stroke_follows_each_line()
     test_body_stroke_and_press_black()
