@@ -870,17 +870,20 @@ def _line_record(block: dict, mode: str, reason: str) -> dict:
     }
 
 
-def read_blocks(bgr: np.ndarray, extra: bool = True) -> list:
+def read_blocks(bgr: np.ndarray, extra: bool = True, fast: bool = False) -> list:
     """One OCR pass on a downscaled copy. Results are cached by picture hash.
 
     extra runs the crop re-read used by font substitution. Trace mode leaves
-    it off: those passes only rewrite the words, not the boxes.
+    it off: those passes only rewrite the words, not the boxes. fast is the
+    gate strip: letter crops, no short-side enlarge, no angle check.
     """
     from ai_rebuild import _block, _space_blocks
     from ocr_reader import local_rows
 
     small, back = _downscale(bgr, DETECT_LONG_EDGE)
     key = hashlib.sha256(small.tobytes()).hexdigest()[:32]
+    if fast:
+        key += "-gate"
     os.makedirs(OCR_CACHE, exist_ok=True)
     cache_path = os.path.join(OCR_CACHE, key + ".json")
     rows = None
@@ -891,7 +894,7 @@ def read_blocks(bgr: np.ndarray, extra: bool = True) -> list:
         except Exception:
             rows = None
     if not isinstance(rows, list):
-        raw = local_rows(small) or []
+        raw = local_rows(small, fast=fast) or []
         rows = []
         for item in raw:
             box = item[0]

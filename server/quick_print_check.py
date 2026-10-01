@@ -1055,6 +1055,23 @@ def test_catch_fire_raster_is_traced() -> None:
         )
     wrong = [row for row in gate if str(row.get("render") or "") in {"8AM", "BANDILE", "CHURC"}]
     check("catch-no-wrong-character", not wrong, str(wrong)[:300])
+    timings = (result.get("vectorText") or {}).get("timings") or {}
+    extra = 0.08 * int(timings.get("spawns") or 0)
+    predicted = {
+        "ocr_s": timings.get("ocr_s"),
+        "enlarge_s": timings.get("enlarge_s"),
+        "trace_s": round(float(timings.get("trace_s") or 0) + extra, 3),
+        "colour_s": timings.get("colour_s"),
+        "compose_s": timings.get("compose_s"),
+        "gate_s": timings.get("gate_s"),
+        "total_s": round(float(timings.get("total_s") or 0) + extra, 3),
+        "spawns": timings.get("spawns"),
+        "spawn_s": round(extra, 3),
+    }
+    print("PREDICTED poster", predicted)
+    check("catch-spawns", int(timings.get("spawns") or 99) <= 4, str(timings.get("spawns")))
+    check("catch-gate", float(predicted.get("gate_s") or 99) <= 4.0, str(predicted))
+    check("catch-total", float(predicted.get("total_s") or 99) <= 30.0, str(predicted))
     _save_poster_join(result["pressPath"], picture_path=src)
     _save_church_line(result["pressPath"], gate)
 

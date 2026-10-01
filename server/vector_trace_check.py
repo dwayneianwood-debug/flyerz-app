@@ -995,11 +995,38 @@ def _check_card_back_raster(side: dict) -> None:
     check("by-identifying-y-seen", checked >= 2, str(checked))
 
 
-def test_medella_coverage_and_gate_speed() -> None:
-    """Two threads. The render is read back once per side, and a mismatch stays raster.
+def _predicted(timings: dict) -> dict:
+    """Add 80ms for each potrace start, which is what Windows pays."""
+    timings = dict(timings or {})
+    extra = 0.08 * int(timings.get("spawns") or 0)
+    timings["trace_s"] = round(float(timings.get("trace_s") or 0) + extra, 3)
+    timings["total_s"] = round(float(timings.get("total_s") or 0) + extra, 3)
+    timings["spawn_s"] = round(extra, 3)
+    return timings
 
-    Card sides stay within 15s. Flyer sides stay within 30s. The letter check
-    itself may use up to 6s.
+
+def _check_allergies_column(gate: list) -> None:
+    """The infections column is one weight. A vector heading next to raster body is not."""
+    rows = gate or []
+    heading = [row for row in rows if "ALLERGIES" in str(row.get("text") or "").upper()]
+    body = [row for row in rows if "Identifies triggers" in str(row.get("text") or "")]
+    check("allergies-present", bool(heading), str(rows)[:240])
+    check(
+        "allergies-heading-raster",
+        bool(heading) and all(row.get("mode") == "raster" for row in heading),
+        str(heading)[:300],
+    )
+    check(
+        "allergies-description-raster",
+        bool(body) and all(row.get("mode") == "raster" for row in body),
+        str(body)[:300],
+    )
+
+
+def test_medella_coverage_and_gate_speed() -> None:
+    """Two threads. Times include 80ms per potrace start, so they predict the laptop.
+
+    Every side stays within 30s. The letter check stays within 4s.
     """
     phrases = {
         "flyer_front": (
@@ -1023,29 +1050,35 @@ def test_medella_coverage_and_gate_speed() -> None:
     }
     card = _trace_side("card_front", 90, 50)
     check("card-front-count", int(card.get("vector_lines") or 0) >= 9, str(card.get("vector_lines")))
-    timings = card.get("timings") or {}
-    check("card-front-gate", float(timings.get("gate_s") or 99) < 6.0, str(timings))
-    check("card-front-total", float(timings.get("total_s") or 99) <= 15.0, str(timings))
+    timings = _predicted(card.get("timings") or {})
+    print("PREDICTED card_front", timings)
+    check("card-front-gate", float(timings.get("gate_s") or 99) <= 4.0, str(timings))
+    check("card-front-total", float(timings.get("total_s") or 99) <= 30.0, str(timings))
     check("card-front-letters", not _vector_reads_match(card.get("textGate")), str(_vector_reads_match(card.get("textGate")))[:400])
     check("card-front-source", card.get("source_guard") is True, str(card.get("source_guard")))
     _check_medella_swash(card)
     back = _trace_side("card_back", 90, 50)
     check("card-back-still", int(back.get("vector_lines") or 0) >= 40, str(back.get("vector_lines")))
-    check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 6.0, str(back.get("timings")))
-    check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 15.0, str(back.get("timings")))
+    back_pred = _predicted(back.get("timings") or {})
+    print("PREDICTED card_back", back_pred)
+    check("card-back-gate", float(back_pred.get("gate_s") or 99) <= 4.0, str(back_pred))
+    check("card-back-total", float(back_pred.get("total_s") or 99) <= 30.0, str(back_pred))
     check("card-back-letters", not _vector_reads_match(back.get("textGate")), str(_vector_reads_match(back.get("textGate")))[:400])
     check("card-back-source-guard", back.get("source_guard") is True, str(back.get("source_guard")))
     _check_card_back_raster(back)
     front = _trace_side("flyer_front", 148, 210)
-    front_t = front.get("timings") or {}
-    check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 8.0, str(front_t))
+    front_t = _predicted(front.get("timings") or {})
+    print("PREDICTED flyer_front", front_t)
+    check("flyer-front-gate", float(front_t.get("gate_s") or 99) <= 4.0, str(front_t))
     check("flyer-front-total", float(front_t.get("total_s") or 99) <= 30.0, str(front_t))
     check("flyer-front-letters", not _vector_reads_match(front.get("textGate")), str(_vector_reads_match(front.get("textGate")))[:500])
     check("flyer-front-source", front.get("source_guard") is True, str(front.get("source_guard")))
     flyer_back = _trace_side("flyer_back", 148, 210)
-    back_t = flyer_back.get("timings") or {}
-    check("flyer-back-gate", float(back_t.get("gate_s") or 99) < 8.0, str(back_t))
+    back_t = _predicted(flyer_back.get("timings") or {})
+    print("PREDICTED flyer_back", back_t)
+    check("flyer-back-gate", float(back_t.get("gate_s") or 99) <= 4.0, str(back_t))
     check("flyer-back-total", float(back_t.get("total_s") or 99) <= 30.0, str(back_t))
+    _check_allergies_column(flyer_back.get("textGate") or [])
     check("flyer-back-letters", not _vector_reads_match(flyer_back.get("textGate")), str(_vector_reads_match(flyer_back.get("textGate")))[:500])
     check("flyer-back-source", flyer_back.get("source_guard") is True, str(flyer_back.get("source_guard")))
     gates = {"flyer_front": front.get("textGate") or [], "flyer_back": flyer_back.get("textGate") or []}
@@ -1134,6 +1167,69 @@ def test_paths_and_local_plate() -> None:
     check("sharpen-paper", int(np.abs(out.astype(np.int16) - plate.astype(np.int16)).sum()) > 0)
 
 
+def test_one_potrace_covers_the_page() -> None:
+    """Two lines are one process, and a counter in the first line stays open."""
+    import vector_trace as vt
+
+    first = np.zeros((28, 60), np.uint8)
+    first[6:22, 8:22] = 255
+    first[8:20, 12:18] = 0
+    second = np.zeros((28, 70), np.uint8)
+    second[6:22, 30:52] = 255
+    vt._spawn_count = 0
+    many = vt._trace_many([first, second])
+    check("one-spawn", vt._spawn_count == 1, str(vt._spawn_count))
+    check("batch-has-both", len(many) == 2 and bool(many[0]) and bool(many[1]), str(len(item) for item in many))
+    alone = vt.trace_mask(first)
+    painted_many = vt.rasterise_paths(many[0], first.shape[1], first.shape[0])
+    painted_one = vt.rasterise_paths(alone, first.shape[1], first.shape[0])
+    check("batch-matches-one", vt.mask_iou(painted_many, painted_one) >= 0.95, f"{vt.mask_iou(painted_many, painted_one):.3f}")
+    check("batch-keeps-counter", int(painted_many[14, 15]) == 0, str(int(painted_many[14, 15])))
+    other = vt.rasterise_paths(many[1], second.shape[1], second.shape[0])
+    check("batch-second-ink", int(other.max()) > 0)
+
+
+def test_column_style_follows_the_majority() -> None:
+    """Same size and colour in one column follows whichever mode is in the majority."""
+    from vector_trace import _keep_uniform
+
+    ink = (20.0, 30.0, 40.0)
+    other = (200.0, 210.0, 220.0)
+
+    def item(text, rect, colour):
+        return {
+            "text": text,
+            "rect": rect,
+            "style": colour,
+            "paths": [[]],
+            "fill": (0, 0, 0, 1),
+            "origin": rect[:2],
+            "iou": 0.95,
+        }
+
+    drawn = [
+        item("ALLERGIES & SENSITIVITIES", (400, 200, 180, 18), ink),
+        item("Identifies triggers and", (400, 224, 170, 18), ink),
+    ]
+    rasters = [
+        {"text": "Boosts immunity", "rect": (400, 80, 160, 18), "anchor": "line", "style": ink},
+        {"text": "Supports the gut", "rect": (400, 110, 170, 18), "anchor": "line", "style": ink},
+        {"text": "Calms the skin", "rect": (400, 140, 150, 18), "anchor": "line", "style": ink},
+    ]
+    kept = [row["text"] for row in _keep_uniform(drawn, [], rasters)]
+    check("column-style-raster", kept == [], str(kept))
+    gold = [
+        item("Heading", (40, 40, 160, 28), other),
+        item("Second", (40, 80, 150, 28), other),
+    ]
+    one = [{"text": "Third", "rect": (40, 120, 140, 28), "anchor": "line", "style": other}]
+    stayed = [row["text"] for row in _keep_uniform(gold, [], one)]
+    check("column-style-vector-stays", stayed == ["Heading", "Second"], str(stayed))
+    heading = [item("INFECTIONS", (400, 40, 180, 36), ink)]
+    kept_heading = [row["text"] for row in _keep_uniform(heading, [], rasters)]
+    check("different-size-stays", kept_heading == ["INFECTIONS"], str(kept_heading))
+
+
 def main() -> None:
     test_segment_dark_light_and_fills()
     test_trace_matches_the_ink()
@@ -1153,6 +1249,8 @@ def main() -> None:
     test_glyphs_reject_a_changed_letter()
     test_paint_follows_the_glyph_not_the_box()
     test_a_line_is_not_half_traced()
+    test_one_potrace_covers_the_page()
+    test_column_style_follows_the_majority()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()
     test_medella_coverage_and_gate_speed()

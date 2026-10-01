@@ -13,9 +13,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -37,6 +35,8 @@ BELOW_FRAC = 0.35
 
 _NUM = r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"
 _TOKEN = re.compile(rf"[MmLlHhVvCcZz]|{_NUM}")
+# Potrace starts once per bitmap. The timing test adds the Windows cost of that start.
+_spawn_count = 0
 
 
 def segment_ink(roi: np.ndarray):
@@ -153,14 +153,19 @@ def refine_ink(roi: np.ndarray, mask: np.ndarray):
         area = int(stats[index, cv2.CC_STAT_AREA])
         if area < 4:
             continue
-        component = labels == index
-        local = distance * component
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        w = int(stats[index, cv2.CC_STAT_WIDTH])
+        h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        window = labels[y:y + h, x:x + w]
+        comp = window == index
+        local = distance[y:y + h, x:x + w] * comp
         peak = float(local.max()) if local.size else 0.0
         core = local >= max(0.8, peak * 0.45)
         if int(core.sum()) < 3:
-            core = component
-        tone = float(np.median(gray[core]))
-        found.append((index, area, tone, core))
+            core = comp
+        tone = float(np.median(gray[y:y + h, x:x + w][core]))
+        found.append((index, area, tone, x, y, w, h, core))
     if not found:
         return None, None
     furthest = max(found, key=lambda item: abs(item[2] - paper))
@@ -178,9 +183,9 @@ def refine_ink(roi: np.ndarray, mask: np.ndarray):
         kept = [furthest]
     cleaned = np.zeros((height, width), np.uint8)
     samples = []
-    for index, _area, _tone, core in kept:
-        cleaned[labels == index] = 255
-        samples.append(roi[core])
+    for index, _area, _tone, x, y, w, h, core in kept:
+        cleaned[y:y + h, x:x + w][labels[y:y + h, x:x + w] == index] = 255
+        samples.append(roi[y:y + h, x:x + w][core])
     if int(cleaned.max()) == 0 or not samples:
         return None, None
     colour = np.median(np.concatenate(samples, axis=0), axis=0).astype(np.float32)
@@ -606,49 +611,54 @@ def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
     x1, y1 = min(width, x1), min(height, y1)
     if x1 - x0 < 2 or y1 - y0 < 2:
         return mask
-    count, labels = cv2.connectedComponents((mask > 0).astype(np.uint8), 8)
-    zone = np.zeros((height, width), np.uint8)
-    zone[y0:y1, x0:x1] = 1
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
     keep = np.zeros((height, width), np.uint8)
+    boxes = []
+    kept_flag = np.zeros(count, np.bool_)
     for index in range(1, count):
-        component = labels == index
-        area = int(component.sum())
+        area = int(stats[index, cv2.CC_STAT_AREA])
         if area < 2:
             continue
-        inside = int(np.count_nonzero(component & (zone > 0)))
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        w = int(stats[index, cv2.CC_STAT_WIDTH])
+        h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        # Inclusive edges, matching a pixel walk of this component.
+        right = x + w - 1
+        bottom = y + h - 1
+        ox0, oy0 = max(x, x0), max(y, y0)
+        ox1, oy1 = min(x + w, x1), min(y + h, y1)
+        inside = 0
+        if ox1 > ox0 and oy1 > oy0:
+            inside = int(np.count_nonzero(labels[oy0:oy1, ox0:ox1] == index))
         # A descender is mostly below the word box. Keeping it only when 40% of
         # the stroke sits in that box drops the tail and leaves a floating speck.
         if inside >= max(4, int(round(0.08 * area))):
-            keep[component] = 255
+            keep[y:y + h, x:x + w][labels[y:y + h, x:x + w] == index] = 255
+            kept_flag[index] = True
+        boxes.append((index, x, y, right, bottom, area))
     # A tail that the threshold split off sits under a kept letter and outside
     # the word box. It is not the next line: it is short, and it shares the
     # letter's columns.
-    kept_ids = [index for index in range(1, count) if int(keep[labels == index].max()) > 0]
-    for index in range(1, count):
-        if int(keep[labels == index].max()) > 0:
+    kept_ids = [item for item in boxes if kept_flag[item[0]]]
+    for index, left, top, right, bottom, area in boxes:
+        if kept_flag[index] or area < 4:
             continue
-        component = labels == index
-        ys, xs = np.where(component)
-        if ys.size < 4:
-            continue
-        top, bottom = int(ys.min()), int(ys.max())
-        left, right = int(xs.min()), int(xs.max())
         if top < y1:
             continue
         if bottom - top > max(8, int(round(0.55 * (y1 - y0)))):
             continue
-        for kept in kept_ids:
-            ky, kx = np.where(labels == kept)
-            if ky.size == 0:
-                continue
-            k_bottom = int(ky.max())
+        for _kept, k_left, _k_top, k_right, k_bottom, _k_area in kept_ids:
             gap = top - k_bottom - 1
             if gap < 0 or gap > max(6, int(round(0.35 * (y1 - y0)))):
                 continue
-            k_left, k_right = int(kx.min()), int(kx.max())
             overlap = min(right, k_right) - max(left, k_left)
             if overlap >= max(2, int(round(0.35 * (right - left + 1)))):
-                keep[component] = 255
+                y = int(stats[index, cv2.CC_STAT_TOP])
+                x = int(stats[index, cv2.CC_STAT_LEFT])
+                h = int(stats[index, cv2.CC_STAT_HEIGHT])
+                w = int(stats[index, cv2.CC_STAT_WIDTH])
+                keep[y:y + h, x:x + w][labels[y:y + h, x:x + w] == index] = 255
                 break
     if int(keep.max()) == 0:
         return None
@@ -733,25 +743,10 @@ def is_lettering(text: str) -> bool:
 
 def trace_mask(mask: np.ndarray) -> list:
     """Bezier subpaths in the mask's own pixel space. Empty when potrace finds nothing."""
-    if mask is None or int(mask.max()) == 0:
+    binary = _trace_binary(mask)
+    if binary is None:
         return []
-    height, width = mask.shape[:2]
-    big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
-    _thr, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
-    svg = _potrace_svg(binary)
-    if not svg:
-        return []
-    transform = _svg_transform(svg, binary.shape[0])
-    paths = []
-    for raw in re.findall(r'<path\b[^>]*\bd="([^"]+)"', svg, flags=re.I | re.S):
-        subpaths = _parse_path(raw, transform)
-        # The 4× bitmap is scaled back to the crop.
-        scaled = []
-        for sub in subpaths:
-            scaled.append([(cmd, [(x / TRACE_SCALE, y / TRACE_SCALE) for x, y in pts]) for cmd, pts in sub])
-        if scaled:
-            paths.append(scaled)
-    return paths
+    return _scale_paths(_paths_from_svg(_potrace_svg(binary), binary.shape[0]), 1.0 / TRACE_SCALE)
 
 
 def _letter_erase_mask(mask: np.ndarray) -> np.ndarray:
@@ -1378,7 +1373,7 @@ def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
     return canvas
 
 
-def _raster_box(text: str, left: int, top: int, right: int, bottom: int, core=None, scope: str = "paragraph") -> dict:
+def _raster_box(text: str, left: int, top: int, right: int, bottom: int, core=None, scope: str = "paragraph", style=None) -> dict:
     """A box that stayed in the picture.
 
     Any fallback pulls the other boxes on its own line. A paragraph goes
@@ -1390,6 +1385,7 @@ def _raster_box(text: str, left: int, top: int, right: int, bottom: int, core=No
         "rect": rect,
         "core": core or rect,
         "anchor": scope,
+        "style": _as_style(style),
     }
 
 
@@ -1436,6 +1432,122 @@ def _same_paragraph(above, below) -> bool:
     if spacing < -0.35 * min(above[3], below[3]):
         return False
     return spacing <= 1.6 * max(above[3], below[3])
+
+
+def _as_style(value):
+    """Three colour numbers, or nothing when this line has no ink sample."""
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if arr.size < 3:
+        return None
+    return (float(arr[0]), float(arr[1]), float(arr[2]))
+
+
+def _sample_style(image: np.ndarray):
+    """Median ink colour of a crop. The border is the paper."""
+    if image is None or getattr(image, "size", 0) == 0 or getattr(image, "ndim", 0) != 3:
+        return None
+    if image.shape[0] < 4 or image.shape[1] < 4:
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = np.concatenate([
+        gray[:2, :].reshape(-1),
+        gray[-2:, :].reshape(-1),
+        gray[:, :2].reshape(-1),
+        gray[:, -2:].reshape(-1),
+    ])
+    paper = float(np.median(edges))
+    ink = np.abs(gray.astype(np.int16) - paper) > 28
+    if int(ink.sum()) < 8:
+        return None
+    return _as_style(np.median(image[ink], axis=0))
+
+
+def _same_text_style(left, right) -> bool:
+    """Same font size and the same ink colour."""
+    if left.get("colour") is None or right.get("colour") is None:
+        return False
+    h1 = float(left["rect"][3])
+    h2 = float(right["rect"][3])
+    if abs(h1 - h2) > max(4.0, 0.18 * max(h1, h2, 1.0)):
+        return False
+    return float(np.linalg.norm(
+        np.asarray(left["colour"], np.float32) - np.asarray(right["colour"], np.float32)
+    )) <= 40.0
+
+
+def _same_column(above, below) -> bool:
+    """Stacked lines of one column. A page-wide title does not swallow a narrow column."""
+    ax, ay, aw, ah = [float(v) for v in above]
+    bx, by, bw, bh = [float(v) for v in below]
+    overlap = min(ax + aw, bx + bw) - max(ax, bx)
+    if overlap <= 0:
+        return False
+    narrow = min(aw, bw)
+    wide = max(aw, bw)
+    if narrow < 0.55 * wide:
+        return False
+    if overlap < 0.45 * narrow:
+        return False
+    if ay + ah <= by:
+        gap = by - (ay + ah)
+    elif by + bh <= ay:
+        gap = ay - (by + bh)
+    else:
+        gap = 0.0
+    return gap <= 14.0 * max(ah, bh, 1.0)
+
+
+def _column_style_demote(entries: list) -> set:
+    """Indexes to put back in the picture so one style in a column matches.
+
+    Most siblings of the same size and colour are raster, so the traced ones
+    stay in the picture too. Most siblings vector leaves a failed line in the
+    picture and does not invent a trace for it. A line with no colour sample
+    is not a sibling.
+    """
+    count = len(entries)
+    if count < 2:
+        return set()
+    parent = list(range(count))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left, right):
+        parent[find(left)] = find(right)
+
+    for i in range(count):
+        for j in range(i + 1, count):
+            if not _same_text_style(entries[i], entries[j]):
+                continue
+            if not _same_column(entries[i]["rect"], entries[j]["rect"]):
+                continue
+            union(i, j)
+    groups = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(index)
+    demote = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        rasters = sum(1 for index in members if entries[index]["raster"])
+        vectors = len(members) - rasters
+        if rasters <= vectors:
+            continue
+        for index in members:
+            if entries[index]["raster"]:
+                continue
+            for item in entries[index]["indexes"]:
+                demote.add(item)
+    return demote
 
 
 def _paragraph_roots(line_rects: dict) -> dict:
@@ -1663,6 +1775,7 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
             "mode": "vector",
             "rect": item.get("core") or item["rect"],
             "scope": "",
+            "colour": _as_style(item.get("style")),
         })
     for box in raster_boxes:
         scope = box.get("anchor")
@@ -1675,6 +1788,7 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
             "mode": "raster",
             "rect": box.get("core") or box["rect"],
             "scope": scope,
+            "colour": _as_style(box.get("style")),
         })
     parent = list(range(len(records)))
 
@@ -1731,6 +1845,23 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
             for member in lines[line_id]:
                 if records[member]["mode"] == "vector" and records[member]["index"] is not None:
                     drop.add(records[member]["index"])
+    style_rows = []
+    for line_id, members in lines.items():
+        colours = [records[member].get("colour") for member in members if records[member].get("colour") is not None]
+        live = [
+            records[member]["index"]
+            for member in members
+            if records[member]["mode"] == "vector"
+            and records[member]["index"] is not None
+            and records[member]["index"] not in drop
+        ]
+        style_rows.append({
+            "rect": line_rect[line_id],
+            "raster": not live,
+            "colour": colours[0] if colours else None,
+            "indexes": live,
+        })
+    drop.update(_column_style_demote(style_rows))
     if not drop:
         return drawn
     kept = []
@@ -1773,6 +1904,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     from vector_plate import place_plate
     from vector_text_v2 import MIN_PPI, _note, _rect, read_blocks
 
+    global _spawn_count
+    _spawn_count = 0
     _note(progress, "reading", "Reading the lettering.")
     ocr_started = time.perf_counter()
     if blocks is None:
@@ -1830,6 +1963,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if not is_lettering(text):
             raster_lines.append(_line(text, "raster", "An icon was left in the picture."))
             continue
+        style = None
         owner = owner_cursor
         owner_cursor += 1
         raw = _rect(block, bgr.shape[1], bgr.shape[0])
@@ -1850,25 +1984,26 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         )
         if right - left < 4 or bottom - top < 4:
             raster_lines.append(_line(text, "raster", "The box was too small to trace."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         crop = plate[top:bottom, left:right]
+        style = _sample_style(crop)
         mask, colour = segment_ink(crop)
         if mask is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         mask = ink_touching(mask, (
             inner_left - left, inner_top - top, inner_right - left, inner_bottom - top,
         ))
         if mask is None:
             raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         mask, colour = refine_ink(crop, mask)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         # A logo in the same box is not a letter. A letter touching it stays.
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -1876,13 +2011,13 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         mask, colour = refine_ink(crop, mask)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         # Only this line's ink. A neighbour's ascender in the expanded crop stays put.
         owned = _keep_line_glyphs(mask, left, top, owner, plate_cores)
         if owned is None:
             raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
             continue
         refined_mask, refined_colour = refine_ink(crop, owned)
         if refined_mask is not None and refined_colour is not None:
@@ -1905,6 +2040,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "crop": crop,
             "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
             "clear": halo,
+            "style": style,
         })
     harmonise_pending(pending)
     traced = _trace_many([item["mask"] for item in pending])
@@ -1915,18 +2051,18 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         core = item.get("core")
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
             continue
         score, accepted, painted = _accept_trace(mask, paths)
         if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
             continue
         check_crop = _hide_foreign_ink(item["crop"], mask)
         reason = shape_gate(check_crop, mask, painted, item["inner"])
         if reason:
             raster_lines.append(_line(text, "raster", reason))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
             continue
         if _topology_fails(check_crop, painted, plate_ppi):
             if os.environ.get("TOPO_DEBUG"):
@@ -1935,7 +2071,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
                 text, "raster",
                 "A letter lost its tail or its counter, so this line stayed in the picture.",
             ))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", style))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
@@ -1951,6 +2087,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "changed": bool(item.get("changed")),
             "_mask": mask,
             "_clear": item.get("clear"),
+            "style": item.get("style"),
         })
     drawn = _keep_uniform(drawn, raster_lines, raster_boxes)
     pristine = plate.copy()
@@ -2035,6 +2172,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "compose_s": round(compose_s, 3),
         "gate_s": round(gate_s, 3),
         "total_s": round(time.perf_counter() - started, 3),
+        "spawns": int(_spawn_count),
     }
     timing_line = (
         f"Timing: OCR {timings['ocr_s']:.2f}s, upscale {timings['enlarge_s']:.2f}s, "
@@ -3003,7 +3141,7 @@ def _reread_empty_slots(strip: np.ndarray, rects: list, readings: list, sources:
             interpolation=cv2.INTER_AREA,
         )
         boxes = [None if box is None else tuple(int(round(value * scale)) for value in box) for box in boxes]
-    rows = read_blocks(canvas, extra=False)
+    rows = read_blocks(canvas, extra=False, fast=True)
     parsed = _parse_reads(rows, canvas.shape[1], canvas.shape[0])
     for index, box in zip(blanks, boxes):
         fresh = _slot_reading(parsed, box)
@@ -3022,7 +3160,7 @@ def _read_render_strip(crops: list, sources: list) -> list:
         return []
     crops = [_ink_crop(crop) for crop in crops]
     strip, rects = _pack_render_strip(crops)
-    rows = read_blocks(strip, extra=False)
+    rows = read_blocks(strip, extra=False, fast=True)
     parsed = _parse_reads(rows, strip.shape[1], strip.shape[0])
     readings = [_slot_reading(parsed, rect) for rect in rects]
     _reread_empty_slots(strip, rects, readings, sources)
@@ -3184,6 +3322,17 @@ def _apply_text_gate(
             for index in line_members[line_id]:
                 if report[index]["_vector"]:
                     report[index]["_revert"] = True
+    style_rows = []
+    for index, row in enumerate(report):
+        live = row["_vector"] and not row["_revert"]
+        style_rows.append({
+            "rect": row["_core"],
+            "raster": not live,
+            "colour": _sample_style(row.get("_source")),
+            "indexes": [index] if live else [],
+        })
+    for index in _column_style_demote(style_rows):
+        report[index]["_revert"] = True
     kept = []
     reverted = False
     if pristine is not None:
@@ -3488,13 +3637,18 @@ def _workers() -> int:
 
 
 def _trace_many(masks: list) -> list:
-    """Potrace each mask. A pool overlaps the CLI calls. Order stays the page order."""
+    """One potrace process for the page. Order stays the page order.
+
+    Each trace is a few milliseconds. Starting a process per line costs about
+    80ms on Windows, and a pool would pay that once per line, so the lines
+    share one bitmap.     A process pool is not used: the start cost is the whole job.
+    """
+    _workers()
     if not masks:
         return []
-    if len(masks) == 1 or _workers() == 1:
-        return [trace_mask(mask) for mask in masks]
-    with ThreadPoolExecutor(max_workers=_workers()) as pool:
-        return list(pool.map(trace_mask, masks))
+    binaries = [_trace_binary(mask) for mask in masks]
+    placed = _potrace_placed(binaries)
+    return [_scale_paths(paths, 1.0 / TRACE_SCALE) for paths in placed]
 
 
 def sharpen_background(plate: np.ndarray, ink: np.ndarray) -> np.ndarray:
@@ -3514,41 +3668,151 @@ def sharpen_background(plate: np.ndarray, ink: np.ndarray) -> np.ndarray:
     return out
 
 
-def _potrace_svg(binary: np.ndarray) -> str:
-    height, width = binary.shape[:2]
-    handle = tempfile.NamedTemporaryFile(prefix="trace-", suffix=".pbm", delete=False)
-    path = handle.name
-    try:
-        bits = (binary > 127).astype(np.uint8)
-        pad = (8 - (width % 8)) % 8
-        if pad:
-            bits = np.pad(bits, ((0, 0), (0, pad)))
-        packed = np.packbits(bits, axis=1)
-        handle.write(f"P4\n{width} {height}\n".encode())
-        handle.write(packed.tobytes())
-        handle.close()
-        # Potrace traces black. PBM 1-bits are black, and those are our ink pixels.
-        from host_paths import find_potrace
+def _trace_binary(mask: np.ndarray):
+    """The 4× bitmap potrace fits. None when the mask is empty."""
+    if mask is None or int(np.max(mask)) == 0:
+        return None
+    height, width = mask.shape[:2]
+    big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
+    _thr, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
+    return binary
 
-        result = subprocess.run(
-            [
-                find_potrace(), "-s", "--flat",
-                "-t", str(TURDSIZE),
-                "-a", str(ALPHAMAX),
-                "-O", str(OPTTOLERANCE),
-                "-u", "10",
-                "-o", "-",
-                path,
-            ],
-            check=False,
-            capture_output=True,
-            timeout=20,
-        )
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+
+def _paths_from_svg(svg: str, height: int) -> list:
+    if not svg:
+        return []
+    transform = _svg_transform(svg, height)
+    paths = []
+    for raw in re.findall(r'<path\b[^>]*\bd="([^"]+)"', svg, flags=re.I | re.S):
+        subpaths = _parse_path(raw, transform)
+        if subpaths:
+            paths.append(subpaths)
+    return paths
+
+
+def _group_center(group) -> tuple | None:
+    xs = []
+    ys = []
+    for sub in group:
+        for _cmd, pts in sub:
+            for x, y in pts:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None
+    return (min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5
+
+
+def _shift_group(group, dx: float, dy: float):
+    shifted = []
+    for sub in group:
+        shifted.append([(cmd, [(x - dx, y - dy) for x, y in pts]) for cmd, pts in sub])
+    return shifted
+
+
+def _potrace_placed(bitmaps: list) -> list:
+    """Paths in each bitmap's own pixel space. One process traces the page."""
+    results = [[] for _ in bitmaps]
+    usable = [
+        index for index, bitmap in enumerate(bitmaps)
+        if bitmap is not None and bitmap.size and int(bitmap.max()) > 0
+    ]
+    if not usable:
+        return results
+    chunks = []
+    current = []
+    pixels = 0
+    for index in usable:
+        area = int(bitmaps[index].shape[0]) * int(bitmaps[index].shape[1])
+        if current and pixels + area > 24_000_000:
+            chunks.append(current)
+            current = []
+            pixels = 0
+        current.append(index)
+        pixels += area
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        _potrace_chunk(bitmaps, chunk, results)
+    return results
+
+
+def _potrace_chunk(bitmaps: list, indexes: list, results: list) -> None:
+    gap = 8
+    width = max(int(bitmaps[index].shape[1]) for index in indexes)
+    height = sum(int(bitmaps[index].shape[0]) for index in indexes) + gap * (len(indexes) - 1)
+    canvas = np.zeros((height, width), np.uint8)
+    slots = []
+    top = 0
+    for index in indexes:
+        bitmap = bitmaps[index]
+        band_h, band_w = bitmap.shape[:2]
+        canvas[top:top + band_h, :band_w] = bitmap
+        slots.append((index, top, band_h, band_w))
+        top += band_h + gap
+    svg = _potrace_svg(canvas)
+    groups = _paths_from_svg(svg, canvas.shape[0])
+    if not groups:
+        for index in indexes:
+            bitmap = bitmaps[index]
+            results[index] = _paths_from_svg(_potrace_svg(bitmap), bitmap.shape[0])
+        return
+    # A hole stays with the letter it sits in. Even-odd fill then punches the counter.
+    buckets = {index: [] for index in indexes}
+    for group in groups:
+        for sub in group:
+            center = _group_center([sub])
+            if center is None:
+                continue
+            cx, cy = center
+            owner = None
+            best = 1e18
+            for index, slot_top, band_h, band_w in slots:
+                if 0 <= cx <= band_w and slot_top <= cy <= slot_top + band_h:
+                    owner = (index, slot_top)
+                    break
+                dx = 0.0 if 0 <= cx <= band_w else min(abs(cx), abs(cx - band_w))
+                dy = 0.0 if slot_top <= cy <= slot_top + band_h else min(abs(cy - slot_top), abs(cy - (slot_top + band_h)))
+                dist = dx + dy
+                if dist < best:
+                    best = dist
+                    owner = (index, slot_top)
+            if owner is None:
+                continue
+            index, slot_top = owner
+            buckets[index].append(_shift_group([sub], 0.0, float(slot_top))[0])
+    for index, subs in buckets.items():
+        if subs:
+            results[index].append(subs)
+
+
+def _potrace_svg(binary: np.ndarray) -> str:
+    global _spawn_count
+    height, width = binary.shape[:2]
+    bits = (binary > 127).astype(np.uint8)
+    pad = (8 - (width % 8)) % 8
+    if pad:
+        bits = np.pad(bits, ((0, 0), (0, pad)))
+    packed = np.packbits(bits, axis=1)
+    # Potrace traces black. PBM 1-bits are black, and those are our ink pixels.
+    payload = f"P4\n{width} {height}\n".encode() + packed.tobytes()
+    from host_paths import find_potrace
+
+    _spawn_count += 1
+    result = subprocess.run(
+        [
+            find_potrace(), "-s", "--flat",
+            "-t", str(TURDSIZE),
+            "-a", str(ALPHAMAX),
+            "-O", str(OPTTOLERANCE),
+            "-u", "10",
+            "-o", "-",
+        ],
+        input=payload,
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
     if result.returncode != 0:
         return ""
     return result.stdout.decode("utf-8", errors="replace")

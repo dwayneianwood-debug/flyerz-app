@@ -60,8 +60,22 @@ def engine_name() -> str:
     return _ENGINE_NAME
 
 
-def local_rows(bgr):
+def local_rows(bgr, fast=False):
+    """Read one picture.
+
+    fast is the text-gate strip. Those crops are already letter-sized, so the
+    detector must not enlarge the short side, and upright type skips the
+    angle check. The page read leaves both on.
+    """
     global _ENGINE, _ENGINE_NAME
     if _ENGINE is None:
         _ENGINE, _ENGINE_NAME = _load()
-    return rows_from_output(_ENGINE(bgr))
+    if not fast:
+        return rows_from_output(_ENGINE(bgr))
+    detector = _ENGINE.text_det
+    previous = detector.limit_type
+    detector.limit_type = "max"
+    try:
+        return rows_from_output(_ENGINE(bgr, use_cls=False))
+    finally:
+        detector.limit_type = previous
