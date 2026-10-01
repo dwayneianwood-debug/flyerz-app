@@ -118,7 +118,7 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
         cv2.circle(erase, (cx, cy), radius, 255, -1)
     if int(erase.max()) == 0:
         return bgr.copy(), [], skipped
-    mask = cv2.dilate(erase, np.ones((3, 3), np.uint8))
+    mask = cv2.dilate(erase, np.ones((3, 5), np.uint8))
     if int(spare.max()) > 0:
         # Inpaint reaches past the mask. A heart or tick just beside the words stays.
         halo = cv2.dilate(spare, np.ones((13, 13), np.uint8))

@@ -532,6 +532,101 @@ def test_symbol_beside_the_words_stays() -> None:
     check("words-were-erased", int(words.max()) > 40, str(int(words.max())))
 
 
+def test_repeated_tokens_fail() -> None:
+    """A neighbouring word repeated on the rebuild, and not in the source, is a failure."""
+    from vector_text_v2 import repeats_hold, vector_rebuild_enabled
+
+    check("repeat-aa", repeats_hold("A small drop of blood", "A A small drop of blood") is False)
+    check("repeat-amp", repeats_hold("INFECTIONS &", "INFECTIONS & &") is False)
+    check("repeat-only", repeats_hold("By appointment only", "By appointment only only") is False)
+    check("repeat-dd", repeats_hold("vitamin D", "vitamin DD") is False)
+    check("repeat-clean", repeats_hold("A small drop of blood", "A small drop of blood") is True)
+    check("repeat-ocr-noise", repeats_hold("See your health,", "Pee you health 0 0 3") is True)
+    check("repeat-source-pair", repeats_hold("ha ha", "ha ha") is True)
+    check("vector-on", vector_rebuild_enabled() is True)
+    os.environ["VECTOR_REBUILD"] = "0"
+    try:
+        check("vector-off", vector_rebuild_enabled() is False)
+        image = _poster()
+        bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        out = tempfile.mkdtemp(prefix="vector-off-")
+        result = rebuild_fitted(bgr, 148, 210, os.path.join(out, "press.pdf"), blocks=[
+            _block("MARKET DAY", 0.12, 0.50, 0.5, 0.08, "#fff4d2"),
+        ], reocr=lambda _path: "MARKET DAY")
+        check("vector-off-falls-back", result.get("ok") is False and "switched off" in str(result.get("reason")), str(result.get("reason")))
+    finally:
+        os.environ.pop("VECTOR_REBUILD", None)
+
+
+def test_body_tracking_does_not_shrink_the_face() -> None:
+    """A body line's own sidebearings are not added again, so the face is not tiny."""
+    from ai_rebuild import measure_rhythm
+    from vector_text_v2 import _char_advances, _fit_width, _fitz_font, _resolve_fit
+
+    image = Image.new("RGB", (520, 90), (244, 240, 230))
+    draw = ImageDraw.Draw(image)
+    face = ImageFont.truetype(font_path("crimson"), 28)
+    draw.text((24, 28), "Skin conditions", font=face, fill=(40, 48, 36))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    rhythm = measure_rhythm(bgr, [0.02, 0.08, 0.92, 0.78], "Skin conditions")
+    font = _fitz_font("crimson")
+    text = "Skin conditions"
+    box_w, box_h = 220.0, 22.0
+    fitted, _ignored = _fit_width(font, text, box_w, box_h, "body")
+    size, gaps, track = _resolve_fit(
+        font, text, box_w, box_h, "body", rhythm.get("gaps") or [], rhythm.get("track") or 0.0,
+    )
+    check(
+        "body-face-holds-height",
+        size >= fitted * 0.88,
+        f"size {size:.2f} fitted {fitted:.2f} track {track} rhythm {rhythm}",
+    )
+    advances = _char_advances(font, text, size, box_w, "body", gaps, track)
+    glyph = float(font.text_length("S", fontsize=size))
+    check("body-letters-not-spread", advances[0] < glyph * 1.35, f"adv {advances[0]:.2f} glyph {glyph:.2f}")
+
+
+def test_icon_region_stays() -> None:
+    """A one-glyph read on a circular icon is not retyped, and the icon pixels stay."""
+    image = Image.new("RGB", (640, 420), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((70, 80, 150, 160), fill=(36, 92, 58))
+    draw.text((98, 100), "4", font=ImageFont.truetype(font_path("crimson"), 32), fill=(255, 255, 255))
+    draw.text((190, 100), "You receive a plan", font=ImageFont.truetype(font_path("crimson"), 28), fill=(20, 28, 18))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    before = bgr[80:160, 70:150].copy()
+    blocks = [
+        _block("4", 90 / 640, 96 / 420, 28 / 640, 36 / 420, "#ffffff"),
+        _block("You receive a plan", 0.28, 0.22, 0.5, 0.12, "#141c12"),
+    ]
+    out = tempfile.mkdtemp(prefix="vector-icon-")
+    pdf = os.path.join(out, "press.pdf")
+    result = rebuild_fitted(image_bgr(image), 148, 100, pdf, blocks=blocks, reocr=lambda _path: "You receive a plan")
+    check("icon-job", result.get("ok") is True, str(result.get("reason")))
+    mark = [line for line in result.get("lines") or [] if line.get("text") == "4"]
+    check("icon-stays-raster", bool(mark) and mark[0].get("mode") == "raster", str(mark))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    text = doc[0].get_text("text") or ""
+    page = doc[0]
+    # The icon sits in the source. Sample the same disk on the press render.
+    scale, off_x, off_y = __import__("vector_plate", fromlist=["fit_placement"]).fit_placement(
+        640, 420, 148, 100, 5, [(70, 80, 150, 160)],
+    )
+    cx = ((70 + 150) / 2.0) * scale + off_x
+    cy = ((80 + 160) / 2.0) * scale + off_y
+    pix = page.get_pixmap(dpi=72, alpha=False, colorspace=fitz.csRGB)
+    frame = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    px = int(round(cx / 25.4 * 72))
+    py = int(round(cy / 25.4 * 72))
+    doc.close()
+    patch = frame[max(0, py - 8):py + 8, max(0, px - 8):px + 8]
+    source_green = int(((before[:, :, 1] > 70) & (before[:, :, 1] > before[:, :, 2] + 10)).sum())
+    render_green = int(((patch[:, :, 1] > 60) & (patch[:, :, 1] > patch[:, :, 2])).sum()) if patch.size else 0
+    check("icon-not-retyped", "4" not in text and "plan" in text.lower(), text[:200])
+    check("icon-disk-stays", source_green > 100 and render_green > 20, f"source {source_green} render {render_green} at {px},{py}")
+
+
 def test_spacing_assert_catches_a_joined_word() -> None:
     from vector_text_v2 import gaps_hold, tokens_hold
 
@@ -596,13 +691,19 @@ def test_flyer_headings_are_cinzel() -> None:
 
 
 def test_small_script_gets_an_outline() -> None:
-    from vector_text_v2 import _stroke_for
+    """Script is not given a fixed outline. A face already as heavy as the ink stays bare."""
+    from vector_text_v2 import _match_stroke, _render_ink, _stroke_for
 
     dark = {"color": "#242424", "stroke": 0.0}
-    check("script-outline", _stroke_for(dark, 10.0, "script") >= 0.020)
+    check("script-no-fixed-outline", _stroke_for(dark, 10.0, "script") == 0.0)
     check("large-script-unchanged", _stroke_for(dark, 21.0, "script") == 0.0)
     check("body-not-outlined", _stroke_for(dark, 10.0, "body") == 0.0)
     check("light-script-unchanged", _stroke_for({"color": "#f4f1e4", "stroke": 0.0}, 10.0, "script") == 0.0)
+    rendered = _render_ink("live your best life", font_path("parisienne"), 420, 64, "script")
+    check("script-match-no-extra", rendered is not None and _match_stroke(rendered, "live your best life", "parisienne") == 0.0)
+    heavy = cv2.dilate(rendered, np.ones((3, 3), np.uint8))
+    factor = _match_stroke(heavy, "live your best life", "parisienne")
+    check("script-outline-capped", 0 <= factor <= 0.012, f"{factor}")
 
 
 def test_heavy_caps_face_stays_ink() -> None:
@@ -920,6 +1021,9 @@ def main() -> None:
     test_long_script_is_not_a_serif()
     test_tracked_caps_keep_letter_and_word_gaps()
     test_symbol_beside_the_words_stays()
+    test_repeated_tokens_fail()
+    test_body_tracking_does_not_shrink_the_face()
+    test_icon_region_stays()
     test_spacing_assert_catches_a_joined_word()
     test_a_poor_body_match_stays_ink()
     test_heavy_caps_face_stays_ink()

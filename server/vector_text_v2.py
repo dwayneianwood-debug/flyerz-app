@@ -97,6 +97,12 @@ def font_path(key: str) -> str:
     return _FONT_FILES[key]
 
 
+def vector_rebuild_enabled() -> bool:
+    """Vector type can be switched off. The press job then keeps the upscaled picture."""
+    raw = os.environ.get("VECTOR_REBUILD", "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
 def rebuild_fitted(
     bgr: np.ndarray,
     trim_w_mm: float,
@@ -110,6 +116,8 @@ def rebuild_fitted(
 ) -> dict:
     """Build a vector-text press PDF. Never raises. ok False means fall back."""
     started = time.perf_counter()
+    if not vector_rebuild_enabled():
+        return _fail(started, "Vector type is switched off, so the original lettering was kept.")
     try:
         return _rebuild(
             bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
@@ -154,7 +162,12 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     kept, dropped = keep_word_blocks(blocks or [])
     rescued, dropped = _rescue_lines(bgr, dropped)
     kept = list(kept) + rescued
+    kept, dupes = _dedupe_blocks(kept)
     raster_lines = [_line_record(block, "raster", "The read was too uncertain to set as type.") for block in dropped]
+    for block in dupes:
+        raster_lines.append(_line_record(
+            block, "raster", "This box repeated another line, so it was not set again.",
+        ))
     style = _page_style(bgr, kept)
     ordinary = []
     for block in kept:
@@ -172,15 +185,22 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         else:
             raster_lines.append(decision)
     chosen = _harmonise(chosen, style)
+    _share_block_weight(chosen)
     from vector_plate import find_badges
 
     page_badges = find_badges(bgr)
     kept_chosen = []
     for line in chosen:
-        if _inside_badge(line.get("rect"), page_badges):
+        if _inside_badge(line.get("rect"), page_badges) or _near_badge(line.get("rect"), page_badges):
             record = dict(line)
             record.update(mode="raster", font="", kept_on_purpose=True)
             record["reason"] = "Lettering inside a circle stayed in the picture."
+            raster_lines.append(record)
+            continue
+        if _compact_mark(line.get("text") or ""):
+            record = dict(line)
+            record.update(mode="raster", font="", kept_on_purpose=True)
+            record["reason"] = "A short mark stayed in the picture."
             raster_lines.append(record)
             continue
         kept_chosen.append(line)
@@ -212,6 +232,17 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
 
     clean, chosen, skipped = erase_text(bgr, chosen, marks)
     raster_lines.extend(skipped)
+    kept_clear = []
+    for line in chosen:
+        if _ink_remains(clean, bgr, line):
+            _paste_original(clean, bgr, line)
+            record = dict(line)
+            record.update(mode="raster", font="")
+            record["reason"] = "Original letters were still in this line, so it was not set again."
+            raster_lines.append(record)
+            continue
+        kept_clear.append(line)
+    chosen = kept_clear
     paint_s = time.perf_counter() - paint_started
     if not chosen:
         return _fail(
@@ -259,6 +290,14 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         type_s += time.perf_counter() - rewrite
         if not qa.get("wrote"):
             return _fail(started, qa.get("reason") or "The vector press file could not be written.", provider=provider)
+        if reocr is None and _repeat_failures(bgr, chosen, output_pdf, placed):
+            _discard(output_pdf)
+            return _fail(
+                started,
+                "Repeated words were still on the page, so the original lettering was kept.",
+                lines=raster_lines,
+                provider=provider,
+            )
     qa["spacing_raster"] = len(spacing_raster)
 
     qa_started = time.perf_counter()
@@ -362,6 +401,37 @@ def gap_ems_hold(original: dict, rebuild: dict, slack: float = 0.30) -> bool:
     return gaps_hold(kept_src, kept_out, slack)
 
 
+def _word_tokens(text: str) -> list:
+    return re.findall(r"[A-Za-z0-9]+|&", str(text or ""))
+
+
+def repeats_hold(source: str, read: str) -> bool:
+    """A repeated neighbouring word that the source does not have is a double draw.
+
+    'A A', '& &', 'only only', and a doubled glyph such as 'DD' all fail.
+    """
+    src = _word_tokens(source)
+    out = _word_tokens(read)
+    if not out:
+        return True
+    src_pairs = {(left.lower(), right.lower()) for left, right in zip(src, src[1:])}
+    src_set = {token.lower() for token in src}
+    for left, right in zip(out, out[1:]):
+        pair = (left.lower(), right.lower())
+        # A repeated source word ('A A', 'only only', '& &') is a double draw.
+        # A repeated token the source never had ('0 0' from a script misread) is not.
+        if pair[0] == pair[1] and pair not in src_pairs and pair[0] in src_set:
+            return False
+    for token in out:
+        low = token.lower()
+        if len(low) < 2 or len(low) % 2:
+            continue
+        half = low[:len(low) // 2]
+        if low == half * 2 and low not in src_set and half in src_set:
+            return False
+    return True
+
+
 def tokens_hold(source: str, read: str, score: float = 1.0) -> bool:
     """Same letters with a different word count means the spaces were lost or invented.
 
@@ -381,17 +451,64 @@ def tokens_hold(source: str, read: str, score: float = 1.0) -> bool:
     return len(source_words) == len(read_words)
 
 
+def _line_window(line: dict):
+    """The OCR rectangle and the ink rectangle, as one pixel window.
+
+    A thin ink slice must not hide the rest of the original letters.
+    """
+    parts = []
+    rect = line.get("rect")
+    if rect and len(rect) >= 4:
+        x, y, bw, bh = [float(v) for v in rect[:4]]
+        if bw > 1 and bh > 1:
+            parts.append((x, y, x + bw, y + bh))
+    ink = line.get("ink")
+    if ink and len(ink) >= 4:
+        x0, y0, x1, y1 = [float(v) for v in ink[:4]]
+        if x1 > x0 and y1 > y0:
+            parts.append((x0, y0, x1, y1))
+    if not parts:
+        return None
+    x0 = int(np.floor(min(part[0] for part in parts)))
+    y0 = int(np.floor(min(part[1] for part in parts)))
+    x1 = int(np.ceil(max(part[2] for part in parts)))
+    y1 = int(np.ceil(max(part[3] for part in parts)))
+    if rect and len(rect) >= 4:
+        height = max(1, int(round(float(rect[3]))))
+    else:
+        height = max(1, y1 - y0)
+    return x0, y0, x1, y1, height
+
+
+def _qa_box(line: dict, placed: dict | None) -> tuple:
+    """Plate-pixel box for the final-page read. The OCR rect is included."""
+    parts = []
+    media = line.get("media_box")
+    if media and len(media) >= 4:
+        x, y, bw, bh = [float(v) for v in media[:4]]
+        parts.append((x, y, x + bw, y + bh))
+    rect = line.get("rect")
+    mapper = placed.get("map") if placed else None
+    if rect and mapper and len(rect) >= 4:
+        x, y, bw, bh = [float(v) for v in rect[:4]]
+        ax, ay = mapper(x, y)
+        bx, by = mapper(x + bw, y + bh)
+        parts.append((min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)))
+    if not parts:
+        return 0.0, 0.0, 8.0, 8.0
+    x0 = min(part[0] for part in parts)
+    y0 = min(part[1] for part in parts)
+    x1 = max(part[2] for part in parts)
+    y1 = max(part[3] for part in parts)
+    return x0, y0, max(2.0, x1 - x0), max(2.0, y1 - y0)
+
+
 def _paste_original(clean: np.ndarray, source: np.ndarray, line: dict) -> None:
     """Put this line's original pixels back, including the ink just outside the letters."""
-    box = line.get("ink") or None
-    if box and len(box) >= 4:
-        x0, y0, x1, y1 = [int(v) for v in box[:4]]
-    else:
-        rect = line.get("rect")
-        if not rect:
-            return
-        x, y, bw, bh = [int(v) for v in rect[:4]]
-        x0, y0, x1, y1 = x, y, x + bw, y + bh
+    window = _line_window(line)
+    if window is None:
+        return
+    x0, y0, x1, y1, _height = window
     pad = 6
     height, width = clean.shape[:2]
     x0 = max(0, x0 - pad)
@@ -425,7 +542,7 @@ def _spacing_failures(source, lines, pdf_path, placed, check_tokens: bool) -> li
 
     from ai_rebuild import measure_rhythm
 
-    vector = [line for line in lines if line.get("mode") == "vector" and line.get("media_box")]
+    vector = [line for line in lines if line.get("mode") == "vector" and (line.get("media_box") or line.get("rect"))]
     if not vector:
         return []
     doc = fitz.open(pdf_path)
@@ -446,18 +563,25 @@ def _spacing_failures(source, lines, pdf_path, placed, check_tokens: bool) -> li
     crops = []
     originals = []
     for line in vector:
-        x, y, bw, bh = [float(v) for v in line["media_box"][:4]]
-        x0 = max(0, int((x * sx) * scale_x) - 2)
-        y0 = max(0, int((y * sy) * scale_y) - 2)
-        x1 = min(frame.shape[1], int(((x + bw) * sx) * scale_x) + 3)
-        y1 = min(frame.shape[0], int(((y + bh) * sy) * scale_y) + 3)
+        # Word-gap QA stays on the ink box. The wider OCR rect is only for the
+        # token read, so a letter left beside the line is seen without moving the gap.
+        media = line.get("media_box")
+        if media and len(media) >= 4:
+            x, y, bw, bh = [float(v) for v in media[:4]]
+        else:
+            x, y, bw, bh = _qa_box(line, placed)
+        frame_h = max(4.0, bh * sy * scale_y)
+        x0 = max(0, int((x * sx) * scale_x) - int(frame_h * 0.55))
+        y0 = max(0, int((y * sy) * scale_y) - int(frame_h * 0.35))
+        x1 = min(frame.shape[1], int(((x + bw) * sx) * scale_x) + int(frame_h * 0.45))
+        y1 = min(frame.shape[0], int(((y + bh) * sy) * scale_y) + int(frame_h * 0.35))
         crop = frame[y0:y1, x0:x1] if x1 - x0 >= 4 and y1 - y0 >= 4 else None
         crops.append(crop)
         bbox = line.get("bbox") or [0, 0, 1, 0.1]
         originals.append(measure_rhythm(source, bbox, line.get("text") or ""))
     reads = [(" ", 0.0)] * len(vector)
     if check_tokens:
-        reads = _ocr_crops(frame, vector, img_w, img_h, sx, sy, scale_x, scale_y)
+        reads = _ocr_crops(frame, vector, placed, img_w, img_h, sx, sy, scale_x, scale_y)
     failed = []
     for line, crop, original, read in zip(vector, crops, originals, reads):
         text = str(line.get("text") or "")
@@ -471,26 +595,48 @@ def _spacing_failures(source, lines, pdf_path, placed, check_tokens: bool) -> li
             )
             failed.append(line)
             continue
+        if check_tokens and not repeats_hold(text, read[0]):
+            line["repeat_fail"] = True
+            line["spacing_why"] = f"repeat:{read[0][:60]}"
+            failed.append(line)
+            continue
         if check_tokens and not tokens_hold(text, read[0], read[1]):
             line["spacing_why"] = f"tokens:{read[0][:40]}"
             failed.append(line)
     return failed
 
 
-def _ocr_crops(frame, lines, img_w, img_h, sx, sy, scale_x, scale_y) -> list:
+def _repeat_failures(source, lines, pdf_path, placed) -> list:
+    """Lines whose final crop still shows a repeated word."""
+    try:
+        failed = _spacing_failures(source, lines, pdf_path, placed, True)
+    except Exception:
+        return []
+    return [line for line in failed if line.get("repeat_fail")]
+
+
+def _ocr_crops(frame, lines, placed, img_w, img_h, sx, sy, scale_x, scale_y) -> list:
     from ocr_reader import local_rows
 
     height, width = frame.shape[:2]
     blocks = []
     for line in lines:
-        x, y, bw, bh = [float(v) for v in line["media_box"][:4]]
-        x0 = max(0, (x * sx) * scale_x - 2)
-        y0 = max(0, (y * sy) * scale_y - 2)
-        bw_px = max(2.0, bw * sx * scale_x)
+        # Stay on this line. A wide OCR rect pulls in the line above and
+        # turns its first word into a false 'A A'. A modest pad still sees a
+        # leftover letter sitting on the same line.
+        media = line.get("media_box")
+        if media and len(media) >= 4:
+            x, y, bw, bh = [float(v) for v in media[:4]]
+        else:
+            x, y, bw, bh = _qa_box(line, placed)
         bh_px = max(2.0, bh * sy * scale_y)
+        x0 = max(0, (x * sx) * scale_x - bh_px * 0.85)
+        y0 = max(0, (y * sy) * scale_y - bh_px * 0.45)
+        bw_px = max(2.0, bw * sx * scale_x + bh_px * 1.7)
+        bh_box = bh_px * 1.9
         blocks.append({
             "text": line.get("text") or "",
-            "bbox": [x0 / width, y0 / height, bw_px / width, bh_px / height],
+            "bbox": [x0 / width, y0 / height, bw_px / width, bh_box / height],
         })
     try:
         return _reread_many(frame, blocks, local_rows)
@@ -788,6 +934,217 @@ def _upper_ratio(text: str) -> float:
 def _is_numeral(text: str) -> bool:
     raw = str(text or "").strip()
     return raw.isdigit() and len(raw) <= 2
+
+
+def _compact_mark(text: str) -> bool:
+    """One or two glyphs, not a word. Icons misread as 4, 99, or + stay as pixels."""
+    raw = " ".join(str(text or "").split())
+    if not raw or " " in raw or _is_phone(raw):
+        return False
+    core = re.sub(r"[^0-9A-Za-z]", "", raw)
+    if core:
+        return len(core) <= 2
+    return len(raw) <= 2
+
+
+def _near_badge(rect, badges: list) -> bool:
+    """A short box whose centre sits on a circular icon, even if the box is a little wide."""
+    if not rect or not badges:
+        return False
+    x, y, bw, bh = [float(v) for v in rect[:4]]
+    if bw <= 0 or bh <= 0 or max(bw, bh) > min(bw, bh) * 3.2:
+        return False
+    cx = x + bw / 2.0
+    cy = y + bh / 2.0
+    for badge in badges:
+        radius = float(badge.get("radius") or 0)
+        if radius <= 0:
+            continue
+        dx = cx - float(badge.get("cx") or 0)
+        dy = cy - float(badge.get("cy") or 0)
+        if dx * dx + dy * dy <= (radius * 1.35) ** 2 and max(bw, bh) <= radius * 2.4:
+            return True
+    return False
+
+
+def _bbox_tokens_fit(short: str, long: str) -> bool:
+    """Every word of the shorter line appears, in order, in the longer line."""
+    small = [token.lower() for token in _word_tokens(short)]
+    large = [token.lower() for token in _word_tokens(long)]
+    if not small or not large or len(small) >= len(large):
+        return False
+    index = 0
+    for token in large:
+        if index < len(small) and token == small[index]:
+            index += 1
+    return index == len(small)
+
+
+def _region_overlap(a, b) -> bool:
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return False
+    ax, ay, aw, ah = [float(v) for v in a[:4]]
+    bx, by, bw, bh = [float(v) for v in b[:4]]
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return False
+    x0, y0 = max(ax, bx), max(ay, by)
+    x1, y1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    smaller = min(aw * ah, bw * bh)
+    if smaller <= 0:
+        return False
+    if inter / smaller >= 0.45:
+        return True
+    xover = max(0.0, x1 - x0)
+    ygap = max(0.0, y0 - (min(ay, by) + (ah if ay <= by else bh)))
+    # The fragment sits on the same row and shares horizontal space.
+    return xover >= 0.35 * min(aw, bw) and ygap <= 0.45 * max(ah, bh)
+
+
+def _union_bbox(a, b) -> list:
+    ax, ay, aw, ah = [float(v) for v in a[:4]]
+    bx, by, bw, bh = [float(v) for v in b[:4]]
+    x0, y0 = min(ax, bx), min(ay, by)
+    x1, y1 = max(ax + aw, bx + bw), max(ay + ah, by + bh)
+    return [x0, y0, max(0.001, x1 - x0), max(0.001, y1 - y0)]
+
+
+def _dedupe_blocks(blocks: list) -> tuple[list, list]:
+    """One box per region. A fragment whose words sit inside a longer line is dropped.
+
+    The longer box grows to cover the fragment, so those pixels are erased with it
+    and are not drawn a second time.
+    """
+    ordered = sorted(
+        list(blocks or []),
+        key=lambda block: (
+            -len(_word_tokens(block.get("text") or "")),
+            -float(block.get("score") or 0),
+        ),
+    )
+    kept = []
+    dupes = []
+    for block in ordered:
+        text = str(block.get("text") or "")
+        match = None
+        for other in kept:
+            if not _region_overlap(block.get("bbox"), other.get("bbox")):
+                continue
+            if _bbox_tokens_fit(text, other.get("text") or "") or text.strip().lower() == str(other.get("text") or "").strip().lower():
+                match = other
+                break
+        if match is None:
+            kept.append(block)
+            continue
+        match["bbox"] = _union_bbox(match.get("bbox"), block.get("bbox"))
+        match.pop("quad", None)
+        dupes.append(block)
+    return kept, dupes
+
+
+def _share_block_weight(lines: list) -> None:
+    """One stroke for a paragraph, and one caps face for a stack. No per-line jumps."""
+    ordered = sorted(
+        [line for line in lines if line.get("rect")],
+        key=lambda line: (line["rect"][1], line["rect"][0]),
+    )
+    seen = set()
+    for index, line in enumerate(ordered):
+        if id(line) in seen or line.get("role") in ("script", "caps", "phone", "sans-caps", "numeral"):
+            seen.add(id(line))
+            continue
+        block = [line]
+        seen.add(id(line))
+        _x, y, _w, height = line["rect"]
+        bottom = y + height
+        left = line["rect"][0]
+        for other in ordered[index + 1:]:
+            if other.get("role") in ("script", "caps", "phone", "sans-caps", "numeral"):
+                break
+            ox, oy, _ow, oh = other["rect"]
+            if abs(ox - left) > max(14, height * 0.9):
+                continue
+            if oy - bottom > max(height, oh) * 0.9:
+                break
+            block.append(other)
+            seen.add(id(other))
+            bottom = oy + oh
+            height = oh
+        if len(block) < 2:
+            continue
+        strokes = sorted(float(item.get("stroke") or 0) for item in block)
+        median = strokes[len(strokes) // 2]
+        for item in block:
+            item["stroke"] = median
+    caps = [line for line in lines if line.get("role") == "caps" and line.get("rect")]
+    groups: list = []
+    for line in sorted(caps, key=lambda item: (item["rect"][0], item["rect"][1])):
+        x, _y, _w, height = line["rect"]
+        placed = False
+        for group in groups:
+            gx, _gy, _gw, gh = group[0]["rect"]
+            if abs(height - gh) > max(height, gh) * 0.35:
+                continue
+            if abs(x - gx) > max(18, height):
+                continue
+            group.append(line)
+            placed = True
+            break
+        if not placed:
+            groups.append([line])
+    ranks = {"cinzel-400": 0, "cinzel-500": 1, "cinzel-600": 2, "cinzel-700": 3}
+    names = {0: "cinzel-400", 1: "cinzel-500", 2: "cinzel-600", 3: "cinzel-700"}
+    for group in groups:
+        if len(group) < 2:
+            continue
+        values = sorted(ranks.get(item.get("font"), 1) for item in group)
+        font = names[values[len(values) // 2]]
+        knocks = sorted(float(item.get("knockout") or 0) for item in group)
+        knock = knocks[len(knocks) // 2]
+        for item in group:
+            item["font"] = font
+            item["face_lock"] = True
+            item["knockout"] = knock
+            if knock:
+                item["stroke"] = 0.0
+
+
+def _ink_remains(clean: np.ndarray, source: np.ndarray, line: dict) -> bool:
+    """True when a full letter of this line is still sitting in the cleaned picture."""
+    box = line.get("ink") if line.get("ink") else None
+    if box and len(box) >= 4:
+        x0, y0, x1, y1 = [int(v) for v in box[:4]]
+    else:
+        rect = line.get("rect")
+        if not rect:
+            return False
+        x, y, bw, bh = [int(v) for v in rect[:4]]
+        x0, y0, x1, y1 = x, y, x + bw, y + bh
+    height = max(1, y1 - y0)
+    pad_x = int(round(height * 0.5))
+    pad_y = int(round(height * 0.2))
+    limit_h, limit_w = source.shape[:2]
+    x0, y0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+    x1, y1 = min(limit_w, x1 + pad_x), min(limit_h, y1 + pad_y)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return False
+    src = source[y0:y1, x0:x1]
+    out = clean[y0:y1, x0:x1]
+    red, green, blue = _hex_rgb(line.get("ink_hex") or line.get("color") or "#222222")
+    target = np.array([blue * 255.0, green * 255.0, red * 255.0], np.float32)
+    text = np.linalg.norm(src.astype(np.float32) - target, axis=2) < 46
+    if int(text.sum()) < 12:
+        return False
+    unchanged = np.abs(src.astype(np.int16) - out.astype(np.int16)).sum(axis=2) < 36
+    left = (text & unchanged).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(left, 8)
+    for index in range(1, count):
+        comp_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        comp_w = int(stats[index, cv2.CC_STAT_WIDTH])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if comp_h >= height * 0.42 and comp_w >= 2 and area >= 8:
+            return True
+    return False
 
 
 def _inside_badge(rect, badges: list) -> bool:
@@ -1211,6 +1568,17 @@ def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarr
     return record
 
 
+def _coverage(mask: np.ndarray) -> float:
+    """Share of the tight ink box that is actually ink."""
+    if mask is None or mask.size == 0:
+        return 0.0
+    ys, xs = np.where(mask > 40)
+    if len(xs) < 8:
+        return 0.0
+    tight = mask[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1]
+    return float((tight > 40).mean())
+
+
 def _rel_stroke(mask: np.ndarray) -> float:
     """Stroke width at the 80th percentile, as a fraction of the ink height.
 
@@ -1240,11 +1608,25 @@ def _match_stroke(ink: np.ndarray, text: str, key: str) -> float:
     rendered = _render_ink(text, path, max(int(ink.shape[1]), 80), max(int(ink.shape[0]), 24), role)
     if rendered is None:
         return 0.0
-    extra = _rel_stroke(ink) - _rel_stroke(rendered)
+    ink_stroke = _rel_stroke(ink)
+    face_stroke = _rel_stroke(rendered)
+    extra = ink_stroke - face_stroke
     if extra <= 0.008:
         return 0.0
     if role == "script":
-        return float(min(0.028, extra * 0.85))
+        # The outline may not push ink coverage more than 10% past the original.
+        source_cover = _coverage(ink)
+        face_cover = _coverage(rendered)
+        if source_cover > 0 and face_cover >= source_cover * 1.10:
+            return 0.0
+        room = max(0.0, ink_stroke * 1.10 - face_stroke)
+        factor = float(min(0.012, extra * 0.45, room))
+        if source_cover > 0 and face_cover > 0 and factor > 0:
+            # A 1px outline on a thin script adds a lot of area. Stop before +10%.
+            grown = cv2.dilate((rendered > 40).astype(np.uint8), np.ones((3, 3), np.uint8))
+            if _coverage(grown * 255) > source_cover * 1.10:
+                return 0.0
+        return factor
     ratio = {"spaced": 0.70, "tagline": 0.78}.get(role, 0.82)
     return float(min(0.014, extra * ratio))
 
@@ -2103,8 +2485,7 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
     role = _FONT_ROLE.get(line.get("font") or "", "body")
     gap_fracs = list(line.get("gaps") or [])
     track = float(line.get("track") or 0.0)
-    size, _tracking = _fit_width(font, text, box_w, box_h, role)
-    size = _size_for_gaps(font, text, size, box_w, gap_fracs, track)
+    size, gap_fracs, track = _resolve_fit(font, text, box_w, box_h, role, gap_fracs, track)
     asc = size * (0.70 if role != "script" else 0.62)
     desc = size * 0.22 if any(ch in "gjpqy" for ch in text) else 0.0
     ink = asc + desc
@@ -2127,6 +2508,43 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
         _apply_knockout(page, size, knock, str(line.get("bg") or "#f4f1e4"))
     elif stroke:
         _restroke(page, size, stroke)
+
+
+def _resolve_fit(font, text, box_w, box_h, role, gap_fracs, track):
+    """Fit the face to the line. Sidebearings are not extra letter-spacing.
+
+    Measured gaps that are only the face's own sidebearings used to be added
+    again. That spread 'Skin conditions' into 'S k i n' and shrank the face
+    to about 3.5 pt. Open caps such as AND HEALTH keep the surplus.
+    """
+    fitted, _ignored = _fit_width(font, text, box_w, box_h, role)
+    gaps = list(gap_fracs or [])
+    track = _spare_track(float(track or 0.0), float(box_w), fitted, role)
+    size = _size_for_gaps(font, text, fitted, box_w, gaps, track)
+    floor = 0.78 if role == "spaced" else 0.88
+    if fitted > 0 and size < fitted * floor:
+        track = 0.0
+        size = _size_for_gaps(font, text, fitted, box_w, gaps, 0.0)
+        if size < fitted * floor:
+            size = fitted
+            gaps = []
+    return size, gaps, track
+
+
+def _spare_track(track: float, box_w: float, size: float, role: str) -> float:
+    """Ignore a letter gap that is already inside the face. Keep open caps tracking."""
+    track = max(0.0, float(track or 0.0))
+    if track <= 0 or box_w <= 0 or size <= 0:
+        return 0.0
+    gap = track * float(box_w)
+    if role == "spaced":
+        surplus = gap - 0.05 * float(size)
+        if surplus <= 0.04 * float(size):
+            return 0.0
+        return surplus / float(box_w)
+    if gap < 0.20 * float(size):
+        return 0.0
+    return track
 
 
 def _size_for_gaps(font, text: str, size: float, box_w: float, gap_fracs: list, track: float = 0.0) -> float:
@@ -2197,7 +2615,7 @@ def _char_advances(font, text: str, size: float, box_w: float, role: str, gap_fr
         widths[index] = max(widths[index], size * 0.32)
     leftover = box_w - sum(widths)
     if leftover > 1.0 and boundaries:
-        cap = {"spaced": 0.12, "script": 0.05, "tagline": 0.10}.get(role, 0.10) * size
+        cap = {"spaced": 0.12, "script": 0.0, "tagline": 0.06}.get(role, 0.0) * size
         share = min(leftover / float(len(boundaries)), cap)
         for index in boundaries:
             extra[index] = share
@@ -2277,7 +2695,7 @@ def _paper_knock(delta: float, text_hex: str, bg_hex: str) -> float:
     paper_l = _luminance(bg_hex)
     if abs(text_l - paper_l) < 0.18:
         return 0.0
-    return round(min(0.05, max(0.0, (float(delta) - 0.02) * 0.55)), 4)
+    return round(min(0.012, max(0.0, (float(delta) - 0.02) * 0.35)), 4)
 
 
 def _luminance(value: str) -> float:
@@ -2286,17 +2704,12 @@ def _luminance(value: str) -> float:
 
 
 def _stroke_for(line: dict, size: float, role: str) -> float:
-    """Measured stroke, plus an outline on small script so it matches the original weight.
+    """The stroke measured for this line. Script is not given a fixed outline.
 
-    A large script name is left at the face weight. Chandré is already as heavy
-    as its ink, and an outline there goes black.
+    A fixed outline made small script blobby. The measured stroke is already
+    capped so the face stays within about 10% of the original ink.
     """
-    stroke = _stroke_of(line)
-    if role == "script" and 4.0 <= float(size) <= 16.5 and stroke >= 0:
-        red, green, blue = _hex_rgb(line.get("color") or "#222222")
-        if 0.2126 * red + 0.7152 * green + 0.0722 * blue <= 0.72:
-            stroke = max(stroke, 0.020)
-    return stroke
+    return _stroke_of(line)
 
 
 def _restroke(page, size: float, factor: float) -> None:

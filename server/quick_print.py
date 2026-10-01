@@ -642,20 +642,31 @@ def make_print_ready(
             _write_png(raster, fitted_path)
             work_path = fitted_path
             if detected:
-                decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
-                try:
-                    from vector_text_v2 import rebuild_fitted
+                from vector_text_v2 import vector_rebuild_enabled
 
-                    vector_built = rebuild_fitted(
-                        vector_source, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
-                    )
-                except Exception as exc:
+                if not vector_rebuild_enabled():
+                    decisions.append("Vector type is switched off. The original lettering is kept and the picture is enlarged.")
                     vector_built = {
                         "ok": False,
-                        "amber": True,
-                        "reason": f"Vector type failed ({str(exc)[:140]}). The original lettering was kept.",
+                        "amber": False,
+                        "reason": "Vector type is switched off, so the original lettering was kept.",
                         "decisions": [],
                     }
+                else:
+                    decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
+                    try:
+                        from vector_text_v2 import rebuild_fitted
+
+                        vector_built = rebuild_fitted(
+                            vector_source, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
+                        )
+                    except Exception as exc:
+                        vector_built = {
+                            "ok": False,
+                            "amber": True,
+                            "reason": f"Vector type failed ({str(exc)[:140]}). The original lettering was kept.",
+                            "decisions": [],
+                        }
                 if vector_built.get("ok"):
                     work_path = os.path.join(output_dir, "press.pdf")
                     lettering_note = "The lettering was set as vector type."
