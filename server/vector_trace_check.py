@@ -43,6 +43,7 @@ from vector_trace import (
     _expand_rect,
     _topology_fails,
     _hole_count,
+    _min_glyph_iou,
     ABOVE_FRAC,
     BELOW_FRAC,
 )
@@ -459,6 +460,54 @@ def test_descenders_and_counters() -> None:
                 continue
             holes = max(holes, _hole_count(labels == index))
     check("thin-bar-hole", holes >= 1, str(holes))
+
+    # A gold N on navy keeps the paper channel. Growing that channel shut
+    # draws the doubled stem.
+    navy = (28, 22, 16)
+    gold = (90, 180, 215)
+    en = np.full((70, 48, 3), navy, np.uint8)
+    en[16:52, 8:14] = gold
+    en[16:52, 30:36] = gold
+    for step in range(16):
+        en[16 + step, 12 + step:16 + step] = gold
+    gap_mask, _gap_colour = segment_ink(en)
+    check("n-gap-mask", gap_mask is not None)
+    if gap_mask is not None:
+        channel = gap_mask[28:40, 16:28]
+        check("n-gap-stays-open", int(np.count_nonzero(channel == 0)) >= 12, str(int(np.count_nonzero(channel == 0))))
+    else:
+        check("n-gap-stays-open", False, "no mask")
+
+    def _block_letter(canvas, x, y, colour):
+        canvas[y:y + 28, x:x + 6] = colour
+        canvas[y:y + 28, x + 16:x + 22] = colour
+        canvas[y:y + 6, x:x + 22] = colour
+
+    clean = np.full((60, 80, 3), (236, 232, 226), np.uint8)
+    _block_letter(clean, 8, 16, (20, 18, 16))
+    _block_letter(clean, 44, 16, (20, 18, 16))
+    same = clean.copy()
+    check("glyph-iou-match", _min_glyph_iou(clean, same) >= 0.85, f"{_min_glyph_iou(clean, same):.3f}")
+    outline = clean.copy()
+    ink = np.any(clean.astype(int) < 80, axis=2)
+    fringe = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    outline[fringe & ~ink] = (20, 18, 16)
+    check("glyph-iou-outline", _min_glyph_iou(clean, outline) >= 0.85, f"{_min_glyph_iou(clean, outline):.3f}")
+    barred = clean.copy()
+    barred[20:44, 17:21] = (20, 18, 16)
+    barred_score = _min_glyph_iou(clean, barred)
+    check("glyph-iou-extra-bar", barred_score < 0.85, f"{barred_score:.3f}")
+    # The vector's hard edge sits one pixel inside the picture's soft edge.
+    inset = np.full_like(clean, (236, 232, 226))
+    eroded = cv2.erode(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    inset[eroded] = (20, 18, 16)
+    inset_score = _min_glyph_iou(clean, inset)
+    check("glyph-iou-inset", inset_score >= 0.85, f"{inset_score:.3f}")
+    # A missing crossbar is a gap, not that one-pixel inset.
+    gap = clean.copy()
+    gap[16:22, 8:22] = (236, 232, 226)
+    gap_score = _min_glyph_iou(clean, gap)
+    check("glyph-iou-missing-bar", gap_score < 0.85, f"{gap_score:.3f}")
 
     src = np.full((80, 40, 3), paper, np.uint8)
     src[15:40, 8:28] = (16, 14, 12)

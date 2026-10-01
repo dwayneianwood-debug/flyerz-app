@@ -111,8 +111,9 @@ def _grow_thin_strokes(sample: np.ndarray, ink: np.ndarray, otsu: float) -> np.n
         comp = labels == label
         core = int(np.count_nonzero(comp & ink))
         extra = int(np.count_nonzero(comp & ~ink))
-        # A crossbar is a fraction of the letter. A fringe that doubles it is not.
-        if extra > max(8, int(round(0.45 * core))):
+        # A pale crossbar is a small fraction of the letter. The channel
+        # through an N, or a spur beside a T, is about half the stroke.
+        if extra > max(8, int(round(0.32 * core))):
             continue
         grown[comp] = True
     if float(grown.mean()) > 0.62:
@@ -2316,7 +2317,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         sys.stderr.write(
             f"  {flag} {row.get('mode')} ssim={float(row.get('ssim') or 0):.3f} "
             f"white={bool(row.get('whiteBlock'))} clip={bool(row.get('clipped'))} "
-            f"glyph={bool(row.get('glyphFail'))} mismatch={bool(row.get('mismatch'))} "
+            f"glyph={bool(row.get('glyphFail'))} iou={row.get('glyphIou')} mismatch={bool(row.get('mismatch'))} "
             f"{row.get('text')!r} -> {row.get('render')!r}\n"
         )
     return {
@@ -2973,6 +2974,127 @@ def _glyph_sharpness(gray: np.ndarray, part: dict) -> float:
     return float(np.median(np.hypot(gx, gy)[edge]))
 
 
+def _otsu_ink(image: np.ndarray):
+    """Ink, distance from the border paper, and how far that ink sits from the paper.
+
+    Light type and dark type use the same cut. None when the crop is flat.
+    """
+    if image is None or getattr(image, "ndim", 0) != 3 or image.shape[0] < 8 or image.shape[1] < 8:
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    border = np.zeros(gray.shape, np.bool_)
+    border[:2, :] = True
+    border[-2:, :] = True
+    border[:, :2] = True
+    border[:, -2:] = True
+    if int(border.sum()) < 8:
+        return None
+    paper = float(np.median(gray[border]))
+    distance = np.abs(gray.astype(np.float32) - paper)
+    sample = np.clip(distance, 0, 255).astype(np.uint8)
+    if float(sample.std()) < 4.0:
+        return None
+    _level, binary = cv2.threshold(sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink = binary > 0
+    if float(ink[border].mean()) > 0.5:
+        ink = ~ink
+    if int(ink.sum()) < 20:
+        return None
+    core = float(np.median(distance[ink]))
+    if core < 12.0:
+        return None
+    return ink, distance, core
+
+
+def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
+    """Lowest IoU of one source glyph against the render in that same place.
+
+    A one-pixel outline is the vector's hard edge against the picture's soft
+    edge, so it does not count. Paint that fills a paper gap inside the
+    letter, or a bar that stands off the stroke, does. 1.0 means the crop
+    has no letter-sized glyphs to judge.
+    """
+    if source_bgr is None or render_bgr is None or getattr(source_bgr, "size", 0) == 0:
+        return 1.0
+    if render_bgr.shape[:2] != source_bgr.shape[:2]:
+        source_bgr = cv2.resize(
+            source_bgr,
+            (int(render_bgr.shape[1]), int(render_bgr.shape[0])),
+            interpolation=cv2.INTER_AREA,
+        )
+    packed = _otsu_ink(source_bgr)
+    render_packed = _otsu_ink(render_bgr)
+    if packed is None or render_packed is None:
+        return 1.0
+    source_ink, distance, core = packed
+    render_ink = render_packed[0]
+    source_parts = _components(source_ink.astype(np.uint8) * 255, 16)
+    render_parts = _components(render_ink.astype(np.uint8) * 255, 16)
+    if len(source_parts) < 2 or len(render_parts) < 2:
+        return 1.0
+    heights = [part["h"] for part in source_parts]
+    areas = [part["area"] for part in source_parts]
+    median_h = float(np.median(heights))
+    median_area = float(np.median(areas))
+    if median_h < 8.0:
+        return 1.0
+    floor = max(16, int(round(0.12 * median_area)))
+    letters = [
+        part for part in source_parts
+        if part["area"] >= floor and part["h"] >= 0.55 * median_h
+    ]
+    if len(letters) < 2:
+        return 1.0
+    radius = cv2.distanceTransform(source_ink.astype(np.uint8), cv2.DIST_L2, 3)
+    stroke = float(np.median(radius[source_ink])) if int(source_ink.sum()) else 1.0
+    ksize = int(round(1.6 * stroke)) * 2 + 1
+    # Wider than the stroke bridges a counter (an O, an A) and calls the
+    # paper a filled gap. Seven pixels still closes the channel through an N.
+    ksize = max(3, min(7, ksize))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    closed = cv2.morphologyEx(source_ink.astype(np.uint8), cv2.MORPH_CLOSE, kernel) > 0
+    # A gap the close bridges counts only where the picture is still paper.
+    interior = closed & ~source_ink & (distance <= 0.40 * core)
+    outside = cv2.distanceTransform((~source_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    near_render = cv2.distanceTransform((~render_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    height, width = source_ink.shape[:2]
+    worst = 1.0
+    for part in letters:
+        x0 = max(0, part["x"] - ksize)
+        y0 = max(0, part["y"] - ksize)
+        x1 = min(width, part["x"] + part["w"] + ksize)
+        y1 = min(height, part["y"] + part["h"] + ksize)
+        source_box = np.zeros((y1 - y0, x1 - x0), np.bool_)
+        source_box[part["pixels"][y0:y1, x0:x1]] = True
+        render_box = render_ink[y0:y1, x0:x1]
+        extra = render_box & ~source_box
+        # The hard edge may sit one pixel outside the soft picture. A filled
+        # counter is inside the letter, so it still counts.
+        ignore = extra & ~interior[y0:y1, x0:x1] & (outside[y0:y1, x0:x1] < 1.5)
+        counted = extra & ~ignore
+        missing = source_box & ~render_box
+        near = near_render[y0:y1, x0:x1]
+        # A one-pixel inset is the same hard edge. A gap that continues past
+        # that pixel is a missing stroke, so the fringe of the gap still counts.
+        far = missing & (near >= 1.5)
+        attached = cv2.dilate(far.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        ignore_missing = missing & (near < 1.5) & ~attached
+        kept = source_box & ~ignore_missing
+        inter = int(np.count_nonzero(kept & render_box))
+        union = int(np.count_nonzero(kept | counted))
+        score = 0.0 if union == 0 else inter / float(union)
+        if score < worst:
+            worst = score
+    for part in render_parts:
+        if part["area"] < floor or part["h"] < 0.55 * median_h:
+            continue
+        overlap = int(np.count_nonzero(part["pixels"] & source_ink))
+        if overlap >= 0.35 * part["area"]:
+            continue
+        worst = min(worst, overlap / float(part["area"]))
+    return worst
+
+
 def _score_pair(source_bgr: np.ndarray, render_bgr: np.ndarray, source_text: str, render_text: str) -> dict:
     source_bgr = _match_scale(source_bgr, render_bgr)
     ssim = _ssim_luma(source_bgr, render_bgr)
@@ -3410,6 +3532,14 @@ def _apply_text_gate(
         row["_pixelFail"] = bool(score["pixelFail"])
         if not row["_vector"]:
             row["ok"] = bool(score["ok"])
+            row["glyphIou"] = None
+            continue
+        glyph_iou = _min_glyph_iou(row["_source"], row["_render"])
+        row["glyphIou"] = round(float(glyph_iou), 3)
+        # One glyph under 0.85 is a different letter, even when the line's
+        # SSIM is high. The whole line goes back to the picture.
+        if glyph_iou < 0.85:
+            row["glyphFail"] = True
     parent = list(range(len(report)))
 
     def find(node: int) -> int:
