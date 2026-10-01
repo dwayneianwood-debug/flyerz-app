@@ -60,16 +60,21 @@ FONTS = (
     ("libre", "LibreBaskerville-Regular.ttf", "body"),
 )
 
-PROBE = ("cinzel-600", "eb-semibold", "crimson", "eb-italic", "parisienne", "montserrat")
-EXPAND = {
-    "cinzel-600": ("cinzel-500", "cinzel-700", "cormorant-sc"),
-    "eb-semibold": ("cormorant", "marcellus", "libre"),
-    "crimson": ("libre", "poppins-regular", "inter"),
-    "eb-italic": ("parisienne",),
-    "parisienne": ("greatvibes", "allura", "pinyon"),
-    "montserrat": ("poppins", "inter", "cinzel-700"),
+# Approved faces. A serif page never leaves this set. Sans is only for a page
+# whose lettering has no serif feet and clearly matches a sans face.
+SANS_KEYS = {"montserrat", "poppins", "poppins-regular", "inter"}
+ROLE_FONT = {
+    "caps": "cinzel-600",
+    "head": "eb-semibold",
+    "body": "crimson",
+    "tagline": "eb-italic",
+    "script": "parisienne",
+    "phone": "crimson",
+    "sans-caps": "montserrat",
+    "sans-body": "poppins-regular",
 }
-THICKEN = {"crimson", "libre", "poppins-regular", "inter"}
+SCRIPT_KEYS = ("parisienne", "greatvibes", "allura", "pinyon")
+THICKEN = {"crimson", "libre"}
 
 _FONT_FILES = {key: os.path.join(FONT_DIR, name) for key, name, _role in FONTS}
 _FONT_ROLE = {key: role for key, _name, role in FONTS}
@@ -136,14 +141,26 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     from ai_rebuild import keep_word_blocks
 
     kept, dropped = keep_word_blocks(blocks or [])
+    rescued, dropped = _rescue_lines(bgr, dropped)
+    kept = list(kept) + rescued
     raster_lines = [_line_record(block, "raster", "The read was too uncertain to set as type.") for block in dropped]
-    chosen = []
+    style = _page_style(bgr, kept)
+    ordinary = []
     for block in kept:
-        decision = _choose_font(bgr, block)
+        if _is_wordmark(block, kept):
+            record = _line_record(block, "raster", "Large logo lettering stayed in the picture.")
+            record["kept_on_purpose"] = True
+            raster_lines.append(record)
+            continue
+        ordinary.append(block)
+    chosen = []
+    for block in ordinary:
+        decision = _choose_font(bgr, block, style)
         if decision.get("mode") == "vector":
             chosen.append(decision)
         else:
             raster_lines.append(decision)
+    chosen = _harmonise(chosen, style)
 
     if not chosen:
         return _fail(
@@ -216,7 +233,8 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
             reason = "The picture was under 400 PPI, so the original lettering was kept."
         return _fail(started, reason, provider=provider, qa=qa, lines=chosen + raster_lines)
 
-    amber = bool(raster_lines)
+    uncertain = [line for line in raster_lines if not line.get("kept_on_purpose")]
+    amber = bool(uncertain)
     reason = ""
     if amber:
         reason = "Some lettering stayed in the picture because the read was uncertain. Glance at it before printing."
@@ -256,6 +274,7 @@ def _public_line(line: dict) -> dict:
         "text": line.get("text") or "",
         "mode": line.get("mode") or "",
         "font": line.get("font") or "",
+        "role": line.get("role") or "",
         "match": line.get("match"),
         "reason": line.get("reason") or "",
     }
@@ -319,7 +338,40 @@ def read_blocks(bgr: np.ndarray) -> list:
             index, text, x0, y0, max(2.0, x1 - x0), max(2.0, y1 - y0),
             width, height, bgr, float(item.get("score") or 0),
         ))
-    return _refine_blocks(bgr, _space_blocks(blocks, bgr))
+    return _repair_short(bgr, _refine_blocks(bgr, _space_blocks(blocks, bgr)))
+
+
+def _repair_short(bgr: np.ndarray, blocks: list) -> list:
+    """A second read of short lines. Page OCR misreads script such as The Surface."""
+    from ocr_reader import local_rows
+
+    indexes = [
+        index for index, block in enumerate(blocks)
+        if 1 <= len(str(block.get("text") or "").split()) <= 3
+    ]
+    if not indexes:
+        return blocks
+    reads = _reread_many(bgr, [blocks[index] for index in indexes], local_rows)
+    for index, (new_text, new_score) in zip(indexes, reads):
+        block = blocks[index]
+        old_text = str(block.get("text") or "")
+        try:
+            old_score = float(block.get("score") or 0)
+        except (TypeError, ValueError):
+            old_score = 0.0
+        old_core = re.sub(r"[^A-Za-z0-9]", "", old_text)
+        new_core = re.sub(r"[^A-Za-z0-9]", "", new_text or "")
+        if (
+            new_text
+            and new_score >= 0.97
+            and new_score >= old_score
+            and len(new_text.split()) >= len(old_text.split())
+            and len(new_core) >= max(4, int(len(old_core) * 0.8))
+            and " ".join(new_text.split()).upper() != " ".join(old_text.split()).upper()
+        ):
+            block["text"] = new_text
+            block["score"] = round(float(new_score), 3)
+    return blocks
 
 
 def _refine_blocks(bgr: np.ndarray, blocks: list) -> list:
@@ -398,9 +450,10 @@ def _refine_blocks(bgr: np.ndarray, blocks: list) -> list:
         if (
             new_text
             and new_score >= 0.9
-            and new_score + 0.02 >= old_score
+            and new_score >= old_score
             and len(new_core) >= max(4, int(len(old_core) * 0.8))
             and new_spaced != old_spaced
+            and (len(new_text.split()) >= len(old_text.split()) or new_score >= 0.99)
         ):
             block["text"] = new_text
             block["score"] = round(new_score, 3)
@@ -418,14 +471,265 @@ def _downscale(bgr: np.ndarray, long_edge: int) -> tuple[np.ndarray, float]:
     return small, back
 
 
-def _choose_font(bgr: np.ndarray, block: dict) -> dict:
+def _letters(text: str) -> list:
+    return [ch for ch in str(text or "") if ch.isalpha()]
+
+
+def _upper_ratio(text: str) -> float:
+    letters = _letters(text)
+    if not letters:
+        return 0.0
+    return sum(ch.isupper() for ch in letters) / float(len(letters))
+
+
+def _is_phone(text: str) -> bool:
+    raw = " ".join(str(text or "").split())
+    digits = re.sub(r"\D", "", raw)
+    return 7 <= len(digits) <= 15 and len(_letters(raw)) <= 2
+
+
+def _rescue_kind(text: str) -> str:
+    """Lines the word filter drops, but a second read can still set."""
+    raw = " ".join(str(text or "").split())
+    if not raw or len(re.sub(r"[^0-9A-Za-zÀ-ÿ]", "", raw)) <= 1:
+        return ""
+    if _is_phone(raw):
+        return "phone"
+    words = raw.split()
+    letters = _letters(raw)
+    if 1 <= len(words) <= 3 and 2 <= len(letters) <= 24 and raw[0].isupper() and _upper_ratio(raw) < 0.85:
+        return "name"
+    if len(letters) >= 8 and _upper_ratio(raw) >= 0.65:
+        return "letters"
+    return ""
+
+
+def _rescue_lines(bgr: np.ndarray, dropped: list) -> tuple[list, list]:
+    """Second chance for a name, a phone number, and a caps line the filter skipped."""
+    from ocr_reader import local_rows
+
+    rescued = []
+    still = []
+    pending = []
+    for block in dropped or []:
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text") or "").strip()
+        kind = _rescue_kind(text)
+        if not kind:
+            still.append(block)
+            continue
+        pending.append((block, kind, text))
+    if not pending:
+        return rescued, still
+    reads = _reread_many(bgr, [block for block, _kind, _text in pending], local_rows)
+    for (block, kind, text), found in zip(pending, reads):
+        new_text, new_score = found
+        if kind == "phone":
+            chosen = text
+            if new_text and _is_phone(new_text) and new_score >= 0.5:
+                chosen = new_text
+            block = dict(block)
+            block["text"] = chosen
+            block["score"] = max(float(block.get("score") or 0), new_score, 0.8)
+            block["rescued"] = "phone"
+            rescued.append(block)
+            continue
+        if kind == "name":
+            block = dict(block)
+            if new_text and new_score >= 0.55 and 1 <= len(new_text.split()) <= 4:
+                block["text"] = new_text
+                block["score"] = new_score
+            block["score"] = max(float(block.get("score") or 0), 0.72)
+            block["rescued"] = "name"
+            rescued.append(block)
+            continue
+        if new_text and new_score >= 0.88 and len(_letters(new_text)) >= 6:
+            block = dict(block)
+            block["text"] = new_text
+            block["score"] = new_score
+            block["rescued"] = "letters"
+            rescued.append(block)
+            continue
+        try:
+            old_score = float(block.get("score") or 0)
+        except (TypeError, ValueError):
+            old_score = 0.0
+        if old_score >= 0.9 and len(_letters(text)) >= 8:
+            block = dict(block)
+            block["score"] = old_score
+            block["rescued"] = "letters"
+            rescued.append(block)
+            continue
+        still.append(block)
+    return rescued, still
+
+
+def _reread_many(bgr: np.ndarray, blocks: list, local_rows) -> list:
+    pad = 8
+    prepared = []
+    for block in blocks:
+        rect = _rect(block, bgr.shape[1], bgr.shape[0])
+        crop = _safe_crop(bgr, rect)
+        if crop is None or crop.shape[0] < 6:
+            prepared.append(None)
+            continue
+        scale = 96.0 / float(crop.shape[0])
+        prepared.append(cv2.resize(
+            crop,
+            (max(24, int(round(crop.shape[1] * scale))), 96),
+            interpolation=cv2.INTER_CUBIC,
+        ))
+    if not any(crop is not None for crop in prepared):
+        return [("", 0.0) for _ in blocks]
+    width = min(1600, max(crop.shape[1] for crop in prepared if crop is not None) + pad * 2)
+    height = pad + sum((crop.shape[0] + pad) if crop is not None else pad for crop in prepared)
+    canvas = np.full((height, width, 3), 255, np.uint8)
+    spans = []
+    cursor = pad
+    for crop in prepared:
+        if crop is None:
+            spans.append(None)
+            continue
+        if crop.shape[1] > width - pad * 2:
+            crop = cv2.resize(crop, (width - pad * 2, crop.shape[0]), interpolation=cv2.INTER_AREA)
+        x = max(pad, (width - crop.shape[1]) // 2)
+        canvas[cursor:cursor + crop.shape[0], x:x + crop.shape[1]] = crop
+        spans.append((cursor, cursor + crop.shape[0]))
+        cursor += crop.shape[0] + pad
+    try:
+        rows = local_rows(canvas) or []
+    except Exception:
+        return [("", 0.0) for _ in blocks]
+    grouped = [[] for _ in spans]
+    for item in rows:
+        box = item[0]
+        if box is None or len(box) == 0:
+            continue
+        center = sum(float(point[1]) for point in box) / float(len(box))
+        for index, span in enumerate(spans):
+            if span and span[0] - 2 <= center <= span[1] + 2:
+                grouped[index].append(item)
+                break
+    found = []
+    for items in grouped:
+        if not items:
+            found.append(("", 0.0))
+            continue
+        items.sort(key=lambda item: min(float(point[0]) for point in item[0]))
+        text = " ".join(str(item[1] or "").strip() for item in items if str(item[1] or "").strip())
+        score = min(float(item[2] if len(item) > 2 else 0) for item in items)
+        found.append((text, score))
+    return found
+
+
+def _page_style(bgr: np.ndarray, blocks: list) -> str:
+    """Serif unless the lettering has no feet and a sans face is clearly closer."""
+    feet = []
+    sans_wins = 0
+    checked = 0
+    for block in blocks or []:
+        text = str(block.get("text") or "").strip()
+        if len(_letters(text)) < 6 or _is_phone(text):
+            continue
+        rect = _rect(block, bgr.shape[1], bgr.shape[0])
+        crop = _safe_crop(bgr, rect)
+        ink = _ink_mask(crop, block.get("color_hex") or "") if crop is not None else None
+        if ink is None:
+            continue
+        feet.append(_serif_feet(ink))
+        serif_key = "cinzel-600" if _upper_ratio(text) >= 0.72 else "crimson"
+        sans_key = "montserrat" if serif_key == "cinzel-600" else "poppins-regular"
+        serif = _score_key(ink, text, serif_key)
+        sans = _score_key(ink, text, sans_key)
+        checked += 1
+        if sans > serif + 0.12:
+            sans_wins += 1
+        if checked >= 8:
+            break
+    if not feet:
+        return "serif"
+    median_feet = float(np.median(feet))
+    if median_feet < 0.92 and checked and sans_wins >= max(2, int(checked * 0.6)):
+        return "sans"
+    return "serif"
+
+
+def _serif_feet(ink: np.ndarray) -> float:
+    """Wider ink at the top and baseline than in the stem means a serif."""
+    source = _tight_binary(ink)
+    if source is None:
+        return 1.0
+    height = source.shape[0]
+    if height < 8:
+        return 1.0
+    row = (source > 40).sum(axis=1).astype(np.float32)
+    mid = float(row[int(height * 0.35):int(height * 0.65)].mean() or 0)
+    if mid < 1:
+        return 1.0
+    top = float(row[:max(2, int(height * 0.18))].mean())
+    bot = float(row[int(height * 0.82):].mean())
+    return (top + bot) / 2.0 / mid
+
+
+def _is_wordmark(block: dict, blocks: list) -> bool:
+    """A single large word, such as the script logo, stays in the picture."""
+    text = " ".join(str(block.get("text") or "").split())
+    if len(text.split()) != 1 or len(_letters(text)) < 4:
+        return False
+    box = block.get("bbox") or [0, 0, 0, 0]
+    if len(box) < 4:
+        return False
+    height = float(box[3])
+    heights = []
+    for other in blocks or []:
+        other_box = other.get("bbox") or [0, 0, 0, 0]
+        if len(other_box) >= 4 and float(other_box[3]) > 0:
+            heights.append(float(other_box[3]))
+    if not heights:
+        return height >= 0.06
+    heights.sort()
+    median = heights[len(heights) // 2]
+    # The script logo is in a class of its own. A large tagline is not a logo.
+    return height >= 0.082 and height >= median * 2.6
+
+
+def _script_allowed(text: str, ink: np.ndarray) -> bool:
+    words = str(text or "").split()
+    if not words or len(words) > 3 or _is_phone(text):
+        return False
+    if len(words) >= 3 and any(word.lower() in {"and", "with", "for", "your"} for word in words):
+        return False
+    return _scripty(ink, text)
+
+
+def _tagline_hint(text: str) -> bool:
+    raw = " ".join(str(text or "").split())
+    if not raw or len(raw.split()) > 12:
+        return False
+    low = raw.lower().rstrip(".,;:")
+    cues = (
+        "see your health",
+        "live your best",
+        "because you deserve",
+        "empowering you",
+        "invest in your health",
+        "when you know better",
+        "your health journey",
+    )
+    return any(low.startswith(cue) for cue in cues)
+
+
+def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
     text = str(block.get("text") or "").strip()
     rect = _rect(block, bgr.shape[1], bgr.shape[0])
     crop = _safe_crop(bgr, rect)
+    rescued = str(block.get("rescued") or "")
     record = {
         "text": text,
         "mode": "raster",
         "font": "",
+        "role": "",
         "match": 0.0,
         "reason": "",
         "score": block.get("score"),
@@ -441,44 +745,162 @@ def _choose_font(bgr: np.ndarray, block: dict) -> dict:
     if ink is None:
         record["reason"] = "The letters could not be separated from the picture."
         return record
-    if _scripty(ink, text) and ocr_score < SCRIPT_OCR_FLOOR:
+    if _is_phone(text) or rescued == "phone":
+        key = "poppins-regular" if style == "sans" else "crimson"
+        record.update(mode="vector", font=key, role="phone", match=0.5)
+        return record
+    if _scripty(ink, text) and ocr_score < SCRIPT_OCR_FLOOR and rescued != "name":
         record["reason"] = "Script lettering was hard to read, so it stayed in the picture."
         return record
-    ranked = []
-    for key in PROBE:
-        path = _FONT_FILES.get(key)
-        if not path or not os.path.exists(path):
-            continue
-        ranked.append((key, _score_font(ink, text, path, _FONT_ROLE.get(key, "body"))))
-    ranked.sort(key=lambda item: item[1], reverse=True)
-    if not ranked:
-        record["reason"] = "No font matched this line closely enough."
-        return record
-    leader = ranked[0][0]
-    extra = list(EXPAND.get(leader, ()))
-    if _scripty(ink, text):
-        extra = list(dict.fromkeys(list(extra) + ["greatvibes", "allura", "pinyon", "parisienne"]))
-    best_key, best_score = ranked[0]
-    for key in extra:
-        if key == best_key:
-            continue
-        path = _FONT_FILES.get(key)
-        if not path or not os.path.exists(path):
-            continue
-        score = _score_font(ink, text, path, _FONT_ROLE.get(key, "body"))
-        if score > best_score:
-            best_score = score
-            best_key = key
-    record["match"] = round(float(best_score), 3)
-    if best_score < MATCH_FLOOR:
-        record["reason"] = "No font matched this line closely enough."
-        return record
-    if _FONT_ROLE.get(best_key) == "script" and ocr_score < SCRIPT_OCR_FLOOR:
+    role, key, score = _assign_role(text, ink, style, rescued)
+    record["match"] = round(float(score), 3)
+    record["role"] = role
+    confident = ocr_score >= 0.8 or rescued in ("name", "phone", "letters")
+    if role == "script" and ocr_score < SCRIPT_OCR_FLOOR and rescued != "name":
         record["reason"] = "Script lettering was hard to read, so it stayed in the picture."
+        return record
+    script_ok = role == "script" and score >= 0.12 and (confident or ocr_score >= SCRIPT_OCR_FLOOR)
+    plain_ok = role != "script" and confident and score > -0.05
+    if score < MATCH_FLOOR and rescued not in ("name", "phone", "letters") and not script_ok and not plain_ok:
+        record["reason"] = "No font matched this line closely enough."
         return record
     record["mode"] = "vector"
-    record["font"] = best_key
+    record["font"] = key
     return record
+
+
+def _assign_role(text: str, ink: np.ndarray, style: str, rescued: str) -> tuple[str, str, float]:
+    if style == "sans" and _upper_ratio(text) >= 0.72 and len(_letters(text)) >= 3:
+        score = _score_key(ink, text, "montserrat")
+        return "sans-caps", "montserrat", score
+    if style == "sans":
+        score = _score_key(ink, text, "poppins-regular")
+        return "sans-body", "poppins-regular", score
+    if _upper_ratio(text) >= 0.72 and len(_letters(text)) >= 3:
+        # Every caps line on a serif page uses one Cinzel. A low score still sets it
+        # when the read itself is confident.
+        score = _score_key(ink, text, "cinzel-600")
+        return "caps", "cinzel-600", score
+    words = text.split()
+    if len(words) <= 2 and _upper_ratio(text) < 0.72 and not _is_phone(text):
+        body = _score_key(ink, text, "crimson")
+        best_key, best = _best_script(ink, text)
+        # A real script word beats the body serif. A list item does not.
+        if best >= body + 0.07 and best >= 0.12:
+            return "script", best_key, best
+    if _script_allowed(text, ink) or (rescued == "name" and _scripty(ink, text)):
+        body = _score_key(ink, text, "crimson")
+        best_key, best = _best_script(ink, text)
+        if best >= body + 0.07 and best >= 0.12:
+            return "script", best_key, best
+    if _tagline_hint(text) or (rescued == "name" and not _scripty(ink, text)):
+        italic = _score_key(ink, text, "eb-italic")
+        body = _score_key(ink, text, "crimson")
+        if italic + 0.02 >= body:
+            return "tagline", "eb-italic", italic
+        return "body", "crimson", body
+    # Body copy stays one weight. Short list lines are not promoted to a bold head.
+    score = _score_key(ink, text, "crimson")
+    return "body", "crimson", score
+
+
+def _best_script(ink: np.ndarray, text: str) -> tuple[str, float]:
+    scores = {key: _score_key(ink, text, key) for key in SCRIPT_KEYS}
+    best_key = max(scores, key=lambda key: scores[key])
+    # Parisienne is the house script. Another face has to win clearly.
+    if best_key != "parisienne" and scores[best_key] < scores.get("parisienne", 0) + 0.08:
+        best_key = "parisienne"
+    return best_key, scores[best_key]
+
+
+def _score_key(ink: np.ndarray, text: str, key: str) -> float:
+    path = _FONT_FILES.get(key)
+    if not path or not os.path.exists(path):
+        return 0.0
+    return _score_font(ink, text, path, _FONT_ROLE.get(key, "body"))
+
+
+def _harmonise(lines: list, style: str) -> list:
+    """One face per role and size, and one weight inside a paragraph."""
+    if style == "serif":
+        for line in lines:
+            role = line.get("role") or "body"
+            if role == "script":
+                continue
+            if line.get("font") in SANS_KEYS or role in ROLE_FONT:
+                line["font"] = ROLE_FONT.get(role, "crimson")
+    scripts = [line for line in lines if line.get("role") == "script"]
+    if len(scripts) >= 2:
+        winner = max(
+            set(item.get("font") or "parisienne" for item in scripts),
+            key=lambda font: sum(1 for item in scripts if item.get("font") == font),
+        )
+        for item in scripts:
+            item["font"] = winner
+    bands: dict = {}
+    for line in lines:
+        height = max(8, int(line["rect"][3]))
+        band = int(round(height / 6.0))
+        bands.setdefault((line.get("role") or "", band), []).append(line)
+    for group in bands.values():
+        if len(group) < 2:
+            continue
+        role = group[0].get("role") or ""
+        if role == "script":
+            continue
+        winner = ROLE_FONT.get(role, group[0].get("font") or "crimson")
+        for item in group:
+            item["font"] = winner
+    _normalise_paragraphs(lines, style)
+    return lines
+
+
+def _normalise_paragraphs(lines: list, style: str) -> None:
+    ordered = sorted(lines, key=lambda line: (line["rect"][1], line["rect"][0]))
+    seen = set()
+    for index, line in enumerate(ordered):
+        if id(line) in seen or line.get("role") in ("script", "caps", "phone", "sans-caps"):
+            seen.add(id(line))
+            continue
+        block = [line]
+        seen.add(id(line))
+        _x, y, _w, height = line["rect"]
+        bottom = y + height
+        left = line["rect"][0]
+        for other in ordered[index + 1:]:
+            if other.get("role") in ("script", "caps", "phone", "sans-caps"):
+                break
+            ox, oy, _ow, oh = other["rect"]
+            if abs(ox - left) > max(14, height * 0.9):
+                continue
+            if oy - bottom > max(height, oh) * 0.9:
+                break
+            block.append(other)
+            seen.add(id(other))
+            bottom = oy + oh
+            height = oh
+        if len(block) < 2:
+            continue
+        short = all(len(str(item.get("text") or "").split()) <= 8 for item in block)
+        font = "poppins-regular" if style == "sans" else "crimson"
+        if style != "sans" and all(item.get("role") == "head" for item in block):
+            font = "eb-semibold"
+        elif style != "sans" and short and any(item.get("role") == "tagline" for item in block):
+            font = "eb-italic"
+        elif style != "sans" and any(item.get("role") == "tagline" for item in block):
+            for item in block:
+                if item.get("role") != "tagline":
+                    item["font"] = "crimson"
+                    item["role"] = "body"
+            continue
+        for item in block:
+            item["font"] = font
+            if font == "crimson":
+                item["role"] = "body"
+            elif font == "eb-semibold":
+                item["role"] = "head"
+            elif font == "eb-italic":
+                item["role"] = "tagline"
 
 
 def _rect(block: dict, width: int, height: int) -> tuple[int, int, int, int]:
@@ -563,15 +985,15 @@ def _scripty(ink: np.ndarray, text: str) -> bool:
 
 
 def _score_font(ink: np.ndarray, text: str, path: str, role: str) -> float:
-    """Compare letter shapes after both are fitted, plus the spacing rhythm."""
+    """Compare letter shapes, serif bands, and the spacing rhythm."""
     source = _tight_binary(ink)
     rendered = _render_ink(text, path, max(int(ink.shape[1]), 80), max(int(ink.shape[0]), 24), role)
     rendered = _tight_binary(rendered) if rendered is not None else None
     if source is None or rendered is None:
         return 0.0
-    shape = _ncc(_fit_canvas(source, 280, 48), _fit_canvas(rendered, 280, 48))
+    stretch = _ncc(_fit_canvas(source, 280, 48), _fit_canvas(rendered, 280, 48))
     rhythm = _rhythm(source, rendered)
-    return 0.65 * shape + 0.35 * rhythm
+    return 0.65 * stretch + 0.35 * rhythm
 
 
 def _tight_binary(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -804,6 +1226,8 @@ def _remove_text(image: np.ndarray, lines: list) -> tuple[np.ndarray, list, list
     before = image.copy()
     mask = np.zeros(image.shape[:2], np.uint8)
     bullets = []
+    badges = []
+    ticks = []
     for line in lines:
         rect = line["media_box"]
         ink = _tight_ink(painted, rect, line.get("color") or "")
@@ -813,12 +1237,22 @@ def _remove_text(image: np.ndarray, lines: list) -> tuple[np.ndarray, list, list
             line["reason"] = "The letters could not be separated from the picture."
             continue
         x, y, bw, bh = rect
+        ink, icon_boxes = _strip_side_icons(ink)
+        for ix, iy, iw, ih in icon_boxes:
+            ticks.append((x + ix, y + iy, iw, ih))
         mask[y:y + bh, x:x + bw] = np.maximum(mask[y:y + bh, x:x + bw], ink)
-        bullet = _bullet_near(before, rect)
-        if bullet:
-            cx, cy, radius, colour = bullet
-            cv2.circle(mask, (int(cx), int(cy)), int(radius) + 1, 255, -1)
-            bullets.append(bullet)
+        mark = _mark_near(before, rect)
+        if not mark:
+            continue
+        if mark[0] == "badge":
+            badges.append(mark)
+            line["text"] = re.sub(r"^\d{1,2}\s+", "", str(line.get("text") or ""))
+            continue
+        if any(abs(mark[1] - old[1]) < 6 and abs(mark[2] - old[2]) < 6 for old in bullets):
+            continue
+        cx, cy, radius, colour = mark[1], mark[2], mark[3], mark[4]
+        cv2.circle(mask, (int(cx), int(cy)), int(radius) + 1, 255, -1)
+        bullets.append((cx, cy, radius, colour))
     if int(mask.max()) == 0:
         for line in lines:
             line["blotch"] = True
@@ -828,9 +1262,10 @@ def _remove_text(image: np.ndarray, lines: list) -> tuple[np.ndarray, list, list
     heights = [int(line["media_box"][3]) for line in lines if line.get("media_box")]
     radius = 3
     if heights:
-        radius = int(np.clip(float(np.median(heights)) * 0.05, 3, 9))
+        radius = int(np.clip(float(np.median(heights)) * 0.045, 3, 6))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
     mask = cv2.dilate(mask, kernel, iterations=1)
+    _protect_marks(mask, badges, ticks, radius + 3)
     painted = cv2.inpaint(painted, mask, radius, cv2.INPAINT_TELEA)
     _patch_specks(painted, mask)
     blotches = []
@@ -875,6 +1310,87 @@ def _tight_ink(image: np.ndarray, rect: tuple[int, int, int, int], colour_hex: s
     if fraction < 0.01 or fraction > 0.75:
         return None
     return ink
+
+
+def _strip_side_icons(ink: np.ndarray) -> tuple[np.ndarray, list]:
+    """Drop a tick or icon that sits in a gap to the left of the words."""
+    binary = (ink > 0).astype(np.uint8)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
+    if count <= 2:
+        return ink, []
+    height, width = ink.shape[:2]
+    boxes = []
+    for index in range(1, count):
+        left = int(stats[index, cv2.CC_STAT_LEFT])
+        top = int(stats[index, cv2.CC_STAT_TOP])
+        bw = int(stats[index, cv2.CC_STAT_WIDTH])
+        bh = int(stats[index, cv2.CC_STAT_HEIGHT])
+        boxes.append((index, left, top, bw, bh))
+    boxes.sort(key=lambda item: item[1])
+    for pos in range(len(boxes) - 1):
+        _index, left, _top, bw, _bh = boxes[pos]
+        right_edge = left + bw
+        next_left = boxes[pos + 1][1]
+        gap = next_left - right_edge
+        if gap >= max(4, int(width * 0.035)) and right_edge < width * 0.42:
+            removed = []
+            for index, ileft, itop, ibw, ibh in boxes:
+                if ileft + ibw <= right_edge + 1:
+                    ink[labels == index] = 0
+                    removed.append((ileft, itop, ibw, ibh))
+            return ink, removed
+    return ink, []
+
+
+def _protect_marks(mask: np.ndarray, badges: list, ticks: list, pad: int) -> None:
+    """Filled badges and ticks stay as drawn. Inpaint must not enter them."""
+    for mark in badges:
+        cx, cy, radius = int(mark[1]), int(mark[2]), int(round(mark[3])) + pad
+        cv2.circle(mask, (cx, cy), max(2, radius), 0, -1)
+    height, width = mask.shape[:2]
+    for x, y, bw, bh in ticks:
+        x0 = max(0, int(x) - pad)
+        y0 = max(0, int(y) - pad)
+        x1 = min(width, int(x + bw) + pad)
+        y1 = min(height, int(y + bh) + pad)
+        mask[y0:y1, x0:x1] = 0
+
+
+def _mark_near(image: np.ndarray, rect: tuple[int, int, int, int]):
+    """A round mark left of a line. A filled badge that holds a digit is left alone."""
+    found = _bullet_near(image, rect)
+    if not found:
+        return None
+    cx, cy, radius, colour = found
+    if _badge_has_mark(image, cx, cy, radius):
+        return ("badge", cx, cy, radius)
+    return ("bullet", cx, cy, radius, colour)
+
+
+def _badge_has_mark(image: np.ndarray, cx: float, cy: float, radius: float) -> bool:
+    """True when the disk is not one flat colour, so a digit sits inside it."""
+    radius = float(radius)
+    if radius < 4:
+        return False
+    x0 = max(0, int(cx - radius))
+    y0 = max(0, int(cy - radius))
+    x1 = min(image.shape[1], int(cx + radius + 1))
+    y1 = min(image.shape[0], int(cy + radius + 1))
+    roi = image[y0:y1, x0:x1]
+    if roi.size == 0:
+        return False
+    yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
+    dist = np.sqrt((xx - (cx - x0)) ** 2 + (yy - (cy - y0)) ** 2)
+    inner = dist <= radius * 0.62
+    if int(inner.sum()) < 12:
+        return False
+    pixels = roi[inner].astype(np.float32)
+    lum = pixels.mean(axis=1)
+    spread = float(lum.max() - lum.min())
+    median = float(np.median(lum))
+    bright = float((lum > median + 28).mean())
+    dark = float((lum < median - 28).mean())
+    return spread > 36 and (bright > 0.05 or dark > 0.05)
 
 
 def _bullet_near(image: np.ndarray, rect: tuple[int, int, int, int]):

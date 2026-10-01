@@ -14,7 +14,13 @@ from vector_text_v2 import (
     BLEED_MM,
     FONTS,
     MIN_PPI,
+    SANS_KEYS,
+    SCRIPT_KEYS,
+    _is_phone,
+    _rescue_kind,
+    _script_allowed,
     _scripty,
+    _strip_side_icons,
     fit_line,
     font_path,
     rebuild_fitted,
@@ -150,6 +156,163 @@ def test_refine_repairs_a_joined_word() -> None:
     check("refine-blood", "BLOOD ANALYSIS" in text and "BLOODA" not in text, text)
 
 
+def test_list_item_is_not_script() -> None:
+    ink = np.zeros((36, 280), np.uint8)
+    cv2.rectangle(ink, (4, 6), (270, 30), 255, -1)
+    check("detox-not-script", _script_allowed("Detox and wellness support", ink) is False)
+    check("phone-shape", _is_phone("073 703 0766"))
+    check("name-rescue", _rescue_kind("Chandré") == "name")
+    check("phone-rescue", _rescue_kind("073 703 0766") == "phone")
+
+
+def test_tick_leaves_the_mask() -> None:
+    ink = np.zeros((40, 220), np.uint8)
+    cv2.line(ink, (6, 22), (14, 32), 255, 2)
+    cv2.line(ink, (14, 32), (26, 8), 255, 2)
+    cv2.rectangle(ink, (78, 8), (200, 32), 255, -1)
+    stripped, removed = _strip_side_icons(ink)
+    check("tick-gap-removed", bool(removed) and int(stripped[:, :40].max()) == 0, str(removed))
+    check("tick-words-kept", int(stripped[:, 80:].max()) > 0)
+
+
+def test_serif_page_is_consistent() -> None:
+    """Caps, body, a list line, a name and a phone share the approved serif set."""
+    crimson = font_path("crimson")
+    cinzel = font_path("cinzel-600")
+    image = Image.new("RGB", (980, 1400), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    body = ImageFont.truetype(crimson, 34)
+    caps = ImageFont.truetype(cinzel, 42)
+    script = ImageFont.truetype(font_path("parisienne"), 78)
+    green = (36, 58, 40)
+    draw.text((70, 40), "SEE BEYOND", font=caps, fill=green)
+    draw.text((70, 160), "Early detection of imbalances", font=body, fill=green)
+    draw.text((70, 230), "Supports natural healing daily", font=body, fill=green)
+    draw.text((70, 300), "Detox and wellness support", font=body, fill=green)
+    draw.text((70, 430), "Chandré", font=script, fill=green)
+    draw.text((70, 560), "073 703 0766", font=body, fill=green)
+    draw.text((80, 980), "Medella", font=ImageFont.truetype(font_path("parisienne"), 150), fill=green)
+    blocks = [
+        _block("SEE BEYOND", 0.06, 0.025, 0.42, 0.045, "#243a28"),
+        _block("Early detection of imbalances", 0.06, 0.11, 0.62, 0.04, "#243a28"),
+        _block("Supports natural healing daily", 0.06, 0.16, 0.62, 0.04, "#243a28"),
+        _block("Detox and wellness support", 0.06, 0.21, 0.55, 0.04, "#243a28"),
+        _block("Chandré", 0.06, 0.30, 0.28, 0.07, "#243a28"),
+        _block("073 703 0766", 0.06, 0.39, 0.40, 0.04, "#243a28"),
+        _block("Medella", 0.06, 0.68, 0.55, 0.14, "#243a28"),
+    ]
+    blocks[4]["score"] = 0.62
+    blocks[5]["score"] = 0.4
+    out = tempfile.mkdtemp(prefix="vector-serif-")
+    pdf = os.path.join(out, "press.pdf")
+    result = rebuild_fitted(image_bgr(image), 148, 210, pdf, blocks=blocks, reocr=lambda _path: " ".join(
+        line["text"] for line in blocks if line["text"] != "Medella"
+    ))
+    check("serif-job", result.get("ok") is True, str(result.get("reason")))
+    vector = [line for line in result.get("lines") or [] if line.get("mode") == "vector"]
+    fonts = {line.get("font") for line in vector}
+    check("serif-no-sans", fonts.isdisjoint(SANS_KEYS), str(sorted(fonts)))
+    body_fonts = {line.get("font") for line in vector if "detection" in line["text"] or "Supports" in line["text"] or "Detox" in line["text"]}
+    check("serif-one-body", body_fonts == {"crimson"}, str(body_fonts))
+    detox = next(line for line in vector if line["text"].startswith("Detox"))
+    check("detox-not-script-face", detox.get("font") not in SCRIPT_KEYS, str(detox))
+    caps_line = next(line for line in vector if line["text"] == "SEE BEYOND")
+    check("caps-are-cinzel", caps_line.get("font") == "cinzel-600", str(caps_line))
+    phone = next(line for line in result.get("lines") or [] if "073" in line["text"])
+    name = next(line for line in result.get("lines") or [] if "hand" in line["text"].lower() or "Chand" in line["text"])
+    check("phone-is-vector", phone.get("mode") == "vector" and phone.get("font") == "crimson", str(phone))
+    check("name-is-vector", name.get("mode") == "vector" and name.get("font") not in SANS_KEYS, str(name))
+    logo = next(line for line in result.get("lines") or [] if line["text"] == "Medella")
+    check("logo-stays-raster", logo.get("mode") == "raster", str(logo))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    text = doc[0].get_text("text") or ""
+    doc.close()
+    check("logo-not-retyped", "Medella" not in text, text[:240])
+
+
+def test_badge_digit_stays() -> None:
+    image = Image.new("RGB", (900, 420), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((100, 140, 200, 240), fill=(36, 92, 58))
+    draw.text((136, 162), "1", font=ImageFont.truetype(SANS, 48), fill=(255, 255, 255))
+    draw.text((230, 168), "A small drop of blood", font=ImageFont.truetype(font_path("crimson"), 32), fill=(36, 58, 40))
+    draw.line((70, 310, 86, 332), fill=(36, 92, 58), width=4)
+    draw.line((86, 332, 112, 292), fill=(36, 92, 58), width=4)
+    draw.text((140, 300), "Looks at the cause", font=ImageFont.truetype(font_path("crimson"), 32), fill=(36, 58, 40))
+    blocks = [
+        _block("A small drop of blood", 0.24, 0.36, 0.55, 0.22, "#243a28"),
+        _block("Looks at the cause", 0.06, 0.66, 0.55, 0.18, "#243a28"),
+    ]
+    out = tempfile.mkdtemp(prefix="vector-badge-")
+    pdf = os.path.join(out, "press.pdf")
+    result = rebuild_fitted(
+        image_bgr(image), 148, 80, pdf, blocks=blocks,
+        reocr=lambda _path: "A small drop of blood Looks at the cause",
+    )
+    check("badge-job", result.get("ok") is True, str(result.get("reason")))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    page = doc[0]
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    doc.close()
+    white = (rgb[:, :, 0] > 210) & (rgb[:, :, 1] > 210) & (rgb[:, :, 2] > 210)
+    green = (rgb[:, :, 1] > 70) & (rgb[:, :, 1] > rgb[:, :, 0] + 15) & (rgb[:, :, 1] > rgb[:, :, 2] + 10)
+    # The digit is white pixels enclosed by the green disk.
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(green.astype(np.uint8), 8)
+    held = False
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_AREA]) < 80:
+            continue
+        ys, xs = np.where(labels == index)
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        if int(white[y0:y1 + 1, x0:x1 + 1].sum()) > 8:
+            held = True
+    check("badge-digit-survives", held, f"white {int(white.sum())} green {int(green.sum())}")
+
+
+def test_cover_drops_the_side_band() -> None:
+    """A slightly tall AI picture is cover-fitted. The synthetic side pad stays out of the trim."""
+    from quick_print import make_print_ready
+
+    image = Image.new("RGB", (1024, 1536), (236, 228, 214))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((984, 0, 1023, 1535), fill=(210, 40, 40))
+    draw.rectangle((960, 0, 983, 1535), fill=(30, 50, 190))
+    draw.text((180, 680), "MARKET DAY", font=ImageFont.truetype(SANS, 72), fill=(30, 50, 30))
+    folder = tempfile.mkdtemp(prefix="vector-cover-")
+    src = os.path.join(folder, "src.png")
+    image.save(src)
+    out = os.path.join(folder, "out")
+    result = make_print_ready(src, out, 148, 210, "a5", "A5", filename="src.png")
+    check("cover-press", bool(result.get("pressPath")), str(result.get("reasons"))[:300])
+    joined = " ".join(result.get("decisions") or [])
+    check("cover-fitted", "fitted to the trim" in joined, joined[:400])
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    page = doc[0]
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    inset = int(round(float(page.trimbox.x0) / page.rect.width * pix.w))
+    doc.close()
+    trim = rgb[:, inset:pix.w - inset]
+    # Cover keeps the source's right-hand blue stripe about 40px inside the trim.
+    # A synthetic side pad would still be showing the continued red edge here.
+    probe = np.median(trim[:, -38], axis=0)
+    outer = np.median(trim[:, -4], axis=0)
+    check(
+        "cover-keeps-artwork-edge",
+        float(probe[2]) > float(probe[0]) + 20 and float(outer[0]) > float(outer[2]) + 40,
+        f"probe {probe.astype(int).tolist()} outer {outer.astype(int).tolist()}",
+    )
+
+
+def image_bgr(image: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+
 def test_real_ocr_is_quick() -> None:
     import time
 
@@ -214,6 +377,11 @@ def main() -> None:
     test_overlap_and_qa_gate()
     test_bullet_cmyk_and_boxes()
     test_refine_repairs_a_joined_word()
+    test_list_item_is_not_script()
+    test_tick_leaves_the_mask()
+    test_serif_page_is_consistent()
+    test_badge_digit_stays()
+    test_cover_drops_the_side_band()
     test_real_ocr_is_quick()
     print("ALL PASS")
 

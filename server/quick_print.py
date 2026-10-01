@@ -634,6 +634,9 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
+            # Vector type cover-fits this picture. The extended canvas is only
+            # the fallback, so a synthetic side band never lands inside the trim.
+            vector_source = raster
             raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
@@ -644,7 +647,7 @@ def make_print_ready(
                     from vector_text_v2 import rebuild_fitted
 
                     vector_built = rebuild_fitted(
-                        raster, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
+                        vector_source, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
                     )
                 except Exception as exc:
                     vector_built = {
@@ -656,6 +659,11 @@ def make_print_ready(
                 if vector_built.get("ok"):
                     work_path = os.path.join(output_dir, "press.pdf")
                     lettering_note = "The lettering was set as vector type."
+                    aspect_extended = False
+                    decisions = [line for line in decisions if "gap was filled" not in line]
+                    decisions.append(
+                        "The picture was fitted to the trim so the artwork fills the page. It was not stretched."
+                    )
                     for line in vector_built.get("decisions") or []:
                         decisions.append(str(line))
                     if vector_built.get("amber"):
