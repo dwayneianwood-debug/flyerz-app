@@ -44,6 +44,8 @@ from vector_trace import (
     _topology_fails,
     _hole_count,
     _min_glyph_iou,
+    _paint_halo_fails,
+    _ghost_double_fails,
     ABOVE_FRAC,
     BELOW_FRAC,
 )
@@ -528,6 +530,52 @@ def test_descenders_and_counters() -> None:
     thick[8:18, 7:9] = (20, 18, 16)
     tiny_score = _min_glyph_iou(tiny, thick)
     check("glyph-iou-tiny-edge", tiny_score >= 0.85, f"{tiny_score:.3f}")
+    # Two pixels clear of the stem is a bar beside the letter, not the hard edge.
+    beside = clean.copy()
+    beside[20:44, 68:71] = (20, 18, 16)
+    beside_score = _min_glyph_iou(clean, beside)
+    check("glyph-iou-side-bar", beside_score < 0.85, f"{beside_score:.3f}")
+
+    photo = np.random.default_rng(1).integers(70, 160, (52, 90), np.uint8)
+    halo_src = cv2.cvtColor(photo, cv2.COLOR_GRAY2BGR)
+    halo_src[10:42, 24:36] = (248, 248, 248)
+    halo_src[10:18, 24:62] = (248, 248, 248)
+    halo_ren = halo_src.copy()
+    halo_ren[8:44, 20:40] = (96, 96, 96)
+    halo_ren[8:20, 20:66] = (96, 96, 96)
+    halo_ren[12:40, 26:34] = (248, 248, 248)
+    halo_ren[12:18, 26:58] = (248, 248, 248)
+    check("halo-on-photo", _paint_halo_fails(halo_src, halo_ren) is True)
+    navy = np.full((52, 90, 3), (28, 22, 16), np.uint8)
+    gold = navy.copy()
+    gold[10:42, 24:36] = (90, 180, 215)
+    gold[10:18, 24:62] = (90, 180, 215)
+    check("halo-on-navy", _paint_halo_fails(gold, gold.copy()) is False)
+    check("halo-same-photo", _paint_halo_fails(halo_src, halo_src.copy()) is False)
+
+    small = np.full((26, 180, 3), (236, 232, 226), np.uint8)
+    for x in range(8, 160, 16):
+        small[6:18, x:x + 3] = (30, 28, 26)
+        small[6:9, x:x + 8] = (30, 28, 26)
+    doubled = small.copy()
+    shifted = np.full_like(small, (236, 232, 226))
+    shifted[:, 4:] = small[:, :-4]
+    ink = np.any(shifted.astype(int) < 80, axis=2)
+    doubled[ink] = (30, 28, 26)
+    check("ghost-double", _ghost_double_fails(small, doubled) is True)
+    check("ghost-clean", _ghost_double_fails(small, small.copy()) is False)
+    bold = small.copy()
+    stem = np.any(small.astype(int) < 80, axis=2).astype(np.uint8)
+    bold[cv2.dilate(stem, np.ones((3, 3), np.uint8)) > 0] = (30, 28, 26)
+    check("ghost-one-pixel", _ghost_double_fails(small, bold) is False)
+
+    wide = np.full((1000, 1700, 3), (230, 226, 220), np.uint8)
+    wide[400:460, 200:260] = (16, 14, 12)
+    erase = np.zeros(wide.shape[:2], np.uint8)
+    erase[400:460, 200:260] = 255
+    filled_wide = _fill_from_paper(wide, erase)
+    patch = filled_wide[420:440, 220:240]
+    check("fast-fill-paper", int(patch.min()) > 180, str(int(patch.min())))
 
     src = np.full((80, 40, 3), paper, np.uint8)
     src[15:40, 8:28] = (16, 14, 12)

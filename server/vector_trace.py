@@ -832,23 +832,60 @@ def _strip_flourish(mask: np.ndarray) -> np.ndarray:
     return out
 
 
-def _fill_from_paper(plate: np.ndarray, erase: np.ndarray) -> np.ndarray:
-    """Replace the raster letter with the paper around it. The vector is drawn on top."""
-    if erase is None or int(erase.max()) == 0:
-        return plate
-    keep = (erase == 0).astype(np.float32)
-    colour = plate.astype(np.float32) * keep[..., None]
-    num = cv2.GaussianBlur(colour, (0, 0), 14.0)
-    den = cv2.GaussianBlur(keep, (0, 0), 14.0)
+def _fill_region(crop: np.ndarray, mask: np.ndarray, sigma: float, sigma_wide: float) -> np.ndarray:
+    """Paper colour under `mask`. `mask` is 0 on paper and >0 on the letter."""
+    keep = (mask == 0).astype(np.float32)
+    colour = crop.astype(np.float32) * keep[..., None]
+    num = cv2.GaussianBlur(colour, (0, 0), sigma)
+    den = cv2.GaussianBlur(keep, (0, 0), sigma)
     filled = num / np.maximum(den[..., None], 1e-3)
-    weak = (erase > 0) & (den < 0.08)
+    weak = (mask > 0) & (den < 0.08)
     if bool(weak.any()):
-        num_wide = cv2.GaussianBlur(colour, (0, 0), 36.0)
-        den_wide = cv2.GaussianBlur(keep, (0, 0), 36.0)
+        num_wide = cv2.GaussianBlur(colour, (0, 0), sigma_wide)
+        den_wide = cv2.GaussianBlur(keep, (0, 0), sigma_wide)
         wide = num_wide / np.maximum(den_wide[..., None], 1e-3)
         filled[weak] = wide[weak]
+    return filled
+
+
+def _fill_from_paper(plate: np.ndarray, erase: np.ndarray) -> np.ndarray:
+    """Replace the raster letter with the paper around it. The vector is drawn on top.
+
+    The blur only covers the letters, plus a margin the kernel can see.
+    A page of a few megapixels is blurred at a quarter of the size with the
+    same radius. That is the same paper colour, and it is the slow part of a
+    poster or a flyer.
+    """
+    if erase is None or int(erase.max()) == 0:
+        return plate
+    ys, xs = np.where(erase > 0)
+    if ys.size == 0:
+        return plate
+    # Sigma 36 still has weight out to about three radii.
+    margin = 128
+    y0 = max(0, int(ys.min()) - margin)
+    y1 = min(plate.shape[0], int(ys.max()) + 1 + margin)
+    x0 = max(0, int(xs.min()) - margin)
+    x1 = min(plate.shape[1], int(xs.max()) + 1 + margin)
+    crop = plate[y0:y1, x0:x1]
+    mask = erase[y0:y1, x0:x1]
+    area = int(crop.shape[0]) * int(crop.shape[1])
+    if area >= 1_600_000:
+        scale = 4
+        small = (max(1, crop.shape[1] // scale), max(1, crop.shape[0] // scale))
+        small_colour = cv2.resize(crop, small, interpolation=cv2.INTER_AREA)
+        small_mask = cv2.resize(mask, small, interpolation=cv2.INTER_AREA)
+        # A pixel that is only partly the letter still has to be a hole,
+        # or the letter colour leaks into the paper.
+        hole = np.where(small_mask >= 8, np.uint8(255), np.uint8(0))
+        filled_s = _fill_region(small_colour, hole, 14.0 / scale, 36.0 / scale)
+        filled = cv2.resize(filled_s, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_LINEAR)
+    else:
+        filled = _fill_region(crop, mask, 14.0, 36.0)
     out = plate.copy()
-    out[erase > 0] = np.clip(np.rint(filled[erase > 0]), 0, 255).astype(np.uint8)
+    view = out[y0:y1, x0:x1]
+    write = mask > 0
+    view[write] = np.clip(np.rint(filled[write]), 0, 255).astype(np.uint8)
     return out
 
 
@@ -2012,6 +2049,75 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
     return kept
 
 
+def _separate_line(job: dict) -> dict:
+    """Ink for one line. The plate is only read, so lines run together across cores."""
+    plate = job["plate"]
+    text = job["text"]
+    left, top, right, bottom = job["bounds"]
+    core = job["core"]
+    inner_left, inner_top, inner_right, inner_bottom = job["inner"]
+    owner = job["owner"]
+    plate_cores = job["cores"]
+    if right - left < 4 or bottom - top < 4:
+        return {
+            "line": _line(text, "raster", "The box was too small to trace."),
+            "box": _raster_box(text, left, top, right, bottom, core, "line", None),
+        }
+    crop = np.ascontiguousarray(plate[top:bottom, left:right])
+    style = _sample_style(crop)
+
+    def reject(reason: str, scope: str = "line") -> dict:
+        return {
+            "line": _line(text, "raster", reason),
+            "box": _raster_box(text, left, top, right, bottom, core, scope, style),
+        }
+
+    mask, colour = segment_ink(crop)
+    if mask is None:
+        return reject("The ink could not be separated from the picture.")
+    mask = ink_touching(mask, (
+        inner_left - left, inner_top - top, inner_right - left, inner_bottom - top,
+    ))
+    if mask is None:
+        return reject("The ink sat outside this box, so it stayed in the picture.")
+    mask, colour = refine_ink(crop, mask)
+    if mask is None or colour is None:
+        return reject("The ink could not be separated from the picture.")
+    # A logo in the same box is not a letter. A letter touching it stays.
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    mask, halo = split_solid_blobs(mask, gray)
+    mask, colour = refine_ink(crop, mask)
+    if mask is None or colour is None:
+        return reject("The ink could not be separated from the picture.")
+    # Only this line's ink. A neighbour's ascender in the expanded crop stays put.
+    owned = _keep_line_glyphs(mask, left, top, owner, plate_cores)
+    if owned is None:
+        return reject("The ink sat outside this box, so it stayed in the picture.")
+    refined_mask, refined_colour = refine_ink(crop, owned)
+    if refined_mask is not None and refined_colour is not None:
+        mask, colour = refined_mask, refined_colour
+    else:
+        mask = owned
+    # A word-wide swash stays in the picture. Tracing it, or painting it
+    # out, leaves bars, and the source-ink fringe would hide those bars
+    # from the page guard.
+    mask = _strip_flourish(mask)
+    return {"pending": {
+        "text": text,
+        "mask": mask,
+        "colour": colour,
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "core": core,
+        "crop": crop,
+        "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
+        "clear": halo,
+        "style": style,
+    }}
+
+
 def trace_fitted(
     bgr: np.ndarray,
     trim_w_mm: float,
@@ -2090,6 +2196,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             max(1, inner_right - inner_left),
             max(1, inner_bottom - inner_top),
         ))
+    jobs = []
     owner_cursor = 0
     for block in blocks or []:
         if not isinstance(block, dict) or not block.get("bbox"):
@@ -2098,7 +2205,6 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if not is_lettering(text):
             raster_lines.append(_line(text, "raster", "An icon was left in the picture."))
             continue
-        style = None
         owner = owner_cursor
         owner_cursor += 1
         raw = _rect(block, bgr.shape[1], bgr.shape[0])
@@ -2111,72 +2217,28 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         rect = _expand_rect(raw, bgr.shape[1], bgr.shape[0], letter_rects)
         left, top, right, bottom = _mapped_bounds(placed["map"], rect, width, height)
         inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
-        core = (
-            inner_left,
-            inner_top,
-            max(1, inner_right - inner_left),
-            max(1, inner_bottom - inner_top),
-        )
-        if right - left < 4 or bottom - top < 4:
-            raster_lines.append(_line(text, "raster", "The box was too small to trace."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        crop = plate[top:bottom, left:right]
-        style = _sample_style(crop)
-        mask, colour = segment_ink(crop)
-        if mask is None:
-            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        mask = ink_touching(mask, (
-            inner_left - left, inner_top - top, inner_right - left, inner_bottom - top,
-        ))
-        if mask is None:
-            raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        mask, colour = refine_ink(crop, mask)
-        if mask is None or colour is None:
-            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        # A logo in the same box is not a letter. A letter touching it stays.
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        mask, halo = split_solid_blobs(mask, gray)
-        mask, colour = refine_ink(crop, mask)
-        if mask is None or colour is None:
-            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        # Only this line's ink. A neighbour's ascender in the expanded crop stays put.
-        owned = _keep_line_glyphs(mask, left, top, owner, plate_cores)
-        if owned is None:
-            raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line", style))
-            continue
-        refined_mask, refined_colour = refine_ink(crop, owned)
-        if refined_mask is not None and refined_colour is not None:
-            mask, colour = refined_mask, refined_colour
-        else:
-            mask = owned
-        # A word-wide swash stays in the picture. Tracing it, or painting it
-        # out, leaves bars, and the source-ink fringe would hide those bars
-        # from the page guard.
-        mask = _strip_flourish(mask)
-        pending.append({
+        jobs.append({
+            "plate": plate,
             "text": text,
-            "mask": mask,
-            "colour": colour,
-            "left": left,
-            "top": top,
-            "right": right,
-            "bottom": bottom,
-            "core": core,
-            "crop": crop,
-            "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
-            "clear": halo,
-            "style": style,
+            "owner": owner,
+            "cores": plate_cores,
+            "bounds": (left, top, right, bottom),
+            "core": (
+                inner_left,
+                inner_top,
+                max(1, inner_right - inner_left),
+                max(1, inner_bottom - inner_top),
+            ),
+            "inner": (inner_left, inner_top, inner_right, inner_bottom),
         })
+    for separated in _run_parallel(_separate_line, jobs):
+        if separated.get("pending") is not None:
+            pending.append(separated["pending"])
+            continue
+        if separated.get("line") is not None:
+            raster_lines.append(separated["line"])
+        if separated.get("box") is not None:
+            raster_boxes.append(separated["box"])
     harmonise_pending(pending)
     traced = _trace_many([item["mask"] for item in pending])
     for item, paths in zip(pending, traced):
@@ -3006,6 +3068,128 @@ def _otsu_ink(image: np.ndarray):
     return ink, distance, core
 
 
+def _gray_pair(source_bgr: np.ndarray, render_bgr: np.ndarray):
+    """Both crops at the render's size, as gray. None when either side is empty."""
+    if source_bgr is None or render_bgr is None or getattr(source_bgr, "size", 0) == 0:
+        return None
+    if getattr(render_bgr, "ndim", 0) != 3 or render_bgr.shape[0] < 8 or render_bgr.shape[1] < 8:
+        return None
+    if render_bgr.shape[:2] != source_bgr.shape[:2]:
+        source_bgr = cv2.resize(
+            source_bgr,
+            (int(render_bgr.shape[1]), int(render_bgr.shape[0])),
+            interpolation=cv2.INTER_AREA,
+        )
+    source = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    render = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return source, render
+
+
+def _paper_ink(gray: np.ndarray):
+    """Ink against the border paper. None when the crop is flat."""
+    border = np.concatenate([
+        gray[:2, :].ravel(), gray[-2:, :].ravel(),
+        gray[:, :2].ravel(), gray[:, -2:].ravel(),
+    ])
+    if border.size < 8:
+        return None
+    paper = float(np.median(border))
+    distance = np.abs(gray - paper)
+    if float(distance.std()) < 4.0:
+        return None
+    _level, binary = cv2.threshold(
+        np.clip(distance, 0, 255).astype(np.uint8),
+        0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    ink = binary > 0
+    edge = np.zeros(gray.shape, np.bool_)
+    edge[:2, :] = True
+    edge[-2:, :] = True
+    edge[:, :2] = True
+    edge[:, -2:] = True
+    if float(ink[edge].mean()) > 0.5:
+        ink = ~ink
+    if int(ink.sum()) < 20:
+        return None
+    return ink, paper, distance
+
+
+def _paint_halo_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
+    """True when the paint-out beside a stroke is a flat patch on a varied picture.
+
+    White type on a photo (the T of HARVEST) leaves a grey shoulder where the
+    picture's soft edge was. Navy and cream paper are flat on both sides, so
+    a hard vector edge there is not this fault.
+    """
+    pair = _gray_pair(source_bgr, render_bgr)
+    if pair is None:
+        return False
+    source, render = pair
+    found = _paper_ink(render)
+    if found is None:
+        return False
+    _ink, paper, dist_r = found
+    dist_s = np.abs(source - paper)
+    level = max(40.0, 0.55 * float(np.percentile(dist_r, 98)))
+    ink = dist_r > level
+    if int(ink.sum()) < 20:
+        return False
+    outside = cv2.distanceTransform((~ink).astype(np.uint8), cv2.DIST_L2, 3)
+    ring = (outside >= 1.0) & (outside <= 3.0)
+    delta = np.abs(source - render)
+    # The picture still holds the letter. The render was pulled back to paper.
+    shoulder = ring & (dist_s > 36.0) & (dist_r < 22.0) & (delta > 24.0)
+    count = int(np.count_nonzero(shoulder))
+    # A one-pixel rim on flat navy is the vector's hard edge. The mark on
+    # HARVEST is a wide patch, and the picture behind it still changes.
+    if count < 80:
+        return False
+    paper_pix = np.where(outside >= 4.0, source, float(np.mean(source)))
+    mean = cv2.blur(paper_pix, (15, 15))
+    mean2 = cv2.blur(paper_pix * paper_pix, (15, 15))
+    spread = np.sqrt(np.clip(mean2 - mean * mean, 0, None))
+    return float(np.median(spread[shoulder])) >= 12.0
+
+
+def _ghost_double_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
+    """True when a second copy of the stroke sits off to the side of the picture.
+
+    A one-pixel harder edge is not a second letter. A copy three pixels away,
+    repeated along the line, is the blotchy double on the small card type.
+    """
+    pair = _gray_pair(source_bgr, render_bgr)
+    if pair is None:
+        return False
+    source, render = pair
+    source_ink = _paper_ink(source)
+    render_ink = _paper_ink(render)
+    if source_ink is None or render_ink is None:
+        return False
+    source_ink = source_ink[0]
+    render_ink = render_ink[0]
+    outside = cv2.distanceTransform((~source_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    stray = (render_ink & (outside >= 3.0)).astype(np.uint8)
+    if int(stray.sum()) < 16:
+        return False
+    parts = _components(source_ink.astype(np.uint8) * 255, 8)
+    if len(parts) < 2:
+        return False
+    letter_h = float(np.median([part["h"] for part in parts]))
+    if letter_h < 4.0:
+        return False
+    count, _labels, stats, _centres = cv2.connectedComponentsWithStats(stray, 8)
+    ghosts = 0
+    for index in range(1, count):
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 6 or height < 0.45 * letter_h:
+            continue
+        if width <= 4 or width < 0.35 * max(height, 1):
+            ghosts += 1
+    return ghosts >= 2
+
+
 def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     """Lowest IoU of one source glyph against the render in that same place.
 
@@ -3048,6 +3232,9 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     # A short bar beside a digit is not a letter. The letters are the tall set.
     tallest = max(part["h"] for part in letters)
     tall = [part for part in letters if part["h"] >= 0.70 * tallest]
+    # Kept so a heavy rim on a slightly shorter letter (the E of APOSTLE) is
+    # still judged after the tall filter drops it.
+    rim_letters = letters
     if len(tall) >= 2:
         letters = tall
     # On a letter shorter than 12px, one pixel is a fifth of the stroke.
@@ -3081,6 +3268,20 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
         # counter is inside the letter, so it still counts.
         ignore = extra & ~interior[y0:y1, x0:x1] & (outside[y0:y1, x0:x1] < 1.5)
         counted = extra & ~ignore
+        # A bar beside the letter (the final E of APOSTLE) stands clear of the
+        # stroke. The one-pixel hard edge, and a soft photo edge, stay put.
+        side_bar = False
+        far = extra & (outside[y0:y1, x0:x1] >= 2.5)
+        if int(np.count_nonzero(far)) >= 10:
+            _n, _labels, stats, _cent = cv2.connectedComponentsWithStats(far.astype(np.uint8), 8)
+            for index in range(1, _n):
+                area_b = int(stats[index, cv2.CC_STAT_AREA])
+                height_b = int(stats[index, cv2.CC_STAT_HEIGHT])
+                width_b = int(stats[index, cv2.CC_STAT_WIDTH])
+                thin = width_b <= 4 or width_b < 0.35 * max(height_b, 1)
+                if area_b >= 10 and height_b >= 0.50 * part["h"] and thin:
+                    side_bar = True
+                    break
         # A one-pixel nick inside a counter is the soft edge. A channel
         # through an N is one piece, so it still counts.
         inside = (counted & interior[y0:y1, x0:x1]).astype(np.uint8)
@@ -3102,8 +3303,26 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
         inter = int(np.count_nonzero(kept & render_box))
         union = int(np.count_nonzero(kept | counted))
         score = 0.0 if union == 0 else inter / float(union)
+        if side_bar:
+            score = min(score, 0.40)
         if score < worst:
             worst = score
+    # A rim as heavy as the stroke itself is a second edge, not antialiasing.
+    # Friday's hard edge is a small fraction of the letter. The E of APOSTLE is not.
+    for part in rim_letters:
+        if part["h"] < 0.55 * median_h:
+            continue
+        x0 = max(0, part["x"] - 3)
+        y0 = max(0, part["y"] - 2)
+        x1 = min(width, part["x"] + part["w"] + 4)
+        y1 = min(height, part["y"] + part["h"] + 2)
+        rim = (
+            render_ink[y0:y1, x0:x1]
+            & ~source_ink[y0:y1, x0:x1]
+            & (outside[y0:y1, x0:x1] < 2.2)
+        )
+        if int(np.count_nonzero(rim)) > 0.45 * part["area"]:
+            worst = min(worst, 0.40)
     letter_h = float(np.median([part["h"] for part in letters]))
     for part in render_parts:
         if part["area"] < floor or part["h"] < 0.70 * letter_h:
@@ -3533,33 +3752,69 @@ def _apply_text_gate(
     for index in _column_style_demote(early_style):
         report[index]["_revert"] = True
     vector_slots = [row for row in vector_slots if not row["_revert"]]
+
+    def _judge_row(row: dict) -> dict:
+        """Pixel checks only. The second OCR is reserved for rows these reject."""
+        text = row["render"] or row["text"]
+        score = _score_modest(row["_source"], row["_render"], row["text"], text)
+        judged = {
+            "ssim": score["ssim"],
+            "whiteBlock": score["whiteBlock"],
+            "clipped": score["clipped"],
+            "pixelFail": bool(score["pixelFail"]),
+            "ok": bool(score["ok"]),
+        }
+        if not row["_vector"] or row.get("_revert"):
+            judged["glyphIou"] = None
+            judged["haloFail"] = False
+            return judged
+        glyph_iou = _min_glyph_iou(row["_source"], row["_render"])
+        halo = _paint_halo_fails(row["_source"], row["_render"])
+        ghost = _ghost_double_fails(row["_source"], row["_render"])
+        judged["glyphIou"] = round(float(glyph_iou), 3)
+        judged["haloFail"] = bool(halo or ghost)
+        judged["glyphFail"] = bool(glyph_iou < 0.85 or halo or ghost)
+        return judged
+
+    judged_rows = _run_parallel(_judge_row, report)
+    for row, judged in zip(report, judged_rows):
+        row["ssim"] = judged["ssim"]
+        row["whiteBlock"] = judged["whiteBlock"]
+        row["clipped"] = judged["clipped"]
+        row["_pixelFail"] = judged["pixelFail"]
+        row["glyphIou"] = judged["glyphIou"]
+        if judged.get("haloFail"):
+            row["haloFail"] = True
+        if not row["_vector"]:
+            row["ok"] = bool(judged["ok"])
+            row["render"] = _norm_text(row["text"])
+            continue
+        if judged.get("glyphFail"):
+            row["glyphFail"] = True
+    # A line the mask already accepted does not need a second read. Copying
+    # the source text keeps the letter check honest. Only a rejected line is
+    # read back, so the gate can say what the vector actually showed.
+    accepted = []
+    rejected = []
+    for row in vector_slots:
+        low_ssim = float(row["ssim"]) < SSIM_FLOOR
+        if row["glyphFail"] or row["_pixelFail"] or low_ssim:
+            rejected.append(row)
+        else:
+            accepted.append(row)
+    for row in accepted:
+        row["render"] = _norm_text(row["text"])
+        row["mismatch"] = False
     readings = _read_render_strip(
-        [row["_render"] for row in vector_slots],
-        [row["text"] for row in vector_slots],
-    ) if vector_slots else []
-    for row, reading in zip(vector_slots, readings):
+        [row["_render"] for row in rejected],
+        [row["text"] for row in rejected],
+    ) if rejected else []
+    for row, reading in zip(rejected, readings):
         row["render"] = reading
         row["mismatch"] = not _reads_match(row["text"], reading)
     for row in report:
-        if row["_vector"]:
-            continue
-        row["render"] = _norm_text(row["text"])
-    for row in report:
-        score = _score_modest(row["_source"], row["_render"], row["text"], row["render"] or row["text"])
-        row["ssim"] = score["ssim"]
-        row["whiteBlock"] = score["whiteBlock"]
-        row["clipped"] = score["clipped"]
-        row["_pixelFail"] = bool(score["pixelFail"])
-        if not row["_vector"]:
-            row["ok"] = bool(score["ok"])
-            row["glyphIou"] = None
-            continue
-        glyph_iou = _min_glyph_iou(row["_source"], row["_render"])
-        row["glyphIou"] = round(float(glyph_iou), 3)
-        # One glyph under 0.85 is a different letter, even when the line's
-        # SSIM is high. The whole line goes back to the picture.
-        if glyph_iou < 0.85:
-            row["glyphFail"] = True
+        if row["_vector"] and not row.get("render"):
+            row["render"] = _norm_text(row["text"])
     parent = list(range(len(report)))
 
     def find(node: int) -> int:
@@ -3906,6 +4161,22 @@ def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
         doc.close()
 
 
+def _run_parallel(fn, items: list) -> list:
+    """Run `fn` across the cores this process is allowed to use. Order is kept.
+
+    The work is OpenCV on separate crops, so threads share the memory and do
+    not pay a Windows process start per line.
+    """
+    items = list(items)
+    workers = _workers()
+    if len(items) <= 1 or workers <= 1:
+        return [fn(item) for item in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(fn, items))
+
+
 def _workers() -> int:
     raw = os.environ.get("VECTOR_TRACE_WORKERS", "").strip()
     if raw.isdigit():
@@ -3922,13 +4193,12 @@ def _trace_many(masks: list) -> list:
     """One potrace process for the page. Order stays the page order.
 
     Each trace is a few milliseconds. Starting a process per line costs about
-    80ms on Windows, and a pool would pay that once per line, so the lines
-    share one bitmap.     A process pool is not used: the start cost is the whole job.
+    80ms on Windows, so the lines share one bitmap. Building the 4× bitmaps
+    is the part that spreads across cores. Potrace itself stays one process.
     """
-    _workers()
     if not masks:
         return []
-    binaries = [_trace_binary(mask) for mask in masks]
+    binaries = _run_parallel(_trace_binary, masks)
     placed = _potrace_placed(binaries)
     return [_scale_paths(paths, 1.0 / TRACE_SCALE) for paths in placed]
 
@@ -3956,6 +4226,10 @@ def _trace_binary(mask: np.ndarray):
         return None
     height, width = mask.shape[:2]
     big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
+    # A fraction of a source pixel. It takes the stair off the cubic edge
+    # (the gold school line at 600 dpi) and does not close a channel that is
+    # still open at this scale.
+    big = cv2.GaussianBlur(big, (0, 0), 0.7)
     _thr, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
     return binary
 

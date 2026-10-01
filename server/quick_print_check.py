@@ -641,7 +641,10 @@ def _save_church_line(press_path: str, gate: list) -> None:
     check(
         "catch-top-church-complete",
         top.get("mode") == "raster"
-        and float(top.get("glyphIou") or 1) < 0.85
+        and (
+            float(top.get("glyphIou") or 1) < 0.85
+            or top.get("haloFail") is True
+        )
         and render == "GREATER HARVEST FAMILY CHURCH"
         and float(top.get("ssim") or 0) >= 0.85
         and top.get("whiteBlock") is False
