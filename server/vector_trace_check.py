@@ -40,6 +40,11 @@ from vector_trace import (
     _texts_equal,
     _vector_glyphs_disagree,
     _trace_fill,
+    _expand_rect,
+    _topology_fails,
+    _hole_count,
+    ABOVE_FRAC,
+    BELOW_FRAC,
 )
 
 SANS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "LiberationSans-Bold.ttf")
@@ -413,6 +418,62 @@ def test_merged_or_split_glyphs_fail() -> None:
     check("paint-out-counter", int(np.max(np.abs(filled[30:36, 33:38].astype(int) - plate[30:36, 33:38].astype(int)))) == 0)
 
 
+def test_descenders_and_counters() -> None:
+    """A word box grows past the x-height, and a clipped tail or an open e fails."""
+    rect = (20, 100, 80, 40)
+    grown = _expand_rect(rect, 400, 500, ())
+    check("expand-above", grown[1] <= 100 - int(40 * ABOVE_FRAC), str(grown))
+    check("expand-below", grown[1] + grown[3] >= 140 + int(40 * BELOW_FRAC), str(grown))
+    below = (20, 152, 80, 40)
+    clamped = _expand_rect(rect, 400, 500, (rect, below))
+    check("clamp-below", clamped[1] + clamped[3] <= 147, str(clamped))
+    check("clamp-still-grows", clamped[1] + clamped[3] > 140, str(clamped))
+    beside = (110, 100, 60, 40)
+    same = _expand_rect(rect, 400, 500, (rect, beside))
+    check("same-line-full-below", same[1] + same[3] >= 140 + int(40 * BELOW_FRAC), str(same))
+
+    paper = (245, 242, 236)
+    crop = np.full((70, 50, 3), paper, np.uint8)
+    crop[12:58, 8:14] = (18, 16, 14)
+    crop[12:18, 8:40] = (18, 16, 14)
+    crop[12:36, 34:40] = (18, 16, 14)
+    crop[52:58, 8:40] = (18, 16, 14)
+    crop[32:36, 8:38] = (150, 146, 140)
+    mask, _colour = segment_ink(crop)
+    check("thin-bar-mask", mask is not None)
+    holes = 0
+    if mask is not None:
+        count, labels, stats, _cent = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+        for index in range(1, count):
+            if int(stats[index, cv2.CC_STAT_AREA]) < 20:
+                continue
+            holes = max(holes, _hole_count(labels == index))
+    check("thin-bar-hole", holes >= 1, str(holes))
+
+    src = np.full((80, 40, 3), paper, np.uint8)
+    src[15:40, 8:28] = (16, 14, 12)
+    src[40:70, 14:22] = (16, 14, 12)
+    clipped = np.zeros((80, 40), np.uint8)
+    clipped[15:40, 8:28] = 255
+    check("clipped-tail-fails", _topology_fails(src, clipped, 400) is True)
+    whole = clipped.copy()
+    whole[40:70, 14:22] = 255
+    check("full-tail-passes", _topology_fails(src, whole, 400) is False)
+
+    letter = np.full((60, 40, 3), paper, np.uint8)
+    letter[8:52, 6:12] = (16, 14, 12)
+    letter[8:14, 6:32] = (16, 14, 12)
+    letter[8:34, 26:32] = (16, 14, 12)
+    letter[28:34, 6:30] = (16, 14, 12)
+    letter[46:52, 6:32] = (16, 14, 12)
+    closed = np.zeros((60, 40), np.uint8)
+    closed[letter[:, :, 0] < 40] = 255
+    opened = closed.copy()
+    opened[28:34, 12:30] = 0
+    check("open-e-fails", _topology_fails(letter, opened, 400) is True)
+    check("closed-e-passes", _topology_fails(letter, closed, 400) is False)
+
+
 def test_glyphs_reject_a_changed_letter() -> None:
     mask = np.zeros((40, 80), np.uint8)
     mask[8:32, 6:18] = 255
@@ -539,8 +600,24 @@ def test_medella_coverage_and_gate_speed() -> None:
     itself may use up to 6s.
     """
     phrases = {
-        "flyer_front": ("fatigue or low energy", "A small drop of blood", "imbalances"),
+        "flyer_front": (
+            "fatigue or low energy",
+            "A small drop of blood",
+            "imbalances",
+            "Through",
+            "analysis",
+            "Supports natural",
+            "Guides you to make",
+            "Supports long-term",
+            "effectiveness",
+            "Detox",
+            "Anyone who wants to take",
+            "your unique health story",
+        ),
         "flyer_back": ("chronic inflammation", "Identifies triggers"),
+    }
+    aliases = {
+        "Supports natural": ("Supports natural", "Supts noral"),
     }
     card = _trace_side("card_front", 90, 50)
     check("card-front-count", int(card.get("vector_lines") or 0) >= 9, str(card.get("vector_lines")))
@@ -567,11 +644,18 @@ def test_medella_coverage_and_gate_speed() -> None:
     for side, wanted in phrases.items():
         blob = "\n".join(str(row.get("text") or "") for row in gates[side])
         for phrase in wanted:
-            check("letters-" + phrase[:24], phrase in blob, blob[:240])
-            hits = [row for row in gates[side] if phrase in str(row.get("text") or "")]
+            keys = aliases.get(phrase, (phrase,))
+            check("letters-" + phrase[:24], any(key in blob for key in keys), blob[:240])
+            hits = [
+                row for row in gates[side]
+                if any(key in str(row.get("text") or "") for key in keys)
+            ]
             wrong = [
                 row for row in hits
-                if row.get("mode") == "vector" and not _reads_match(str(row.get("text") or ""), str(row.get("render") or ""))
+                if row.get("mode") == "vector" and (
+                    row.get("glyphFail")
+                    or not _reads_match(str(row.get("text") or ""), str(row.get("render") or ""))
+                )
             ]
             check("render-" + phrase[:24], bool(hits) and not wrong, str(hits)[:400])
     print("MEDELLA", {
@@ -655,6 +739,7 @@ def main() -> None:
     test_vector_line_flags_a_soft_glyph()
     test_gate_is_exact_and_sees_a_white_block()
     test_merged_or_split_glyphs_fail()
+    test_descenders_and_counters()
     test_glyphs_reject_a_changed_letter()
     test_a_line_is_not_half_traced()
     test_paths_and_local_plate()

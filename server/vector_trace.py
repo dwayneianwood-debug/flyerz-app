@@ -30,6 +30,10 @@ OPTTOLERANCE = 0.2
 IOU_FLOOR = 0.9
 CHOKE_PX = 1
 PAD_FRAC = 0.14
+# A word box stops at the x-height. Descenders hang below it and ascenders
+# above it, so the trace crop has to be taller than the box OCR returned.
+ABOVE_FRAC = 0.25
+BELOW_FRAC = 0.35
 
 _NUM = r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"
 _TOKEN = re.compile(rf"[MmLlHhVvCcZz]|{_NUM}")
@@ -59,11 +63,12 @@ def segment_ink(roi: np.ndarray):
     sample = np.clip(distance, 0, 255).astype(np.uint8)
     if float(sample.std()) < 4.0:
         return None, None
-    _threshold, binary = cv2.threshold(sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu, binary = cv2.threshold(sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     ink = binary > 0
     # Otsu can pick the paper when the letters fill the crop. The ring is paper.
     if float(ink[ring].mean()) > 0.5:
         ink = ~ink
+    ink = _grow_thin_strokes(sample, ink, float(otsu))
     fraction = float(ink.mean())
     if fraction < 0.012 or fraction > 0.62:
         return None, None
@@ -80,6 +85,36 @@ def segment_ink(roi: np.ndarray):
     if colour is None:
         return None, None
     return mask, colour
+
+
+def _grow_thin_strokes(sample: np.ndarray, ink: np.ndarray, otsu: float) -> np.ndarray:
+    """Pull a light crossbar or a pale tail back onto the stroke it touches.
+
+    Otsu keeps the stem and drops the thinner, lighter stroke, so an e is
+    traced as a c. Only pixels next to the stem, and still well clear of the
+    paper, are added. A counter sits on the paper and stays empty.
+    """
+    if ink is None or not bool(ink.any()):
+        return ink
+    if float(np.median(sample[ink])) < max(8.0, otsu * 0.75):
+        return ink
+    cut = max(6.0, otsu * 0.40)
+    weak = sample >= cut
+    count, labels = cv2.connectedComponents((weak | ink).astype(np.uint8), 8)
+    grown = ink.copy()
+    for label in np.unique(labels[ink]):
+        if int(label) == 0:
+            continue
+        comp = labels == label
+        core = int(np.count_nonzero(comp & ink))
+        extra = int(np.count_nonzero(comp & ~ink))
+        # A crossbar is smaller than the letter. A photo touching the stroke is not.
+        if extra > max(core, 1):
+            continue
+        grown[comp] = True
+    if float(grown.mean()) > 0.62:
+        return ink
+    return grown
 
 
 def ink_colour(roi: np.ndarray, mask: np.ndarray):
@@ -581,7 +616,9 @@ def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
         if area < 2:
             continue
         inside = int(np.count_nonzero(component & (zone > 0)))
-        if inside >= max(4, int(0.40 * area)):
+        # A descender is mostly below the word box. Keeping it only when 40% of
+        # the stroke sits in that box drops the tail and leaves a floating speck.
+        if inside >= max(4, int(round(0.08 * area))):
             keep[component] = 255
     if int(keep.max()) == 0:
         return None
@@ -880,11 +917,11 @@ def _components(mask: np.ndarray, min_area: int) -> list:
     return parts
 
 
-def _hole_count(component: np.ndarray) -> int:
-    """Enclosed holes. 9 has one, 8 has two, S has none, B has two. Specks do not count."""
+def _hole_areas(component: np.ndarray, min_hole: int = 8) -> list:
+    """Areas of enclosed holes. Specks smaller than ``min_hole`` are not counters."""
     ys, xs = np.where(component)
     if ys.size < 12:
-        return 0
+        return []
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     crop = np.zeros((y1 - y0, x1 - x0), np.uint8)
@@ -895,12 +932,21 @@ def _hole_count(component: np.ndarray) -> int:
     cv2.floodFill(inv, flood_mask, (0, 0), 128)
     holes = (inv == 255).astype(np.uint8)
     count, _labels, stats, _cent = cv2.connectedComponentsWithStats(holes, 8)
-    min_hole = max(8, int(round(float(ys.size) * 0.02)))
-    found = 0
+    found = []
     for index in range(1, count):
-        if int(stats[index, cv2.CC_STAT_AREA]) >= min_hole:
-            found += 1
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area >= min_hole:
+            found.append(area)
     return found
+
+
+def _hole_count(component: np.ndarray) -> int:
+    """Enclosed holes. 9 has one, 8 has two, S has none, B has two. Specks do not count."""
+    ys, xs = np.where(component)
+    if ys.size < 12:
+        return 0
+    min_hole = max(8, int(round(float(ys.size) * 0.02)))
+    return len(_hole_areas(component, min_hole))
 
 
 def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner: tuple) -> str:
@@ -973,6 +1019,112 @@ def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner
             if union > 0 and best_overlap / float(union) < 0.36:
                 return "The trace closed or opened a counter, so this box stayed in the picture."
     return ""
+
+
+def _topology_fails(crop: np.ndarray, painted: np.ndarray, ppi: float = 400.0) -> bool:
+    """True when a traced glyph lost its tail or its counter.
+
+    OCR reads a clipped g as the right word, so the text compare does not see
+    it. The glyph's bottom has to match the source ink within 1px at 300 dpi,
+    and the enclosed holes have to match the source glyph. One miss is enough.
+    """
+    if crop is None or painted is None or getattr(painted, "size", 0) == 0:
+        return False
+    if crop.ndim != 3 or crop.shape[0] < 6 or crop.shape[1] < 6:
+        return False
+    if int(np.max(painted)) == 0:
+        return False
+    if painted.shape[:2] != crop.shape[:2]:
+        return True
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    paint = painted > 0
+    ink_px = gray[paint]
+    if ink_px.size < 8:
+        return False
+    ink_tone = float(np.median(ink_px))
+    near = cv2.dilate(paint.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    paper_px = gray[near & ~paint]
+    if paper_px.size < 8:
+        return False
+    paper_tone = float(np.median(paper_px))
+    span = abs(ink_tone - paper_tone)
+    if span < 16.0:
+        return False
+    dark = ink_tone < paper_tone
+    # The counter check uses a lighter cut so a thin crossbar still closes the hole.
+    # The tail check uses the solid stroke, so a pale fringe is not a longer letter.
+    hole_cut = paper_tone - 0.42 * span if dark else paper_tone + 0.42 * span
+    extent_cut = paper_tone - 0.62 * span if dark else paper_tone + 0.62 * span
+    source_holes_ink = gray <= hole_cut if dark else gray >= hole_cut
+    source_extent = gray <= extent_cut if dark else gray >= extent_cut
+    tolerance = max(1, int(round(float(ppi) / 300.0)))
+    parts = _components((paint.astype(np.uint8) * 255), 20)
+    if len(parts) < 1:
+        return False
+    median_area = float(np.median([part["area"] for part in parts]))
+    significant = max(36, int(round(0.12 * median_area)))
+    height, width = gray.shape[:2]
+    for part in parts:
+        if part["area"] < significant:
+            continue
+        x0 = max(0, part["x"] - 1)
+        x1 = min(width, part["x"] + part["w"] + 1)
+        y0 = max(0, part["y"] - 1)
+        y1 = min(height, part["y"] + part["h"] + 1)
+        window = np.zeros((height, width), np.uint8)
+        window[y0:y1, x0:x1] = source_holes_ink[y0:y1, x0:x1].astype(np.uint8)
+        count, labels = cv2.connectedComponents(window, 8)
+        body = np.zeros((height, width), np.bool_)
+        for index in range(1, count):
+            comp = labels == index
+            if np.any(comp & part["pixels"]):
+                body[comp] = True
+        source_areas = _hole_areas(body, 4)
+        paint_areas = _hole_areas(part["pixels"], 4)
+        # A counter the trace filled in or left open. A 1px paint hole is still a counter.
+        substantial = max(12, int(round(0.08 * part["area"])))
+        if any(area >= substantial for area in source_areas) and not paint_areas:
+            eroded = cv2.erode(part["pixels"].astype(np.uint8), np.ones((3, 3), np.uint8))
+            opened = _hole_areas(eroded > 0, 4) if int(eroded.max()) else []
+            if not opened:
+                if os.environ.get("TOPO_DEBUG"):
+                    sys.stderr.write(
+                        f"[topo] holes src={source_areas} paint={paint_areas} "
+                        f"x={part['x']} w={part['w']} h={part['h']}\n"
+                    )
+                return True
+        y1 = min(height, part["y"] + part["h"] + int(round(0.40 * part["h"])))
+        x0 = max(0, part["x"])
+        x1 = min(width, part["x"] + part["w"])
+        if y1 <= part["y"] or x1 <= x0:
+            continue
+        column = source_extent[part["y"]:y1, x0:x1]
+        rows = column.any(axis=1)
+        last = 0
+        gap = 0
+        found = False
+        gap_limit = max(3, int(round(0.12 * part["h"])))
+        for index, hit in enumerate(rows):
+            if hit:
+                last = index
+                gap = 0
+                found = True
+                continue
+            gap += 1
+            if found and gap > gap_limit:
+                break
+        if not found:
+            continue
+        src_bottom = part["y"] + last
+        paint_bottom = part["y"] + part["h"] - 1
+        if src_bottom - paint_bottom > tolerance:
+            if os.environ.get("TOPO_DEBUG"):
+                sys.stderr.write(
+                    f"[topo] tail delta={src_bottom - paint_bottom} tol={tolerance} "
+                    f"x={part['x']} h={part['h']}\n"
+                )
+            return True
+    return False
 
 
 def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
@@ -1216,6 +1368,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     clear = np.zeros(plate.shape[:2], np.uint8)
     height, width = plate.shape[:2]
     pending = []
+    letter_rects = _letter_rects(blocks, bgr.shape[1], bgr.shape[0])
+    plate_ppi = float(placed.get("ppi") or MIN_PPI)
     for block in blocks or []:
         if not isinstance(block, dict) or not block.get("bbox"):
             continue
@@ -1230,7 +1384,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if len(glyph) == 1 and glyph.islower() and int(raw[3]) < 48:
             raster_lines.append(_line(text, "raster", "A single small glyph stayed in the picture."))
             continue
-        rect = _padded(raw, bgr.shape[1], bgr.shape[0])
+        rect = _expand_rect(raw, bgr.shape[1], bgr.shape[0], letter_rects)
         left, top, right, bottom = _mapped_bounds(placed["map"], rect, width, height)
         inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
         core = (
@@ -1302,6 +1456,15 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if reason:
             raster_lines.append(_line(text, "raster", reason))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
+            continue
+        if _topology_fails(item["crop"], painted, plate_ppi):
+            if os.environ.get("TOPO_DEBUG"):
+                sys.stderr.write(f"[topo] line {text!r}\n")
+            raster_lines.append(_line(
+                text, "raster",
+                "A letter lost its tail or its counter, so this line stayed in the picture.",
+            ))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
@@ -1450,14 +1613,75 @@ def _mapped_bounds(mapper, rect, width, height):
     return left, top, right, bottom
 
 
-def _padded(rect, width, height):
-    x, y, bw, bh = rect
-    pad = max(2, int(round(bh * PAD_FRAC)))
-    x0 = max(0, x - pad)
-    y0 = max(0, y - pad)
-    x1 = min(width, x + bw + pad)
-    y1 = min(height, y + bh + pad)
+def _expand_rect(rect, width, height, neighbours=()):
+    """Grow a word box by 25% above and 35% below, without entering the next line.
+
+    Horizontal padding stays the usual fraction of the line height. A neighbour
+    on the same line does not clamp this one. A line above or below splits the
+    gap, so a descender is traced and a neighbour's body is not.
+    """
+    x, y, bw, bh = [int(round(float(v))) for v in rect]
+    bh = max(2, bh)
+    bw = max(2, bw)
+    pad_x = max(2, int(round(bh * PAD_FRAC)))
+    up = max(pad_x, int(round(bh * ABOVE_FRAC)))
+    down = max(pad_x, int(round(bh * BELOW_FRAC)))
+    for other in neighbours or ():
+        nx, ny, nw, nh = [int(round(float(v))) for v in other]
+        if nw < 2 or nh < 2:
+            continue
+        if nx == x and ny == y and nw == bw and nh == bh:
+            continue
+        overlap = min(x + bw, nx + nw) - max(x, nx)
+        if overlap <= 0 or overlap < 0.35 * min(bw, nw):
+            continue
+        v_overlap = min(y + bh, ny + nh) - max(y, ny)
+        if v_overlap >= 0.55 * min(bh, nh):
+            continue
+        this_cy = y + bh * 0.5
+        other_cy = ny + nh * 0.5
+        if other_cy < this_cy:
+            their_claim = ny + nh + int(round(nh * BELOW_FRAC))
+            if their_claim <= y - up:
+                continue
+            if ny + nh < y:
+                mid = (ny + nh + y) // 2
+                up = min(up, max(0, y - mid))
+            else:
+                mid = int(round((this_cy + other_cy) * 0.5))
+                up = min(up, max(0, y - mid))
+        else:
+            their_claim = ny - int(round(nh * ABOVE_FRAC))
+            if y + bh + down <= their_claim:
+                continue
+            if y + bh < ny:
+                mid = (y + bh + ny) // 2
+                down = min(down, max(0, mid - (y + bh)))
+            else:
+                mid = int(round((this_cy + other_cy) * 0.5))
+                down = min(down, max(0, mid - (y + bh)))
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - up)
+    x1 = min(int(width), x + bw + pad_x)
+    y1 = min(int(height), y + bh + down)
     return x0, y0, max(2, x1 - x0), max(2, y1 - y0)
+
+
+def _padded(rect, width, height):
+    return _expand_rect(rect, width, height, ())
+
+
+def _letter_rects(blocks, width, height) -> list:
+    from vector_text_v2 import _rect
+
+    found = []
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        if not is_lettering(block.get("text") or ""):
+            continue
+        found.append(_rect(block, int(width), int(height)))
+    return found
 
 
 def _trace_fill(colour: np.ndarray):
@@ -1799,11 +2023,11 @@ def _box_mm(rect, plate_shape, trim_w, trim_h, bleed_mm) -> list:
     return [round(x, 2), round(y, 2), round(w, 2), round(h, 2)]
 
 
-def _plate_rect(block, source_shape, placed, plate_shape, padded: bool = True) -> tuple:
+def _plate_rect(block, source_shape, placed, plate_shape, padded: bool = True, neighbours=None) -> tuple:
     from vector_text_v2 import _rect
 
     raw = _rect(block, int(source_shape[1]), int(source_shape[0]))
-    chosen = _padded(raw, int(source_shape[1]), int(source_shape[0])) if padded else raw
+    chosen = _expand_rect(raw, int(source_shape[1]), int(source_shape[0]), neighbours or ()) if padded else raw
     left, top, right, bottom = _mapped_bounds(
         placed["map"], chosen, int(plate_shape[1]), int(plate_shape[0]),
     )
@@ -2028,13 +2252,14 @@ def _score_pair(source_bgr: np.ndarray, render_bgr: np.ndarray, source_text: str
 def _measure_boxes(blocks, drawn, trim, plate_image, plate_shape, source_shape, placed, trim_w, trim_h, bleed_mm, rows):
     """One row per lettering box: exact reading plus the pixel checks."""
     prepared = []
+    neighbours = _letter_rects(blocks, int(source_shape[1]), int(source_shape[0]))
     for block in blocks or []:
         if not isinstance(block, dict):
             continue
         text = str(block.get("text") or "")
         if not is_lettering(text):
             continue
-        rect = _plate_rect(block, source_shape, placed, plate_shape, padded=True)
+        rect = _plate_rect(block, source_shape, placed, plate_shape, padded=True, neighbours=neighbours)
         tight = _plate_rect(block, source_shape, placed, plate_shape, padded=False)
         tight_box = _trim_rect(trim.shape, plate_shape, tight, trim_w, trim_h, bleed_mm, 300)
         prepared.append((block, text, rect, tight_box))
@@ -2292,13 +2517,15 @@ def _apply_text_gate(
     by_rect = list(drawn)
     report = []
     vector_slots = []
+    letter_rects = _letter_rects(blocks, int(source_shape[1]), int(source_shape[0]))
+    plate_ppi = float((placed or {}).get("ppi") or 400)
     for block in blocks or []:
         if not isinstance(block, dict):
             continue
         text = str(block.get("text") or "")
         if not is_lettering(text):
             continue
-        rect = _plate_rect(block, source_shape, placed, plate_shape, padded=True)
+        rect = _plate_rect(block, source_shape, placed, plate_shape, padded=True, neighbours=letter_rects)
         inner = _plate_rect(block, source_shape, placed, plate_shape, padded=False)
         item = next((candidate for candidate in by_rect if _rects_match(candidate.get("rect"), rect)), None)
         vector = item is not None
@@ -2315,6 +2542,16 @@ def _apply_text_gate(
                 if glyph_fail and os.environ.get("GLYPH_DEBUG"):
                     sys.stderr.write(f"[glyph] text {text!r}\n")
             else:
+                glyph_fail = True
+            full = item.get("painted")
+            origin = _plate_crop(base, rect)
+            if (
+                full is not None
+                and not glyph_fail
+                and origin is not None
+                and origin.shape[:2] == full.shape[:2]
+                and _topology_fails(origin, full, plate_ppi)
+            ):
                 glyph_fail = True
         core = item.get("core") if item is not None and item.get("core") else inner
         bbox = block.get("bbox") or [0, 0, 0, 0]
