@@ -620,6 +620,60 @@ def _save_poster_join(press_path: str, picture_path: str) -> None:
     check("catch-rendered-seam", metrics["ok"] is True, str(metrics))
 
 
+def _save_church_line(press_path: str, gate: list) -> None:
+    """600 dpi crop of the top church-name line, plus the per-box gate table."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    rows = [row for row in gate if row.get("text") == "GREATER HARVEST FAMILY CHURCH"]
+    check("catch-church-rows", len(rows) >= 1, str(len(rows)))
+    if not rows:
+        return
+    top = min(rows, key=lambda row: float(row.get("y") or 0))
+    box = top.get("boxMm") or [0, 0, 0, 0]
+    render = str(top.get("render") or "")
+    check(
+        "catch-top-church-complete",
+        top.get("ok") is True
+        and render == "GREATER HARVEST FAMILY CHURCH"
+        and float(top.get("ssim") or 0) >= 0.85
+        and top.get("whiteBlock") is False
+        and top.get("clipped") is False
+        and render.endswith("CHURCH"),
+        str(top)[:500],
+    )
+    os.makedirs(os.path.join(ART, "catch_fire"), exist_ok=True)
+    doc = fitz.open(press_path)
+    page = doc[0]
+    pix = page.get_pixmap(matrix=fitz.Matrix(600.0 / 72.0, 600.0 / 72.0), alpha=False)
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    doc.close()
+    bleed = int(round(5.0 / 25.4 * 600.0))
+    trim = rgb[bleed:rgb.shape[0] - bleed, bleed:rgb.shape[1] - bleed]
+    ppm = 600.0 / 25.4
+    pad_x = int(round(2.0 * ppm))
+    pad_y = int(round(3.5 * ppm))
+    x0 = max(0, int(np.floor(float(box[0]) * ppm)) - pad_x)
+    y0 = max(0, int(np.floor(float(box[1]) * ppm)) - pad_y)
+    x1 = min(trim.shape[1], int(np.ceil((float(box[0]) + float(box[2])) * ppm)) + pad_x)
+    y1 = min(trim.shape[0], int(np.ceil((float(box[1]) + float(box[3])) * ppm)) + pad_y)
+    crop = trim[y0:y1, x0:x1]
+    Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "church_600.png"), dpi=(600, 600))
+    print(f"CHURCH CROP {crop.shape[1]}x{crop.shape[0]} boxMm {box} render {render!r}")
+    lines = ["ok mode ssim white clip y text => render"]
+    for row in sorted(gate, key=lambda item: (float(item.get("y") or 0), str(item.get("text") or ""))):
+        lines.append(
+            f"{'OK' if row.get('ok') else 'FAIL'} {row.get('mode')} "
+            f"ssim={float(row.get('ssim') or 0):.3f} white={bool(row.get('whiteBlock'))} "
+            f"clip={bool(row.get('clipped'))} y={float(row.get('y') or 0):.4f} "
+            f"{row.get('text')!r} => {row.get('render')!r}"
+        )
+    table = "\n".join(lines) + "\n"
+    with open(os.path.join(ART, "catch_fire", "gate_table.txt"), "w", encoding="utf-8") as handle:
+        handle.write(table)
+    print(table)
+
+
 def test_large_block_join_is_soft() -> None:
     """A tall extension meets the picture without a hard line or a pale row.
 
@@ -752,12 +806,15 @@ def test_catch_fire_raster_is_traced() -> None:
         hit = [row for row in gate if row.get("text") == phrase]
         check(
             "catch-line-" + phrase[:16],
-            bool(hit) and all(row.get("ok") and phrase in str(row.get("render") or "") for row in hit),
-            str(hit)[:300],
+            bool(hit) and all(
+                row.get("ok") and str(row.get("render") or "") == phrase for row in hit
+            ),
+            str(hit)[:400],
         )
     wrong = [row for row in gate if str(row.get("render") or "") in {"8AM", "BANDILE", "CHURC"}]
     check("catch-no-wrong-character", not wrong, str(wrong)[:300])
     _save_poster_join(result["pressPath"], picture_path=src)
+    _save_church_line(result["pressPath"], gate)
 
 
 def main() -> None:

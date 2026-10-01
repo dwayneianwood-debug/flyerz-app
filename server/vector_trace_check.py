@@ -14,6 +14,7 @@ import vector_trace
 from vector_text_v2 import font_substitution_enabled, rebuild_fitted
 from vector_trace import (
     choke_ink,
+    drop_solid_blobs,
     glyphs_agree,
     ink_colour,
     is_lettering,
@@ -25,6 +26,11 @@ from vector_trace import (
     sharpen_background,
     trace_fitted,
     trace_mask,
+    _edge_clipped,
+    _novel_white_block,
+    _readings_for_boxes,
+    _ssim_luma,
+    _texts_equal,
     _trace_fill,
 )
 
@@ -229,6 +235,69 @@ def test_closed_counter_stays_raster() -> None:
     check("fragment-outside", "fragment" in outside or "background" in outside, outside)
 
 
+def test_solid_logo_is_not_traced() -> None:
+    """A tall solid mark in a text line is the flame beside CHURCH, not a letter."""
+    mask = np.zeros((90, 420), np.uint8)
+    for x in range(8, 280, 26):
+        mask[30:58, x:x + 14] = 255
+    mask[4:86, 340:400] = 255
+    cleaned = drop_solid_blobs(mask)
+    check("logo-dropped", int(cleaned[:, 340:400].max()) == 0, str(int(cleaned[:, 340:400].sum())))
+    check("letters-kept", int(cleaned[:, :280].sum()) == int(mask[:, :280].sum()))
+    even = np.zeros((40, 200), np.uint8)
+    for x in range(4, 180, 20):
+        even[8:32, x:x + 12] = 255
+    check("even-letters-kept", np.array_equal(drop_solid_blobs(even), even))
+
+    crop = np.full((90, 420, 3), 28, np.uint8)
+    crop[mask > 0] = (250, 250, 250)
+    reason = shape_gate(crop, mask, mask, (0, 0, 420, 90))
+    check("solid-block-rejected", "solid block" in reason, reason)
+    letters = mask.copy()
+    letters[:, 320:] = 0
+    check("letters-pass-shape", shape_gate(crop, letters, letters, (0, 0, 320, 90)) == "")
+
+
+def test_gate_is_exact_and_sees_a_white_block() -> None:
+    """CHURC is not CHURCH. A new white rectangle is a failed box. A halo is not."""
+    full = "GREATER HARVEST FAMILY CHURCH"
+    check("exact-church", _texts_equal(full, "GREATER  HARVEST\tFAMILY CHURCH"))
+    check("exact-rejects-churc", _texts_equal(full, "GREATER HARVEST FAMILY CHURC") is False)
+    check("exact-rejects-substring", _texts_equal("CHURCH", full) is False)
+    check("exact-rejects-blank", _texts_equal(full, "") is False and _texts_equal("", full) is False)
+
+    source = np.full((70, 280, 3), 36, np.uint8)
+    source[20:50, 16:36] = 248
+    source[20:50, 48:78] = 248
+    render = source.copy()
+    render[8:62, 200:258] = 255
+    check("white-block", _novel_white_block(source, render) is True)
+    check("white-clean", _novel_white_block(source, source.copy()) is False)
+    halo = source.copy()
+    halo[18:52, 14:38] = 255
+    check("white-halo-ok", _novel_white_block(source, halo) is False, "a fatter letter is not a block")
+    check("ssim-same", _ssim_luma(source, source.copy()) >= 0.99)
+    check("ssim-block", _ssim_luma(source, render) < 0.99)
+    clipped = source.copy()
+    clipped[18:52, 0:8] = 250
+    check("edge-clipped", _edge_clipped(source, clipped) is True)
+    check("edge-clean", _edge_clipped(source, source.copy()) is False)
+    split = _readings_for_boxes(
+        ["OCT", "OCT"],
+        [(0, 0, 20, 10), (12, 0, 32, 10)],
+        [{"text": "OCT OCT", "bbox": [0, 0, 1, 1]}],
+        32, 10,
+    )
+    check("oct-split", split == ["OCT", "OCT"], str(split))
+    swapped = _readings_for_boxes(
+        ["9AM"],
+        [(0, 0, 30, 12)],
+        [{"text": "8AM", "bbox": [0, 0, 1, 1]}],
+        30, 12,
+    )
+    check("nine-not-eight", swapped == ["8AM"] and swapped[0] != "9AM", str(swapped))
+
+
 def test_glyphs_reject_a_changed_letter() -> None:
     mask = np.zeros((40, 80), np.uint8)
     mask[8:32, 6:18] = 255
@@ -338,6 +407,8 @@ def main() -> None:
     test_default_trace_and_font_flag()
     test_rebuild_defaults_to_trace()
     test_closed_counter_stays_raster()
+    test_solid_logo_is_not_traced()
+    test_gate_is_exact_and_sees_a_white_block()
     test_glyphs_reject_a_changed_letter()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()
