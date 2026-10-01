@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""Trace the original lettering into vector paths.
+
+The picture is enlarged and left as it is. Each text box is split into ink
+and paper, the ink mask is traced with potrace, and those paths are filled
+in the same place with the sampled ink colour. Nothing is retyped. A box
+whose trace does not match the ink (IoU under 0.9) stays as pixels.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import tempfile
+import time
+
+import cv2
+import numpy as np
+
+TRACE_SCALE = 4
+# Specks smaller than this, on the 4× bitmap, are not letters.
+TURDSIZE = 12
+# Corner threshold. 1.0 keeps type corners without rounding them off.
+ALPHAMAX = 1.0
+# Curve optimisation. Potrace's opticurve stays on; this is its tolerance.
+OPTTOLERANCE = 0.2
+IOU_FLOOR = 0.9
+CHOKE_PX = 1
+PAD_FRAC = 0.14
+
+_NUM = r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"
+_TOKEN = re.compile(rf"[MmLlHhVvCcZz]|{_NUM}")
+
+
+def segment_ink(roi: np.ndarray):
+    """Split a text crop into an ink mask and the stroke-core colour.
+
+    Distance from the local paper is thresholded with Otsu, so light type on
+    a dark ground is ink as well as dark type on a light ground. A flat crop,
+    an empty crop, or a crop that is mostly one solid fill is not text.
+    """
+    if roi is None or roi.ndim != 3 or roi.shape[0] < 6 or roi.shape[1] < 6:
+        return None, None
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    height, width = lab.shape[:2]
+    band = max(2, min(6, min(height, width) // 8))
+    ring = np.zeros((height, width), np.bool_)
+    ring[:band, :] = True
+    ring[-band:, :] = True
+    ring[:, :band] = True
+    ring[:, -band:] = True
+    if int(ring.sum()) < 8:
+        return None, None
+    paper = np.median(lab[ring], axis=0)
+    distance = np.linalg.norm(lab - paper, axis=2)
+    sample = np.clip(distance, 0, 255).astype(np.uint8)
+    if float(sample.std()) < 4.0:
+        return None, None
+    _threshold, binary = cv2.threshold(sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink = binary > 0
+    # Otsu can pick the paper when the letters fill the crop. The ring is paper.
+    if float(ink[ring].mean()) > 0.5:
+        ink = ~ink
+    fraction = float(ink.mean())
+    if fraction < 0.012 or fraction > 0.62:
+        return None, None
+    mask = ink.astype(np.uint8) * 255
+    core_distance = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    peak = float(core_distance.max()) if core_distance.size else 0.0
+    if peak < 0.5:
+        return None, None
+    # A solid fill is thick. Letter strokes are thin next to the crop.
+    short = float(min(height, width))
+    if peak >= 0.22 * short and fraction > 0.28:
+        return None, None
+    colour = ink_colour(roi, mask)
+    if colour is None:
+        return None, None
+    return mask, colour
+
+
+def ink_colour(roi: np.ndarray, mask: np.ndarray):
+    """Median colour of the stroke cores. See refine_ink."""
+    refined, colour = refine_ink(roi, mask)
+    if colour is None and refined is not None:
+        return np.median(roi[refined > 0], axis=0).astype(np.float32)
+    return colour
+
+
+def refine_ink(roi: np.ndarray, mask: np.ndarray):
+    """Drop pale blotches and return the letter strokes with their core colour.
+
+    A thick shadow can be larger than the letters and would tint the sample.
+    The stroke colour is the component furthest from the local paper. Other
+    components are kept only when they are on that same side of the paper.
+    """
+    if roi is None or mask is None or int(mask.max()) == 0:
+        return None, None
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    band = max(2, min(6, min(height, width) // 8))
+    ring = np.zeros((height, width), np.bool_)
+    ring[:band, :] = True
+    ring[-band:, :] = True
+    ring[:, :band] = True
+    ring[:, -band:] = True
+    if int(ring.sum()) < 8:
+        return None, None
+    paper = float(np.median(gray[ring]))
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    found = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 4:
+            continue
+        component = labels == index
+        local = distance * component
+        peak = float(local.max()) if local.size else 0.0
+        core = local >= max(0.8, peak * 0.45)
+        if int(core.sum()) < 3:
+            core = component
+        tone = float(np.median(gray[core]))
+        found.append((index, area, tone, core))
+    if not found:
+        return None, None
+    furthest = max(found, key=lambda item: abs(item[2] - paper))
+    span = abs(furthest[2] - paper)
+    if span < 12.0:
+        return None, None
+    dark = furthest[2] < paper
+    if dark:
+        limit = paper - 0.62 * span
+        kept = [item for item in found if item[2] <= limit]
+    else:
+        limit = paper + 0.62 * span
+        kept = [item for item in found if item[2] >= limit]
+    if not kept:
+        kept = [furthest]
+    cleaned = np.zeros((height, width), np.uint8)
+    samples = []
+    for index, _area, _tone, core in kept:
+        cleaned[labels == index] = 255
+        samples.append(roi[core])
+    if int(cleaned.max()) == 0 or not samples:
+        return None, None
+    colour = np.median(np.concatenate(samples, axis=0), axis=0).astype(np.float32)
+    return cleaned, colour
+
+
+def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
+    """Keep strokes that belong to this box. Padding must not pull in the next line."""
+    if mask is None or int(mask.max()) == 0:
+        return None
+    height, width = mask.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in inner]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(width, x1), min(height, y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return mask
+    count, labels = cv2.connectedComponents((mask > 0).astype(np.uint8), 8)
+    zone = np.zeros((height, width), np.uint8)
+    zone[y0:y1, x0:x1] = 1
+    keep = np.zeros((height, width), np.uint8)
+    for index in range(1, count):
+        component = labels == index
+        area = int(component.sum())
+        if area < 2:
+            continue
+        inside = int(np.count_nonzero(component & (zone > 0)))
+        if inside >= max(4, int(0.40 * area)):
+            keep[component] = 255
+    if int(keep.max()) == 0:
+        return None
+    return keep
+
+
+def mask_iou(left: np.ndarray, right: np.ndarray) -> float:
+    """Intersection over union of two ink masks."""
+    a = left > 0
+    b = right > 0
+    union = int(np.count_nonzero(a | b))
+    if union == 0:
+        return 1.0
+    return float(np.count_nonzero(a & b)) / float(union)
+
+
+def choke_ink(plate: np.ndarray, mask: np.ndarray, pixels: int = CHOKE_PX) -> None:
+    """Pull the raster ink in by ``pixels`` so its soft edge does not show past the vector.
+
+    Only that ring changes. The stroke core and the rest of the picture stay.
+    """
+    if pixels <= 0 or mask is None or int(mask.max()) == 0:
+        return
+    kernel = np.ones((pixels * 2 + 1, pixels * 2 + 1), np.uint8)
+    eroded = cv2.erode((mask > 0).astype(np.uint8) * 255, kernel)
+    ring = ((mask > 0) & (eroded == 0)).astype(np.uint8) * 255
+    if int(ring.max()) == 0:
+        return
+    plate[:] = cv2.inpaint(plate, ring, max(1, pixels), cv2.INPAINT_TELEA)
+
+
+def is_lettering(text: str) -> bool:
+    """Icons and ornaments are not traced. Words, figures and badge numbers are."""
+    return re.search(r"[0-9A-Za-zÀ-ÿ]", str(text or "")) is not None
+
+
+def trace_mask(mask: np.ndarray) -> list:
+    """Bezier subpaths in the mask's own pixel space. Empty when potrace finds nothing."""
+    if mask is None or int(mask.max()) == 0:
+        return []
+    height, width = mask.shape[:2]
+    big = cv2.resize(mask, (width * TRACE_SCALE, height * TRACE_SCALE), interpolation=cv2.INTER_CUBIC)
+    _thr, binary = cv2.threshold(big, 127, 255, cv2.THRESH_BINARY)
+    svg = _potrace_svg(binary)
+    if not svg:
+        return []
+    transform = _svg_transform(svg, binary.shape[0])
+    paths = []
+    for raw in re.findall(r'<path\b[^>]*\bd="([^"]+)"', svg, flags=re.I | re.S):
+        subpaths = _parse_path(raw, transform)
+        # The 4× bitmap is scaled back to the crop.
+        scaled = []
+        for sub in subpaths:
+            scaled.append([(cmd, [(x / TRACE_SCALE, y / TRACE_SCALE) for x, y in pts]) for cmd, pts in sub])
+        if scaled:
+            paths.append(scaled)
+    return paths
+
+
+def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
+    """Fill the traced paths onto a binary mask the size of the crop."""
+    import pymupdf as fitz
+
+    canvas = np.zeros((max(1, height), max(1, width)), np.uint8)
+    if not paths:
+        return canvas
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=max(1, width), height=max(1, height))
+        _paint_paths(page, paths, (0.0, 0.0, 0.0, 1.0), 1.0, 1.0, 0.0, 0.0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csGRAY)
+        gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    finally:
+        doc.close()
+    fitted = gray
+    if fitted.shape[0] != height or fitted.shape[1] != width:
+        fitted = cv2.resize(fitted, (width, height), interpolation=cv2.INTER_AREA)
+    canvas[fitted < 200] = 255
+    return canvas
+
+
+def trace_fitted(
+    bgr: np.ndarray,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    output_pdf: str,
+    bleed_mm: float = 5.0,
+    progress=None,
+    blocks: list | None = None,
+) -> dict:
+    """Enlarge the picture and trace its lettering. Never raises."""
+    from vector_text_v2 import _fail, _note
+
+    started = time.perf_counter()
+    try:
+        return _trace(
+            bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
+            float(bleed_mm), progress, blocks, started,
+        )
+    except Exception as exc:
+        return _fail(started, f"Vector trace failed ({str(exc)[:160]}). The original lettering was kept.")
+
+
+def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started) -> dict:
+    from vector_plate import place_plate
+    from vector_text_v2 import MIN_PPI, _note, _rect, read_blocks
+
+    _note(progress, "reading", "Reading the lettering.")
+    ocr_started = time.perf_counter()
+    if blocks is None:
+        blocks = read_blocks(bgr)
+    ocr_s = time.perf_counter() - ocr_started
+    guide = []
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        if not is_lettering(block.get("text") or ""):
+            continue
+        rx, ry, rw, rh = _rect(block, bgr.shape[1], bgr.shape[0])
+        guide.append((rx, ry, rx + rw, ry + rh))
+    if not guide:
+        from vector_text_v2 import _fail
+        return _fail(started, "No lettering was found to trace, so the original picture was kept.")
+
+    _note(progress, "enlarging", "Enlarging the picture.")
+    enlarge_started = time.perf_counter()
+    placed = place_plate(bgr, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+    plate = placed["image"].copy()
+    enlarge_s = time.perf_counter() - enlarge_started
+    provider = placed["provider"]
+
+    _note(progress, "tracing", "Tracing the lettering.")
+    trace_started = time.perf_counter()
+    drawn = []
+    raster_lines = []
+    choke = np.zeros(plate.shape[:2], np.uint8)
+    height, width = plate.shape[:2]
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        text = str(block.get("text") or "")
+        if not is_lettering(text):
+            raster_lines.append(_line(text, "raster", "An icon was left in the picture."))
+            continue
+        raw = _rect(block, bgr.shape[1], bgr.shape[0])
+        rect = _padded(raw, bgr.shape[1], bgr.shape[0])
+        left, top, right, bottom = _mapped_bounds(placed["map"], rect, width, height)
+        inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
+        if right - left < 4 or bottom - top < 4:
+            raster_lines.append(_line(text, "raster", "The box was too small to trace."))
+            continue
+        crop = plate[top:bottom, left:right]
+        mask, colour = segment_ink(crop)
+        if mask is None:
+            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            continue
+        mask = ink_touching(mask, (
+            inner_left - left, inner_top - top, inner_right - left, inner_bottom - top,
+        ))
+        if mask is None:
+            raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
+            continue
+        mask, colour = refine_ink(crop, mask)
+        if mask is None or colour is None:
+            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            continue
+        paths = trace_mask(mask)
+        if not paths:
+            raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
+            continue
+        painted = rasterise_paths(paths, mask.shape[1], mask.shape[0])
+        score = mask_iou(mask, painted)
+        if score < IOU_FLOOR:
+            raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
+            continue
+        fill = _trace_fill(colour)
+        drawn.append({
+            "text": text,
+            "paths": paths,
+            "fill": fill,
+            "origin": (left, top),
+            "iou": round(score, 3),
+            "rect": (left, top, right - left, bottom - top),
+        })
+        choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
+    if int(choke.max()) > 0:
+        choke_ink(plate, choke, CHOKE_PX)
+    trace_s = time.perf_counter() - trace_started
+    if not drawn and not raster_lines:
+        from vector_text_v2 import _fail
+        return _fail(started, "No lettering was traced, so the original picture was kept.", provider=provider)
+
+    qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed)
+    if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
+        from vector_text_v2 import _discard, _fail
+        _discard(output_pdf)
+        reason = "The traced press file failed the check, so the original lettering was kept."
+        if not qa.get("cmyk"):
+            reason = "The press file was not CMYK, so the original lettering was kept."
+        elif not qa.get("boxes"):
+            reason = "The trim box was wrong, so the original lettering was kept."
+        elif not qa.get("ppi"):
+            reason = "The picture was under 400 PPI, so the original lettering was kept."
+        return _fail(started, reason, provider=provider, qa=qa)
+
+    vector_lines = []
+    for item in drawn:
+        vector_lines.append({
+            "text": item["text"],
+            "mode": "vector",
+            "font": "",
+            "reason": "",
+            "match": item["iou"],
+            "pt": _points(item["rect"][3], placed.get("ppi") or MIN_PPI),
+        })
+    amber = bool(raster_lines)
+    reason = ""
+    if amber:
+        reason = "Some lettering stayed in the picture because its trace did not match. Glance at it before printing."
+    decisions = [
+        f"The lettering was traced as vector shapes ({len(vector_lines)} boxes).",
+        "The original letters were not removed. A 1px edge under each trace was pulled in.",
+        f"The picture was enlarged with {provider}.",
+        "The press file is CMYK at 400 PPI or more, with the trim 5 mm inside the bleed.",
+    ]
+    if reason:
+        decisions.append(reason)
+    timings = {
+        "ocr_s": round(ocr_s, 3),
+        "enlarge_s": round(enlarge_s, 3),
+        "trace_s": round(trace_s, 3),
+        "total_s": round(time.perf_counter() - started, 3),
+    }
+    return {
+        "ok": True,
+        "amber": amber,
+        "reason": reason,
+        "decisions": decisions,
+        "elapsed_s": timings["total_s"],
+        "timings": timings,
+        "lines": vector_lines + raster_lines,
+        "qa": qa,
+        "provider": provider,
+        "pdf": output_pdf,
+        "vector_lines": len(vector_lines),
+        "raster_lines": len(raster_lines),
+        "mode": "trace",
+    }
+
+
+def _mapped_bounds(mapper, rect, width, height):
+    x0, y0 = mapper(rect[0], rect[1])
+    x1, y1 = mapper(rect[0] + rect[2], rect[1] + rect[3])
+    left, top = int(np.floor(min(x0, x1))), int(np.floor(min(y0, y1)))
+    right, bottom = int(np.ceil(max(x0, x1))), int(np.ceil(max(y0, y1)))
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(width, right), min(height, bottom)
+    return left, top, right, bottom
+
+
+def _padded(rect, width, height):
+    x, y, bw, bh = rect
+    pad = max(2, int(round(bh * PAD_FRAC)))
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(width, x + bw + pad)
+    y1 = min(height, y + bh + pad)
+    return x0, y0, max(2, x1 - x0), max(2, y1 - y0)
+
+
+def _trace_fill(colour: np.ndarray):
+    """CMYK for a stroke. Near-black type is 100% K so it does not print as a grey mix."""
+    from vector_text_v2 import _cmyk
+
+    red = float(colour[2]) / 255.0
+    green = float(colour[1]) / 255.0
+    blue = float(colour[0]) / 255.0
+    lum = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    chroma = max(red, green, blue) - min(red, green, blue)
+    if lum < 0.08 and chroma < 0.06:
+        return (0.0, 0.0, 0.0, 1.0)
+    return _cmyk((red, green, blue))
+
+
+def _line(text: str, mode: str, reason: str) -> dict:
+    return {"text": text, "mode": mode, "font": "", "reason": reason, "match": None, "pt": 0}
+
+
+def _points(height_px: int, ppi: int) -> float:
+    if ppi <= 0:
+        return 0.0
+    return round(float(height_px) / float(ppi) * 72.0, 2)
+
+
+def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> dict:
+    import io
+
+    import pymupdf as fitz
+    from PIL import Image, ImageCms
+
+    from vector_text_v2 import MIN_PPI, MM_TO_PT, _press_cmyk, _set_boxes
+
+    qa = {"wrote": False, "cmyk": False, "boxes": False, "ppi": False, "fonts": True, "reason": ""}
+    os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
+    rgb = cv2.cvtColor(plate, cv2.COLOR_BGR2RGB)
+    cmyk = ImageCms.applyTransform(Image.fromarray(rgb), _press_cmyk())
+    buffer = io.BytesIO()
+    cmyk.save(buffer, format="TIFF", dpi=(MIN_PPI, MIN_PPI))
+    width_pt = (trim_w + 2 * bleed_mm) * MM_TO_PT
+    height_pt = (trim_h + 2 * bleed_mm) * MM_TO_PT
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=width_pt, height=height_pt)
+        page.insert_image(page.rect, stream=buffer.getvalue())
+        img_h, img_w = plate.shape[:2]
+        sx = page.rect.width / float(img_w)
+        sy = page.rect.height / float(img_h)
+        for item in drawn:
+            _paint_paths(page, item["paths"], item["fill"], sx, sy, item["origin"][0], item["origin"][1])
+        _set_boxes(page, trim_w, trim_h, bleed_mm)
+        doc.save(output_pdf, deflate=True, garbage=4)
+        qa["wrote"] = True
+    finally:
+        doc.close()
+    _inspect_plate(output_pdf, trim_w, trim_h, bleed_mm, qa)
+    qa["traced"] = len(drawn)
+    return qa
+
+
+def _paint_paths(page, paths, fill, sx, sy, origin_x, origin_y) -> None:
+    import pymupdf as fitz
+
+    shape = page.new_shape()
+    used = False
+    for group in paths:
+        for sub in group:
+            cursor = None
+            start = None
+            for cmd, pts in sub:
+                if cmd == "M" and pts:
+                    cursor = pts[0]
+                    start = pts[0]
+                    continue
+                if cmd == "L" and pts and cursor is not None:
+                    end = pts[0]
+                    shape.draw_line(_pt(cursor, sx, sy, origin_x, origin_y), _pt(end, sx, sy, origin_x, origin_y))
+                    cursor = end
+                    used = True
+                    continue
+                if cmd == "C" and len(pts) == 3 and cursor is not None:
+                    shape.draw_bezier(
+                        _pt(cursor, sx, sy, origin_x, origin_y),
+                        _pt(pts[0], sx, sy, origin_x, origin_y),
+                        _pt(pts[1], sx, sy, origin_x, origin_y),
+                        _pt(pts[2], sx, sy, origin_x, origin_y),
+                    )
+                    cursor = pts[2]
+                    used = True
+                    continue
+                if cmd == "Z" and cursor is not None and start is not None:
+                    shape.draw_line(_pt(cursor, sx, sy, origin_x, origin_y), _pt(start, sx, sy, origin_x, origin_y))
+                    cursor = start
+                    used = True
+    if not used:
+        return
+    shape.finish(color=None, fill=tuple(fill), width=0, even_odd=True, closePath=False)
+    shape.commit()
+
+
+def _pt(point, sx, sy, origin_x, origin_y):
+    import pymupdf as fitz
+
+    return fitz.Point((origin_x + point[0]) * sx, (origin_y + point[1]) * sy)
+
+
+def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
+    import pymupdf as fitz
+
+    from vector_text_v2 import MIN_PPI
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        media = page.mediabox
+        trim = page.trimbox
+        bleed = page.bleedbox
+        inset_x = trim.x0 * 25.4 / 72.0
+        inset_y = trim.y0 * 25.4 / 72.0
+        qa["boxes"] = (
+            abs(inset_x - bleed_mm) < 0.45
+            and abs(inset_y - bleed_mm) < 0.45
+            and abs(trim.width * 25.4 / 72.0 - trim_w) < 0.6
+            and abs(trim.height * 25.4 / 72.0 - trim_h) < 0.6
+            and abs(bleed.width - media.width) < 1.5
+            and abs(bleed.height - media.height) < 1.5
+        )
+        images = page.get_images()
+        qa["image_count"] = len(images)
+        if images:
+            info = doc.extract_image(images[0][0])
+            qa["cmyk"] = info.get("colorspace") == 4 or "CMYK" in str(info.get("cs-name", ""))
+            width_in = media.width / 72.0
+            height_in = media.height / 72.0
+            ppi_x = info.get("width", 0) / width_in if width_in else 0
+            ppi_y = info.get("height", 0) / height_in if height_in else 0
+            qa["ppi_x"] = round(ppi_x, 1)
+            qa["ppi_y"] = round(ppi_y, 1)
+            qa["ppi"] = ppi_x >= MIN_PPI - 1 and ppi_y >= MIN_PPI - 1
+        else:
+            qa["cmyk"] = False
+            qa["ppi"] = False
+    finally:
+        doc.close()
+
+
+def _potrace_svg(binary: np.ndarray) -> str:
+    height, width = binary.shape[:2]
+    handle = tempfile.NamedTemporaryFile(prefix="trace-", suffix=".pbm", delete=False)
+    path = handle.name
+    try:
+        bits = (binary > 127).astype(np.uint8)
+        pad = (8 - (width % 8)) % 8
+        if pad:
+            bits = np.pad(bits, ((0, 0), (0, pad)))
+        packed = np.packbits(bits, axis=1)
+        handle.write(f"P4\n{width} {height}\n".encode())
+        handle.write(packed.tobytes())
+        handle.close()
+        # Potrace traces black. PBM 1-bits are black, and those are our ink pixels.
+        result = subprocess.run(
+            [
+                "potrace", "-s", "--flat",
+                "-t", str(TURDSIZE),
+                "-a", str(ALPHAMAX),
+                "-O", str(OPTTOLERANCE),
+                "-u", "10",
+                "-o", "-",
+                path,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=20,
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _svg_transform(svg: str, height: int):
+    found = re.search(
+        r"translate\(\s*(" + _NUM + r")\s*,\s*(" + _NUM + r")\s*\)\s*scale\(\s*(" + _NUM + r")\s*,\s*(" + _NUM + r")\s*\)",
+        svg,
+    )
+    if not found:
+        return 0.0, float(height), 1.0, -1.0
+    return tuple(float(found.group(index)) for index in range(1, 5))
+
+
+def _parse_path(raw: str, transform) -> list:
+    tokens = _TOKEN.findall(raw.replace(",", " "))
+    tx, ty, sx, sy = transform
+
+    def apply(x, y):
+        return tx + sx * x, ty + sy * y
+
+    subpaths = []
+    current = []
+    cursor = (0.0, 0.0)
+    start = (0.0, 0.0)
+    command = ""
+    index = 0
+
+    def numbers(count):
+        nonlocal index
+        values = []
+        for _ in range(count):
+            if index >= len(tokens) or tokens[index].isalpha():
+                return None
+            values.append(float(tokens[index]))
+            index += 1
+        return values
+
+    while index < len(tokens):
+        token = tokens[index]
+        if token.isalpha():
+            command = token
+            index += 1
+        elif not command:
+            break
+        relative = command.islower() and command.lower() != "z"
+        kind = command.lower()
+        if kind == "z":
+            if current:
+                current.append(("Z", []))
+                subpaths.append(current)
+            current = []
+            cursor = start
+            continue
+        if kind == "m":
+            pair = numbers(2)
+            if pair is None:
+                break
+            x, y = pair
+            if relative:
+                x, y = cursor[0] + x, cursor[1] + y
+            if current:
+                subpaths.append(current)
+            cursor = (x, y)
+            start = cursor
+            current = [("M", [apply(x, y)])]
+            # Further pairs are implicit lineto.
+            command = "l" if command == "m" else "L"
+            continue
+        if kind == "l":
+            pair = numbers(2)
+            if pair is None:
+                break
+            x, y = pair
+            if relative:
+                x, y = cursor[0] + x, cursor[1] + y
+            cursor = (x, y)
+            current.append(("L", [apply(x, y)]))
+            continue
+        if kind == "c":
+            values = numbers(6)
+            if values is None:
+                break
+            if relative:
+                values = [
+                    cursor[0] + values[0], cursor[1] + values[1],
+                    cursor[0] + values[2], cursor[1] + values[3],
+                    cursor[0] + values[4], cursor[1] + values[5],
+                ]
+            points = [apply(values[0], values[1]), apply(values[2], values[3]), apply(values[4], values[5])]
+            cursor = (values[4], values[5])
+            current.append(("C", points))
+            continue
+        if kind in ("h", "v"):
+            value = numbers(1)
+            if value is None:
+                break
+            x, y = cursor
+            if kind == "h":
+                x = cursor[0] + value[0] if relative else value[0]
+            else:
+                y = cursor[1] + value[0] if relative else value[0]
+            cursor = (x, y)
+            current.append(("L", [apply(x, y)]))
+            continue
+        break
+    if current:
+        subpaths.append(current)
+    return subpaths

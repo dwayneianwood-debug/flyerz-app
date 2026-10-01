@@ -103,6 +103,12 @@ def vector_rebuild_enabled() -> bool:
     return raw not in ("0", "off", "false", "no")
 
 
+def font_substitution_enabled() -> bool:
+    """Font substitution is opt-in. Tracing the original ink is the default."""
+    raw = os.environ.get("VECTOR_FONTS", "0").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
 def rebuild_fitted(
     bgr: np.ndarray,
     trim_w_mm: float,
@@ -114,11 +120,21 @@ def rebuild_fitted(
     reocr: Optional[Callable[[str], str]] = None,
     recall_floor: float = RECALL_FLOOR,
 ) -> dict:
-    """Build a vector-text press PDF. Never raises. ok False means fall back."""
+    """Build a vector press PDF. Never raises. ok False means fall back.
+
+    The default traces the original ink. Set VECTOR_FONTS=1 to set new type instead.
+    """
     started = time.perf_counter()
     if not vector_rebuild_enabled():
         return _fail(started, "Vector type is switched off, so the original lettering was kept.")
     try:
+        if not font_substitution_enabled():
+            from vector_trace import trace_fitted
+
+            return trace_fitted(
+                bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
+                float(bleed_mm), progress, blocks,
+            )
         return _rebuild(
             bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
             float(bleed_mm), progress, blocks, reocr, float(recall_floor), started,

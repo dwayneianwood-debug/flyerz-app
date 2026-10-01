@@ -1050,6 +1050,8 @@ def _render(path: str, dest: str) -> None:
 
 
 def main() -> None:
+    # Font substitution is opt-in. These checks cover that path.
+    os.environ["VECTOR_FONTS"] = "1"
     test_faces_and_leashes()
     test_width_fit()
     test_script_stays_raster()
@@ -1087,6 +1089,7 @@ def main() -> None:
     test_body_stroke_and_press_black()
     test_real_ocr_is_quick()
     test_medella_matches_approved_text()
+    os.environ.pop("VECTOR_FONTS", None)
     print("ALL PASS")
 
 

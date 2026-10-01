@@ -653,7 +653,12 @@ def make_print_ready(
                         "decisions": [],
                     }
                 else:
-                    decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
+                    from vector_text_v2 import font_substitution_enabled
+
+                    if font_substitution_enabled():
+                        decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
+                    else:
+                        decisions.append("This looks like AI-generated artwork. The lettering is traced as vector shapes.")
                     try:
                         from vector_text_v2 import rebuild_fitted
 
@@ -669,7 +674,10 @@ def make_print_ready(
                         }
                 if vector_built.get("ok"):
                     work_path = os.path.join(output_dir, "press.pdf")
-                    lettering_note = "The lettering was set as vector type."
+                    if vector_built.get("mode") == "trace":
+                        lettering_note = "The lettering was traced as vector shapes."
+                    else:
+                        lettering_note = "The lettering was set as vector type."
                     aspect_extended = False
                     decisions = [line for line in decisions if "gap was filled" not in line]
                     decisions.append(
