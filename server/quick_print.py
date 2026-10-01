@@ -365,6 +365,15 @@ def _scrub_marks(band):
         )
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     short = min(work.shape[:2])
+    # Compact panels and lettering. A full-height colour bar is wider than this and stays.
+    object_px = int(max(31, min(short * 0.36, 201)))
+    if object_px % 2 == 0:
+        object_px += 1
+    object_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (object_px, object_px))
+    opened = cv2.morphologyEx(work, cv2.MORPH_OPEN, object_kernel)
+    closed = cv2.morphologyEx(work, cv2.MORPH_CLOSE, object_kernel)
+    background = (opened.astype(np.float32) + closed.astype(np.float32)) * 0.5
+    object_delta = np.max(np.abs(work.astype(np.float32) - background), axis=2)
     kernel_px = int(max(9, min(31, round(short * 0.04))))
     if kernel_px % 2 == 0:
         kernel_px += 1
@@ -372,7 +381,7 @@ def _scrub_marks(band):
     black = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
     white = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
     marks = np.zeros(gray.shape, np.uint8)
-    marks[(black > 20) | (white > 20)] = 255
+    marks[(black > 20) | (white > 20) | (object_delta > 22)] = 255
     column_frac = (marks > 0).mean(axis=0)
     marks[:, column_frac > 0.65] = 0
     if int(marks.max()) == 0:
