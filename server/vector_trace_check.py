@@ -720,7 +720,13 @@ def test_descenders_and_counters() -> None:
     split[48:66, 14:22] = 255
     kept = ink_touching(split, (4, 8, 36, 44))
     check("tail-kept", kept is not None and int(kept[48:66, 14:22].max()) == 255)
-    check("tail-joined", kept is not None and int(kept[40:48, 14:22].max()) == 255)
+    # Eight pixels of paper is the next line, not a broken join.
+    check("paper-gap-not-bridged", kept is not None and int(kept[40:48, 14:22].max()) == 0)
+    crack = np.zeros((70, 40), np.uint8)
+    crack[12:40, 8:28] = 255
+    crack[42:60, 14:22] = 255
+    joined = ink_touching(crack, (4, 8, 36, 44))
+    check("tail-joined", joined is not None and int(joined[40:42, 14:22].max()) == 255)
 
     # The tail is its own stroke. The short body must not be read as clipped.
     sibling = clipped.copy()
@@ -747,6 +753,32 @@ def test_descenders_and_counters() -> None:
     filled = np.zeros((60, 50), np.uint8)
     filled[8:52, 8:40] = 255
     check("gray-gap-passes", _topology_fails(gap, filled, 400) is False)
+
+
+def test_a_traced_line_does_not_enter_the_next_line() -> None:
+    """A stroke on the next line's paper is new ink. The letter's own edge is not."""
+    from vector_trace import _drop_other_lines, _new_ink_in_band
+
+    mask = np.zeros((80, 60), np.uint8)
+    mask[10:40, 8:14] = 255
+    mask[36:70, 8:11] = 255
+    cores = [(4, 8, 50, 36), (4, 52, 50, 20)]
+    cleared = _drop_other_lines(mask.copy(), 0, 0, 0, cores)
+    check("descender-stops-at-next-box", cleared is not None and int(cleared[52:, 8:11].max()) == 0)
+    check("descender-above-the-box-stays", cleared is not None and int(cleared[40, 10]) == 255)
+
+    source = np.full((40, 80, 3), (236, 232, 226), np.uint8)
+    source[18:36, 8:70] = (24, 22, 20)
+    # The path covers the letters, plus a 3px stem dropped through the gap above them.
+    painted = np.zeros((50, 80), np.uint8)
+    painted[8:36, 8:70] = 255
+    painted[0:22, 20:23] = 255
+    area = _new_ink_in_band(painted, (0, 0), source, (0, 0, 80, 40))
+    check("stem-on-the-next-line", area >= 12, str(area))
+    flush = np.zeros((40, 80), np.uint8)
+    flush[16:36, 6:72] = 255
+    edge = _new_ink_in_band(flush, (0, 0), source, (0, 0, 80, 40))
+    check("edge-on-the-letters", edge < 12, str(edge))
 
 
 def test_a_wide_swash_is_not_traced() -> None:
@@ -1235,7 +1267,6 @@ def _check_card_back_raster(side: dict) -> None:
         return
     if ident[0].get("mode") == "raster":
         check("by-identifying-y-matches", True)
-        return
     from vector_plate import place_plate
     from vector_text_v2 import MIN_PPI, _rect, read_blocks
 
@@ -1267,6 +1298,15 @@ def _check_card_back_raster(side: dict) -> None:
     left, top, right, bottom = _mapped_bounds(placed["map"], raw, clean.shape[1], clean.shape[0])
     source = clean[top:bottom, left:right]
     painted = render[top:bottom, left:right]
+    # The line above used to drop a stem onto these letters. New ink in the
+    # gap above them is that stem. The letters' own hard edge is not.
+    band = max(4, source.shape[0] // 3)
+    src_ink = source[:band] < 160
+    near = cv2.dilate(src_ink.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    stray = (painted[:band] < 150) & ~near
+    check("by-identifying-no-new-stem", int(np.count_nonzero(stray)) < 12, str(int(np.count_nonzero(stray))))
+    if ident[0].get("mode") == "raster":
+        return
     _thr, source_bin = cv2.threshold(source, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     _thr, paint_bin = cv2.threshold(painted, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     count, _labels, stats, _cent = cv2.connectedComponentsWithStats(source_bin, 8)
@@ -1612,6 +1652,7 @@ def main() -> None:
     test_gate_is_exact_and_sees_a_white_block()
     test_merged_or_split_glyphs_fail()
     test_descenders_and_counters()
+    test_a_traced_line_does_not_enter_the_next_line()
     test_a_wide_swash_is_not_traced()
     test_swash_bars_are_not_exempt()
     test_glyphs_reject_a_changed_letter()

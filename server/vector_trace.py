@@ -670,11 +670,12 @@ def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
 
 
 def _join_descenders(mask: np.ndarray, inner: tuple) -> np.ndarray:
-    """Bridge a thin gap between a letter and the tail under it.
+    """Bridge a one-pixel crack between a letter and the tail under it.
 
-    Upscale and the threshold open a one-pixel join, so the tail is traced as
-    a floating speck. The bridge is two pixels wide, only where the tail
-    already sits under that letter.
+    Upscale and the threshold open that crack, so the tail is traced as a
+    floating speck. The bridge is two pixels wide, only where the tail already
+    sits under that letter. A longer gap is paper, or the next line: filling
+    it draws a stroke the picture does not have.
     """
     height, width = mask.shape[:2]
     _x0, _y0, _x1, y1 = [int(v) for v in inner]
@@ -701,7 +702,8 @@ def _join_descenders(mask: np.ndarray, inner: tuple) -> np.ndarray:
             if int(stats[upper, cv2.CC_STAT_AREA]) < la:
                 continue
             gap = ly - (uy + uh)
-            if gap < 1 or gap > max(4, int(round(0.30 * max(uh, 1)))):
+            # Two pixels is the opened join. Anything longer reaches past the ink.
+            if gap < 1 or gap > 2:
                 continue
             overlap = min(lx + lw, ux + uw) - max(lx, ux)
             if overlap < max(2, int(round(0.35 * lw))):
@@ -2049,6 +2051,97 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
     return kept
 
 
+def _drop_other_lines(mask: np.ndarray | None, left: int, top: int, owner: int, cores: list) -> np.ndarray | None:
+    """Take this line's ink back out of every other line's box.
+
+    A descender that only hangs in the gap stays. Ink inside the next line
+    is that line's, and tracing it draws over those letters.
+    """
+    if mask is None or int(np.max(mask)) == 0 or not cores:
+        return mask
+    height, width = mask.shape[:2]
+    for index, core in enumerate(cores):
+        if index == owner:
+            continue
+        cx, cy, cw, ch = [int(v) for v in core]
+        if cw < 2 or ch < 2:
+            continue
+        x0 = max(0, cx - int(left))
+        y0 = max(0, cy - int(top))
+        x1 = min(width, cx + cw - int(left))
+        y1 = min(height, cy + ch - int(top))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        mask[y0:y1, x0:x1] = 0
+    if int(mask.max()) == 0:
+        return None
+    return mask
+
+
+def _new_ink_in_band(painted: np.ndarray, origin, source_bgr: np.ndarray, band) -> int:
+    """Largest blob of this line's paths that the source does not show inside ``band``.
+
+    The band is another line's own box. A curve that sits on that line's ink
+    is the shared edge. A stroke on the paper there is new, and it prints on
+    top of the letters.
+    """
+    if painted is None or source_bgr is None or origin is None or band is None:
+        return 0
+    if getattr(painted, "size", 0) == 0 or source_bgr.ndim != 3:
+        return 0
+    left, top = int(origin[0]), int(origin[1])
+    nx, ny, nw, nh = [int(v) for v in band]
+    x0 = max(left, nx)
+    y0 = max(top, ny)
+    x1 = min(left + painted.shape[1], nx + nw)
+    y1 = min(top + painted.shape[0], ny + nh)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return 0
+    path = painted[y0 - top:y1 - top, x0 - left:x1 - left] > 0
+    if not bool(path.any()):
+        return 0
+    found = _paper_ink(cv2.cvtColor(source_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY))
+    if found is None:
+        stray = path
+    else:
+        # Two pixels of curve past the soft edge is still that letter.
+        # A stem dropped onto the next line is not.
+        near = cv2.dilate(found[0].astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        stray = path & ~near
+    if not bool(stray.any()):
+        return 0
+    _count, _labels, stats, _cent = cv2.connectedComponentsWithStats(stray.astype(np.uint8), 8)
+    largest = 0
+    for index in range(1, _count):
+        largest = max(largest, int(stats[index, cv2.CC_STAT_AREA]))
+    return largest
+
+
+def _flag_neighbour_ink(report, drawn, source_bgr) -> None:
+    """Send back a traced line whose paths add ink inside another line's box."""
+    if source_bgr is None or not report:
+        return
+    bands = [row.get("_core") for row in report if row.get("_core") is not None]
+    for row in report:
+        if not row.get("_vector") or row.get("_revert"):
+            continue
+        item = next(
+            (candidate for candidate in drawn if _rects_match(candidate.get("rect"), row.get("_rect"))),
+            None,
+        )
+        if item is None:
+            continue
+        own = row.get("_core")
+        for band in bands:
+            if band is own:
+                continue
+            # A speck on the shared edge is the curve. A stroke is the defect.
+            if _new_ink_in_band(item.get("painted"), item.get("origin"), source_bgr, band) >= 12:
+                row["glyphFail"] = True
+                row["_invadeFail"] = True
+                break
+
+
 def _separate_line(job: dict) -> dict:
     """Ink for one line. The plate is only read, so lines run together across cores."""
     plate = job["plate"]
@@ -2102,6 +2195,10 @@ def _separate_line(job: dict) -> dict:
     # out, leaves bars, and the source-ink fringe would hide those bars
     # from the page guard.
     mask = _strip_flourish(mask)
+    # This line's paths are this line's ink. The next line's box stays out of the trace.
+    mask = _drop_other_lines(mask, left, top, owner, plate_cores)
+    if mask is None:
+        return reject("The ink sat outside this box, so it stayed in the picture.")
     return {"pending": {
         "text": text,
         "mask": mask,
@@ -4180,6 +4277,9 @@ def _apply_text_gate(
             row["_glyphOcr"] = True
         if judged.get("lineOnly"):
             row["_lineOnly"] = True
+    # A path that draws ink the picture does not have inside the next line
+    # goes back. The victim line is left as it was. This does not need a read.
+    _flag_neighbour_ink(report, by_rect, base)
     # A line the mask already accepted does not need a second read. Copying
     # the source text keeps the letter check honest. Only a rejected line is
     # read back, so the gate can say what the vector actually showed.
@@ -4190,7 +4290,7 @@ def _apply_text_gate(
     quiet = []
     for row in vector_slots:
         low_ssim = float(row["ssim"]) < SSIM_FLOOR
-        if row.get("_lineOnly") or row.get("_strokeFail"):
+        if row.get("_lineOnly") or row.get("_strokeFail") or row.get("_invadeFail"):
             quiet.append(row)
         elif row["glyphFail"] or row["_pixelFail"] or low_ssim:
             rejected.append(row)
@@ -4319,7 +4419,9 @@ def _apply_text_gate(
                 kept.append(item)
                 continue
             _restore_glyphs(plate, pristine, item)
-            if row.get("mismatch") or row.get("glyphFail"):
+            if row.get("_invadeFail"):
+                why = "The trace crossed into the next line, so this line stayed in the picture."
+            elif row.get("mismatch") or row.get("glyphFail"):
                 why = "The render did not read back as this line, so the line stayed in the picture."
             elif row.get("_pixelFail"):
                 why = "The render covered or clipped this line, so the line stayed in the picture."
@@ -4365,7 +4467,7 @@ def _apply_text_gate(
         item.pop("_ink", None)
         item.pop("core", None)
     for row in report:
-        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_smallText", "_glyphOcr"):
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_invadeFail", "_smallText", "_glyphOcr"):
             row.pop(key, None)
     return report, kept, qa, source_guard
 
