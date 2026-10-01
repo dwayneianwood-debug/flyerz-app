@@ -34,12 +34,16 @@ QA_LONG_EDGE = 1100
 MATCH_FLOOR = 0.18
 SCRIPT_OCR_FLOOR = 0.75
 RECALL_FLOOR = 0.60
+# A caps line under this size may stay as pixels. Larger headings are set in
+# Cinzel, using Regular and a paper-coloured stroke when SemiBold is too heavy.
+CAPS_INK_FLOOR_PT = 8.0
 OCR_CACHE = os.environ.get("VECTOR_OCR_CACHE", "/tmp/flyerz-ocr-cache")
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "v2")
 
 # key, filename, role. Roles pick the shortlist and the tracking limit.
 FONTS = (
+    ("cinzel-400", "Cinzel-400.ttf", "spaced"),
     ("cinzel-500", "Cinzel-500.ttf", "spaced"),
     ("cinzel-600", "Cinzel-600.ttf", "spaced"),
     ("cinzel-700", "Cinzel-700.ttf", "spaced"),
@@ -162,7 +166,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         ordinary.append(block)
     chosen = []
     for block in ordinary:
-        decision = _choose_font(bgr, block, style)
+        decision = _choose_font(bgr, block, style, trim_h)
         if decision.get("mode") == "vector":
             chosen.append(decision)
         else:
@@ -291,6 +295,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     ]
     if raster_lines:
         decisions.append(reason)
+    _stamp_points(list(chosen) + list(raster_lines), bgr, trim_h)
     timings = {
         "ocr_s": round(ocr_s, 3),
         "enlarge_s": round(enlarge_s, 3),
@@ -494,14 +499,25 @@ def _ocr_crops(frame, lines, img_w, img_h, sx, sy, scale_x, scale_y) -> list:
 
 
 def _public_line(line: dict) -> dict:
-    return {
+    payload = {
         "text": line.get("text") or "",
         "mode": line.get("mode") or "",
         "font": line.get("font") or "",
         "role": line.get("role") or "",
         "match": line.get("match"),
         "reason": line.get("reason") or "",
+        "pt": line.get("pt") or 0,
     }
+    if line.get("knockout"):
+        payload["knockout"] = line.get("knockout")
+    return payload
+
+
+def _stamp_points(lines: list, bgr: np.ndarray, trim_h_mm: float) -> None:
+    for line in lines:
+        if line.get("pt"):
+            continue
+        line["pt"] = round(_line_points(bgr, line, trim_h_mm), 2)
 
 
 def _line_record(block: dict, mode: str, reason: str) -> dict:
@@ -1057,7 +1073,7 @@ def _tagline_hint(text: str) -> bool:
     return any(low.startswith(cue) for cue in cues)
 
 
-def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
+def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif", trim_h_mm: float | None = None) -> dict:
     text = str(block.get("text") or "").strip()
     rect = _rect(block, bgr.shape[1], bgr.shape[0])
     crop = _safe_crop(bgr, rect)
@@ -1074,20 +1090,22 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         "rect": rect,
         "color": block.get("color_hex") or "#222222",
         "quad": block.get("quad"),
+        "pt": round(_line_points(bgr, block, trim_h_mm), 2),
+        "knockout": 0.0,
     }
     ink = _ink_mask(crop, record["color"]) if crop is not None else None
     if _is_numeral(text) or rescued == "numeral":
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="numeral", match=0.5)
-        return _decorate(record, bgr, block, ink)
+        return _decorate(record, bgr, block, ink, trim_h_mm)
     if _is_email(text):
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="phone", match=0.8)
-        return _decorate(record, bgr, block, ink)
+        return _decorate(record, bgr, block, ink, trim_h_mm)
     if _is_phone(text) or rescued == "phone":
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="phone", match=0.5)
-        return _decorate(record, bgr, block, ink)
+        return _decorate(record, bgr, block, ink, trim_h_mm)
     try:
         ocr_score = float(block.get("score") or 0)
     except (TypeError, ValueError):
@@ -1103,7 +1121,7 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         # A confident read of a script tagline is set in Parisienne. A weak read stays ink.
         if _tagline_hint(text) and ocr_score >= 0.9:
             record.update(mode="vector", font="parisienne", role="script", match=0.12)
-            return _decorate(record, bgr, block, ink)
+            return _decorate(record, bgr, block, ink, trim_h_mm)
         record["reason"] = "This looked like script, so it stayed in the picture."
         return record
     confident = ocr_score >= 0.8 or rescued in ("name", "phone", "letters")
@@ -1122,14 +1140,52 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         return record
     record["mode"] = "vector"
     record["font"] = key
-    return _decorate(record, bgr, block, ink)
+    return _decorate(record, bgr, block, ink, trim_h_mm)
 
 
-def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarray]) -> dict:
+def _line_points(bgr: np.ndarray, block: dict, trim_h_mm: float | None) -> float:
+    """The line's height on the trim, in points. Zero when the page size is unknown."""
+    height = max(1, int(bgr.shape[0]))
+    box = block.get("bbox") or [0, 0, 0.1, 0.05]
+    try:
+        pixels = max(1.0, float(box[3]) * height)
+    except (TypeError, ValueError):
+        return 0.0
+    if not trim_h_mm:
+        return 0.0
+    return pixels * (float(trim_h_mm) / float(height)) * (72.0 / 25.4)
+
+
+def _sample_bg(bgr: np.ndarray, block: dict) -> str:
+    """The paper colour just outside this line, used to thin a face that is still too heavy."""
+    height, width = bgr.shape[:2]
+    x, y, bw, bh = _rect(block, width, height)
+    pad = max(3, int(round(min(bw, bh) * 0.45)))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(width, x + bw + pad), min(height, y + bh + pad)
+    parts = []
+    if y0 < y:
+        parts.append(bgr[y0:y, x0:x1].reshape(-1, bgr.shape[2]))
+    if y + bh < y1:
+        parts.append(bgr[y + bh:y1, x0:x1].reshape(-1, bgr.shape[2]))
+    if x0 < x:
+        parts.append(bgr[y:y + bh, x0:x].reshape(-1, bgr.shape[2]))
+    if x + bw < x1:
+        parts.append(bgr[y:y + bh, x + bw:x1].reshape(-1, bgr.shape[2]))
+    parts = [part for part in parts if part.size]
+    if not parts:
+        return "#f4f1e4"
+    edge = np.concatenate(parts, axis=0)
+    blue, green, red = [int(v) for v in np.median(edge, axis=0)[:3]]
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarray], trim_h_mm: float | None = None) -> dict:
     """Word gaps, letter-spacing, and a stroke matched to this line's own ink."""
     record["gaps"] = []
     record["track"] = 0.0
     record["stroke"] = 0.0
+    record["pt"] = round(_line_points(bgr, block, trim_h_mm), 2)
     if record.get("mode") != "vector":
         return record
     from ai_rebuild import measure_rhythm
@@ -1140,14 +1196,15 @@ def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarr
     key = str(record.get("font") or "")
     red, green, blue = _hex_rgb(record.get("color") or "#222222")
     light_ink = 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72
-    # Cinzel SemiBold is heavier than most dark caps. Use the lighter cut when
-    # it is close, and leave the original pixels when even that cut is heavy.
+    # Cinzel SemiBold is heavier than most dark caps. Step down to Medium, then
+    # Regular. A heading that is still heavy is thinned with a paper stroke.
     # Light lettering on a dark ground is left to the face: its mask is the edge.
     if key == "cinzel-600" and ink is not None and record.get("role") == "caps" and not light_ink:
-        key = _lighter_caps(record, ink) or ""
+        key = _lighter_caps(record, bgr, block, ink, trim_h_mm) or ""
         if record.get("mode") != "vector" or not key:
             return record
-    if light_ink:
+    if light_ink or record.get("knockout"):
+        record["stroke"] = 0.0
         return record
     if ink is not None and key:
         record["stroke"] = _match_stroke(ink, str(record.get("text") or ""), key)
@@ -2060,9 +2117,15 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
     for index, ch in enumerate(text):
         writer.append((cursor, baseline), ch, font=font, fontsize=size)
         cursor += advances[index] if index < len(advances) else font.text_length(ch, fontsize=size)
-    stroke = _stroke_for(line, size, role)
-    writer.write_text(page, color=colour, render_mode=2 if stroke else 0)
-    if stroke:
+    try:
+        knock = max(0.0, float(line.get("knockout") or 0.0))
+    except (TypeError, ValueError):
+        knock = 0.0
+    stroke = 0.0 if knock else _stroke_for(line, size, role)
+    writer.write_text(page, color=colour, render_mode=2 if (stroke or knock) else 0)
+    if knock:
+        _apply_knockout(page, size, knock, str(line.get("bg") or "#f4f1e4"))
+    elif stroke:
         _restroke(page, size, stroke)
 
 
@@ -2152,27 +2215,74 @@ def _stroke_of(line: dict) -> float:
         return 0.0
 
 
-def _lighter_caps(record: dict, ink: np.ndarray) -> str:
-    """Return the caps face that is not heavier than this ink, or raster the line."""
+def _lighter_caps(record: dict, bgr: np.ndarray, block: dict, ink: np.ndarray, trim_h_mm: float | None) -> str:
+    """The heaviest Cinzel that is not heavier than this ink.
+
+    Comparison is at least 72 px tall, so hinting does not hide Regular from Medium.
+    A heading that is still heavy stays in Cinzel Regular with a thin paper stroke.
+    Only a line under about 8 pt falls back to the original pixels.
+    """
     text = str(record.get("text") or "")
-    height = max(int(ink.shape[0]), 28)
-    width = max(int(ink.shape[1]), 80)
+    native_h = max(int(ink.shape[0]), 8)
+    native_w = max(int(ink.shape[1]), 24)
+    scale = max(1.0, 72.0 / float(native_h))
+    if native_w * scale > 2200:
+        scale = 2200.0 / float(native_w)
+    height = max(48, int(round(native_h * scale)))
+    width = max(80, int(round(native_w * scale)))
     ink_stroke = _rel_stroke(ink)
-    semi = _render_ink(text, _FONT_FILES.get("cinzel-600") or "", width, height, "spaced")
-    if semi is None or _rel_stroke(semi) <= ink_stroke + 0.03:
-        return "cinzel-600"
-    light = _render_ink(text, _FONT_FILES.get("cinzel-500") or "", width, height, "spaced")
-    # The mask of a real Cinzel line reads a little lighter than a fresh render.
-    # A larger gap means even the lighter cut is heavier than the ink.
-    if light is not None and _rel_stroke(light) <= ink_stroke + 0.05:
-        record["font"] = "cinzel-500"
+    deltas = {}
+    for key in ("cinzel-600", "cinzel-500", "cinzel-400"):
+        rendered = _render_ink(text, _FONT_FILES.get(key) or "", width, height, "spaced")
+        if rendered is None:
+            continue
+        deltas[key] = _rel_stroke(rendered) - ink_stroke
+    # A fresh render reads slightly heavier than the scanned ink. More than
+    # about one percent is a heavier cut, so the next lighter face is used.
+    for key in ("cinzel-600", "cinzel-500", "cinzel-400"):
+        if key in deltas and deltas[key] <= 0.01:
+            record["font"] = key
+            record["knockout"] = 0.0
+            if key != "cinzel-600":
+                record["face_lock"] = True
+            return key
+    pt = float(record.get("pt") or 0.0)
+    if not pt:
+        pt = _line_points(bgr, block, trim_h_mm)
+        record["pt"] = round(pt, 2)
+    # An unknown page size is treated as a heading, so a direct check does not
+    # raster large type just because the trim was not passed in.
+    if pt == 0 or pt >= CAPS_INK_FLOOR_PT:
+        delta = float(deltas.get("cinzel-400", 0.08))
+        bg = _sample_bg(bgr, block)
+        record["font"] = "cinzel-400"
         record["face_lock"] = True
-        return "cinzel-500"
+        record["bg"] = bg
+        record["knockout"] = _paper_knock(delta, str(record.get("color") or "#222222"), bg)
+        record["stroke"] = 0.0
+        return "cinzel-400"
     record["mode"] = "raster"
     record["font"] = ""
     record["face_lock"] = True
-    record["reason"] = "The caps face was heavier than this line, so it stayed in the picture."
+    record["knockout"] = 0.0
+    record["reason"] = (
+        f"This caps line is {pt:.1f} pt and the lightest face was still heavier, so it stayed in the picture."
+    )
     return ""
+
+
+def _paper_knock(delta: float, text_hex: str, bg_hex: str) -> float:
+    """A small stroke in the paper colour. Zero when the paper matches the ink."""
+    text_l = _luminance(text_hex)
+    paper_l = _luminance(bg_hex)
+    if abs(text_l - paper_l) < 0.18:
+        return 0.0
+    return round(min(0.05, max(0.0, (float(delta) - 0.02) * 0.55)), 4)
+
+
+def _luminance(value: str) -> float:
+    red, green, blue = _hex_rgb(value)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
 
 
 def _stroke_for(line: dict, size: float, role: str) -> float:
@@ -2203,6 +2313,37 @@ def _restroke(page, size: float, factor: float) -> None:
     width = f"{float(size) * float(factor):.4g}"
     updated, count = re.subn(r"(?m)^([0-9]*\.?[0-9]+) w$", width + " w", text, count=1)
     if count:
+        doc.update_stream(xref, updated.encode("latin1"))
+
+
+def _apply_knockout(page, size: float, factor: float, bg_hex: str) -> None:
+    """Replace the stroke on the text just written with a thin outline in the paper colour.
+
+    The fill stays the ink colour. Render mode 2 paints that stroke over the
+    glyph edge, so the face reads lighter without a second text object.
+    """
+    doc = page.parent
+    xrefs = page.get_contents()
+    if not xrefs:
+        return
+    xref = xrefs[-1]
+    raw = doc.xref_stream(xref)
+    if not raw:
+        return
+    text = raw.decode("latin1")
+    cyan, magenta, yellow, black = _cmyk(_hex_rgb(bg_hex))
+    stroke_colour = f"{cyan:.4g} {magenta:.4g} {yellow:.4g} {black:.4g} K"
+    updated, count = re.subn(
+        r"(?m)^([0-9]*\.?[0-9]+(?:\s+[0-9]*\.?[0-9]+){3}) K$",
+        stroke_colour,
+        text,
+        count=1,
+    )
+    if not count:
+        return
+    width = f"{float(size) * float(factor):.4g}"
+    updated, width_count = re.subn(r"(?m)^([0-9]*\.?[0-9]+) w$", width + " w", updated, count=1)
+    if width_count:
         doc.update_stream(xref, updated.encode("latin1"))
 
 

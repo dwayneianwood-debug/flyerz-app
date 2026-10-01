@@ -229,8 +229,8 @@ def test_serif_page_is_consistent() -> None:
     check("detox-not-script-face", detox.get("font") not in SCRIPT_KEYS, str(detox))
     caps_line = next(line for line in result.get("lines") or [] if line["text"] == "SEE BEYOND")
     check(
-        "caps-are-cinzel-or-ink",
-        caps_line.get("mode") == "raster" or caps_line.get("font") in ("cinzel-500", "cinzel-600"),
+        "caps-are-cinzel",
+        caps_line.get("mode") == "vector" and caps_line.get("font") in ("cinzel-400", "cinzel-500", "cinzel-600"),
         str(caps_line),
     )
     phone = next(line for line in result.get("lines") or [] if "073" in line["text"])
@@ -566,6 +566,35 @@ def test_a_poor_body_match_stays_ink() -> None:
     )
 
 
+def test_flyer_headings_are_cinzel() -> None:
+    """The headings the designer set in Cinzel stay vector, including Regular."""
+    from ai_rebuild import _text_hex
+    from vector_text_v2 import _choose_font
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    bgr = cv2.imread(os.path.join(root, "tests/fixtures/medella/flyer_front.png"))
+    check("flyer-heading-source", bgr is not None, "flyer_front.png")
+    height, width = bgr.shape[:2]
+    boxes = {
+        "SEE BEYOND": (521.9, 43.4, 813.7, 89.8),
+        "OUR APPROACH": (397.0, 884.9, 572.2, 908.1),
+        "BOOK YOUR": (759.6, 943.0, 893.0, 966.2),
+    }
+    for text, (x0, y0, x1, y1) in boxes.items():
+        colour = _text_hex(bgr, int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+        decision = _choose_font(bgr, {
+            "text": text,
+            "bbox": [x0 / width, y0 / height, (x1 - x0) / width, (y1 - y0) / height],
+            "score": 0.99,
+            "color_hex": colour,
+        }, "serif", 210)
+        check(
+            f"heading-vector-{text.split()[0].lower()}",
+            decision.get("mode") == "vector" and str(decision.get("font") or "").startswith("cinzel") and float(decision.get("pt") or 0) >= 8,
+            f"{decision.get('mode')} {decision.get('font')} {decision.get('pt')} {decision.get('reason')}",
+        )
+
+
 def test_small_script_gets_an_outline() -> None:
     from vector_text_v2 import _stroke_for
 
@@ -577,28 +606,68 @@ def test_small_script_gets_an_outline() -> None:
 
 
 def test_heavy_caps_face_stays_ink() -> None:
-    """A caps line lighter than both Cinzel cuts stays in the picture."""
-    from vector_text_v2 import _choose_font
+    """A large hairline heading is Cinzel Regular with a paper stroke. Under 8 pt it stays ink."""
+    from vector_text_v2 import _choose_font, _draw_line
 
-    image = Image.new("RGB", (860, 90), (246, 241, 228))
+    image = Image.new("RGB", (860, 180), (246, 241, 228))
     draw = ImageDraw.Draw(image)
     cursor = 24
     for word in ("SEE", "BEYOND"):
-        for ch in word:
-            draw.line((cursor, 58, cursor, 28), fill=(90, 96, 82), width=1)
-            cursor += 18
-        cursor += 36
+        for _ch in word:
+            draw.line((cursor, 120, cursor, 40), fill=(90, 96, 82), width=1)
+            cursor += 28
+        cursor += 48
     bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     decision = _choose_font(bgr, {
         "text": "SEE BEYOND",
-        "bbox": [0.02, 0.15, 0.9, 0.6],
+        "bbox": [0.02, 0.12, 0.9, 0.55],
         "score": 0.98,
         "color_hex": "#5a6052",
-    }, "serif")
+    }, "serif", 210)
+    knock = float(decision.get("knockout") or 0)
     check(
-        "hairline-caps-stay-ink",
-        decision.get("mode") == "raster" and not decision.get("font"),
-        f"{decision.get('mode')} {decision.get('font')}",
+        "hairline-heading-is-regular",
+        decision.get("mode") == "vector" and decision.get("font") == "cinzel-400" and decision.get("pt", 0) >= 8,
+        f"{decision.get('mode')} {decision.get('font')} {decision.get('pt')} {decision.get('reason')}",
+    )
+    check("hairline-heading-knockout", 0 < knock <= 0.05, f"{knock}")
+    import pymupdf as fitz
+    doc = fitz.open()
+    page = doc.new_page(width=420, height=140)
+    drawn = dict(decision)
+    drawn["media_box"] = (12, 24, 380, 90)
+    _draw_line(page, drawn, 1.0, 1.0)
+    raw = doc.xref_stream(page.get_contents()[-1]).decode("latin1")
+    doc.close()
+    stroke = re.search(r"(?m)^([0-9.]+(?:\s+[0-9.]+){3}) K$", raw)
+    fill = re.search(r"(?m)^([0-9.]+(?:\s+[0-9.]+){3}) k$", raw)
+    width = re.search(r"(?m)^([0-9.]+) w$", raw)
+    size = re.search(r"/F\d+ ([0-9.]+) Tf", raw)
+    check("knockout-stroke-is-paper", bool(stroke and fill) and stroke.group(1) != fill.group(1), raw[:240])
+    check(
+        "knockout-width",
+        bool(width and size) and float(width.group(1)) <= float(size.group(1)) * 0.05 + 0.05,
+        raw[:240],
+    )
+
+    tiny = Image.new("RGB", (1800, 4000), (246, 241, 228))
+    pen = ImageDraw.Draw(tiny)
+    left = 80
+    for word in ("SEE", "BEYOND"):
+        for _ch in word:
+            pen.line((left, 1644, left, 1604), fill=(90, 96, 82), width=1)
+            left += 22
+        left += 40
+    small = _choose_font(cv2.cvtColor(np.array(tiny), cv2.COLOR_RGB2BGR), {
+        "text": "SEE BEYOND",
+        "bbox": [0.02, 0.40, 0.55, 0.012],
+        "score": 0.98,
+        "color_hex": "#5a6052",
+    }, "serif", 210)
+    check(
+        "tiny-caps-stay-ink",
+        small.get("mode") == "raster" and float(small.get("pt") or 99) < 8 and "heavier" in str(small.get("reason") or ""),
+        f"{small.get('mode')} {small.get('pt')} {small.get('reason')}",
     )
 
 
@@ -854,6 +923,7 @@ def main() -> None:
     test_spacing_assert_catches_a_joined_word()
     test_a_poor_body_match_stays_ink()
     test_heavy_caps_face_stays_ink()
+    test_flyer_headings_are_cinzel()
     test_small_script_gets_an_outline()
     test_stroke_follows_each_line()
     test_body_stroke_and_press_black()
