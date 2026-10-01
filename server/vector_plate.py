@@ -266,6 +266,7 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         media_h - paste_y - art_h,
         paste_x,
         media_w - paste_x - art_w,
+        px_per_mm=ppm,
     )
     if image.shape[0] != media_h or image.shape[1] != media_w:
         image = cv2.resize(image, (media_w, media_h), interpolation=cv2.INTER_LANCZOS4)

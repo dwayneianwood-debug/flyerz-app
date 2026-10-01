@@ -410,7 +410,12 @@ def test_extended_band_does_not_streak() -> None:
     _no_more_streak_than_the_edge("side-left", fitted[:, :side], portrait[:, :side], outward_axis=1)
     _no_more_streak_than_the_edge("side-right", fitted[:, -side:], portrait[:, -side:], outward_axis=1, seam_at_end=False)
     middle = fitted[:, side:side + portrait.shape[1]]
-    check("side-keeps-picture", middle.shape == portrait.shape and np.array_equal(middle, portrait))
+    # A tall side pad feathers a few millimetres into the picture. The interior stays exact.
+    inset = int(round(8.0 * fitted.shape[0] / 148.0))
+    check(
+        "side-keeps-picture",
+        middle.shape == portrait.shape and np.array_equal(middle[:, inset:-inset], portrait[:, inset:-inset]),
+    )
 
 
 def _orange(bgr: np.ndarray) -> np.ndarray:
@@ -551,7 +556,139 @@ def test_tall_extension_is_not_striped() -> None:
     check("old-rim-is-striped", vertical_streaks_dominate(old), "the thin rim should fail the stripe gate")
     fitted = _extend_vertical(picture, 600, 0)
     check("tall-not-striped", vertical_streaks_dominate(fitted[:600]) is False, "tall extension still has vertical streaks")
-    check("tall-keeps-picture", np.array_equal(fitted[600:], picture))
+    from quick_print import _join_overlap
+    overlap = _join_overlap(picture, 300.0 / 25.4)
+    check(
+        "tall-keeps-picture",
+        np.array_equal(fitted[600 + overlap + 2:], picture[overlap + 2:]),
+        f"overlap {overlap}",
+    )
+
+
+def _save_poster_join(press_path: str, picture_path: str) -> None:
+    """150 dpi trim, plus a 300 dpi strip centred on the extension join."""
+    import cv2
+    import pymupdf as fitz
+    from PIL import Image
+    from quick_print import SAFE_ZONE_MM, seam_metrics
+
+    picture = cv2.imread(picture_path)
+    trim_w, trim_h = 148.0, 210.0
+    width = picture.shape[1]
+    height = picture.shape[0]
+    canvas_w = int(round(width * trim_w / (trim_w - 2.0 * SAFE_ZONE_MM)))
+    canvas_h = int(round(canvas_w * trim_h / trim_w))
+    bottom = max(1, int(round(SAFE_ZONE_MM * canvas_w / trim_w)))
+    top = canvas_h - height - bottom
+    join_mm = top / float(canvas_h) * trim_h
+    os.makedirs(os.path.join(ART, "catch_fire"), exist_ok=True)
+
+    def render(dpi: float):
+        doc = fitz.open(press_path)
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0), alpha=False)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+        doc.close()
+        bleed_px = int(round(5.0 / 25.4 * dpi))
+        return rgb[bleed_px:rgb.shape[0] - bleed_px, bleed_px:rgb.shape[1] - bleed_px]
+
+    trim150 = render(150.0)
+    Image.fromarray(trim150).save(os.path.join(ART, "catch_fire", "trim_150.png"), dpi=(150, 150))
+    trim300 = render(300.0)
+    join_y = int(round(join_mm / 25.4 * 300.0))
+    half = int(round(20.0 / 25.4 * 300.0))
+    y0 = max(0, join_y - half)
+    y1 = min(trim300.shape[0], join_y + half)
+    crop = trim300[y0:y1]
+    Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "join_300.png"), dpi=(300, 300))
+    metrics = seam_metrics(cv2.cvtColor(trim300, cv2.COLOR_RGB2BGR), join_y, side="top", px_per_mm=300.0 / 25.4)
+    lines = [
+        f"join_mm {join_mm:.2f}",
+        f"crop_px {crop.shape[1]}x{crop.shape[0]}",
+        f"joinStep {metrics['joinStep']}",
+        f"artStep {metrics['artStep']}",
+        f"extStep {metrics['extStep']}",
+        f"stepLimit {metrics['stepLimit']}",
+        f"stepRatio {metrics['stepRatio']}",
+        f"bandDev {metrics['bandDev']}",
+        f"bandLimit {metrics['bandLimit']}",
+        f"ok {metrics['ok']}",
+    ]
+    with open(os.path.join(ART, "catch_fire", "seam_metrics.txt"), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("SEAM", " ".join(lines))
+    check("catch-rendered-seam", metrics["ok"] is True, str(metrics))
+
+
+def test_large_block_join_is_soft() -> None:
+    """A tall extension meets the picture without a hard line or a pale row.
+
+    The blur starts between sigma 2 and 4 and climbs over 15–20 mm. The blend
+    may enter the picture by about 7 mm, and it stops 2 mm short of lettering.
+    """
+    import cv2
+    from quick_print import (
+        SAFE_ZONE_MM,
+        TALL_BLUR_S0,
+        TALL_CLEAR_MM,
+        TALL_OVERLAP_MM,
+        TALL_RAMP_MM,
+        _extend_edges,
+        _extend_vertical,
+        _first_ink_row,
+        _join_overlap,
+        _layout_with_bar,
+        seam_metrics,
+    )
+
+    check("blur-starts-soft", 2.0 <= TALL_BLUR_S0 <= 4.0, str(TALL_BLUR_S0))
+    check("blur-ramps-over-15-20mm", 15.0 <= TALL_RAMP_MM <= 20.0, str(TALL_RAMP_MM))
+    check("overlap-is-6-8mm", 6.0 <= TALL_OVERLAP_MM <= 8.0, str(TALL_OVERLAP_MM))
+    check("text-clearance-is-2mm", abs(TALL_CLEAR_MM - 2.0) < 0.01, str(TALL_CLEAR_MM))
+
+    ruled = np.full((120, 160, 3), 30, np.uint8)
+    ruled[60] = 210
+    hard = seam_metrics(ruled, 60, side="top", px_per_mm=4.0)
+    check("hard-line-fails-seam", hard["ok"] is False and hard["okStep"] is False and hard["okBand"] is False, str(hard))
+
+    src = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "catch_fire", "src.jpg"))
+    picture = cv2.imread(src)
+    trim_w, trim_h = 148.0, 210.0
+    canvas_w = int(round(picture.shape[1] * trim_w / (trim_w - 2.0 * SAFE_ZONE_MM)))
+    ppm = canvas_w / trim_w
+    ink = _first_ink_row(picture, ppm)
+    overlap = _join_overlap(picture, ppm)
+    clear = int(round(TALL_CLEAR_MM * ppm))
+    check("poster-finds-title", ink is not None and 50 <= ink <= 90, str(ink))
+    check("poster-stops-short-of-title", overlap <= int(ink) - clear, f"overlap {overlap} ink {ink} clear {clear}")
+    fitted = _layout_with_bar(picture, trim_w, trim_h)
+    check("poster-laid-out", fitted is not None, "layout failed")
+    if fitted is None or ink is None:
+        return
+    top = fitted.shape[0] - picture.shape[0] - max(1, int(round(SAFE_ZONE_MM * canvas_w / trim_w)))
+    side = (fitted.shape[1] - picture.shape[1]) // 2
+    metrics = seam_metrics(fitted, top, side="top", px_per_mm=ppm)
+    check("poster-seam", metrics["ok"] is True, str(metrics))
+    art = fitted[top:top + picture.shape[0], side:side + picture.shape[1]]
+    check(
+        "poster-title-untouched",
+        np.array_equal(art[ink:, 24:-24], picture[ink:, 24:-24]),
+        f"ink row {ink}",
+    )
+
+    gradient = np.zeros((280, 200, 3), np.uint8)
+    for y in range(gradient.shape[0]):
+        gradient[y] = (30 + y // 4, 50, 90)
+    bar = gradient.copy()
+    bar[48:64] = (245, 245, 245)
+    below = _extend_vertical(bar, 0, 220, px_per_mm=10.0)
+    bottom = seam_metrics(below, bar.shape[0], side="bottom", px_per_mm=10.0)
+    check("bottom-seam", bottom["ok"] is True, str(bottom))
+    check("bottom-bar-untouched", np.array_equal(below[48:64], bar[48:64]))
+    sided = _extend_edges(gradient, 0, 0, 160, 160, px_per_mm=10.0)
+    left = seam_metrics(sided, 160, side="left", px_per_mm=10.0)
+    right = seam_metrics(sided, 160 + gradient.shape[1], side="right", px_per_mm=10.0)
+    check("side-seams", left["ok"] is True and right["ok"] is True, f"{left} {right}")
 
 
 def test_catch_fire_raster_is_traced() -> None:
@@ -618,6 +755,7 @@ def test_catch_fire_raster_is_traced() -> None:
         )
     wrong = [row for row in gate if str(row.get("render") or "") in {"8AM", "BANDILE", "CHURC"}]
     check("catch-no-wrong-character", not wrong, str(wrong)[:300])
+    _save_poster_join(result["pressPath"], picture_path=src)
 
 
 def main() -> None:
@@ -627,6 +765,7 @@ def main() -> None:
     test_touching_object_stays_reasonable_and_amber()
     test_bottom_bar_stays_at_the_bottom()
     test_tall_extension_is_not_striped()
+    test_large_block_join_is_soft()
     test_catch_fire_raster_is_traced()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
     try:

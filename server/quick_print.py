@@ -249,8 +249,13 @@ MIRROR_RIM_PX = 28
 # Pads shorter than this (the 5 mm bleed, the orange-disc test) keep the shallow rim.
 # A tall gap mirrors a block as tall as the gap. A 28px rim smears into stripes.
 TALL_PAD_PX = 120
-TALL_BLUR_S0 = 25.0
+# The blur at the join is a soft continuation, then it climbs over 15–20 mm.
+TALL_BLUR_S0 = 3.0
 TALL_BLUR_SMAX = 80.0
+TALL_RAMP_MM = 18.0
+# The blend steps into the picture, and stops 2 mm short of text or a logo.
+TALL_OVERLAP_MM = 7.0
+TALL_CLEAR_MM = 2.0
 # Lettering stays this far inside the trim when a short page is lengthened.
 SAFE_ZONE_MM = 4.0
 EDGE_LOWPASS_FRACTION = 0.04
@@ -341,11 +346,84 @@ def _progressive_blur(strip, smax: float, reach: float, s0: float = 0.0, strong:
     return out
 
 
-def _scrub_marks(band):
+def _mm_px(mm: float, px_per_mm: float, minimum: int = 1) -> int:
+    return max(int(minimum), int(round(float(mm) * float(px_per_mm))))
+
+
+def _smoothstep(t):
+    """Zero slope at both ends, so a blend does not leave a new edge."""
+    import numpy as np
+
+    x = np.clip(np.asarray(t, np.float32), 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _first_ink_row(art, px_per_mm: float, from_end: bool = False):
+    """Distance from this edge to the first text or logo line.
+
+    A photograph has edge energy on every row. Lettering is a step up from
+    the rows above it, held for about half a millimetre. None means this
+    edge has no such line inside the search.
+    """
+    import cv2
+    import numpy as np
+
+    if art is None or getattr(art, "size", 0) == 0 or art.shape[0] < 8:
+        return None
+    gray = cv2.cvtColor(art, cv2.COLOR_BGR2GRAY)
+    if from_end:
+        gray = gray[::-1]
+    plane = gray.astype(np.float32)
+    horizontal = np.abs(cv2.Sobel(plane, cv2.CV_32F, 1, 0, ksize=3)).mean(axis=1)
+    vertical = np.abs(cv2.Sobel(plane, cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
+    energy = np.maximum(horizontal, vertical)
+    sigma = max(0.8, 0.30 * float(px_per_mm))
+    smooth = cv2.GaussianBlur(energy.reshape(1, -1), (0, 0), sigma).ravel()
+    window = _mm_px(6.0, px_per_mm, 5)
+    need = _mm_px(0.45, px_per_mm, 2)
+    search = min(int(smooth.size), _mm_px(24.0, px_per_mm, need + window))
+    run = 0
+    for y in range(search):
+        lo = max(0, y - window)
+        if y - lo < max(4, window // 3):
+            run = 0
+            continue
+        bg = float(np.percentile(smooth[lo:y], 35))
+        if float(smooth[y]) > max(42.0, bg * 2.5) and float(smooth[y]) > bg + 18.0:
+            run += 1
+            if run >= need:
+                return int(y - need + 1)
+        else:
+            run = 0
+    return None
+
+
+def _join_overlap(art, px_per_mm: float, from_end: bool = False) -> int:
+    """How far the blend may enter the picture: 6–8 mm, but 2 mm clear of type."""
+    target = _mm_px(TALL_OVERLAP_MM, px_per_mm, 4)
+    clear = _mm_px(TALL_CLEAR_MM, px_per_mm, 2)
+    ink = _first_ink_row(art, px_per_mm, from_end=from_end)
+    if ink is None:
+        return min(target, max(0, int(art.shape[0]) // 6))
+    return max(0, min(target, int(ink) - clear))
+
+
+def _protect_rows(art, px_per_mm: float, from_end: bool = False) -> int:
+    """Edge rows kept out of the inpaint, so the join is not a filled grey line."""
+    ink = _first_ink_row(art, px_per_mm, from_end=from_end)
+    clear = _mm_px(TALL_CLEAR_MM, px_per_mm, 2)
+    if ink is None:
+        return min(clear * 2, max(0, int(art.shape[0]) // 6))
+    return max(0, min(int(art.shape[0]) - 1, int(ink) - 1))
+
+
+def _scrub_marks(band, protect_px: int = 0, protect_end: bool = False):
     """Inpaint lettering and logos on a copy used only to grow the page.
 
     The art itself is not changed. A flat field and a wide colour bar are left,
     because those are the colour the extension is supposed to continue.
+    `protect_px` rows against the picture stay real, so the fill cannot paint
+    a light line on the join.
     """
     import cv2
     import numpy as np
@@ -387,6 +465,15 @@ def _scrub_marks(band):
     if int(marks.max()) == 0:
         return band
     marks = cv2.dilate(marks, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    if protect_px > 0:
+        prot = max(1, int(round(float(protect_px) * scale)))
+        prot = min(prot, marks.shape[0] - 1)
+        if protect_end:
+            marks[-prot:] = 0
+        else:
+            marks[:prot] = 0
+    if int(marks.max()) == 0:
+        return band
     keep = (marks == 0).astype(np.float32)
     sigma = 18.0
     num = cv2.GaussianBlur(work.astype(np.float32) * keep[..., None], (0, 0), sigma)
@@ -417,25 +504,30 @@ def _feather_to_edge(pad, edge_row, at_end: bool, depth: int = 36):
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
-def _mirror_extend(band, pad: int, forward: bool, strong: bool = False):
+def _mirror_extend(band, pad: int, forward: bool, strong: bool = False, ramp_px: int | None = None, protect_px: int = 0):
     """Reflect the rim and blur it more the further it sits from the picture.
 
     A short pad reflects the outer 28px. A tall pad reflects a block as tall as
     the gap (tiled when the picture is shorter than the gap), with the lettering
-    painted out of that copy first. `band` row 0 is the edge when forward is false.
+    painted out of that copy first. The blur starts near sigma 3 on the join
+    and reaches its full width over about 18 mm. `band` row 0 is the edge when
+    forward is false.
     """
     import numpy as np
 
     width = int(band.shape[1])
     if pad <= 0:
         return np.zeros((0, width, 3), np.uint8)
-    source = _scrub_marks(band) if strong else band
+    if strong:
+        source = _scrub_marks(band, protect_px=protect_px, protect_end=forward)
+    else:
+        source = band
     work = np.ascontiguousarray(source.astype(np.float32))
     if not forward:
         work = work[::-1]
     reflected = _reflect_from_edge(work, pad)
     if strong:
-        reach = max(float(pad) * 0.70, 1.0)
+        reach = float(ramp_px if ramp_px else max(int(pad), 1))
         blurred = _progressive_blur(reflected, TALL_BLUR_SMAX, reach, s0=TALL_BLUR_S0, strong=True)
     else:
         reach = float(min(max(pad - 1, 1), 110))
@@ -444,9 +536,57 @@ def _mirror_extend(band, pad: int, forward: bool, strong: bool = False):
     out = np.clip(np.rint(blurred), 0, 255).astype(np.uint8)
     if not forward:
         out = out[::-1]
-    if strong:
-        edge_row = band[-1] if forward else band[0]
-        out = _feather_to_edge(out, edge_row, at_end=not forward, depth=36)
+    return out
+
+
+def _match_join_colour(pad, art, at_end: bool, depth: int):
+    """Per-column low-pass so the rows against the picture share its edge colour.
+
+    A filled mirror can leave one light row. The correction is full on the join
+    and fades, so it does not repaint the rest of the extension.
+    """
+    import numpy as np
+
+    rows = min(3, int(pad.shape[0]), int(art.shape[0]))
+    if rows < 1 or pad.shape[1] != art.shape[1]:
+        return pad
+    if at_end:
+        ext = pad[-rows:].astype(np.float32).mean(axis=0)
+        edge = art[:rows].astype(np.float32).mean(axis=0)
+    else:
+        ext = pad[:rows].astype(np.float32).mean(axis=0)
+        edge = art[-rows:].astype(np.float32).mean(axis=0)
+    delta = _lowpass_along(edge - ext, fraction=0.025)
+    out = pad.astype(np.float32)
+    depth = min(int(depth), int(out.shape[0]))
+    if depth < 1:
+        return pad
+    span = float(max(depth - 1, 1))
+    for dist in range(depth):
+        fade = float(1.0 - _smoothstep(dist / span))
+        y = (out.shape[0] - 1 - dist) if at_end else dist
+        out[y] = out[y] + delta * fade
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def _feather_into_art(pad, art, overlap: int, at_end: bool):
+    """Smoothstep the extension into the picture. The far end of the ramp is the real art."""
+    import numpy as np
+
+    overlap = int(min(max(int(overlap), 0), int(pad.shape[0]), int(art.shape[0])))
+    if overlap < 2 or pad.shape[1] != art.shape[1]:
+        return art
+    out = np.array(art, copy=True)
+    original = art.astype(np.float32)
+    soft = pad.astype(np.float32)
+    for dist in range(overlap):
+        alpha = float(_smoothstep((dist + 0.5) / float(overlap)))
+        if at_end:
+            mixed = soft[-(dist + 1)] * (1.0 - alpha) + original[dist] * alpha
+            out[dist] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
+        else:
+            mixed = soft[dist] * (1.0 - alpha) + original[-(dist + 1)] * alpha
+            out[-(dist + 1)] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
     return out
 
 
@@ -480,41 +620,150 @@ def vertical_streaks_dominate(band) -> bool:
     return bool(ratio >= 6.0 and var_y <= 30.0 and var_x >= 40.0)
 
 
-def _extend_vertical(img, top: int, bottom: int):
+def _luma(bgr):
     import numpy as np
 
+    image = bgr.astype(np.float32)
+    return image[..., 0] * 0.114 + image[..., 1] * 0.587 + image[..., 2] * 0.299
+
+
+def _orient_join(image, join: int, side: str):
+    """Put the extension above row `join`, which is the first row of the picture."""
+    import numpy as np
+
+    side = str(side or "top")
+    if side == "top":
+        return image, int(join)
+    if side == "bottom":
+        flipped = image[::-1]
+        return flipped, int(image.shape[0] - int(join))
+    turned = np.ascontiguousarray(np.transpose(image, (1, 0, 2)))
+    if side == "left":
+        return turned, int(join)
+    flipped = turned[::-1]
+    return flipped, int(turned.shape[0] - int(join))
+
+
+def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = None) -> dict:
+    """Row-to-row luminance step at a large-block join, and a thin-band check.
+
+    The join step is the mean absolute change across the seam, ±3 rows.
+    It fails when that step is more than twice the larger of the median step
+    inside the picture and inside the extension. A one-row light or dark
+    band fails the row-mean deviation check.
+    """
+    import numpy as np
+
+    work, seam = _orient_join(image, join, side)
+    luma = _luma(work)
+    height = int(luma.shape[0])
+    ppm = float(px_per_mm) if px_per_mm else (300.0 / 25.4)
+    gap = _mm_px(TALL_OVERLAP_MM + 2.0, ppm, 8)
+    slab = _mm_px(12.0, ppm, 12)
+    seam = int(max(3, min(height - 4, int(seam))))
+
+    window = luma[seam - 3:seam + 4]
+    join_step = float(np.mean(np.abs(np.diff(window, axis=0))))
+
+    def median_step(start: int, stop: int) -> float:
+        start = int(max(0, start))
+        stop = int(min(height, stop))
+        if stop - start < 4:
+            return 0.0
+        steps = np.abs(np.diff(luma[start:stop], axis=0)).mean(axis=1)
+        return float(np.median(steps))
+
+    art_step = median_step(seam + gap, seam + gap + slab)
+    ext_step = median_step(seam - gap - slab, seam - gap)
+    reference = max(art_step, ext_step)
+    step_limit = 2.0 * reference
+    ok_step = bool(join_step <= step_limit + 0.05)
+
+    means = luma.mean(axis=1)
+    band_dev = float(max(
+        abs(means[seam] - 0.5 * (means[seam - 2] + means[seam + 2])),
+        abs(means[seam - 1] - 0.5 * (means[seam - 3] + means[seam + 1])),
+    ))
+    art_lo = min(height - 2, seam + gap)
+    art_hi = min(height, art_lo + slab)
+    jumps = np.abs(np.diff(means[art_lo:art_hi])) if art_hi - art_lo >= 4 else np.array([0.0])
+    typical = float(np.median(jumps)) if jumps.size else 0.0
+    band_limit = max(3.0, 2.0 * typical)
+    ok_band = bool(band_dev <= band_limit + 0.05)
+    return {
+        "joinStep": round(join_step, 3),
+        "artStep": round(art_step, 3),
+        "extStep": round(ext_step, 3),
+        "stepLimit": round(step_limit, 3),
+        "stepRatio": round(join_step / max(reference, 1e-6), 3),
+        "bandDev": round(band_dev, 3),
+        "bandLimit": round(band_limit, 3),
+        "okStep": ok_step,
+        "okBand": ok_band,
+        "ok": bool(ok_step and ok_band),
+    }
+
+
+def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None):
+    import numpy as np
+
+    ppm = float(px_per_mm) if px_per_mm else (300.0 / 25.4)
     parts = []
     height = img.shape[0]
     rim = min(MIRROR_RIM_PX, height)
     core = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
+    art = core
+    ramp = _mm_px(TALL_RAMP_MM, ppm, 8)
+    match_depth = _mm_px(6.0, ppm, 4)
+
+    def strong_pad(forward: bool, pad: int, block: int):
+        nonlocal art
+        source = core[-block:] if forward else core[:block]
+        protect = _protect_rows(core, ppm, from_end=forward)
+        overlap = _join_overlap(core, ppm, from_end=forward)
+        if art is core:
+            art = np.ascontiguousarray(core)
+        built = _mirror_extend(
+            source, pad, forward=forward, strong=True, ramp_px=ramp, protect_px=protect,
+        )
+        # The pad's first row touches the picture when the pad is below it.
+        at_end = not forward
+        built = _match_join_colour(built, art, at_end=at_end, depth=max(match_depth, overlap))
+        art = _feather_into_art(built, art, overlap, at_end=at_end)
+        return built
+
+    top_part = None
+    bottom_part = None
     if top:
         if top >= TALL_PAD_PX:
-            block = min(top, height)
-            parts.append(_mirror_extend(core[:block], top, forward=False, strong=True))
+            top_part = strong_pad(False, top, min(top, height))
         else:
-            parts.append(_mirror_extend(core[:rim], top, forward=False, strong=False))
-    parts.append(core)
+            top_part = _mirror_extend(core[:rim], top, forward=False, strong=False)
     if bottom:
         if bottom >= TALL_PAD_PX:
-            block = min(bottom, height)
-            parts.append(_mirror_extend(core[-block:], bottom, forward=True, strong=True))
+            bottom_part = strong_pad(True, bottom, min(bottom, height))
         else:
-            parts.append(_mirror_extend(core[-rim:], bottom, forward=True, strong=False))
+            bottom_part = _mirror_extend(core[-rim:], bottom, forward=True, strong=False)
+    if top_part is not None:
+        parts.append(top_part)
+    parts.append(art)
+    if bottom_part is not None:
+        parts.append(bottom_part)
     if len(parts) == 1:
         return parts[0]
     return np.concatenate(parts, axis=0)
 
 
-def _extend_edges(img, top: int, bottom: int, left: int, right: int):
+def _extend_edges(img, top: int, bottom: int, left: int, right: int, px_per_mm: float | None = None):
     """Grow a picture without copying one row of pixels down the page."""
     import numpy as np
 
     out = img
     if top or bottom:
-        out = _extend_vertical(out, top, bottom)
+        out = _extend_vertical(out, top, bottom, px_per_mm=px_per_mm)
     if left or right:
         turned = np.ascontiguousarray(np.transpose(out, (1, 0, 2)))
-        turned = _extend_vertical(turned, left, right)
+        turned = _extend_vertical(turned, left, right, px_per_mm=px_per_mm)
         out = np.ascontiguousarray(np.transpose(turned, (1, 0, 2)))
     return out
 
@@ -567,7 +816,7 @@ def _bottom_bar_row(img) -> int | None:
     return start
 
 
-def _soften_art_rim(canvas, top: int, left: int, art_h: int, art_w: int):
+def _soften_art_rim(canvas, top: int, left: int, art_h: int, art_w: int, include_top: bool = True):
     """Feather only the outer rim of the picture into a blur. The contact band stays sharp."""
     import cv2
     import numpy as np
@@ -583,7 +832,7 @@ def _soften_art_rim(canvas, top: int, left: int, art_h: int, art_w: int):
         return canvas
     blurred = cv2.GaussianBlur(art, (0, 0), 7)
     alpha = np.zeros(art.shape[:2], np.float32)
-    if top_depth >= 4:
+    if include_top and top_depth >= 4:
         ramp = np.linspace(0.62, 0.0, top_depth, dtype=np.float32)
         alpha[:top_depth] = np.maximum(alpha[:top_depth], ramp[:, None])
     if side_depth >= 4:
@@ -596,8 +845,8 @@ def _soften_art_rim(canvas, top: int, left: int, art_h: int, art_w: int):
     return out
 
 
-def _restitch(canvas, top: int, left: int, art_h: int, art_w: int, reach: int = 8):
-    """Pull the pad's seam row onto the feathered picture so the join is not a line."""
+def _restitch(canvas, top: int, left: int, art_h: int, art_w: int, reach: int = 8, include_top: bool = True, include_sides: bool = True):
+    """Pull a short pad's seam onto the picture. A tall blend already owns its join."""
     import numpy as np
 
     out = canvas
@@ -605,14 +854,17 @@ def _restitch(canvas, top: int, left: int, art_h: int, art_w: int, reach: int = 
     y1, x1 = y0 + int(art_h), x0 + int(art_w)
     if y0 <= 0 or x1 <= x0:
         return out
-    edge = out[y0, x0:x1].astype(np.float32)
-    for dist in range(1, reach + 1):
-        y = y0 - dist
-        if y < 0:
-            break
-        weight = dist / float(reach + 1)
-        row = out[y, x0:x1].astype(np.float32)
-        out[y, x0:x1] = np.clip(edge * (1.0 - weight) + row * weight, 0, 255).astype(np.uint8)
+    if include_top:
+        edge = out[y0, x0:x1].astype(np.float32)
+        for dist in range(1, reach + 1):
+            y = y0 - dist
+            if y < 0:
+                break
+            weight = dist / float(reach + 1)
+            row = out[y, x0:x1].astype(np.float32)
+            out[y, x0:x1] = np.clip(edge * (1.0 - weight) + row * weight, 0, 255).astype(np.uint8)
+    if not include_sides:
+        return out
     for dist in range(1, reach + 1):
         weight = dist / float(reach + 1)
         x = x0 - dist
@@ -648,12 +900,19 @@ def _layout_with_bar(img, trim_w: float, trim_h: float):
     if extra <= bottom + 4:
         return None
     top = extra - bottom
-    vertical = _extend_edges(img, top, bottom, 0, 0)
-    fitted = _extend_edges(vertical, 0, 0, side_left, side_right)
+    px_per_mm = float(canvas_w) / float(trim_w)
+    vertical = _extend_edges(img, top, bottom, 0, 0, px_per_mm=px_per_mm)
+    fitted = _extend_edges(vertical, 0, 0, side_left, side_right, px_per_mm=px_per_mm)
     if fitted.shape[0] != canvas_h or fitted.shape[1] != canvas_w:
         return None
-    fitted = _soften_art_rim(fitted, top, side_left, height, width)
-    fitted = _restitch(fitted, top, side_left, height, width)
+    # A tall pad already feathered its join. The 4 mm side pads are still short.
+    tall_top = top >= TALL_PAD_PX
+    tall_side = side_left >= TALL_PAD_PX or side_right >= TALL_PAD_PX
+    fitted = _soften_art_rim(fitted, top, side_left, height, width, include_top=not tall_top)
+    fitted = _restitch(
+        fitted, top, side_left, height, width,
+        include_top=not tall_top, include_sides=not tall_side,
+    )
     return fitted
 
 
@@ -684,12 +943,14 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
         new_h = max(height, int(round(width / target)))
         pad = new_h - height
         top = pad // 2
-        fitted = _extend_edges(img, top, pad - top, 0, 0)
+        ppm = float(new_h) / float(trim_h) if trim_h else None
+        fitted = _extend_edges(img, top, pad - top, 0, 0, px_per_mm=ppm)
     else:
         new_w = max(width, int(round(height * target)))
         pad = new_w - width
         left = pad // 2
-        fitted = _extend_edges(img, 0, 0, left, pad - left)
+        ppm = float(new_w) / float(trim_w) if trim_w else None
+        fitted = _extend_edges(img, 0, 0, left, pad - left, px_per_mm=ppm)
     decisions.append(
         "The picture was a different shape from the product. The whole picture was kept and the gap was filled by continuing the edge colour and texture. It was not stretched and the picture was not copied."
     )
