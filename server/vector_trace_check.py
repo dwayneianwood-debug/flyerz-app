@@ -431,6 +431,16 @@ def test_descenders_and_counters() -> None:
     beside = (110, 100, 60, 40)
     same = _expand_rect(rect, 400, 500, (rect, beside))
     check("same-line-full-below", same[1] + same[3] >= 140 + int(40 * BELOW_FRAC), str(same))
+    # Word boxes overlap. The descender still gets the full 35%, up to the next line's center.
+    over = (375, 978, 196, 25)
+    nxt = (385, 1000, 175, 25)
+    opened = _expand_rect(over, 1024, 1536, (over, nxt))
+    want_down = max(int(round(25 * 0.14)), int(round(25 * BELOW_FRAC)))
+    check("overlap-grows-below", opened[1] + opened[3] >= 1003 + want_down, str(opened))
+    heading = (10, 20, 200, 80)
+    tall = _expand_rect(heading, 800, 600, ())
+    check("heading-not-35", tall[1] + tall[3] < 100 + int(80 * BELOW_FRAC), str(tall))
+    check("heading-still-padded", tall[1] + tall[3] > 100, str(tall))
 
     paper = (245, 242, 236)
     crop = np.full((70, 50, 3), paper, np.uint8)
@@ -472,6 +482,41 @@ def test_descenders_and_counters() -> None:
     opened[28:34, 12:30] = 0
     check("open-e-fails", _topology_fails(letter, opened, 400) is True)
     check("closed-e-passes", _topology_fails(letter, closed, 400) is False)
+
+    from vector_trace import ink_touching
+
+    split = np.zeros((70, 40), np.uint8)
+    split[12:40, 8:28] = 255
+    split[48:66, 14:22] = 255
+    kept = ink_touching(split, (4, 8, 36, 44))
+    check("tail-kept", kept is not None and int(kept[48:66, 14:22].max()) == 255)
+    check("tail-joined", kept is not None and int(kept[40:48, 14:22].max()) == 255)
+
+    # The tail is its own stroke. The short body must not be read as clipped.
+    sibling = clipped.copy()
+    sibling[42:70, 14:22] = 255
+    check("sibling-tail-passes", _topology_fails(src, sibling, 400) is False)
+    # A mark a gap below the word is the next line, not a descender.
+    speck = np.full((90, 120, 3), paper, np.uint8)
+    speck[20:50, 8:100] = (16, 14, 12)
+    speck[68:80, 40:58] = (16, 14, 12)
+    body_only = np.zeros((90, 120), np.uint8)
+    body_only[20:50, 8:100] = 255
+    check("distant-mark-passes", _topology_fails(speck, body_only, 400) is False)
+    fringe = np.full((80, 40, 3), paper, np.uint8)
+    fringe[15:40, 8:28] = (16, 14, 12)
+    fringe[40:42, 18:19] = (16, 14, 12)
+    check("fringe-passes", _topology_fails(fringe, clipped, 400) is False)
+    # A gray gap between strokes is not a counter. An e's bowl is paper.
+    gap = np.full((60, 50, 3), paper, np.uint8)
+    gap[8:52, 8:14] = (16, 14, 12)
+    gap[8:14, 8:40] = (16, 14, 12)
+    gap[8:52, 34:40] = (16, 14, 12)
+    gap[46:52, 8:40] = (16, 14, 12)
+    gap[16:44, 16:32] = (170, 166, 160)
+    filled = np.zeros((60, 50), np.uint8)
+    filled[8:52, 8:40] = 255
+    check("gray-gap-passes", _topology_fails(gap, filled, 400) is False)
 
 
 def test_glyphs_reject_a_changed_letter() -> None:

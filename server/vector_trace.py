@@ -108,8 +108,8 @@ def _grow_thin_strokes(sample: np.ndarray, ink: np.ndarray, otsu: float) -> np.n
         comp = labels == label
         core = int(np.count_nonzero(comp & ink))
         extra = int(np.count_nonzero(comp & ~ink))
-        # A crossbar is smaller than the letter. A photo touching the stroke is not.
-        if extra > max(core, 1):
+        # A crossbar is a fraction of the letter. A fringe that doubles it is not.
+        if extra > max(8, int(round(0.45 * core))):
             continue
         grown[comp] = True
     if float(grown.mean()) > 0.62:
@@ -620,9 +620,85 @@ def ink_touching(mask: np.ndarray, inner: tuple) -> np.ndarray | None:
         # the stroke sits in that box drops the tail and leaves a floating speck.
         if inside >= max(4, int(round(0.08 * area))):
             keep[component] = 255
+    # A tail that the threshold split off sits under a kept letter and outside
+    # the word box. It is not the next line: it is short, and it shares the
+    # letter's columns.
+    kept_ids = [index for index in range(1, count) if int(keep[labels == index].max()) > 0]
+    for index in range(1, count):
+        if int(keep[labels == index].max()) > 0:
+            continue
+        component = labels == index
+        ys, xs = np.where(component)
+        if ys.size < 4:
+            continue
+        top, bottom = int(ys.min()), int(ys.max())
+        left, right = int(xs.min()), int(xs.max())
+        if top < y1:
+            continue
+        if bottom - top > max(8, int(round(0.55 * (y1 - y0)))):
+            continue
+        for kept in kept_ids:
+            ky, kx = np.where(labels == kept)
+            if ky.size == 0:
+                continue
+            k_bottom = int(ky.max())
+            gap = top - k_bottom - 1
+            if gap < 0 or gap > max(6, int(round(0.35 * (y1 - y0)))):
+                continue
+            k_left, k_right = int(kx.min()), int(kx.max())
+            overlap = min(right, k_right) - max(left, k_left)
+            if overlap >= max(2, int(round(0.35 * (right - left + 1)))):
+                keep[component] = 255
+                break
     if int(keep.max()) == 0:
         return None
-    return keep
+    return _join_descenders(keep, (x0, y0, x1, y1))
+
+
+def _join_descenders(mask: np.ndarray, inner: tuple) -> np.ndarray:
+    """Bridge a thin gap between a letter and the tail under it.
+
+    Upscale and the threshold open a one-pixel join, so the tail is traced as
+    a floating speck. The bridge is two pixels wide, only where the tail
+    already sits under that letter.
+    """
+    height, width = mask.shape[:2]
+    _x0, _y0, _x1, y1 = [int(v) for v in inner]
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    if count < 3:
+        return mask
+    out = mask.copy()
+    ids = [index for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 8]
+    for lower in ids:
+        ly = int(stats[lower, cv2.CC_STAT_TOP])
+        lh = int(stats[lower, cv2.CC_STAT_HEIGHT])
+        lx = int(stats[lower, cv2.CC_STAT_LEFT])
+        lw = int(stats[lower, cv2.CC_STAT_WIDTH])
+        la = int(stats[lower, cv2.CC_STAT_AREA])
+        if ly + lh < y1:
+            continue
+        for upper in ids:
+            if upper == lower:
+                continue
+            uy = int(stats[upper, cv2.CC_STAT_TOP])
+            uh = int(stats[upper, cv2.CC_STAT_HEIGHT])
+            ux = int(stats[upper, cv2.CC_STAT_LEFT])
+            uw = int(stats[upper, cv2.CC_STAT_WIDTH])
+            if int(stats[upper, cv2.CC_STAT_AREA]) < la:
+                continue
+            gap = ly - (uy + uh)
+            if gap < 1 or gap > max(4, int(round(0.30 * max(uh, 1)))):
+                continue
+            overlap = min(lx + lw, ux + uw) - max(lx, ux)
+            if overlap < max(2, int(round(0.35 * lw))):
+                continue
+            mid = (max(lx, ux) + min(lx + lw, ux + uw)) // 2
+            xa = max(0, mid - 1)
+            xb = min(width, mid + 2)
+            ya = max(0, uy + uh - 1)
+            yb = min(height, ly + 1)
+            out[ya:yb, xa:xb] = 255
+    return out
 
 
 def mask_iou(left: np.ndarray, right: np.ndarray) -> float:
@@ -917,11 +993,11 @@ def _components(mask: np.ndarray, min_area: int) -> list:
     return parts
 
 
-def _hole_areas(component: np.ndarray, min_hole: int = 8) -> list:
-    """Areas of enclosed holes. Specks smaller than ``min_hole`` are not counters."""
+def _hole_labels(component: np.ndarray):
+    """Binary hole mask and per-hole stats, in the component's own crop."""
     ys, xs = np.where(component)
     if ys.size < 12:
-        return []
+        return None
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     crop = np.zeros((y1 - y0, x1 - x0), np.uint8)
@@ -931,12 +1007,59 @@ def _hole_areas(component: np.ndarray, min_hole: int = 8) -> list:
     flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
     cv2.floodFill(inv, flood_mask, (0, 0), 128)
     holes = (inv == 255).astype(np.uint8)
-    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(holes, 8)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(holes, 8)
+    return y0, x0, count, labels, stats
+
+
+def _hole_areas(component: np.ndarray, min_hole: int = 8) -> list:
+    """Areas of enclosed holes. Specks smaller than ``min_hole`` are not counters."""
+    packed = _hole_labels(component)
+    if packed is None:
+        return []
+    _y0, _x0, count, _labels, stats = packed
     found = []
     for index in range(1, count):
         area = int(stats[index, cv2.CC_STAT_AREA])
         if area >= min_hole:
             found.append(area)
+    return found
+
+
+def _paper_hole_areas(component, gray, dark: bool, paper_tone: float, span: float, min_hole: int) -> list:
+    """Holes whose interior is paper, not the gray fringe between strokes.
+
+    A light threshold closes a script gap and invents a counter. A real counter
+    (the bowl of an e or an a) is the paper colour.
+    """
+    packed = _hole_labels(component)
+    if packed is None or span < 16.0:
+        return []
+    y0, x0, count, labels, stats = packed
+    # Keep a counter that is clearly nearer the paper than the ink.
+    limit = paper_tone - 0.28 * span if dark else paper_tone + 0.28 * span
+    found = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < min_hole:
+            continue
+        hole = labels == index
+        # labels include the 1px border, so shift back onto the gray crop.
+        sub = hole[1:-1, 1:-1]
+        if sub.shape[0] < 1 or sub.shape[1] < 1:
+            continue
+        abs_hole = np.zeros(gray.shape[:2], np.bool_)
+        y1 = min(gray.shape[0], y0 + sub.shape[0])
+        x1 = min(gray.shape[1], x0 + sub.shape[1])
+        abs_hole[y0:y1, x0:x1] = sub[: y1 - y0, : x1 - x0]
+        vals = gray[abs_hole]
+        if vals.size == 0:
+            continue
+        med = float(np.median(vals))
+        if dark and med < limit:
+            continue
+        if not dark and med > limit:
+            continue
+        found.append(area)
     return found
 
 
@@ -1058,6 +1181,10 @@ def _topology_fails(crop: np.ndarray, painted: np.ndarray, ppi: float = 400.0) -
     source_holes_ink = gray <= hole_cut if dark else gray >= hole_cut
     source_extent = gray <= extent_cut if dark else gray >= extent_cut
     tolerance = max(1, int(round(float(ppi) / 300.0)))
+    # A sibling stroke covers the source. A one-pixel halo around it is fringe.
+    cover = cv2.dilate(paint.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    # The join of a tail is a couple of pixels. A mark further away is the next line.
+    gap_limit = max(4, int(round(2.0 * float(ppi) / 300.0)))
     parts = _components((paint.astype(np.uint8) * 255), 20)
     if len(parts) < 1:
         return False
@@ -1079,49 +1206,56 @@ def _topology_fails(crop: np.ndarray, painted: np.ndarray, ppi: float = 400.0) -
             comp = labels == index
             if np.any(comp & part["pixels"]):
                 body[comp] = True
-        source_areas = _hole_areas(body, 4)
+        source_areas = _paper_hole_areas(body, gray, dark, paper_tone, span, 4)
         paint_areas = _hole_areas(part["pixels"], 4)
-        # A counter the trace filled in or left open. A 1px paint hole is still a counter.
+        # Substantial counters have to match. An e that lost its bar has none,
+        # and a g that lost its loop has one instead of two. Specks do not count.
         substantial = max(12, int(round(0.08 * part["area"])))
-        if any(area >= substantial for area in source_areas) and not paint_areas:
+        src_holes = sum(1 for area in source_areas if area >= substantial)
+        paint_holes = sum(1 for area in paint_areas if area >= max(4, substantial // 3))
+        if src_holes != paint_holes and src_holes > 0 and paint_holes < src_holes:
             eroded = cv2.erode(part["pixels"].astype(np.uint8), np.ones((3, 3), np.uint8))
             opened = _hole_areas(eroded > 0, 4) if int(eroded.max()) else []
-            if not opened:
+            opened_n = sum(1 for area in opened if area >= max(4, substantial // 3))
+            if opened_n < src_holes:
                 if os.environ.get("TOPO_DEBUG"):
                     sys.stderr.write(
                         f"[topo] holes src={source_areas} paint={paint_areas} "
                         f"x={part['x']} w={part['w']} h={part['h']}\n"
                     )
                 return True
-        y1 = min(height, part["y"] + part["h"] + int(round(0.40 * part["h"])))
+        paint_bottom = part["y"] + part["h"] - 1
+        y_end = min(height, paint_bottom + 1 + max(gap_limit + 2, int(round(0.50 * part["h"]))))
         x0 = max(0, part["x"])
         x1 = min(width, part["x"] + part["w"])
-        if y1 <= part["y"] or x1 <= x0:
+        if y_end <= paint_bottom + 1 or x1 <= x0:
             continue
-        column = source_extent[part["y"]:y1, x0:x1]
-        rows = column.any(axis=1)
-        last = 0
+        # Only ink the paint missed. A tail drawn as its own stroke is covered.
         gap = 0
-        found = False
-        gap_limit = max(3, int(round(0.12 * part["h"])))
-        for index, hit in enumerate(rows):
-            if hit:
-                last = index
-                gap = 0
-                found = True
-                continue
-            gap += 1
-            if found and gap > gap_limit:
+        run_pixels = 0
+        run_bottom = paint_bottom
+        started = False
+        for y in range(paint_bottom + 1, y_end):
+            uncovered = source_extent[y, x0:x1] & ~cover[y, x0:x1]
+            row_span = int(np.count_nonzero(uncovered))
+            # The next line fills the column. A descender does not.
+            if row_span > max(4, int(round(0.85 * max(1, part["w"])))):
                 break
-        if not found:
-            continue
-        src_bottom = part["y"] + last
-        paint_bottom = part["y"] + part["h"] - 1
-        if src_bottom - paint_bottom > tolerance:
+            if row_span <= 1:
+                gap += 1
+                if gap > gap_limit:
+                    break
+                continue
+            gap = 0
+            started = True
+            run_pixels += row_span
+            run_bottom = y
+        # A one-pixel fringe is not a tail. A clipped g or y is.
+        if started and run_bottom - paint_bottom > tolerance and run_pixels >= 8:
             if os.environ.get("TOPO_DEBUG"):
                 sys.stderr.write(
-                    f"[topo] tail delta={src_bottom - paint_bottom} tol={tolerance} "
-                    f"x={part['x']} h={part['h']}\n"
+                    f"[topo] tail delta={run_bottom - paint_bottom} tol={tolerance} "
+                    f"px={run_pixels} x={part['x']} h={part['h']}\n"
                 )
             return True
     return False
@@ -1624,8 +1758,14 @@ def _expand_rect(rect, width, height, neighbours=()):
     bh = max(2, bh)
     bw = max(2, bw)
     pad_x = max(2, int(round(bh * PAD_FRAC)))
-    up = max(pad_x, int(round(bh * ABOVE_FRAC)))
-    down = max(pad_x, int(round(bh * BELOW_FRAC)))
+    # Body-copy boxes stop at the x-height, so they need the descender pad.
+    # A tall heading already contains the tail; the same fraction pulls in the logo.
+    if bh <= 40:
+        up = max(pad_x, int(round(bh * ABOVE_FRAC)))
+        down = max(pad_x, int(round(bh * BELOW_FRAC)))
+    else:
+        up = pad_x
+        down = pad_x
     for other in neighbours or ():
         nx, ny, nw, nh = [int(round(float(v))) for v in other]
         if nw < 2 or nh < 2:
@@ -1641,25 +1781,19 @@ def _expand_rect(rect, width, height, neighbours=()):
         this_cy = y + bh * 0.5
         other_cy = ny + nh * 0.5
         if other_cy < this_cy:
-            their_claim = ny + nh + int(round(nh * BELOW_FRAC))
-            if their_claim <= y - up:
-                continue
-            if ny + nh < y:
-                mid = (ny + nh + y) // 2
-                up = min(up, max(0, y - mid))
-            else:
-                mid = int(round((this_cy + other_cy) * 0.5))
-                up = min(up, max(0, y - mid))
+            # Stop at their body. Overlapping word boxes still leave room for an ascender.
+            up = min(up, max(0, y - int(round(other_cy))))
+        elif ny >= y + bh:
+            gap = ny - (y + bh)
+            their_asc = int(round(nh * ABOVE_FRAC))
+            usable = gap - their_asc
+            if usable < int(round(bh * BELOW_FRAC)):
+                usable = gap // 2
+            down = min(down, max(0, usable))
         else:
-            their_claim = ny - int(round(nh * ABOVE_FRAC))
-            if y + bh + down <= their_claim:
-                continue
-            if y + bh < ny:
-                mid = (y + bh + ny) // 2
-                down = min(down, max(0, mid - (y + bh)))
-            else:
-                mid = int(round((this_cy + other_cy) * 0.5))
-                down = min(down, max(0, mid - (y + bh)))
+            # The next word box starts inside this one. Its center is the body,
+            # so the band above that center is this line's descender.
+            down = min(down, max(0, int(round(other_cy)) - (y + bh)))
     x0 = max(0, x - pad_x)
     y0 = max(0, y - up)
     x1 = min(int(width), x + bw + pad_x)
