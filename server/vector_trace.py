@@ -2051,33 +2051,6 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
     return kept
 
 
-def _drop_other_lines(mask: np.ndarray | None, left: int, top: int, owner: int, cores: list) -> np.ndarray | None:
-    """Take this line's ink back out of every other line's box.
-
-    A descender that only hangs in the gap stays. Ink inside the next line
-    is that line's, and tracing it draws over those letters.
-    """
-    if mask is None or int(np.max(mask)) == 0 or not cores:
-        return mask
-    height, width = mask.shape[:2]
-    for index, core in enumerate(cores):
-        if index == owner:
-            continue
-        cx, cy, cw, ch = [int(v) for v in core]
-        if cw < 2 or ch < 2:
-            continue
-        x0 = max(0, cx - int(left))
-        y0 = max(0, cy - int(top))
-        x1 = min(width, cx + cw - int(left))
-        y1 = min(height, cy + ch - int(top))
-        if x1 <= x0 or y1 <= y0:
-            continue
-        mask[y0:y1, x0:x1] = 0
-    if int(mask.max()) == 0:
-        return None
-    return mask
-
-
 def _new_ink_in_band(painted: np.ndarray, origin, source_bgr: np.ndarray, band) -> int:
     """Largest blob of this line's paths that the source does not show inside ``band``.
 
@@ -2113,7 +2086,14 @@ def _new_ink_in_band(painted: np.ndarray, origin, source_bgr: np.ndarray, band) 
     _count, _labels, stats, _cent = cv2.connectedComponentsWithStats(stray.astype(np.uint8), 8)
     largest = 0
     for index in range(1, _count):
-        largest = max(largest, int(stats[index, cv2.CC_STAT_AREA]))
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        # The curve's lower edge can sit in the next box as a wide lip on the
+        # paper gap. A stroke dropped onto that line is taller than it is wide.
+        if area < 12 or height < 8 or height <= width:
+            continue
+        largest = max(largest, area)
     return largest
 
 
@@ -2195,10 +2175,6 @@ def _separate_line(job: dict) -> dict:
     # out, leaves bars, and the source-ink fringe would hide those bars
     # from the page guard.
     mask = _strip_flourish(mask)
-    # This line's paths are this line's ink. The next line's box stays out of the trace.
-    mask = _drop_other_lines(mask, left, top, owner, plate_cores)
-    if mask is None:
-        return reject("The ink sat outside this box, so it stayed in the picture.")
     return {"pending": {
         "text": text,
         "mask": mask,

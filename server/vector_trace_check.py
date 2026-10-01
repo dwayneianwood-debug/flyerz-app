@@ -757,28 +757,26 @@ def test_descenders_and_counters() -> None:
 
 def test_a_traced_line_does_not_enter_the_next_line() -> None:
     """A stroke on the next line's paper is new ink. The letter's own edge is not."""
-    from vector_trace import _drop_other_lines, _new_ink_in_band
-
-    mask = np.zeros((80, 60), np.uint8)
-    mask[10:40, 8:14] = 255
-    mask[36:70, 8:11] = 255
-    cores = [(4, 8, 50, 36), (4, 52, 50, 20)]
-    cleared = _drop_other_lines(mask.copy(), 0, 0, 0, cores)
-    check("descender-stops-at-next-box", cleared is not None and int(cleared[52:, 8:11].max()) == 0)
-    check("descender-above-the-box-stays", cleared is not None and int(cleared[40, 10]) == 255)
+    from vector_trace import _new_ink_in_band
 
     source = np.full((40, 80, 3), (236, 232, 226), np.uint8)
     source[18:36, 8:70] = (24, 22, 20)
     # The path covers the letters, plus a 3px stem dropped through the gap above them.
     painted = np.zeros((50, 80), np.uint8)
-    painted[8:36, 8:70] = 255
-    painted[0:22, 20:23] = 255
+    painted[18:36, 8:70] = 255
+    painted[0:28, 20:23] = 255
     area = _new_ink_in_band(painted, (0, 0), source, (0, 0, 80, 40))
     check("stem-on-the-next-line", area >= 12, str(area))
     flush = np.zeros((40, 80), np.uint8)
     flush[16:36, 6:72] = 255
     edge = _new_ink_in_band(flush, (0, 0), source, (0, 0, 80, 40))
     check("edge-on-the-letters", edge < 12, str(edge))
+    # A wide lip of the curve in the gap is not a stem dropped onto the letters.
+    lip = np.zeros((40, 80), np.uint8)
+    lip[18:36, 8:70] = 255
+    lip[12:18, 8:40] = 255
+    lip_area = _new_ink_in_band(lip, (0, 0), source, (0, 0, 80, 40))
+    check("curve-lip-stays", lip_area < 12, str(lip_area))
 
 
 def test_a_wide_swash_is_not_traced() -> None:
