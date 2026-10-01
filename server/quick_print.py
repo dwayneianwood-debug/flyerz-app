@@ -634,8 +634,8 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
-            # Vector type cover-fits this picture. The extended canvas is only
-            # the fallback, so a synthetic side band never lands inside the trim.
+            # Vector type keeps this whole picture. The extended canvas is only
+            # the fallback if the vector file cannot be built.
             vector_source = raster
             raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
             fitted_path = os.path.join(output_dir, "fitted.png")
@@ -662,7 +662,7 @@ def make_print_ready(
                     aspect_extended = False
                     decisions = [line for line in decisions if "gap was filled" not in line]
                     decisions.append(
-                        "The picture was fitted to the trim so the artwork fills the page. It was not stretched."
+                        "The whole picture was placed with one scale. Any gap was filled by continuing the edge."
                     )
                     for line in vector_built.get("decisions") or []:
                         decisions.append(str(line))

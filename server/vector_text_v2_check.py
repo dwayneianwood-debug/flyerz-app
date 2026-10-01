@@ -273,8 +273,8 @@ def test_badge_digit_stays() -> None:
     check("badge-digit-survives", held, f"white {int(white.sum())} green {int(green.sum())}")
 
 
-def test_cover_drops_the_side_band() -> None:
-    """A slightly tall AI picture is cover-fitted. The synthetic side pad stays out of the trim."""
+def test_shared_scale_keeps_the_whole_picture() -> None:
+    """The side stripe stays in the trim. The gap beside it is the continued edge, not a crop."""
     from quick_print import make_print_ready
 
     image = Image.new("RGB", (1024, 1536), (236, 228, 214))
@@ -282,14 +282,14 @@ def test_cover_drops_the_side_band() -> None:
     draw.rectangle((984, 0, 1023, 1535), fill=(210, 40, 40))
     draw.rectangle((960, 0, 983, 1535), fill=(30, 50, 190))
     draw.text((180, 680), "MARKET DAY", font=ImageFont.truetype(SANS, 72), fill=(30, 50, 30))
-    folder = tempfile.mkdtemp(prefix="vector-cover-")
+    folder = tempfile.mkdtemp(prefix="vector-place-")
     src = os.path.join(folder, "src.png")
     image.save(src)
     out = os.path.join(folder, "out")
     result = make_print_ready(src, out, 148, 210, "a5", "A5", filename="src.png")
-    check("cover-press", bool(result.get("pressPath")), str(result.get("reasons"))[:300])
+    check("place-press", bool(result.get("pressPath")), str(result.get("reasons"))[:300])
     joined = " ".join(result.get("decisions") or [])
-    check("cover-fitted", "fitted to the trim" in joined, joined[:400])
+    check("place-one-scale", "one scale" in joined, joined[:400])
     import pymupdf as fitz
     doc = fitz.open(result["pressPath"])
     page = doc[0]
@@ -298,15 +298,69 @@ def test_cover_drops_the_side_band() -> None:
     inset = int(round(float(page.trimbox.x0) / page.rect.width * pix.w))
     doc.close()
     trim = rgb[:, inset:pix.w - inset]
-    # Cover keeps the source's right-hand blue stripe about 40px inside the trim.
-    # A synthetic side pad would still be showing the continued red edge here.
-    probe = np.median(trim[:, -38], axis=0)
-    outer = np.median(trim[:, -4], axis=0)
+    blue_at = None
+    red_at = None
+    for col in range(trim.shape[1] - 1, max(0, trim.shape[1] - 180), -1):
+        probe = np.median(trim[:, col], axis=0)
+        if blue_at is None and float(probe[2]) > float(probe[0]) + 15:
+            blue_at = col
+        if red_at is None and float(probe[0]) > float(probe[2]) + 25 and float(probe[0]) > 90:
+            red_at = col
     check(
-        "cover-keeps-artwork-edge",
-        float(probe[2]) > float(probe[0]) + 20 and float(outer[0]) > float(outer[2]) + 40,
-        f"probe {probe.astype(int).tolist()} outer {outer.astype(int).tolist()}",
+        "place-keeps-both-stripes",
+        blue_at is not None and red_at is not None and red_at > blue_at,
+        f"blue {blue_at} red {red_at}",
     )
+
+
+def test_placement_matches_the_reference_fit() -> None:
+    """The general fit reproduces the approved Medella placement. No side is hard-coded."""
+    from vector_plate import fit_placement
+
+    scale, off_x, off_y = fit_placement(1024, 1536, 148, 210, 5, [(51, 43, 936, 1531)])
+    check("flyer-front-scale", abs(scale - 205 / 1536) < 1e-6, f"{scale}")
+    check(
+        "flyer-front-origin",
+        abs(off_y - 7.5) < 1e-6 and abs(off_x - (158 - 1024 * 205 / 1536) / 2) < 1e-4,
+        f"{off_x},{off_y}",
+    )
+    scale, off_x, off_y = fit_placement(1054, 1492, 148, 210, 5, [(63, 53, 1027, 1432)])
+    check("flyer-back-scale", abs(scale - 148 / 1054) < 1e-9, f"{scale}")
+    check("flyer-back-origin", abs(off_x - 5) < 1e-6, f"{off_x},{off_y}")
+    scale, off_x, off_y = fit_placement(1586, 992, 90, 50, 5, [(221, 167, 1478, 865)])
+    check("card-front-scale", abs(scale - 50 / 992) < 1e-9, f"{scale}")
+    check("card-front-origin", abs(off_y - 5) < 1e-6, f"{off_x},{off_y}")
+
+
+def test_erase_clears_the_original() -> None:
+    image = Image.new("RGB", (420, 180), (240, 236, 228))
+    draw = ImageDraw.Draw(image)
+    draw.text((36, 48), "Through", font=ImageFont.truetype(font_path("crimson"), 52), fill=(20, 30, 20))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    line = {"text": "Through", "rect": (24, 36, 320, 100), "font": "crimson", "role": "body", "mode": "vector"}
+    from vector_plate import erase_text
+
+    clean, kept, skipped = erase_text(bgr, [line], [])
+    check("erase-kept", len(kept) == 1 and not skipped, str([item.get("reason") for item in skipped]))
+    crop = clean[48:130, 30:300]
+    dark = int(((crop[:, :, 0] < 90) & (crop[:, :, 1] < 90) & (crop[:, :, 2] < 90)).sum())
+    check("erase-no-ghost", dark < 40, f"dark pixels {dark}")
+
+
+def test_numeral_mask_spares_the_circle() -> None:
+    image = Image.new("RGB", (240, 180), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((40, 30, 130, 120), fill=(36, 92, 58))
+    draw.text((72, 48), "1", font=ImageFont.truetype(font_path("crimson"), 42), fill=(255, 255, 255))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    green_before = (bgr[:, :, 1] > 70) & (bgr[:, :, 1] > bgr[:, :, 2] + 10) & (bgr[:, :, 1] > bgr[:, :, 0] + 10)
+    line = {"text": "1", "rect": (64, 44, 48, 56), "mode": "vector"}
+    from vector_plate import erase_text
+
+    clean, _kept, _skipped = erase_text(bgr, [line], [])
+    green_after = (clean[:, :, 1] > 70) & (clean[:, :, 1] > clean[:, :, 2] + 10) & (clean[:, :, 1] > clean[:, :, 0] + 10)
+    kept_green = int((green_before & green_after).sum())
+    check("circle-survives", kept_green > int(green_before.sum()) * 0.72, f"kept {kept_green} of {int(green_before.sum())}")
 
 
 def image_bgr(image: Image.Image) -> np.ndarray:
@@ -381,7 +435,10 @@ def main() -> None:
     test_tick_leaves_the_mask()
     test_serif_page_is_consistent()
     test_badge_digit_stays()
-    test_cover_drops_the_side_band()
+    test_shared_scale_keeps_the_whole_picture()
+    test_placement_matches_the_reference_fit()
+    test_erase_clears_the_original()
+    test_numeral_mask_spares_the_circle()
     test_real_ocr_is_quick()
     print("ALL PASS")
 

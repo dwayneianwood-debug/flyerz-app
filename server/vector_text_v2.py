@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Vector text rebuild v2.
 
-Quick mode uses this for AI raster artwork. The picture is enlarged to at least
-400 pixels per inch, text is removed with a tight Telea mask, and each OCR line
-is set again as embedded vector type fitted to its original width. Icons stay
-in the picture. A line that cannot be read, or a page that fails the check,
-falls back to the enlarged picture and an amber flag.
+Quick mode uses this for AI raster artwork. Lettering is erased on the original
+picture, that clean plate is enlarged to at least 400 pixels per inch, and each
+OCR line is set again as embedded vector type. The mask and the type share one
+scale and one offset. Icons stay in the picture. A line that cannot be read, or
+a page that fails the check, falls back to the enlarged picture and an amber flag.
 
 The press page is trim plus 5 mm bleed. The trim box sits 5 mm inside the
 bleed box. Fonts are subset. Open-licence faces live in server/fonts/v2
@@ -45,6 +45,9 @@ FONTS = (
     ("cinzel-700", "Cinzel-700.ttf", "spaced"),
     ("eb-semibold", "EBGaramond-SemiBold.ttf", "serif"),
     ("crimson", "CrimsonText-Regular.ttf", "body"),
+    ("crimson-italic", "CrimsonText-Italic.ttf", "body"),
+    ("crimson-semibold", "CrimsonText-SemiBold.ttf", "body"),
+    ("crimson-bold", "CrimsonText-Bold.ttf", "body"),
     ("eb-italic", "EBGaramond-Italic.ttf", "tagline"),
     ("parisienne", "Parisienne-Regular.ttf", "script"),
     ("greatvibes", "GreatVibes-Regular.ttf", "script"),
@@ -170,44 +173,44 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
             timings={"ocr_s": round(ocr_s, 3)},
         )
 
-    _note(progress, "enlarging", "Enlarging the picture and setting the type.")
-    enlarge_started = time.perf_counter()
-    trim_px_w, trim_px_h = _trim_pixels(trim_w, trim_h, MIN_PPI)
-    sharp, provider = _enlarge(bgr, trim_px_w, trim_px_h)
-    colour_source, scale, off_x, off_y = _cover(bgr, trim_px_w, trim_px_h, cv2.INTER_CUBIC)
-    if sharp.shape[0] != trim_px_h or sharp.shape[1] != trim_px_w:
-        sharp, scale, off_x, off_y = _cover(sharp, trim_px_w, trim_px_h, cv2.INTER_LANCZOS4)
-        colour_source, scale, off_x, off_y = _cover(bgr, trim_px_w, trim_px_h, cv2.INTER_CUBIC)
-    restored = _restore_colour(sharp, colour_source)
-    bleed_px = max(1, int(round(bleed_mm / 25.4 * MIN_PPI)))
-    from quick_print import _extend_edges
-
-    media = _extend_edges(restored, bleed_px, bleed_px, bleed_px, bleed_px)
-    enlarge_s = time.perf_counter() - enlarge_started
-
     for line in chosen:
-        line["media_box"] = _map_rect(line["rect"], scale, off_x, off_y, bleed_px, media.shape)
-
+        line["media_box"] = line["rect"]
     chosen = _drop_overlaps(chosen, raster_lines)
+    for line in chosen:
+        line.pop("media_box", None)
     if not chosen:
-        return _fail(started, "The lines overlapped, so the original lettering was kept.", provider=provider)
+        return _fail(started, "The lines overlapped, so the original lettering was kept.")
 
+    _note(progress, "removing", "Removing the old lettering.")
     paint_started = time.perf_counter()
-    painted, bullets, blotches = _remove_text(media, chosen)
-    for line in blotches:
-        raster_lines.append(line)
-    chosen = [line for line in chosen if not line.get("blotch")]
+    marks = _source_marks(bgr, chosen)
+    guide = _guide_boxes(bgr, blocks, chosen)
+    from vector_plate import erase_text, map_rect, place_plate
+
+    clean, chosen, skipped = erase_text(bgr, chosen, marks)
+    raster_lines.extend(skipped)
     paint_s = time.perf_counter() - paint_started
     if not chosen:
         return _fail(
             started,
             "Removing the old lettering marked the picture, so the original lettering was kept.",
-            provider=provider,
             lines=raster_lines,
+            timings={"ocr_s": round(ocr_s, 3), "paint_s": round(paint_s, 3)},
         )
 
+    _note(progress, "enlarging", "Enlarging the picture and setting the type.")
+    enlarge_started = time.perf_counter()
+    placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+    provider = placed["provider"]
+    enlarge_s = time.perf_counter() - enlarge_started
+    for line in chosen:
+        line["media_box"] = map_rect(line["ink"], placed, placed["image"].shape)
+        if line.get("ink_hex"):
+            line["color"] = line["ink_hex"]
+    bullets = _map_bullets(marks, placed)
+
     type_started = time.perf_counter()
-    qa = _write_pdf(painted, chosen, bullets, output_pdf, trim_w, trim_h, bleed_mm)
+    qa = _write_pdf(placed["image"], chosen, bullets, output_pdf, trim_w, trim_h, bleed_mm)
     type_s = time.perf_counter() - type_started
     if not qa.get("wrote"):
         return _fail(started, qa.get("reason") or "The vector press file could not be written.", provider=provider)
@@ -240,6 +243,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         reason = "Some lettering stayed in the picture because the read was uncertain. Glance at it before printing."
     decisions = [
         f"The lettering was set as vector type ({len(chosen)} lines).",
+        "The old lettering was removed from the original picture before it was enlarged.",
         f"The picture was enlarged with {provider} and the original colours were put back.",
         "The press file is CMYK at 400 PPI or more, with the trim 5 mm inside the bleed.",
     ]
@@ -334,10 +338,12 @@ def read_blocks(bgr: np.ndarray) -> list:
         xs = [float(point[0]) * back for point in points]
         ys = [float(point[1]) * back for point in points]
         x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-        blocks.append(_block(
+        block = _block(
             index, text, x0, y0, max(2.0, x1 - x0), max(2.0, y1 - y0),
             width, height, bgr, float(item.get("score") or 0),
-        ))
+        )
+        block["quad"] = [[float(point[0]) * back, float(point[1]) * back] for point in points[:4]]
+        blocks.append(block)
     return _repair_short(bgr, _refine_blocks(bgr, _space_blocks(blocks, bgr)))
 
 
@@ -482,6 +488,11 @@ def _upper_ratio(text: str) -> float:
     return sum(ch.isupper() for ch in letters) / float(len(letters))
 
 
+def _is_numeral(text: str) -> bool:
+    raw = str(text or "").strip()
+    return raw.isdigit() and len(raw) <= 2
+
+
 def _is_phone(text: str) -> bool:
     raw = " ".join(str(text or "").split())
     digits = re.sub(r"\D", "", raw)
@@ -515,6 +526,15 @@ def _rescue_lines(bgr: np.ndarray, dropped: list) -> tuple[list, list]:
         if not isinstance(block, dict):
             continue
         text = str(block.get("text") or "").strip()
+        if _is_numeral(text):
+            block = dict(block)
+            block["rescued"] = "numeral"
+            try:
+                block["score"] = max(float(block.get("score") or 0), 0.8)
+            except (TypeError, ValueError):
+                block["score"] = 0.8
+            rescued.append(block)
+            continue
         kind = _rescue_kind(text)
         if not kind:
             still.append(block)
@@ -736,7 +756,12 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         "bbox": block.get("bbox"),
         "rect": rect,
         "color": block.get("color_hex") or "#222222",
+        "quad": block.get("quad"),
     }
+    if _is_numeral(text) or rescued == "numeral":
+        key = "poppins-regular" if style == "sans" else "crimson"
+        record.update(mode="vector", font=key, role="numeral", match=0.5)
+        return record
     try:
         ocr_score = float(block.get("score") or 0)
     except (TypeError, ValueError):
@@ -859,7 +884,7 @@ def _normalise_paragraphs(lines: list, style: str) -> None:
     ordered = sorted(lines, key=lambda line: (line["rect"][1], line["rect"][0]))
     seen = set()
     for index, line in enumerate(ordered):
-        if id(line) in seen or line.get("role") in ("script", "caps", "phone", "sans-caps"):
+        if id(line) in seen or line.get("role") in ("script", "caps", "phone", "sans-caps", "numeral"):
             seen.add(id(line))
             continue
         block = [line]
@@ -868,7 +893,7 @@ def _normalise_paragraphs(lines: list, style: str) -> None:
         bottom = y + height
         left = line["rect"][0]
         for other in ordered[index + 1:]:
-            if other.get("role") in ("script", "caps", "phone", "sans-caps"):
+            if other.get("role") in ("script", "caps", "phone", "sans-caps", "numeral"):
                 break
             ox, oy, _ow, oh = other["rect"]
             if abs(ox - left) > max(14, height * 0.9):
@@ -1176,6 +1201,67 @@ def _restore_colour(sharp: np.ndarray, original: np.ndarray) -> np.ndarray:
     sharp_lab[:, :, 1] = orig_lab[:, :, 1]
     sharp_lab[:, :, 2] = orig_lab[:, :, 2]
     return cv2.cvtColor(sharp_lab, cv2.COLOR_LAB2BGR)
+
+
+def _guide_boxes(bgr, blocks, lines) -> list:
+    width, height = bgr.shape[1], bgr.shape[0]
+    boxes = []
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        x, y, bw, bh = _rect(block, width, height)
+        boxes.append((x, y, x + bw, y + bh))
+    for line in lines:
+        ink = line.get("ink")
+        if ink:
+            boxes.append(tuple(ink[:4]))
+            continue
+        rect = line.get("rect")
+        if rect:
+            x, y, bw, bh = rect
+            boxes.append((x, y, x + bw, y + bh))
+    return boxes
+
+
+def _source_marks(bgr, lines) -> list:
+    """Badges stay painted. Plain bullets are erased here and redrawn as vectors."""
+    marks = []
+    for line in lines:
+        found = _mark_near(bgr, line["rect"])
+        if not found:
+            continue
+        if found[0] == "badge":
+            marks.append({"kind": "badge", "cx": found[1], "cy": found[2], "radius": found[3]})
+            stripped = re.sub(r"^\d{1,2}\s+", "", str(line.get("text") or ""))
+            if stripped.strip():
+                line["text"] = stripped
+            continue
+        if any(
+            mark.get("kind") == "bullet"
+            and abs(found[1] - mark["cx"]) < 6
+            and abs(found[2] - mark["cy"]) < 6
+            for mark in marks
+        ):
+            continue
+        marks.append({
+            "kind": "bullet",
+            "cx": found[1],
+            "cy": found[2],
+            "radius": found[3],
+            "color": found[4],
+        })
+    return marks
+
+
+def _map_bullets(marks, placed) -> list:
+    bullets = []
+    scale = float(placed.get("px_per_src") or 1.0)
+    for mark in marks:
+        if mark.get("kind") != "bullet":
+            continue
+        cx, cy = placed["map"](mark["cx"], mark["cy"])
+        bullets.append((cx, cy, float(mark["radius"]) * scale, mark["color"]))
+    return bullets
 
 
 def _map_rect(rect, scale, off_x, off_y, bleed, shape) -> tuple[int, int, int, int]:
@@ -1620,6 +1706,10 @@ def _hex_rgb(value: str) -> tuple[float, float, float]:
 
 def _cmyk(rgb: tuple[float, float, float]) -> tuple[float, float, float, float]:
     red, green, blue = rgb
+    # Dark neutral type is solid black. A grey K prints light on the press.
+    lum = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    if max(red, green, blue) - min(red, green, blue) < 0.08 and lum < 0.35:
+        return (0.0, 0.0, 0.0, 1.0)
     if max(red, green, blue) < 0.12 and max(red, green, blue) - min(red, green, blue) < 0.06:
         return (0.0, 0.0, 0.0, 1.0)
     black = 1.0 - max(red, green, blue)
