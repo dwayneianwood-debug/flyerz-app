@@ -532,14 +532,18 @@ def _residual_mask(clean: np.ndarray, meta: list) -> np.ndarray:
 
 
 def _enlarge(clean: np.ndarray, art_w: int, art_h: int) -> tuple[np.ndarray, str]:
-    token = ""
-    try:
-        from ai_enhancements import _get_replicate_token
+    """Lanczos, then a light colour match. Real-ESRGAN only when VECTOR_ESRGAN=1."""
+    from host_paths import esrgan_enabled
 
-        token = (_get_replicate_token() or "").strip()
-    except Exception:
-        token = ""
-    if token and os.environ.get("VECTOR_SKIP_ESRGAN") != "1":
+    token = ""
+    if esrgan_enabled():
+        try:
+            from ai_enhancements import _get_replicate_token
+
+            token = (_get_replicate_token() or "").strip()
+        except Exception:
+            token = ""
+    if token:
         enhanced = _esrgan(clean)
         if enhanced is not None:
             resized = cv2.resize(enhanced, (art_w, art_h), interpolation=cv2.INTER_LANCZOS4)

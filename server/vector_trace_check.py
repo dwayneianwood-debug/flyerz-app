@@ -21,12 +21,13 @@ from vector_trace import (
     rasterise_paths,
     refine_ink,
     segment_ink,
+    sharpen_background,
     trace_fitted,
     trace_mask,
     _trace_fill,
 )
 
-SANS = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
+SANS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "LiberationSans-Bold.ttf")
 
 
 def fail(message: str) -> None:
@@ -245,7 +246,68 @@ def test_card_back_body_is_traced() -> None:
             str(line),
         )
         print(f"IOU {text} {line.get('match')}")
-    check("card-back-time", float(result.get("elapsed_s") or 999) < 120, str(result.get("timings")))
+    check("card-back-count", int(result.get("vector_lines") or 0) == 63, str(result.get("vector_lines")))
+    rasters = [line.get("text") for line in result.get("lines") or [] if line.get("mode") == "raster"]
+    check("card-back-icons", set(rasters) <= {"+", "中", "♡"}, str(rasters))
+    timings = result.get("timings") or {}
+    joined = " ".join(result.get("decisions") or [])
+    check("card-back-timing", "Timing:" in joined and "colour" in joined, joined[-240:])
+    check("card-back-time", float(result.get("elapsed_s") or 999) < 120, str(timings))
+    print("TIMING", timings)
+
+
+def test_paths_and_local_plate() -> None:
+    """Windows-safe files, and Lanczos unless Real-ESRGAN is asked for."""
+    from PIL import ImageCms
+
+    from host_paths import bundled_sans, esrgan_enabled, find_potrace, icc_file
+
+    check("sans-bundled", os.path.isfile(SANS) and SANS == bundled_sans(True), SANS)
+    cmyk = icc_file("default_cmyk.icc")
+    srgb = icc_file("srgb.icc")
+    check("icc-bundled", "assets" in cmyk.replace("\\", "/") and "assets" in srgb.replace("\\", "/"), cmyk)
+    ImageCms.getOpenProfile(cmyk)
+    ImageCms.getOpenProfile(srgb)
+    folder = tempfile.mkdtemp(prefix="potrace-path-")
+    binary = os.path.join(folder, "potrace")
+    with open(binary, "w", encoding="utf-8") as handle:
+        handle.write("")
+    saved_potrace = os.environ.get("POTRACE_PATH")
+    saved_esrgan = os.environ.get("VECTOR_ESRGAN")
+    saved_skip = os.environ.get("VECTOR_SKIP_ESRGAN")
+    try:
+        os.environ["POTRACE_PATH"] = folder
+        check("potrace-dir", find_potrace() == binary, find_potrace())
+        os.environ.pop("VECTOR_ESRGAN", None)
+        os.environ.pop("VECTOR_SKIP_ESRGAN", None)
+        check("esrgan-off", esrgan_enabled() is False)
+        os.environ["VECTOR_ESRGAN"] = "1"
+        check("esrgan-on", esrgan_enabled() is True)
+        os.environ["VECTOR_SKIP_ESRGAN"] = "1"
+        check("esrgan-skip", esrgan_enabled() is False)
+    finally:
+        if saved_potrace is None:
+            os.environ.pop("POTRACE_PATH", None)
+        else:
+            os.environ["POTRACE_PATH"] = saved_potrace
+        if saved_esrgan is None:
+            os.environ.pop("VECTOR_ESRGAN", None)
+        else:
+            os.environ["VECTOR_ESRGAN"] = saved_esrgan
+        if saved_skip is None:
+            os.environ.pop("VECTOR_SKIP_ESRGAN", None)
+        else:
+            os.environ["VECTOR_SKIP_ESRGAN"] = saved_skip
+
+    plate = np.zeros((48, 96, 3), np.uint8)
+    plate[:, :40] = 30
+    plate[:, 40:] = 220
+    ink = np.zeros((48, 96), np.uint8)
+    ink[8:24, 8:28] = 255
+    plate[8:24, 8:28] = (12, 18, 9)
+    out = sharpen_background(plate, ink)
+    check("sharpen-ink", np.array_equal(out[8:24, 8:28], plate[8:24, 8:28]))
+    check("sharpen-paper", int(np.abs(out.astype(np.int16) - plate.astype(np.int16)).sum()) > 0)
 
 
 def main() -> None:
@@ -255,6 +317,7 @@ def main() -> None:
     test_default_trace_and_font_flag()
     test_rebuild_defaults_to_trace()
     test_glyphs_reject_a_changed_letter()
+    test_paths_and_local_plate()
     test_card_back_body_is_traced()
     print("ALL PASS")
 

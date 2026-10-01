@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 from typing import Callable, Optional
 
@@ -37,7 +38,7 @@ RECALL_FLOOR = 0.60
 # A caps line under this size may stay as pixels. Larger headings are set in
 # Cinzel, using Regular and a paper-coloured stroke when SemiBold is too heavy.
 CAPS_INK_FLOOR_PT = 8.0
-OCR_CACHE = os.environ.get("VECTOR_OCR_CACHE", "/tmp/flyerz-ocr-cache")
+OCR_CACHE = os.environ.get("VECTOR_OCR_CACHE") or os.path.join(tempfile.gettempdir(), "flyerz-ocr-cache")
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "v2")
 
@@ -868,8 +869,12 @@ def _line_record(block: dict, mode: str, reason: str) -> dict:
     }
 
 
-def read_blocks(bgr: np.ndarray) -> list:
-    """One OCR pass on a downscaled copy. Results are cached by picture hash."""
+def read_blocks(bgr: np.ndarray, extra: bool = True) -> list:
+    """One OCR pass on a downscaled copy. Results are cached by picture hash.
+
+    extra runs the crop re-read used by font substitution. Trace mode leaves
+    it off: those passes only rewrite the words, not the boxes.
+    """
     from ai_rebuild import _block, _space_blocks
     from ocr_reader import local_rows
 
@@ -916,7 +921,10 @@ def read_blocks(bgr: np.ndarray) -> list:
         )
         block["quad"] = [[float(point[0]) * back, float(point[1]) * back] for point in points[:4]]
         blocks.append(block)
-    return _repair_short(bgr, _refine_blocks(bgr, _space_blocks(blocks, bgr)))
+    spaced = _space_blocks(blocks, bgr)
+    if not extra:
+        return spaced
+    return _repair_short(bgr, _refine_blocks(bgr, spaced))
 
 
 def _prefer_same_line(old_text: str, new_text: str) -> str:
@@ -2352,15 +2360,18 @@ def _cover(bgr: np.ndarray, dst_w: int, dst_h: int, interp: int):
 
 
 def _enlarge(bgr: np.ndarray, dst_w: int, dst_h: int) -> tuple[np.ndarray, str]:
-    """Real-ESRGAN when a token is set. Otherwise one Lanczos cover resize."""
-    token = ""
-    try:
-        from ai_enhancements import _get_replicate_token
+    """Lanczos cover resize. Real-ESRGAN only when VECTOR_ESRGAN=1 and a token is set."""
+    from host_paths import esrgan_enabled
 
-        token = (_get_replicate_token() or "").strip()
-    except Exception:
-        token = ""
-    if token and os.environ.get("VECTOR_SKIP_ESRGAN") != "1":
+    token = ""
+    if esrgan_enabled():
+        try:
+            from ai_enhancements import _get_replicate_token
+
+            token = (_get_replicate_token() or "").strip()
+        except Exception:
+            token = ""
+    if token:
         enhanced = _try_esrgan(bgr, dst_w, dst_h)
         if enhanced is not None:
             fitted, _scale, _x, _y = _cover(enhanced, dst_w, dst_h, cv2.INTER_LANCZOS4)
@@ -3172,7 +3183,9 @@ def _press_cmyk():
     global _PRESS_CMYK
     if _PRESS_CMYK is not None:
         return _PRESS_CMYK
-    profile = "/usr/share/color/icc/ghostscript/default_cmyk.icc"
+    from host_paths import icc_file
+
+    profile = icc_file("default_cmyk.icc")
     _PRESS_CMYK = ImageCms.buildTransform(
         ImageCms.createProfile("sRGB"),
         ImageCms.getOpenProfile(profile),

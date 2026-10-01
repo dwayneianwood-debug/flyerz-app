@@ -359,13 +359,9 @@ def apply_text_overlay(input_path: str, blocks: list) -> dict:
     draw = ImageDraw.Draw(pil)
     H, W = rgb.shape[:2]
 
-    font_candidates = [
-        r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\calibri.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
+    from host_paths import overlay_fonts
+
+    font_candidates = overlay_fonts(True)
 
     def load_font(size: int, bold: bool):
         paths = font_candidates if bold else list(reversed(font_candidates[:2])) + font_candidates[2:]

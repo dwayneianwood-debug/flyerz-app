@@ -12,8 +12,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -343,7 +345,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
     _note(progress, "reading", "Reading the lettering.")
     ocr_started = time.perf_counter()
     if blocks is None:
-        blocks = read_blocks(bgr)
+        blocks = read_blocks(bgr, extra=False)
     ocr_s = time.perf_counter() - ocr_started
     guide = []
     for block in blocks or []:
@@ -370,6 +372,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
     raster_lines = []
     choke = np.zeros(plate.shape[:2], np.uint8)
     height, width = plate.shape[:2]
+    pending = []
     for block in blocks or []:
         if not isinstance(block, dict) or not block.get("bbox"):
             continue
@@ -399,7 +402,20 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
             continue
-        paths = trace_mask(mask)
+        pending.append({
+            "text": text,
+            "mask": mask,
+            "colour": colour,
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+        })
+    traced = _trace_many([item["mask"] for item in pending])
+    for item, paths in zip(pending, traced):
+        text = item["text"]
+        mask = item["mask"]
+        left, top, right, bottom = item["left"], item["top"], item["right"], item["bottom"]
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
             continue
@@ -407,7 +423,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
         if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
             continue
-        fill = _trace_fill(colour)
+        fill = _trace_fill(item["colour"])
         drawn.append({
             "text": text,
             "paths": paths,
@@ -418,6 +434,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
         })
         choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
     if int(choke.max()) > 0:
+        plate[:] = sharpen_background(plate, choke)
         choke_ink(plate, choke, CHOKE_PX)
     trace_s = time.perf_counter() - trace_started
     if not drawn and not raster_lines:
@@ -459,12 +476,23 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
     ]
     if reason:
         decisions.append(reason)
+    colour_s = float(qa.get("colour_s") or 0)
+    compose_s = float(qa.get("compose_s") or 0)
     timings = {
         "ocr_s": round(ocr_s, 3),
         "enlarge_s": round(enlarge_s, 3),
         "trace_s": round(trace_s, 3),
+        "colour_s": round(colour_s, 3),
+        "compose_s": round(compose_s, 3),
         "total_s": round(time.perf_counter() - started, 3),
     }
+    timing_line = (
+        f"Timing: OCR {timings['ocr_s']:.2f}s, upscale {timings['enlarge_s']:.2f}s, "
+        f"trace {timings['trace_s']:.2f}s, colour {timings['colour_s']:.2f}s, "
+        f"PDF {timings['compose_s']:.2f}s."
+    )
+    decisions.append(timing_line)
+    sys.stderr.write("[vector-trace] " + timing_line + "\n")
     return {
         "ok": True,
         "amber": amber,
@@ -536,8 +564,11 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
 
     qa = {"wrote": False, "cmyk": False, "boxes": False, "ppi": False, "fonts": True, "reason": ""}
     os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
+    colour_started = time.perf_counter()
     rgb = cv2.cvtColor(plate, cv2.COLOR_BGR2RGB)
     cmyk = ImageCms.applyTransform(Image.fromarray(rgb), _press_cmyk())
+    qa["colour_s"] = time.perf_counter() - colour_started
+    compose_started = time.perf_counter()
     buffer = io.BytesIO()
     cmyk.save(buffer, format="TIFF", dpi=(MIN_PPI, MIN_PPI))
     width_pt = (trim_w + 2 * bleed_mm) * MM_TO_PT
@@ -557,6 +588,7 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
     finally:
         doc.close()
     _inspect_plate(output_pdf, trim_w, trim_h, bleed_mm, qa)
+    qa["compose_s"] = time.perf_counter() - compose_started
     qa["traced"] = len(drawn)
     return qa
 
@@ -647,6 +679,41 @@ def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
         doc.close()
 
 
+def _workers() -> int:
+    try:
+        count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        count = os.cpu_count() or 2
+    return max(1, min(4, int(count or 1)))
+
+
+def _trace_many(masks: list) -> list:
+    """Potrace each mask. A pool overlaps the CLI calls. Order stays the page order."""
+    if not masks:
+        return []
+    if len(masks) == 1 or _workers() == 1:
+        return [trace_mask(mask) for mask in masks]
+    with ThreadPoolExecutor(max_workers=_workers()) as pool:
+        return list(pool.map(trace_mask, masks))
+
+
+def sharpen_background(plate: np.ndarray, ink: np.ndarray) -> np.ndarray:
+    """Mild unsharp on the paper. Letter pixels, and a ring around them, stay put.
+
+    The ring is what the 1px choke samples. Sharpening it would leave a halo
+    beside the vector. The ink mask itself is already traced, so this does not
+    change the paths or their IoU.
+    """
+    blur = cv2.GaussianBlur(plate, (0, 0), 0.8)
+    sharp = cv2.addWeighted(plate, 1.25, blur, -0.25, 0)
+    if ink is None or int(np.max(ink)) == 0:
+        return sharp
+    protect = cv2.dilate((ink > 0).astype(np.uint8), np.ones((5, 5), np.uint8))
+    out = sharp
+    out[protect > 0] = plate[protect > 0]
+    return out
+
+
 def _potrace_svg(binary: np.ndarray) -> str:
     height, width = binary.shape[:2]
     handle = tempfile.NamedTemporaryFile(prefix="trace-", suffix=".pbm", delete=False)
@@ -661,9 +728,11 @@ def _potrace_svg(binary: np.ndarray) -> str:
         handle.write(packed.tobytes())
         handle.close()
         # Potrace traces black. PBM 1-bits are black, and those are our ink pixels.
+        from host_paths import find_potrace
+
         result = subprocess.run(
             [
-                "potrace", "-s", "--flat",
+                find_potrace(), "-s", "--flat",
                 "-t", str(TURDSIZE),
                 "-a", str(ALPHAMAX),
                 "-O", str(OPTTOLERANCE),

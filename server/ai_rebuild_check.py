@@ -387,7 +387,12 @@ def _lab_delta(left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
 def _proof_bgr(pdf_path: str, dest_png: str) -> np.ndarray:
     """RGB proof of a press PDF through the same FOGRA39 profile."""
     icc = os.path.join(os.path.dirname(__file__), "profiles", "CoatedFOGRA39.icc")
-    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
+    from host_paths import icc_file
+
+    try:
+        srgb = icc_file("srgb.icc")
+    except FileNotFoundError:
+        srgb = ""
     cmd = [
         "gs", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m",
         f"-sOutputFile={dest_png}", "-r110",
