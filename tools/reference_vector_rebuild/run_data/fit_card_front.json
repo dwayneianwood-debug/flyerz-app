@@ -1,0 +1,389 @@
+[
+ {
+  "id": "card_front:0",
+  "text": "Chandr\u00e9",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   990.6985544784734,
+   288.5942043031596
+  ],
+  "ink": [
+   993,
+   187,
+   1419,
+   302
+  ],
+  "tw": 426,
+  "th": 115,
+  "marea": 9172,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.5,
+  "size": 136.7190023906442,
+  "cs": 0.0,
+  "hs": 1.0029429075927017,
+  "wf": 426.25,
+  "hf": 115.25,
+  "bx0": 2.3014455215266594,
+  "by0": -101.59420430315956,
+  "area": 9483,
+  "score": 0.03334178167564054,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   6.0,
+   20.0,
+   9.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "card_front:1",
+  "text": "073 703 0766",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   1080.6557182544277,
+   432.54411764705884
+  ],
+  "ink": [
+   1083,
+   395,
+   1434,
+   433
+  ],
+  "tw": 351,
+  "th": 38,
+  "marea": 3071,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 59.6078431372549,
+  "cs": 2.980392156862745,
+  "hs": 1.0360574140525525,
+  "wf": 351.0,
+  "hf": 38.0,
+  "bx0": 2.3442817455723954,
+  "by0": -37.544117647058826,
+  "area": 2896,
+  "score": 0.058653096498212424,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   3.0,
+   19.0,
+   6.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "card_front:2",
+  "text": "8 Waterbok Street,",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   1082.9351851851852,
+   551.4166666666666
+  ],
+  "ink": [
+   1085,
+   523,
+   1399,
+   558
+  ],
+  "tw": 314,
+  "th": 35,
+  "marea": 2298,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 41.48148148148148,
+  "cs": 0.4117647058823529,
+  "hs": 1.0,
+  "wf": 314.0,
+  "hf": 35.0,
+  "bx0": 2.0648148148148167,
+  "by0": -28.41666666666667,
+  "area": 2012,
+  "score": 0.13284809912339005,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   0.0,
+   16.0,
+   5.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "card_front:3",
+  "text": "Edelweiss, Springs",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   1082.7777777777778,
+   593.75
+  ],
+  "ink": [
+   1084,
+   565,
+   1387,
+   603
+  ],
+  "tw": 303,
+  "th": 38,
+  "marea": 2357,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 42.22222222222222,
+  "cs": -0.029411764705882353,
+  "hs": 1.0,
+  "wf": 303.0,
+  "hf": 38.0,
+  "bx0": 1.2222222222222214,
+  "by0": -28.75,
+  "area": 2188,
+  "score": 0.0743689835744533,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   2.0,
+   18.0,
+   7.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "card_front:4",
+  "text": "LIVE BLOOD ANALYSIS",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   227.3728813559322,
+   632.3389830508474
+  ],
+  "ink": [
+   229,
+   605,
+   813,
+   633
+  ],
+  "tw": 584,
+  "th": 28,
+  "marea": 3373,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 37.96610169491525,
+  "cs": 8.097222222222221,
+  "hs": 1.0,
+  "wf": 584.0,
+  "hf": 28.0,
+  "bx0": 1.6271186440677958,
+  "by0": -27.33898305084746,
+  "area": 3328,
+  "score": 0.013427025530888618,
+  "color": [
+   18.0,
+   18.0,
+   19.0
+  ],
+  "color_raw": [
+   2.0,
+   3.0,
+   4.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "card_front:5",
+  "text": "AND HEALTH",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   383.51637251637254,
+   672.4118381618382
+  ],
+  "ink": [
+   383,
+   654,
+   664,
+   673
+  ],
+  "tw": 281,
+  "th": 19,
+  "marea": 994,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 25.645465645465645,
+  "cs": 11.61111111111111,
+  "hs": 1.0,
+  "wf": 281.0,
+  "hf": 19.0,
+  "bx0": -0.5163725163725168,
+  "by0": -18.411838161838162,
+  "area": 912,
+  "score": 0.08600685656362425,
+  "color": [
+   18.0,
+   18.0,
+   19.0
+  ],
+  "color_raw": [
+   4.0,
+   5.0,
+   6.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "card_front:6",
+  "text": "medella.lba@gmail.com",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   1077.9458598726114,
+   706.2531847133757
+  ],
+  "ink": [
+   1079,
+   677,
+   1469,
+   716
+  ],
+  "tw": 390,
+  "th": 39,
+  "marea": 3048,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 43.05732484076432,
+  "cs": -0.3375,
+  "hs": 1.0,
+  "wf": 390.0,
+  "hf": 38.75,
+  "bx0": 1.0541401273885427,
+  "by0": -29.253184713375788,
+  "area": 2998,
+  "score": 0.016534768239245736,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   1.0,
+   17.0,
+   6.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "card_front:7",
+  "text": "See your health, live your best life",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   296.093869423908,
+   718.1904761904761
+  ],
+  "ink": [
+   295,
+   687,
+   729,
+   737
+  ],
+  "tw": 434,
+  "th": 50,
+  "marea": 2605,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 42.32804232804233,
+  "cs": 0.0,
+  "hs": 0.837029893924783,
+  "wf": 434.0,
+  "hf": 50.0,
+  "bx0": -1.093869423908,
+  "by0": -31.19047619047619,
+  "area": 2342,
+  "score": 0.10638431917699473,
+  "color": [
+   18.0,
+   18.0,
+   19.0
+  ],
+  "color_raw": [
+   10.0,
+   11.0,
+   12.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "card_front:8",
+  "text": "By appointment only",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   1075.2100317568134,
+   818.3618558860494
+  ],
+  "ink": [
+   1076,
+   783,
+   1438,
+   840
+  ],
+  "tw": 362,
+  "th": 57,
+  "marea": 2857,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.25,
+  "size": 48.39547549224969,
+  "cs": 0.0,
+  "hs": 0.9420949902407287,
+  "wf": 362.0,
+  "hf": 57.25,
+  "bx0": 0.7899682431866992,
+  "by0": -35.36185588604944,
+  "area": 2985,
+  "score": 0.04381261960932295,
+  "color": [
+   13.0,
+   40.0,
+   17.0
+  ],
+  "color_raw": [
+   2.0,
+   12.0,
+   7.0
+  ],
+  "cclass": "green"
+ }
+]
