@@ -836,10 +836,16 @@ def _apply_text_gate(blocks, drawn, raster_lines, plate, pristine, output_pdf, t
     plate_shape = plate.shape if pristine is None else pristine.shape
     kept = []
     reverted = False
+    # Pristine-crop reading for a box we put back. That is what the rewritten file shows.
+    restored = {}
     for item in drawn:
         matched, _shown = _line_matches(item["text"], render_lines)
         changed = False
-        if not matched and pristine is not None:
+        original = ""
+        # Body copy is already gated by the counter check. Re-reading every small
+        # miss is most of the gate time, and a closed counter on display type is tall.
+        _box_h = int(item["rect"][3]) if item.get("rect") else 0
+        if not matched and pristine is not None and _box_h >= 44:
             original = _ocr_crop(_plate_crop(pristine, item["rect"]))
             rendered = _ocr_crop(_render_crop(trim, plate_shape, item["rect"], trim_w, trim_h, bleed_mm))
             # Only a proven change of letters (9AM read as 8AM). An unread crop is not proof.
@@ -856,6 +862,7 @@ def _apply_text_gate(blocks, drawn, raster_lines, plate, pristine, output_pdf, t
             "raster",
             "The render did not match this line, so the box stayed in the picture.",
         ))
+        restored[_norm_text(item["text"])] = original
         reverted = True
     if reverted:
         first_colour = float(qa.get("colour_s") or 0)
@@ -863,29 +870,24 @@ def _apply_text_gate(blocks, drawn, raster_lines, plate, pristine, output_pdf, t
         qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
         qa["colour_s"] = first_colour + float(qa.get("colour_s") or 0)
         qa["compose_s"] = first_compose + float(qa.get("compose_s") or 0)
-        try:
-            trim = _trim_bgr(output_pdf, bleed_mm, 300)
-            from vector_text_v2 import read_blocks
-            render_lines = [str(row.get("text") or "") for row in read_blocks(trim, extra=False)]
-        except Exception:
-            pass
     drawn = kept
 
     modes = {_norm_text(item["text"]): "vector" for item in drawn}
-    boxes = {_norm_text(item["text"]): item for item in drawn}
     report = []
     for text in source_lines:
-        ok, shown = _line_matches(text, render_lines)
-        if not ok:
-            item = boxes.get(_norm_text(text))
-            if item is not None:
-                shown = _ocr_crop(_render_crop(trim, plate_shape, item["rect"], trim_w, trim_h, bleed_mm))
-                ok = bool(shown) and _same_reading(text, shown)
+        key = _norm_text(text)
+        if key in restored:
+            shown = restored[key]
+            ok = bool(shown) and _same_reading(text, shown)
+            mode = "raster"
+        else:
+            ok, shown = _line_matches(text, render_lines)
+            mode = modes.get(key, "raster")
         report.append({
             "text": text,
             "ok": bool(ok),
             "render": shown if shown else "",
-            "mode": modes.get(_norm_text(text), "raster"),
+            "mode": mode,
         })
     return report, drawn, qa
 
