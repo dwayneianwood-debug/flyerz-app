@@ -139,6 +139,15 @@ def test_bullet_cmyk_and_boxes() -> None:
     check("bullet-one-image", len(images) == 1, str(len(images)))
 
 
+def test_reread_cannot_swap_the_line() -> None:
+    from vector_text_v2 import _close_reread
+
+    check("surface-stays", _close_reread("The Surface", "Tho Surfuce", 0.95) is False)
+    check("weak-read-replaced", _close_reread("Supts noral", "Supports natural", 0.68))
+    check("best-restored", _close_reread("feel your bes, every day.", "feel your best, every day.", 0.97))
+    check("spacing-restored", _close_reread("LIVE BLOODA NALYSIS", "LIVE BLOOD ANALYSIS", 0.9))
+
+
 def test_refine_repairs_a_joined_word() -> None:
     from vector_text_v2 import _refine_blocks
 
@@ -619,6 +628,7 @@ def main() -> None:
     test_overlap_and_qa_gate()
     test_bullet_cmyk_and_boxes()
     test_refine_repairs_a_joined_word()
+    test_reread_cannot_swap_the_line()
     test_list_item_is_not_script()
     test_tick_leaves_the_mask()
     test_serif_page_is_consistent()

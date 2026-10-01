@@ -385,6 +385,21 @@ def _prefer_same_line(old_text: str, new_text: str) -> str:
     return best
 
 
+def _close_reread(old_text: str, new_text: str, old_score: float = 1.0) -> bool:
+    """A second read may restore a letter. It may not swap a confident line."""
+    old_core = re.sub(r"[^A-Za-z0-9]", "", old_text).upper()
+    new_core = re.sub(r"[^A-Za-z0-9]", "", new_text).upper()
+    if not old_core or not new_core:
+        return False
+    if old_core == new_core or _line_ratio(old_text, new_text) >= 0.72 or _edit(old_core, new_core) <= 1:
+        return True
+    # A weak page read, such as "Supts noral", can take a confident crop read.
+    try:
+        return float(old_score) < 0.8
+    except (TypeError, ValueError):
+        return False
+
+
 def _line_ratio(left: str, right: str) -> float:
     left = re.sub(r"[^a-z0-9]", "", left.lower())
     right = re.sub(r"[^a-z0-9]", "", right.lower())
@@ -431,6 +446,7 @@ def _repair_short(bgr: np.ndarray, blocks: list) -> list:
             and len(new_core) >= len(old_core)
             and len(new_core) >= max(4, int(len(old_core) * 0.8))
             and " ".join(new_text.split()).upper() != " ".join(old_text.split()).upper()
+            and _close_reread(old_text, new_text, old_score)
         ):
             block["text"] = new_text
             block["score"] = round(float(new_score), 3)
@@ -517,6 +533,7 @@ def _refine_blocks(bgr: np.ndarray, blocks: list) -> list:
             and len(new_core) >= max(4, int(len(old_core) * 0.8))
             and new_spaced != old_spaced
             and (len(new_text.split()) >= len(old_text.split()) or new_score >= 0.99)
+            and _close_reread(old_text, new_text, old_score)
         ):
             block["text"] = new_text
             block["score"] = round(new_score, 3)
