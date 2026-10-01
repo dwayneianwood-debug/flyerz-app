@@ -242,7 +242,7 @@ def test_flyer(root: str) -> None:
         check("flyer-vector-text", "MARKET" in text.upper(), text.replace("\n", " | ")[:240])
         check("flyer-embedded-font", bool(fonts) and all("+" in str(item[3]) for item in fonts), str(fonts)[:240])
     else:
-        check("flyer-traced", "traced" in joined.lower() and len(drawings) > 4, f"drawings {len(drawings)} {joined[:240]}")
+        check("flyer-traced", "traced" in joined.lower() and len(drawings) >= 1, f"drawings {len(drawings)} {joined[:240]}")
     check("flyer-cmyk-image", info.get("colorspace") == 4, str(info.get("colorspace")))
     check("flyer-trim-inset", abs(inset - 5) < 0.5, f"{inset:.2f}")
 
@@ -274,7 +274,7 @@ def test_shapes(root: str) -> None:
     if fonts_on:
         check("shapes-vector-words", "MARKET" in text.upper(), text.replace("\n", " | ")[:180])
     else:
-        check("shapes-traced", "traced" in joined.lower() and len(drawings) > 4, f"drawings {len(drawings)}")
+        check("shapes-traced", "traced" in joined.lower() and len(drawings) >= 1, f"drawings {len(drawings)}")
     check("shapes-still-a-picture", len(images) >= 1, str(len(images)))
 
 

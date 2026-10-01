@@ -638,8 +638,55 @@ def _paint_paths(page, paths, fill, sx, sy, origin_x, origin_y) -> None:
     shape.commit()
 
 
+def _pdf_xy(px, py, sx, sy, origin_x, origin_y, page_h) -> tuple[float, float]:
+    return (origin_x + px) * sx, page_h - (origin_y + py) * sy
+
+
+def _append_pdf_paths(chunks, paths, sx, sy, origin_x, origin_y, page_h) -> bool:
+    """PDF path operators. Even-odd fill is applied by the caller."""
+    used = False
+    for group in paths:
+        for sub in group:
+            cursor = None
+            start = None
+            for cmd, pts in sub:
+                if cmd == "M" and pts:
+                    cursor = pts[0]
+                    start = pts[0]
+                    x, y = _pdf_xy(cursor[0], cursor[1], sx, sy, origin_x, origin_y, page_h)
+                    chunks.append(f"{x:.2f} {y:.2f} m\n")
+                    continue
+                if cmd == "L" and pts and cursor is not None:
+                    end = pts[0]
+                    x, y = _pdf_xy(end[0], end[1], sx, sy, origin_x, origin_y, page_h)
+                    chunks.append(f"{x:.2f} {y:.2f} l\n")
+                    cursor = end
+                    used = True
+                    continue
+                if cmd == "C" and len(pts) == 3 and cursor is not None:
+                    c1 = _pdf_xy(pts[0][0], pts[0][1], sx, sy, origin_x, origin_y, page_h)
+                    c2 = _pdf_xy(pts[1][0], pts[1][1], sx, sy, origin_x, origin_y, page_h)
+                    end = _pdf_xy(pts[2][0], pts[2][1], sx, sy, origin_x, origin_y, page_h)
+                    chunks.append(f"{c1[0]:.2f} {c1[1]:.2f} {c2[0]:.2f} {c2[1]:.2f} {end[0]:.2f} {end[1]:.2f} c\n")
+                    cursor = pts[2]
+                    used = True
+                    continue
+                if cmd == "Z" and cursor is not None and start is not None:
+                    x, y = _pdf_xy(start[0], start[1], sx, sy, origin_x, origin_y, page_h)
+                    chunks.append(f"{x:.2f} {y:.2f} l\n")
+                    cursor = start
+                    used = True
+    return used
+
+
 def _paint_drawn(page, drawn, sx, sy) -> None:
-    """One commit per ink colour. A page of black body text is a single drawing."""
+    """Write every trace as PDF path operators. One fill per ink colour.
+
+    Shape.draw_bezier once per curve was most of the press-file time. The
+    operators go into the page stream in one write.
+    """
+    if not drawn:
+        return
     order = []
     groups: dict = {}
     for item in drawn:
@@ -648,16 +695,35 @@ def _paint_drawn(page, drawn, sx, sy) -> None:
             groups[key] = []
             order.append(key)
         groups[key].append(item)
+    page_h = float(page.rect.height)
+    chunks = []
     for key in order:
-        shape = page.new_shape()
+        cyan, magenta, yellow, black = key
+        # Near-black traces are 100% K. The stream keeps that as the four integers.
+        if abs(cyan) < 1e-6 and abs(magenta) < 1e-6 and abs(yellow) < 1e-6 and abs(black - 1.0) < 1e-6:
+            chunks.append("q\n0 0 0 1 k\n")
+        else:
+            chunks.append(f"q\n{cyan:.4f} {magenta:.4f} {yellow:.4f} {black:.4f} k\n")
         used = False
         for item in groups[key]:
-            if _draw_paths(shape, item["paths"], sx, sy, item["origin"][0], item["origin"][1]):
+            if _append_pdf_paths(chunks, item["paths"], sx, sy, item["origin"][0], item["origin"][1], page_h):
                 used = True
-        if not used:
-            continue
-        shape.finish(color=None, fill=key, width=0, even_odd=True, closePath=False)
-        shape.commit()
+        chunks.append("f*\nQ\n" if used else "Q\n")
+    if not chunks:
+        return
+    xrefs = page.get_contents()
+    if len(xrefs) != 1:
+        for key in order:
+            shape = page.new_shape()
+            used = False
+            for item in groups[key]:
+                if _draw_paths(shape, item["paths"], sx, sy, item["origin"][0], item["origin"][1]):
+                    used = True
+            if used:
+                shape.finish(color=None, fill=key, width=0, even_odd=True, closePath=False)
+                shape.commit()
+        return
+    page.parent.update_stream(xrefs[0], page.read_contents() + b"\n" + "".join(chunks).encode("ascii"))
 
 
 def _pt(point, sx, sy, origin_x, origin_y):
