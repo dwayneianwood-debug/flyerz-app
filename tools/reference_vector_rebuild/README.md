@@ -18,14 +18,14 @@ pymupdf, Ghostscript 10 (CMYK conversion + ICC-accurate proofs). Upscaler: Real-
 
 | # | Script | What it does |
 |---|--------|--------------|
-| 1 | `ocr.py` → `data/ocr.json` | RapidOCR on each original: text + 4-point quad per line. |
+| 1 | `ocr.py` → `run_data/ocr.json` | RapidOCR on each original: text + 4-point quad per line. |
 | 2 | `spec.py` | **Hand-corrected line list** (`lines(side)`): fixes OCR wording/accents (Chandré, en dash, phone), drops non-text (logo "Medella", icons), manual quad tweaks. This is the source of truth for wording. |
 | 3 | `masks.py <sides>` | Per-line ink mask → `mask_<side>.png` + `meta_<side>.pkl` (ink box, ink colour, glyph mask). |
 | 4 | `inpaint.py <sides>` | Erase text on the ORIGINAL-resolution image → `clean_<side>.png`. |
 | 5 | (external) Real-ESRGAN x4 | `clean_<side>.png` → `up_<side>.orig.png` (4×). Outpainted/padded variants for bleed: `up_exp_flyer_front.png` (flyer front base, 16:9 expand), `up_exp_card_pad.png` (card front padded), `up_card_back.png`. |
 | 6 | `colorfix4.py` | Colour restore of the upscale → `up_<side>.png` (see below). `colorfix.py/2/3` are earlier, superseded attempts kept for history. |
 | 7 | `fonts.py`, `groups.py`, `match.py`, `sheet.py` | Candidate font pool (64 Google Fonts), role grouping (caps / body / italic / script), render-and-score matching; picks families. |
-| 8 | `fit.py <sides>` → `data/fit_<side>.json` | Per line: font weight, size, tracking (cs), horizontal scale (hs), stroke, baseline origin, angle, colour class. |
+| 8 | `fit.py <sides>` → `run_data/fit_<side>.json` | Per line: font weight, size, tracking (cs), horizontal scale (hs), stroke, baseline origin, angle, colour class. |
 | 9 | `harmonize.py` | One body size per paragraph block (width preserved). Called from `pdf.py`. |
 | 10 | `bg.py` | Composites full-bleed background PNGs per side (art placement, bleed extension). |
 | 11 | `pdf.py` | ReportLab: background image + vector text + vector ornaments, Trim/Bleed boxes, card-back redesign → `rgb_*.pdf`. |
@@ -111,6 +111,6 @@ ESRGAN shifts gold warmer and green lighter and adds chroma fringing. Fix in Lab
 9. Proof with Ghostscript + ICC; pdftoppm misrenders CMYK.
 10. OCR on script fonts is unreliable even on the original; verify script lines by PDF text extraction (whitespace-insensitive, tracked caps extract with spaces) plus zoomed visual compare.
 
-## data/
+## run_data/
 Snapshot of intermediate JSON from the approved run: `ocr.json`, `fit_<side>.json` (all fitted line parameters), `exp_*.json`, `cardback_layout.json`.
 Large intermediates (upscales, clean plates, masks, renders) are intentionally not committed.

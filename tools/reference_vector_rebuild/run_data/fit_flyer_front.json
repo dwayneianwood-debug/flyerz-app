@@ -1,0 +1,3958 @@
+[
+ {
+  "id": "flyer_front:0",
+  "text": "SEE BEYOND",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   525.8311162521688,
+   83.37001156737998
+  ],
+  "ink": [
+   528,
+   51,
+   810,
+   84
+  ],
+  "tw": 282,
+  "th": 33,
+  "marea": 2726,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 44.7888953152111,
+  "cs": -0.6111111111111112,
+  "hs": 1.0,
+  "wf": 282.0,
+  "hf": 33.0,
+  "bx0": 2.168883747831117,
+  "by0": -32.370011567379976,
+  "area": 2738,
+  "score": 0.004390786417489539,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   8.0,
+   33.0,
+   20.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:1",
+  "text": "The Surface",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   513.1372633390706,
+   153.57530120481928
+  ],
+  "ink": [
+   512,
+   98,
+   823,
+   176
+  ],
+  "tw": 311,
+  "th": 78,
+  "marea": 3015,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 75.18072289156626,
+  "cs": 0.0,
+  "hs": 0.8543956043956044,
+  "wf": 311.0,
+  "hf": 78.0,
+  "bx0": -1.1372633390705644,
+  "by0": -55.57530120481928,
+  "area": 3128,
+  "score": 0.036782014541035524,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   6.0,
+   27.0,
+   16.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:3",
+  "text": "Live Blood Analysis gives you a",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   528.1388888888889,
+   235.25
+  ],
+  "ink": [
+   529,
+   221,
+   769,
+   240
+  ],
+  "tw": 240,
+  "th": 19,
+  "marea": 749,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 21.11111111111111,
+  "cs": -0.6083333333333333,
+  "hs": 1.0,
+  "wf": 240.0,
+  "hf": 19.0,
+  "bx0": 0.8611111111111107,
+  "by0": -14.25,
+  "area": 782,
+  "score": 0.04305948946044701,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.0,
+   16.0,
+   16.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:4",
+  "text": "real-time look at your health,",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   528.256993006993,
+   262.2657342657343
+  ],
+  "ink": [
+   529,
+   248,
+   753,
+   267
+  ],
+  "tw": 224,
+  "th": 19,
+  "marea": 709,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 21.25874125874126,
+  "cs": -0.5775862068965517,
+  "hs": 1.0,
+  "wf": 224.0,
+  "hf": 19.0,
+  "bx0": 0.7430069930069898,
+  "by0": -14.265734265734267,
+  "area": 724,
+  "score": 0.020906684819313643,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.0,
+   15.0,
+   16.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:5",
+  "text": "helping to detect imbalances",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   527.7808219178082,
+   288.5068493150685
+  ],
+  "ink": [
+   528,
+   275,
+   747,
+   293
+  ],
+  "tw": 219,
+  "th": 18,
+  "marea": 719,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 19.726027397260275,
+  "cs": 0.05555555555555555,
+  "hs": 1.0,
+  "wf": 219.0,
+  "hf": 18.0,
+  "bx0": 0.21917808219177992,
+  "by0": -13.506849315068493,
+  "area": 668,
+  "score": 0.07346715188187251,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   11.0,
+   11.5,
+   12.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:6",
+  "text": "before symptoms appear.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   527.9195526695527,
+   315.0064935064935
+  ],
+  "ink": [
+   528,
+   301,
+   717,
+   320
+  ],
+  "tw": 189,
+  "th": 19,
+  "marea": 655,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 20.836940836940837,
+  "cs": -0.625,
+  "hs": 1.0,
+  "wf": 189.0,
+  "hf": 18.5,
+  "bx0": 0.08044733044733121,
+  "by0": -14.006493506493506,
+  "area": 664,
+  "score": 0.013626251711765056,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   21.0,
+   22.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:7",
+  "text": "LIVE BLOOD ANALYSIS",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   101.36995453919272,
+   357.45739771318364
+  ],
+  "ink": [
+   102,
+   343,
+   434,
+   358
+  ],
+  "tw": 332,
+  "th": 15,
+  "marea": 1104,
+  "font": "Cinzel",
+  "weight": 700,
+  "path": "/workspace/medfonts/static/Cinzel-w700.ttf",
+  "sw": 0.0,
+  "size": 19.837443173990906,
+  "cs": 5.416666666666667,
+  "hs": 1.0,
+  "wf": 332.0,
+  "hf": 15.0,
+  "bx0": 0.6300454608072741,
+  "by0": -14.457397713183632,
+  "area": 1001,
+  "score": 0.09784733230704308,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   6.0,
+   7.0,
+   7.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:8",
+  "text": "AND HEALTH",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   186.44017094017093,
+   378.11538461538464
+  ],
+  "ink": [
+   186,
+   368,
+   346,
+   378
+  ],
+  "tw": 160,
+  "th": 10,
+  "marea": 332,
+  "font": "Cinzel",
+  "weight": 700,
+  "path": "/workspace/medfonts/static/Cinzel-w700.ttf",
+  "sw": 0.0,
+  "size": 13.675213675213676,
+  "cs": 7.111111111111111,
+  "hs": 1.0,
+  "wf": 160.0,
+  "hf": 10.0,
+  "bx0": -0.44017094017094216,
+  "by0": -10.115384615384617,
+  "area": 318,
+  "score": 0.04295138719559931,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   26.5,
+   29.0,
+   30.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:9",
+  "text": "KNOW BETTER.",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   539.6734217636945,
+   393.39019896831246
+  ],
+  "ink": [
+   541,
+   377,
+   729,
+   394
+  ],
+  "tw": 188,
+  "th": 17,
+  "marea": 951,
+  "font": "Cinzel",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/Cinzel-w500.ttf",
+  "sw": 0.0,
+  "size": 22.716777204618033,
+  "cs": 1.6363636363636365,
+  "hs": 1.0,
+  "wf": 188.0,
+  "hf": 17.0,
+  "bx0": 1.326578236305572,
+  "by0": -16.39019896831246,
+  "area": 595,
+  "score": 0.46832436772601554,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   250.0,
+   251.0,
+   250.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:10",
+  "text": "See your health,",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   178.66450216450215,
+   406.83648170011804
+  ],
+  "ink": [
+   178,
+   388,
+   343,
+   418
+  ],
+  "tw": 165,
+  "th": 30,
+  "marea": 670,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 25.186934277843367,
+  "cs": 0.0,
+  "hs": 1.1,
+  "wf": 165.0,
+  "hf": 30.0,
+  "bx0": -0.6645021645021636,
+  "by0": -18.836481700118064,
+  "area": 562,
+  "score": 0.17548950883199144,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   20.0,
+   22.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:11",
+  "text": "Live Better.",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   542.5340755735492,
+   434.78846153846155
+  ],
+  "ink": [
+   543,
+   404,
+   727,
+   439
+  ],
+  "tw": 184,
+  "th": 35,
+  "marea": 1002,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 43.07692307692307,
+  "cs": 0.0,
+  "hs": 0.9223057644110275,
+  "wf": 184.25,
+  "hf": 34.75,
+  "bx0": 0.4659244264507443,
+  "by0": -30.788461538461533,
+  "area": 1039,
+  "score": 0.03622520417348281,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   247.0,
+   249.0,
+   247.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:12",
+  "text": "live your best life",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   168.71124338624338,
+   436.9404761904762
+  ],
+  "ink": [
+   167,
+   419,
+   337,
+   448
+  ],
+  "tw": 170,
+  "th": 29,
+  "marea": 687,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 24.55026455026455,
+  "cs": 0.0,
+  "hs": 1.15,
+  "wf": 166.25,
+  "hf": 29.0,
+  "bx0": 0.1637566137566111,
+  "by0": -17.94047619047619,
+  "area": 520,
+  "score": 0.27803879617997673,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   24.0,
+   22.5,
+   23.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:13",
+  "text": "HOLISTIC",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   280.64123581336696,
+   553.5677805800757
+  ],
+  "ink": [
+   282,
+   539,
+   389,
+   554
+  ],
+  "tw": 107,
+  "th": 15,
+  "marea": 448,
+  "font": "Cinzel",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/Cinzel-w500.ttf",
+  "sw": 0.0,
+  "size": 20.176544766708698,
+  "cs": 1.6071428571428572,
+  "hs": 1.0,
+  "wf": 107.0,
+  "hf": 14.75,
+  "bx0": 1.3587641866330422,
+  "by0": -14.567780580075656,
+  "area": 377,
+  "score": 0.17212869212266657,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   247.0,
+   249.0,
+   247.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:14",
+  "text": "NATURAL",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   432.14123581336696,
+   553.8177805800757
+  ],
+  "ink": [
+   433,
+   539,
+   543,
+   554
+  ],
+  "tw": 110,
+  "th": 15,
+  "marea": 434,
+  "font": "Cinzel",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/Cinzel-w500.ttf",
+  "sw": 0.0,
+  "size": 20.176544766708698,
+  "cs": 1.75,
+  "hs": 1.0,
+  "wf": 110.0,
+  "hf": 15.0,
+  "bx0": 0.8587641866330422,
+  "by0": -14.817780580075656,
+  "area": 314,
+  "score": 0.322773392263051,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   243.0,
+   246.0,
+   241.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:16",
+  "text": "PROFESSIONAL",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   584.641235813367,
+   553.8177805800757
+  ],
+  "ink": [
+   586,
+   539,
+   755,
+   554
+  ],
+  "tw": 169,
+  "th": 15,
+  "marea": 725,
+  "font": "Cinzel",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/Cinzel-w500.ttf",
+  "sw": 0.0,
+  "size": 20.176544766708698,
+  "cs": 1.4318181818181819,
+  "hs": 1.0,
+  "wf": 169.0,
+  "hf": 15.0,
+  "bx0": 1.3587641866330422,
+  "by0": -14.817780580075656,
+  "area": 551,
+  "score": 0.27400196854770076,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   247.0,
+   249.0,
+   247.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:17",
+  "text": "Empowering you to take charge of your health.",
+  "group": "italic",
+  "angle": 0.0,
+  "origin": [
+   294.88291139240505,
+   580.1740506329114
+  ],
+  "ink": [
+   294,
+   564,
+   690,
+   587
+  ],
+  "tw": 396,
+  "th": 23,
+  "marea": 1480,
+  "font": "EB Garamond Italic",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/EBGaramond-Italic-w500.ttf",
+  "sw": 0.0,
+  "size": 23.29113924050633,
+  "cs": -0.5227272727272727,
+  "hs": 1.0,
+  "wf": 396.0,
+  "hf": 23.0,
+  "bx0": -0.8829113924050631,
+  "by0": -16.174050632911396,
+  "area": 1578,
+  "score": 0.06407419998784328,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   240.0,
+   245.0,
+   240.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:18",
+  "text": "BENEFITS OF",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   100.06623931623932,
+   630.7115384615385
+  ],
+  "ink": [
+   101,
+   617,
+   229,
+   631
+  ],
+  "tw": 128,
+  "th": 14,
+  "marea": 534,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 19.145299145299145,
+  "cs": 0.45,
+  "hs": 1.0,
+  "wf": 128.0,
+  "hf": 14.0,
+  "bx0": 0.9337606837606831,
+  "by0": -13.71153846153846,
+  "area": 512,
+  "score": 0.04199090172523706,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   10.0,
+   22.0,
+   16.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:19",
+  "text": "WHO CAN BENEFIT?",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   398.5044456793554,
+   634.5100027785496
+  ],
+  "ink": [
+   398,
+   620,
+   599,
+   635
+  ],
+  "tw": 201,
+  "th": 15,
+  "marea": 792,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 20.00555709919422,
+  "cs": -0.31666666666666665,
+  "hs": 1.0,
+  "wf": 201.0,
+  "hf": 15.0,
+  "bx0": -0.5044456793553778,
+  "by0": -14.510002778549598,
+  "area": 758,
+  "score": 0.04382144423921805,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   11.0,
+   26.0,
+   19.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:20",
+  "text": "WHAT TO EXPECT",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   731.5044456793554,
+   634.5100027785496
+  ],
+  "ink": [
+   731,
+   620,
+   911,
+   635
+  ],
+  "tw": 180,
+  "th": 15,
+  "marea": 627,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 20.00555709919422,
+  "cs": -0.3076923076923077,
+  "hs": 1.0,
+  "wf": 180.0,
+  "hf": 15.0,
+  "bx0": -0.5044456793553778,
+  "by0": -14.510002778549598,
+  "area": 639,
+  "score": 0.01892800988551886,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   10.0,
+   24.0,
+   16.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:21",
+  "text": "LIVE BLOOD ANALYSIS",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   58.170011894142135,
+   653.5700267618198
+  ],
+  "ink": [
+   59,
+   640,
+   283,
+   654
+  ],
+  "tw": 224,
+  "th": 14,
+  "marea": 854,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 18.650014867677665,
+  "cs": 0.4861111111111111,
+  "hs": 1.0,
+  "wf": 224.0,
+  "hf": 14.0,
+  "bx0": 0.8299881058578666,
+  "by0": -13.570026761819797,
+  "area": 747,
+  "score": 0.13369849096228295,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   8.0,
+   19.0,
+   14.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:22",
+  "text": "Early detection of",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.51346703483021,
+   688.0
+  ],
+  "ink": [
+   127,
+   676,
+   240,
+   692
+  ],
+  "tw": 113,
+  "th": 16,
+  "marea": 335,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.5333333333333333,
+  "hs": 0.9853219008864991,
+  "wf": 113.25,
+  "hf": 16.0,
+  "bx0": 0.48653296516978983,
+  "by0": -12.0,
+  "area": 313,
+  "score": 0.06771817405495086,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   29.5,
+   27.0,
+   30.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:23",
+  "text": "People with ongoing fatigue or low energy",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.4564656654821,
+   689.2145477473347
+  ],
+  "ink": [
+   372,
+   678,
+   638,
+   693
+  ],
+  "tw": 266,
+  "th": 15,
+  "marea": 771,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.508082081852574,
+  "cs": -0.23125,
+  "hs": 1.0,
+  "wf": 266.0,
+  "hf": 15.0,
+  "bx0": 0.5435343345179398,
+  "by0": -11.214547747334635,
+  "area": 680,
+  "score": 0.12542224387526377,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.0,
+   30.0,
+   30.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:24",
+  "text": "A small drop of blood",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.8611111111111,
+   687.75
+  ],
+  "ink": [
+   752,
+   675,
+   910,
+   692
+  ],
+  "tw": 158,
+  "th": 17,
+  "marea": 483,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 18.88888888888889,
+  "cs": -0.075,
+  "hs": 1.0,
+  "wf": 158.0,
+  "hf": 17.0,
+  "bx0": 0.1388888888888875,
+  "by0": -12.75,
+  "area": 476,
+  "score": 0.014568415828290498,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.5,
+   17.0,
+   19.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:25",
+  "text": "imbalances and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.55543298400441,
+   706.4997242140099
+  ],
+  "ink": [
+   127,
+   695,
+   223,
+   707
+  ],
+  "tw": 96,
+  "th": 12,
+  "marea": 268,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.944291230005515,
+  "cs": -0.3269230769230769,
+  "hs": 1.0,
+  "wf": 96.0,
+  "hf": 11.75,
+  "bx0": 0.4445670159955881,
+  "by0": -11.499724214009927,
+  "area": 278,
+  "score": 0.036500402219526426,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   24.5,
+   22.5,
+   23.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:26",
+  "text": "is taken from your finger.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.4667832167833,
+   708.7377622377622
+  ],
+  "ink": [
+   752,
+   696,
+   930,
+   713
+  ],
+  "tw": 178,
+  "th": 17,
+  "marea": 499,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 19.02097902097902,
+  "cs": -0.44,
+  "hs": 1.0,
+  "wf": 178.0,
+  "hf": 17.0,
+  "bx0": 0.5332167832167833,
+  "by0": -12.73776223776224,
+  "area": 532,
+  "score": 0.06391332574365285,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   20.0,
+   19.0,
+   21.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:27",
+  "text": "health issues",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.74732510288065,
+   724.6814814814815
+  ],
+  "ink": [
+   127,
+   714,
+   205,
+   725
+  ],
+  "tw": 78,
+  "th": 11,
+  "marea": 235,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.93415637860082,
+  "cs": 0.041666666666666664,
+  "hs": 1.0,
+  "wf": 78.0,
+  "hf": 10.75,
+  "bx0": 0.2526748971193431,
+  "by0": -10.681481481481477,
+  "area": 209,
+  "score": 0.11672427430814143,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.5,
+   30.0,
+   29.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:28",
+  "text": "Digestive issues and nutrient deficiencies",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.61475409836066,
+   718.2581967213115
+  ],
+  "ink": [
+   372,
+   707,
+   632,
+   722
+  ],
+  "tw": 260,
+  "th": 15,
+  "marea": 717,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.054878048780487805,
+  "hs": 1.0,
+  "wf": 260.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 613,
+  "score": 0.15647464090108176,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   25.0,
+   25.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:29",
+  "text": "Skin conditions",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.365114308347,
+   746.9564220183486
+  ],
+  "ink": [
+   372,
+   735,
+   470,
+   747
+  ],
+  "tw": 98,
+  "th": 12,
+  "marea": 298,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.61467889908257,
+  "cs": -0.5284403669724771,
+  "hs": 0.9839176169334783,
+  "wf": 98.0,
+  "hf": 12.0,
+  "bx0": 0.6348856916530021,
+  "by0": -11.956422018348626,
+  "area": 276,
+  "score": 0.07642606720334788,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   32.0,
+   31.0,
+   29.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:30",
+  "text": "2",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   703.7656,
+   755.97
+  ],
+  "ink": [
+   705,
+   737,
+   718,
+   756
+  ],
+  "tw": 13,
+  "th": 19,
+  "marea": 83,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 30.4,
+  "cs": 1.5,
+  "hs": 1.08,
+  "wf": 12.5,
+  "hf": 19.0,
+  "bx0": 1.4843999999999973,
+  "by0": -18.97,
+  "area": 75,
+  "score": 0.10008345855698253,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   249.0,
+   250.0,
+   249.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:31",
+  "text": "The blood is observed",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   750.5554329840044,
+   744.4997242140099
+  ],
+  "ink": [
+   751,
+   733,
+   910,
+   745
+  ],
+  "tw": 159,
+  "th": 12,
+  "marea": 446,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.944291230005515,
+  "cs": 0.6875,
+  "hs": 1.0,
+  "wf": 159.0,
+  "hf": 11.75,
+  "bx0": 0.4445670159955881,
+  "by0": -11.499724214009927,
+  "area": 418,
+  "score": 0.06468767469143104,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   18.0,
+   16.0,
+   18.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:32",
+  "text": "Personalised health",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.46845436225743,
+   757.9564220183486
+  ],
+  "ink": [
+   127,
+   746,
+   246,
+   758
+  ],
+  "tw": 119,
+  "th": 12,
+  "marea": 354,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.61467889908257,
+  "cs": -0.5284403669724771,
+  "hs": 0.9735101077383208,
+  "wf": 119.0,
+  "hf": 12.0,
+  "bx0": 0.5315456377425605,
+  "by0": -11.956422018348626,
+  "area": 369,
+  "score": 0.04138521616285428,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.0,
+   18.0,
+   18.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:33",
+  "text": "live under a microscope.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.8611111111111,
+   765.75
+  ],
+  "ink": [
+   752,
+   753,
+   926,
+   770
+  ],
+  "tw": 174,
+  "th": 17,
+  "marea": 493,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 18.88888888888889,
+  "cs": -0.20652173913043478,
+  "hs": 1.0,
+  "wf": 174.0,
+  "hf": 17.0,
+  "bx0": 0.1388888888888875,
+  "by0": -12.75,
+  "area": 505,
+  "score": 0.024001152099543045,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   21.0,
+   21.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:34",
+  "text": "insights and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.61475409836066,
+   777.2581967213115
+  ],
+  "ink": [
+   127,
+   766,
+   200,
+   781
+  ],
+  "tw": 73,
+  "th": 15,
+  "marea": 251,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.3409090909090909,
+  "hs": 1.0,
+  "wf": 73.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 207,
+  "score": 0.1918910078101054,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   39.5,
+   37.0,
+   38.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:35",
+  "text": "Frequent colds or infections",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.30546249767355,
+   775.0
+  ],
+  "ink": [
+   372,
+   763,
+   549,
+   779
+  ],
+  "tw": 177,
+  "th": 16,
+  "marea": 501,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.5333333333333333,
+  "hs": 0.9882747068676717,
+  "wf": 177.25,
+  "hf": 16.0,
+  "bx0": 0.6945375023264457,
+  "by0": -12.0,
+  "area": 505,
+  "score": 0.007936549595736342,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   24.0,
+   25.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:36",
+  "text": "recommendations",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.38037716615699,
+   795.6683486238533
+  ],
+  "ink": [
+   127,
+   785,
+   239,
+   796
+  ],
+  "tw": 112,
+  "th": 11,
+  "marea": 319,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.78797145769623,
+  "cs": 0.125,
+  "hs": 1.0,
+  "wf": 112.0,
+  "hf": 10.75,
+  "bx0": 0.6196228338430156,
+  "by0": -10.668348623853216,
+  "area": 280,
+  "score": 0.12996632646002643,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   24.5,
+   24.5,
+   23.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:37",
+  "text": "Detox and wellness support",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.61475409836066,
+   802.2581967213115
+  ],
+  "ink": [
+   372,
+   791,
+   549,
+   806
+  ],
+  "tw": 177,
+  "th": 15,
+  "marea": 472,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": 0.02,
+  "hs": 1.0,
+  "wf": 177.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 426,
+  "score": 0.1023113752633084,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   25.0,
+   24.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:38",
+  "text": "3",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   704.2555445544555,
+   812.9282178217821
+  ],
+  "ink": [
+   705,
+   794,
+   717,
+   813
+  ],
+  "tw": 12,
+  "th": 19,
+  "marea": 79,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 30.099009900990097,
+  "cs": 1.0,
+  "hs": 1.08,
+  "wf": 12.0,
+  "hf": 19.0,
+  "bx0": 0.7444554455445527,
+  "by0": -18.928217821782177,
+  "area": 72,
+  "score": 0.0915671935254905,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   249.5,
+   251.5,
+   250.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:39",
+  "text": "We discuss the findings",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.8611111111111,
+   802.75
+  ],
+  "ink": [
+   752,
+   790,
+   919,
+   807
+  ],
+  "tw": 167,
+  "th": 17,
+  "marea": 511,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 18.88888888888889,
+  "cs": -0.375,
+  "hs": 1.0,
+  "wf": 167.0,
+  "hf": 17.0,
+  "bx0": 0.1388888888888875,
+  "by0": -12.75,
+  "area": 559,
+  "score": 0.08961215868968714,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   15.0,
+   15.0,
+   16.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:40",
+  "text": "with you in detail.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.8611111111111,
+   822.75
+  ],
+  "ink": [
+   752,
+   810,
+   881,
+   827
+  ],
+  "tw": 129,
+  "th": 17,
+  "marea": 376,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 18.88888888888889,
+  "cs": -0.2361111111111111,
+  "hs": 1.0,
+  "wf": 129.0,
+  "hf": 17.0,
+  "bx0": 0.1388888888888875,
+  "by0": -12.75,
+  "area": 371,
+  "score": 0.013351333174864225,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.5,
+   17.0,
+   18.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:41",
+  "text": "Supports natural",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.56161820635505,
+   829.7011409642988
+  ],
+  "ink": [
+   127,
+   819,
+   230,
+   833
+  ],
+  "tw": 103,
+  "th": 14,
+  "marea": 310,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.38952275794381,
+  "cs": 0.23333333333333334,
+  "hs": 1.0,
+  "wf": 103.0,
+  "hf": 14.25,
+  "bx0": 0.43838179364495033,
+  "by0": -10.701140964298858,
+  "area": 259,
+  "score": 0.17911128116370645,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.0,
+   30.0,
+   30.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:42",
+  "text": "Anyone who wants to take",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.7064656654821,
+   830.2145477473347
+  ],
+  "ink": [
+   372,
+   819,
+   541,
+   834
+  ],
+  "tw": 169,
+  "th": 15,
+  "marea": 407,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.508082081852574,
+  "cs": -0.13043478260869565,
+  "hs": 1.0,
+  "wf": 169.0,
+  "hf": 15.0,
+  "bx0": 0.29353433451793975,
+  "by0": -11.214547747334635,
+  "area": 390,
+  "score": 0.04255961441879589,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   24.0,
+   24.0,
+   24.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:43",
+  "text": "prevention",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   125.67647058823529,
+   867.1470588235294
+  ],
+  "ink": [
+   126,
+   857,
+   193,
+   871
+  ],
+  "tw": 67,
+  "th": 14,
+  "marea": 190,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.470588235294116,
+  "cs": -0.4166666666666667,
+  "hs": 1.0,
+  "wf": 67.0,
+  "hf": 14.0,
+  "bx0": 0.3235294117647065,
+  "by0": -10.14705882352941,
+  "area": 173,
+  "score": 0.09321812883210089,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   32.0,
+   30.0,
+   29.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:44",
+  "text": "healing and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.86475409836066,
+   848.2581967213115
+  ],
+  "ink": [
+   127,
+   837,
+   198,
+   852
+  ],
+  "tw": 71,
+  "th": 15,
+  "marea": 208,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.275,
+  "hs": 1.0,
+  "wf": 71.0,
+  "hf": 15.0,
+  "bx0": 0.13524590163934214,
+  "by0": -11.258196721311482,
+  "area": 198,
+  "score": 0.04902942724031864,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   16.0,
+   16.5,
+   17.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:45",
+  "text": "control of their health naturally",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   371.3876880695062,
+   849.9972981563891
+  ],
+  "ink": [
+   372,
+   838,
+   570,
+   854
+  ],
+  "tw": 198,
+  "th": 16,
+  "marea": 539,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.359610086882817,
+  "cs": -0.484375,
+  "hs": 1.0,
+  "wf": 198.0,
+  "hf": 16.0,
+  "bx0": 0.6123119304937461,
+  "by0": -11.997298156389071,
+  "area": 577,
+  "score": 0.06800472911405744,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   22.0,
+   22.0,
+   22.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:46",
+  "text": "4",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   702.8707925234359,
+   870.1854058078927
+  ],
+  "ink": [
+   704,
+   850,
+   718,
+   870
+  ],
+  "tw": 14,
+  "th": 20,
+  "marea": 93,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 31.769669893273765,
+  "cs": 1.0,
+  "hs": 1.0769230769230769,
+  "wf": 14.0,
+  "hf": 20.25,
+  "bx0": 1.1292074765641402,
+  "by0": -20.185405807892778,
+  "area": 77,
+  "score": 0.1865859555804122,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   250.0,
+   251.0,
+   250.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:47",
+  "text": "You receive personalised",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.8611111111111,
+   859.75
+  ],
+  "ink": [
+   752,
+   847,
+   926,
+   864
+  ],
+  "tw": 174,
+  "th": 17,
+  "marea": 495,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 18.88888888888889,
+  "cs": -0.40217391304347827,
+  "hs": 1.0,
+  "wf": 174.0,
+  "hf": 17.0,
+  "bx0": 0.1388888888888875,
+  "by0": -12.75,
+  "area": 532,
+  "score": 0.07194549744091715,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   20.0,
+   19.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:48",
+  "text": "recommendations and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   751.5917431192661,
+   879.9564220183486
+  ],
+  "ink": [
+   752,
+   868,
+   910,
+   880
+  ],
+  "tw": 158,
+  "th": 12,
+  "marea": 484,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.61467889908257,
+  "cs": 0.2916666666666667,
+  "hs": 1.0,
+  "wf": 158.0,
+  "hf": 12.0,
+  "bx0": 0.40825688073394417,
+  "by0": -11.956422018348626,
+  "area": 408,
+  "score": 0.17043373489468144,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   24.5,
+   24.5,
+   27.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:49",
+  "text": "Monitors progress",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   126.53272727272727,
+   899.8236363636364
+  ],
+  "ink": [
+   127,
+   889,
+   239,
+   903
+  ],
+  "tw": 112,
+  "th": 14,
+  "marea": 333,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.29090909090909,
+  "cs": -0.34375,
+  "hs": 1.0,
+  "wf": 112.0,
+  "hf": 14.25,
+  "bx0": 0.4672727272727286,
+  "by0": -10.82363636363636,
+  "area": 305,
+  "score": 0.08755589102431964,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   34.0,
+   31.5,
+   30.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:50",
+  "text": "OUR APPROACH",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   398.6602564102564,
+   904.6730769230769
+  ],
+  "ink": [
+   400,
+   890,
+   568,
+   905
+  ],
+  "tw": 168,
+  "th": 15,
+  "marea": 720,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 20.51282051282051,
+  "cs": -0.4318181818181818,
+  "hs": 1.0,
+  "wf": 168.0,
+  "hf": 15.0,
+  "bx0": 1.3397435897435912,
+  "by0": -14.67307692307692,
+  "area": 726,
+  "score": 0.008287340248570287,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   7.0,
+   21.0,
+   13.5
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:51",
+  "text": "a health plan.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   750.2167832167833,
+   900.7377622377622
+  ],
+  "ink": [
+   751,
+   888,
+   847,
+   905
+  ],
+  "tw": 96,
+  "th": 17,
+  "marea": 278,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 19.02097902097902,
+  "cs": -0.07692307692307693,
+  "hs": 1.0,
+  "wf": 96.0,
+  "hf": 17.0,
+  "bx0": 0.7832167832167833,
+  "by0": -12.73776223776224,
+  "area": 270,
+  "score": 0.02909296094166478,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   14.0,
+   13.5,
+   13.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:52",
+  "text": "and effectiveness of",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   125.59767441860465,
+   918.2197674418604
+  ],
+  "ink": [
+   126,
+   907,
+   249,
+   918
+  ],
+  "tw": 123,
+  "th": 11,
+  "marea": 342,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.372093023255815,
+  "cs": -0.15789473684210525,
+  "hs": 1.0,
+  "wf": 123.0,
+  "hf": 11.25,
+  "bx0": 0.40232558139534724,
+  "by0": -11.219767441860466,
+  "area": 307,
+  "score": 0.10763066419236544,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   33.0,
+   32.0,
+   31.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:53",
+  "text": "your health plan",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   125.95646566548206,
+   937.2145477473347
+  ],
+  "ink": [
+   126,
+   926,
+   227,
+   941
+  ],
+  "tw": 101,
+  "th": 15,
+  "marea": 318,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.508082081852574,
+  "cs": -0.26666666666666666,
+  "hs": 1.0,
+  "wf": 101.0,
+  "hf": 15.0,
+  "bx0": 0.043534334517939755,
+  "by0": -11.214547747334635,
+  "area": 274,
+  "score": 0.14842000511827333,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   35.0,
+   34.0,
+   35.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:54",
+  "text": "We take the time to understand",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   367.8417431192661,
+   955.9564220183486
+  ],
+  "ink": [
+   368,
+   944,
+   580,
+   956
+  ],
+  "tw": 212,
+  "th": 12,
+  "marea": 620,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.61467889908257,
+  "cs": -0.23275862068965517,
+  "hs": 1.0,
+  "wf": 212.0,
+  "hf": 12.0,
+  "bx0": 0.15825688073394417,
+  "by0": -11.956422018348626,
+  "area": 556,
+  "score": 0.10876584200619475,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   25.0,
+   24.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:55",
+  "text": "BOOK YOUR",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   763.030384397965,
+   962.3808648954212
+  ],
+  "ink": [
+   764,
+   948,
+   890,
+   963
+  ],
+  "tw": 126,
+  "th": 15,
+  "marea": 538,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 20.35048049745619,
+  "cs": -0.5625,
+  "hs": 1.0,
+  "wf": 126.0,
+  "hf": 14.75,
+  "bx0": 0.9696156020350486,
+  "by0": -14.38086489542114,
+  "area": 613,
+  "score": 0.1302793572381454,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   7.0,
+   19.0,
+   13.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:56",
+  "text": "A safe, quick and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   125.86475409836066,
+   971.2581967213115
+  ],
+  "ink": [
+   126,
+   960,
+   232,
+   975
+  ],
+  "tw": 106,
+  "th": 15,
+  "marea": 288,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.125,
+  "hs": 1.0,
+  "wf": 106.0,
+  "hf": 15.0,
+  "bx0": 0.13524590163934214,
+  "by0": -11.258196721311482,
+  "area": 253,
+  "score": 0.12909242109389554,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   25.0,
+   24.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:57",
+  "text": "your unique health story.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   391.8876880695062,
+   976.9972981563891
+  ],
+  "ink": [
+   392,
+   965,
+   557,
+   981
+  ],
+  "tw": 165,
+  "th": 16,
+  "marea": 440,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.359610086882817,
+  "cs": -0.1875,
+  "hs": 1.0,
+  "wf": 165.0,
+  "hf": 16.0,
+  "bx0": 0.1123119304937461,
+  "by0": -11.997298156389071,
+  "area": 448,
+  "score": 0.017978012295408394,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   20.0,
+   21.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:58",
+  "text": "APPOINTMENT",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   750.5044456793554,
+   986.5100027785496
+  ],
+  "ink": [
+   750,
+   972,
+   903,
+   987
+  ],
+  "tw": 153,
+  "th": 15,
+  "marea": 643,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 20.00555709919422,
+  "cs": -0.3,
+  "hs": 1.0,
+  "wf": 153.0,
+  "hf": 14.75,
+  "bx0": -0.5044456793553778,
+  "by0": -14.510002778549598,
+  "area": 675,
+  "score": 0.04849434993861056,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   8.0,
+   18.0,
+   13.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:59",
+  "text": "painless process",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   125.70646566548206,
+   990.2145477473347
+  ],
+  "ink": [
+   126,
+   979,
+   225,
+   994
+  ],
+  "tw": 99,
+  "th": 15,
+  "marea": 308,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.508082081852574,
+  "cs": -0.16666666666666666,
+  "hs": 1.0,
+  "wf": 99.0,
+  "hf": 15.0,
+  "bx0": 0.29353433451793975,
+  "by0": -11.214547747334635,
+  "area": 234,
+  "score": 0.27375576275358654,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   40.5,
+   39.0,
+   40.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:60",
+  "text": "Through detailed live blood",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   378.47222222222223,
+   997.0
+  ],
+  "ink": [
+   379,
+   985,
+   566,
+   1001
+  ],
+  "tw": 187,
+  "th": 16,
+  "marea": 597,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.22115384615384615,
+  "hs": 1.0,
+  "wf": 187.0,
+  "hf": 16.0,
+  "bx0": 0.5277777777777768,
+  "by0": -12.0,
+  "area": 539,
+  "score": 0.10202161439231172,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   27.0,
+   26.0,
+   25.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:61",
+  "text": "analysis and professional",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   391.22222222222223,
+   1018.0
+  ],
+  "ink": [
+   392,
+   1006,
+   555,
+   1022
+  ],
+  "tw": 163,
+  "th": 16,
+  "marea": 497,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.3125,
+  "hs": 1.0,
+  "wf": 163.0,
+  "hf": 16.0,
+  "bx0": 0.7777777777777768,
+  "by0": -12.0,
+  "area": 465,
+  "score": 0.06641444289900707,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   22.0,
+   22.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:62",
+  "text": "Chandr\u00e9",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   738.901379791689,
+   1064.2649253731342
+  ],
+  "ink": [
+   740,
+   1023,
+   907,
+   1070
+  ],
+  "tw": 167,
+  "th": 47,
+  "marea": 1249,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 56.11940298507463,
+  "cs": 0.0,
+  "hs": 0.9611510791366906,
+  "wf": 167.0,
+  "hf": 46.75,
+  "bx0": 1.0986202083109617,
+  "by0": -41.26492537313433,
+  "area": 1288,
+  "score": 0.03072317264284048,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   6.0,
+   19.0,
+   12.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:63",
+  "text": "guidance, we create a",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   401.61475409836066,
+   1038.2581967213114
+  ],
+  "ink": [
+   402,
+   1027,
+   543,
+   1042
+  ],
+  "tw": 141,
+  "th": 15,
+  "marea": 411,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": 0.3,
+  "hs": 1.0,
+  "wf": 141.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 318,
+  "score": 0.25583224656468184,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.5,
+   30.0,
+   32.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:64",
+  "text": "Your blood holds the",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   90.80543298400441,
+   1057.49972421401
+  ],
+  "ink": [
+   91,
+   1046,
+   229,
+   1058
+  ],
+  "tw": 138,
+  "th": 12,
+  "marea": 399,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.944291230005515,
+  "cs": -0.05263157894736842,
+  "hs": 1.0,
+  "wf": 138.0,
+  "hf": 11.75,
+  "bx0": 0.19456701599558812,
+  "by0": -11.499724214009927,
+  "area": 376,
+  "score": 0.059219359659971216,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   18.0,
+   16.5,
+   16.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:65",
+  "text": "personalised plan to help",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   389.72222222222223,
+   1059.0
+  ],
+  "ink": [
+   390,
+   1047,
+   556,
+   1063
+  ],
+  "tw": 166,
+  "th": 16,
+  "marea": 463,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.22916666666666666,
+  "hs": 1.0,
+  "wf": 166.0,
+  "hf": 16.0,
+  "bx0": 0.2777777777777768,
+  "by0": -12.0,
+  "area": 498,
+  "score": 0.07272154352526344,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   19.0,
+   17.5,
+   20.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:66",
+  "text": "answers. Let's uncover",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   84.38037716615699,
+   1077.6683486238533
+  ],
+  "ink": [
+   85,
+   1067,
+   235,
+   1078
+  ],
+  "tw": 150,
+  "th": 11,
+  "marea": 365,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.78797145769623,
+  "cs": 0.5357142857142857,
+  "hs": 1.0,
+  "wf": 150.0,
+  "hf": 10.75,
+  "bx0": 0.6196228338430156,
+  "by0": -10.668348623853216,
+  "area": 306,
+  "score": 0.17578558581416903,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   28.0,
+   28.0,
+   27.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:67",
+  "text": "you restore balance and",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   392.97222222222223,
+   1079.0
+  ],
+  "ink": [
+   393,
+   1067,
+   549,
+   1083
+  ],
+  "tw": 156,
+  "th": 16,
+  "marea": 439,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.32954545454545453,
+  "hs": 1.0,
+  "wf": 156.0,
+  "hf": 16.0,
+  "bx0": 0.02777777777777679,
+  "by0": -12.0,
+  "area": 428,
+  "score": 0.025317807984289897,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   20.0,
+   21.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:68",
+  "text": "them together.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   110.63768806950625,
+   1098.997298156389
+  ],
+  "ink": [
+   111,
+   1087,
+   208,
+   1103
+  ],
+  "tw": 97,
+  "th": 16,
+  "marea": 309,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.359610086882817,
+  "cs": -0.15384615384615385,
+  "hs": 1.0,
+  "wf": 97.0,
+  "hf": 16.0,
+  "bx0": 0.3623119304937461,
+  "by0": -11.997298156389071,
+  "area": 289,
+  "score": 0.06669137449867228,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   34.0,
+   33.0,
+   34.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:69",
+  "text": "achieve optimal wellness.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   388.3887386602419,
+   1099.7377622377621
+  ],
+  "ink": [
+   389,
+   1087,
+   555,
+   1104
+  ],
+  "tw": 166,
+  "th": 17,
+  "marea": 502,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 19.02097902097902,
+  "cs": -0.5706293706293706,
+  "hs": 0.9620126968817058,
+  "wf": 166.5,
+  "hf": 17.0,
+  "bx0": 0.6112613397580997,
+  "by0": -12.73776223776224,
+  "area": 546,
+  "score": 0.083858632322242,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   27.0,
+   26.0,
+   25.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:70",
+  "text": "073 703 0766",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   755.6657359146191,
+   1112.1854058078927
+  ],
+  "ink": [
+   757,
+   1092,
+   934,
+   1112
+  ],
+  "tw": 177,
+  "th": 20,
+  "marea": 819,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 31.769669893273765,
+  "cs": 1.2727272727272727,
+  "hs": 1.0,
+  "wf": 177.0,
+  "hf": 20.25,
+  "bx0": 1.3342640853809868,
+  "by0": -20.185405807892778,
+  "area": 809,
+  "score": 0.01227009259181436,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   4.0,
+   21.0,
+   12.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:71",
+  "text": "See your health,",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   91.9076085863158,
+   1128.3690476190477
+  ],
+  "ink": [
+   91,
+   1112,
+   221,
+   1138
+  ],
+  "tw": 130,
+  "th": 26,
+  "marea": 504,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 22.01058201058201,
+  "cs": 0.0,
+  "hs": 0.9885931558935361,
+  "wf": 130.0,
+  "hf": 26.0,
+  "bx0": -0.9076085863158099,
+  "by0": -16.36904761904762,
+  "area": 371,
+  "score": 0.3056645750022133,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   37.0,
+   34.5,
+   36.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:72",
+  "text": "live your best life",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   80.18882485896556,
+   1157.4680575200377
+  ],
+  "ink": [
+   80,
+   1142,
+   214,
+   1167
+  ],
+  "tw": 134,
+  "th": 25,
+  "marea": 518,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 20.954476400020955,
+  "cs": 0.0,
+  "hs": 1.0850202429149798,
+  "wf": 134.25,
+  "hf": 25.0,
+  "bx0": -0.18882485896555679,
+  "by0": -15.468057520037718,
+  "area": 366,
+  "score": 0.34654203511131837,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   34.0,
+   32.0,
+   33.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:73",
+  "text": "Invest in your health today \u2013",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   726.6147540983607,
+   1163.2581967213114
+  ],
+  "ink": [
+   727,
+   1152,
+   921,
+   1167
+  ],
+  "tw": 194,
+  "th": 15,
+  "marea": 480,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": 0.4017857142857143,
+  "hs": 1.0,
+  "wf": 194.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 428,
+  "score": 0.11441035117774422,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   29.0,
+   26.0,
+   26.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:74",
+  "text": "because you deserve to feel",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   732.9722222222222,
+   1184.0
+  ],
+  "ink": [
+   733,
+   1172,
+   915,
+   1188
+  ],
+  "tw": 182,
+  "th": 16,
+  "marea": 481,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 17.77777777777778,
+  "cs": -0.15384615384615385,
+  "hs": 1.0,
+  "wf": 182.0,
+  "hf": 16.0,
+  "bx0": 0.02777777777777679,
+  "by0": -12.0,
+  "area": 478,
+  "score": 0.006243516639685047,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   27.0,
+   26.0,
+   27.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:75",
+  "text": "your best, every day.",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   754.1147540983607,
+   1204.2581967213114
+  ],
+  "ink": [
+   754,
+   1193,
+   891,
+   1208
+  ],
+  "tw": 137,
+  "th": 15,
+  "marea": 350,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": 0.35,
+  "hs": 1.0,
+  "wf": 137.0,
+  "hf": 15.0,
+  "bx0": -0.11475409836065786,
+  "by0": -11.258196721311482,
+  "area": 296,
+  "score": 0.1670540846631662,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.0,
+   31.0,
+   30.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:76",
+  "text": "WHY CHOOSE LIVE",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   54.62819873712196,
+   1264.8509471585244
+  ],
+  "ink": [
+   54,
+   1252,
+   231,
+   1265
+  ],
+  "tw": 177,
+  "th": 13,
+  "marea": 593,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 17.972748421402457,
+  "cs": 0.017857142857142856,
+  "hs": 1.0,
+  "wf": 177.0,
+  "hf": 13.25,
+  "bx0": -0.6281987371219664,
+  "by0": -12.850947158524427,
+  "area": 597,
+  "score": 0.006711434587986778,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   10.0,
+   22.0,
+   18.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:77",
+  "text": "BLOOD ANALYSIS?",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   55.06623931623932,
+   1286.7115384615386
+  ],
+  "ink": [
+   56,
+   1273,
+   225,
+   1287
+  ],
+  "tw": 169,
+  "th": 14,
+  "marea": 590,
+  "font": "Cinzel",
+  "weight": 600,
+  "path": "/workspace/medfonts/static/Cinzel-w600.ttf",
+  "sw": 0.0,
+  "size": 19.145299145299145,
+  "cs": -0.7658119658119658,
+  "hs": 1.0,
+  "wf": 169.5,
+  "hf": 14.0,
+  "bx0": 0.9337606837606831,
+  "by0": -13.71153846153846,
+  "area": 750,
+  "score": 0.23958963435803654,
+  "color": [
+   15.0,
+   51.0,
+   35.0
+  ],
+  "color_raw": [
+   8.0,
+   15.0,
+   11.0
+  ],
+  "cclass": "green"
+ },
+ {
+  "id": "flyer_front:78",
+  "text": "Looks at the cause,",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.43361025063363,
+   1310.1631230639257
+  ],
+  "ink": [
+   64,
+   1300,
+   178,
+   1313
+  ],
+  "tw": 114,
+  "th": 13,
+  "marea": 296,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.22951281329203,
+  "cs": 0.19444444444444445,
+  "hs": 1.0,
+  "wf": 114.0,
+  "hf": 12.5,
+  "bx0": 0.5663897493663743,
+  "by0": -10.163123063925656,
+  "area": 226,
+  "score": 0.268782121321297,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   31.0,
+   30.5,
+   30.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:79",
+  "text": "not just the symptoms",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.476120857699804,
+   1327.2587719298247
+  ],
+  "ink": [
+   64,
+   1317,
+   200,
+   1331
+  ],
+  "tw": 136,
+  "th": 14,
+  "marea": 354,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.282651072124755,
+  "cs": 0.2125,
+  "hs": 1.0,
+  "wf": 136.0,
+  "hf": 13.75,
+  "bx0": 0.5238791423001956,
+  "by0": -10.258771929824562,
+  "area": 277,
+  "score": 0.2444966757847788,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   40.0,
+   39.0,
+   37.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:80",
+  "text": "When you know better,",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   380.3090263364236,
+   1345.4166666666667
+  ],
+  "ink": [
+   381,
+   1328,
+   596,
+   1356
+  ],
+  "tw": 215,
+  "th": 28,
+  "marea": 793,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 23.703703703703702,
+  "cs": 0.0,
+  "hs": 1.0709838107098382,
+  "wf": 215.25,
+  "hf": 28.0,
+  "bx0": 0.6909736635764041,
+  "by0": -17.416666666666664,
+  "area": 648,
+  "score": 0.2016507445430458,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   22.0,
+   21.0,
+   23.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:81",
+  "text": "Helps you understand",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.476120857699804,
+   1348.2587719298247
+  ],
+  "ink": [
+   64,
+   1338,
+   198,
+   1352
+  ],
+  "tw": 134,
+  "th": 14,
+  "marea": 351,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.282651072124755,
+  "cs": 0.25,
+  "hs": 1.0,
+  "wf": 134.0,
+  "hf": 13.5,
+  "bx0": 0.5238791423001956,
+  "by0": -10.258771929824562,
+  "area": 338,
+  "score": 0.03763106821764688,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   28.0,
+   26.5,
+   26.5
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:82",
+  "text": "your body better",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.114754098360656,
+   1365.2581967213114
+  ],
+  "ink": [
+   63,
+   1354,
+   166,
+   1369
+  ],
+  "tw": 103,
+  "th": 15,
+  "marea": 246,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.23333333333333334,
+  "hs": 1.0,
+  "wf": 103.0,
+  "hf": 15.0,
+  "bx0": -0.11475409836065786,
+  "by0": -11.258196721311482,
+  "area": 258,
+  "score": 0.047439725071560565,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   23.0,
+   21.0,
+   19.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:83",
+  "text": "you can do better.",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   410.6670895063189,
+   1373.9756756756756
+  ],
+  "ink": [
+   406,
+   1358,
+   570,
+   1384
+  ],
+  "tw": 164,
+  "th": 26,
+  "marea": 557,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 22.486486486486488,
+  "cs": 0.0,
+  "hs": 1.148861646234676,
+  "wf": 164.25,
+  "hf": 26.0,
+  "bx0": -4.667089506318927,
+  "by0": -15.975675675675681,
+  "area": 413,
+  "score": 0.29849298855599654,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   22.0,
+   21.0,
+   23.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:84",
+  "text": "Guides you to make",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.476120857699804,
+   1386.2587719298247
+  ],
+  "ink": [
+   64,
+   1376,
+   184,
+   1390
+  ],
+  "tw": 120,
+  "th": 14,
+  "marea": 333,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.282651072124755,
+  "cs": 0.14705882352941177,
+  "hs": 1.0,
+  "wf": 120.0,
+  "hf": 13.5,
+  "bx0": 0.5238791423001956,
+  "by0": -10.258771929824562,
+  "area": 285,
+  "score": 0.15514918215684786,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   43.0,
+   42.0,
+   39.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:85",
+  "text": "Your health journey",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   395.90914244485674,
+   1403.642857142857
+  ],
+  "ink": [
+   394,
+   1387,
+   585,
+   1414
+  ],
+  "tw": 191,
+  "th": 27,
+  "marea": 786,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 22.857142857142854,
+  "cs": 0.0,
+  "hs": 1.1024531024531024,
+  "wf": 191.0,
+  "hf": 27.0,
+  "bx0": -1.9091424448567267,
+  "by0": -16.64285714285714,
+  "area": 582,
+  "score": 0.30004106206691084,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   19.0,
+   20.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:86",
+  "text": "informed lifestyle",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.614754098360656,
+   1403.2581967213114
+  ],
+  "ink": [
+   64,
+   1392,
+   170,
+   1407
+  ],
+  "tw": 106,
+  "th": 15,
+  "marea": 310,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 16.393442622950822,
+  "cs": -0.35294117647058826,
+  "hs": 1.0,
+  "wf": 106.0,
+  "hf": 15.0,
+  "bx0": 0.38524590163934214,
+  "by0": -11.258196721311482,
+  "area": 299,
+  "score": 0.036010437523033054,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   39.0,
+   37.0,
+   37.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:87",
+  "text": "and diet choices",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   62.38037716615698,
+   1419.6683486238533
+  ],
+  "ink": [
+   63,
+   1409,
+   161,
+   1420
+  ],
+  "tw": 98,
+  "th": 11,
+  "marea": 250,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.78797145769623,
+  "cs": 0.06666666666666667,
+  "hs": 1.0,
+  "wf": 98.0,
+  "hf": 10.75,
+  "bx0": 0.6196228338430156,
+  "by0": -10.668348623853216,
+  "area": 239,
+  "score": 0.04481401578979254,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   25.0,
+   22.0,
+   24.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:88",
+  "text": "starts with knowledge.",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   390.62473544973545,
+   1434.3690476190477
+  ],
+  "ink": [
+   384,
+   1418,
+   586,
+   1444
+  ],
+  "tw": 202,
+  "th": 26,
+  "marea": 770,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 22.01058201058201,
+  "cs": 0.0,
+  "hs": 1.15,
+  "wf": 191.75,
+  "hf": 26.0,
+  "bx0": -1.4997354497354465,
+  "by0": -16.36904761904762,
+  "area": 547,
+  "score": 0.34141308661531394,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   21.0,
+   21.0,
+   24.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:89",
+  "text": "Supports long-term",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.56161820635505,
+   1440.701140964299
+  ],
+  "ink": [
+   64,
+   1430,
+   181,
+   1444
+  ],
+  "tw": 117,
+  "th": 14,
+  "marea": 339,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.38952275794381,
+  "cs": -0.058823529411764705,
+  "hs": 1.0,
+  "wf": 117.0,
+  "hf": 14.25,
+  "bx0": 0.43838179364495033,
+  "by0": -10.701140964298858,
+  "area": 302,
+  "score": 0.11521281210083788,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   35.5,
+   34.0,
+   34.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:90",
+  "text": "health and vitality",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   63.726120857699804,
+   1456.2587719298247
+  ],
+  "ink": [
+   64,
+   1446,
+   174,
+   1460
+  ],
+  "tw": 110,
+  "th": 14,
+  "marea": 325,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 15.282651072124755,
+  "cs": 0.1388888888888889,
+  "hs": 1.0,
+  "wf": 110.0,
+  "hf": 13.5,
+  "bx0": 0.2738791423001956,
+  "by0": -10.258771929824562,
+  "area": 281,
+  "score": 0.14499031042859406,
+  "color": [
+   33.0,
+   32.0,
+   32.0
+  ],
+  "color_raw": [
+   45.0,
+   43.0,
+   43.0
+  ],
+  "cclass": "neutral"
+ },
+ {
+  "id": "flyer_front:92",
+  "text": "MEDELLA LIVE BLOOD ANALYSIS AND HEALTH",
+  "group": "caps",
+  "angle": 0.0,
+  "origin": [
+   268.6864406779661,
+   1496.6694915254238
+  ],
+  "ink": [
+   269,
+   1483,
+   780,
+   1497
+  ],
+  "tw": 511,
+  "th": 14,
+  "marea": 1484,
+  "font": "Cinzel",
+  "weight": 500,
+  "path": "/workspace/medfonts/static/Cinzel-w500.ttf",
+  "sw": 0.0,
+  "size": 18.983050847457626,
+  "cs": 1.7837837837837838,
+  "hs": 1.0,
+  "wf": 511.0,
+  "hf": 14.0,
+  "bx0": 0.3135593220338979,
+  "by0": -13.66949152542373,
+  "area": 1436,
+  "score": 0.03285716515777505,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   243.5,
+   247.0,
+   244.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:93",
+  "text": "See your health, live your best life",
+  "group": "script",
+  "angle": 0.0,
+  "origin": [
+   346.84283164403644,
+   1520.3690476190477
+  ],
+  "ink": [
+   346,
+   1504,
+   627,
+   1530
+  ],
+  "tw": 281,
+  "th": 26,
+  "marea": 1082,
+  "font": "Parisienne",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/Parisienne-Regular.ttf",
+  "sw": 0.0,
+  "size": 22.01058201058201,
+  "cs": 0.0,
+  "hs": 1.0417052826691382,
+  "wf": 281.0,
+  "hf": 26.0,
+  "bx0": -0.8428316440364654,
+  "by0": -16.36904761904762,
+  "area": 782,
+  "score": 0.32435755101018754,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   227.0,
+   235.0,
+   227.0
+  ],
+  "cclass": "light"
+ },
+ {
+  "id": "flyer_front:num1",
+  "text": "1",
+  "group": "body",
+  "angle": 0.0,
+  "origin": [
+   705.5494883116883,
+   698.7593506493506
+  ],
+  "ink": [
+   707,
+   680,
+   716,
+   699
+  ],
+  "tw": 9,
+  "th": 19,
+  "marea": 68,
+  "font": "Crimson Text",
+  "weight": 400,
+  "path": "/workspace/medfonts/static/CrimsonText-Regular.ttf",
+  "sw": 0.0,
+  "size": 30.005194805194805,
+  "cs": 1.5,
+  "hs": 1.08,
+  "wf": 8.25,
+  "hf": 18.75,
+  "bx0": 1.8255116883116855,
+  "by0": -18.75935064935065,
+  "area": 63,
+  "score": 0.07522342123758752,
+  "color": [
+   252.0,
+   252.0,
+   250.0
+  ],
+  "color_raw": [
+   247.0,
+   248.0,
+   247.5
+  ],
+  "cclass": "light"
+ }
+]
