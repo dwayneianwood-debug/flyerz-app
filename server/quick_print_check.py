@@ -745,6 +745,8 @@ def test_catch_fire_raster_is_traced() -> None:
     gate = (result.get("vectorText") or {}).get("textGate") or []
     vector_bad = [row for row in gate if row.get("mode") == "vector" and not row.get("ok")]
     check("catch-vector-lines-match", bool(gate) and not vector_bad, str(vector_bad)[:500])
+    stray = [row for row in gate if str(row.get("text") or "").strip() == "f" and row.get("mode") == "vector"]
+    check("catch-small-glyph-stays-raster", not stray, str(stray)[:300])
     # A closed counter or a fragment stays raster, and the render must still read the real letters.
     for phrase in ("9AM", "6PM", "11AM", "SANDILE", "GREATER HARVEST FAMILY CHURCH"):
         hit = [row for row in gate if row.get("text") == phrase]

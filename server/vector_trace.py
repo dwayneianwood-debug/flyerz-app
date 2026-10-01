@@ -504,6 +504,12 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             raster_lines.append(_line(text, "raster", "An icon was left in the picture."))
             continue
         raw = _rect(block, bgr.shape[1], bgr.shape[0])
+        # A one-glyph speck under about 4 mm is a logo edge the reader called a letter.
+        # Tracing it punches the picture and the trim does not read it back.
+        glyph = re.sub(r"[^0-9A-Za-zÀ-ÿ]", "", text)
+        if len(glyph) == 1 and glyph.islower() and int(raw[3]) < 48:
+            raster_lines.append(_line(text, "raster", "A single small glyph stayed in the picture."))
+            continue
         rect = _padded(raw, bgr.shape[1], bgr.shape[0])
         left, top, right, bottom = _mapped_bounds(placed["map"], rect, width, height)
         inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
