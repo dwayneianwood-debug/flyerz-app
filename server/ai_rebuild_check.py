@@ -629,6 +629,34 @@ def test_doubtful_marks_are_not_retyped() -> None:
     )
 
 
+def test_contacts_and_dashes_are_words() -> None:
+    """An en dash, an email, and a phone number are lettering."""
+    from ai_rebuild import _word_like, keep_word_blocks
+
+    dash = "Invest in your health today \u2013"
+    email = "medella.lba@gmail.com"
+    phone = "073 703 0766"
+    check("dash-word", _word_like(dash) and _word_like("Save \u2014 today") and _word_like("Tom\u2019s \u2022 list"))
+    check("email-word", _word_like(email))
+    kept, dropped = keep_word_blocks([
+        {"text": dash, "bbox": [0.1, 0.3, 0.5, 0.04], "score": 0.91},
+        {"text": email, "bbox": [0.1, 0.4, 0.5, 0.04], "score": 0.2},
+        {"text": phone, "bbox": [0.1, 0.5, 0.4, 0.04], "score": 0.3},
+        {"text": "###", "bbox": [0.1, 0.1, 0.2, 0.05], "score": 0.9},
+        {"text": "MARKET DAY", "bbox": [0.1, 0.7, 0.4, 0.06], "score": 0.4},
+    ])
+    check(
+        "keeps-dash-email-phone",
+        [item["text"] for item in kept] == [dash, email, phone],
+        str([item["text"] for item in kept]),
+    )
+    check(
+        "still-drops-faint-and-junk",
+        [item["text"] for item in dropped] == ["###", "MARKET DAY"],
+        str([item["text"] for item in dropped]),
+    )
+
+
 def _draw_shape_flyer(path: str) -> None:
     """Big circle, a badge, one large letter, and two real lines. The circle is what OCR calls O."""
     from PIL import ImageDraw, ImageFont
@@ -842,6 +870,7 @@ if __name__ == "__main__":
     test_restore_spaces_from_gaps()
     test_inpaint_removes_the_letters()
     test_doubtful_marks_are_not_retyped()
+    test_contacts_and_dashes_are_words()
     test_upscaled_text_matches_local_placement()
     test_fill_matches_noisy_gradient()
     test_circle_stays_a_circle()

@@ -74,6 +74,15 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
     skipped = []
     meta = []
     for line in lines:
+        if _sits_in_badge(line, marks):
+            skipped.append({
+                **line,
+                "mode": "raster",
+                "font": "",
+                "kept_on_purpose": True,
+                "reason": "Lettering inside a circle stayed in the picture.",
+            })
+            continue
         quad = _quad(line, width, height)
         built = _line_mask(bgr, lab, gold, quad, str(line.get("text") or ""), height, width)
         if built is None:
@@ -107,16 +116,15 @@ def erase_text(bgr: np.ndarray, lines: list, marks: list | None = None) -> tuple
     if int(erase.max()) == 0:
         return bgr.copy(), [], skipped
     mask = cv2.dilate(erase, np.ones((3, 3), np.uint8))
-    for mark in marks:
-        if mark.get("kind") != "badge":
-            continue
-        cx, cy = int(round(mark["cx"])), int(round(mark["cy"]))
-        radius = max(2, int(round(float(mark["radius"]))) + 2)
-        cv2.circle(mask, (cx, cy), radius, 0, -1)
+    protect = _badge_protect(marks, height, width)
+    if int(protect.max()) > 0:
+        mask[protect > 0] = 0
     for item in meta:
         if is_short_numeral(item["line"].get("text")):
-            mask |= item["tight"]
-    painted = _inpaint(bgr, mask, meta)
+            tight = item["tight"].copy()
+            tight[protect > 0] = 0
+            mask |= tight
+    painted = _inpaint(bgr, mask, meta, protect)
     return painted, kept, skipped
 
 
@@ -240,8 +248,7 @@ def _line_mask(bgr, lab, gold, quad, text, height, width):
             keep |= component
     if int(keep.sum()) < 2:
         return None
-    core = (dist > 45) & keep
-    colour = np.median(bgr[y0:y1, x0:x1][core if int(core.sum()) > 10 else keep], axis=0)
+    colour = _core_bgr(bgr[y0:y1, x0:x1], keep)
     ys, xs = np.where(keep)
     gy0, gy1 = int(ys.min()), int(ys.max()) + 1
     gx0, gx1 = int(xs.min()), int(xs.max()) + 1
@@ -324,7 +331,7 @@ def _quad_distance(point, quad) -> float:
     return abs(float(np.dot(point - start, normal))) / height
 
 
-def _inpaint(src: np.ndarray, mask: np.ndarray, meta: list) -> np.ndarray:
+def _inpaint(src: np.ndarray, mask: np.ndarray, meta: list, protect: np.ndarray | None = None) -> np.ndarray:
     mask_u8 = ((mask > 0).astype(np.uint8)) * 255
     painted = cv2.inpaint(src, mask_u8, 5, cv2.INPAINT_TELEA).astype(np.float32)
     rng = np.random.default_rng(3)
@@ -333,6 +340,8 @@ def _inpaint(src: np.ndarray, mask: np.ndarray, meta: list) -> np.ndarray:
     feather = cv2.GaussianBlur(mask_u8.astype(np.float32) / 255.0, (5, 5), 0)[..., None]
     painted = np.clip(painted + noise[..., None] * feather, 0, 255).astype(np.uint8)
     residual = _residual_mask(painted, meta)
+    if protect is not None:
+        residual[protect > 0] = 0
     if int(residual.max()) == 0:
         return painted
     return cv2.inpaint(painted, residual, 4, cv2.INPAINT_TELEA)
@@ -418,6 +427,119 @@ def _colorfix(up: np.ndarray, ref: np.ndarray) -> np.ndarray:
     lifted = cv2.resize(residual, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_CUBIC)
     merged = np.dstack([up_lab[:, :, 0] + lifted, chroma[:, :, 0], chroma[:, :, 1]])
     return cv2.cvtColor(np.clip(merged, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def find_badges(bgr: np.ndarray) -> list:
+    """Filled circles that hold a mark. The mark stays in the picture."""
+    height, width = bgr.shape[:2]
+    if min(height, width) < 40:
+        return []
+    gray = cv2.medianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 5)
+    max_r = max(28, min(48, min(height, width) // 12))
+    found = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=28,
+        param1=70, param2=24, minRadius=12, maxRadius=max_r,
+    )
+    if found is None:
+        return []
+    badges = []
+    for circle in found[0]:
+        cx, cy, radius = [float(v) for v in circle]
+        if not _badge_disk(bgr, cx, cy, radius):
+            continue
+        if any(abs(cx - old["cx"]) < 8 and abs(cy - old["cy"]) < 8 for old in badges):
+            continue
+        badges.append({"cx": cx, "cy": cy, "radius": radius})
+    return badges
+
+
+def _badge_disk(bgr: np.ndarray, cx: float, cy: float, radius: float) -> bool:
+    """A flat filled disk, with a mark in the middle, sitting on a different ground.
+
+    A leaf can trip the circle finder. A real badge has an even ring of colour
+    and a hard edge against whatever is outside it.
+    """
+    height, width = bgr.shape[:2]
+    radius = float(radius)
+    if radius < 12:
+        return False
+    if cx - radius < 2 or cy - radius < 2 or cx + radius > width - 3 or cy + radius > height - 3:
+        return False
+    pad = int(radius * 1.45) + 2
+    x0 = max(0, int(cx) - pad)
+    y0 = max(0, int(cy) - pad)
+    x1 = min(width, int(cx) + pad + 1)
+    y1 = min(height, int(cy) + pad + 1)
+    roi = bgr[y0:y1, x0:x1]
+    yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
+    dist = np.sqrt((xx - (cx - x0)) ** 2 + (yy - (cy - y0)) ** 2)
+    ring = (dist >= radius * 0.50) & (dist <= radius * 0.82)
+    inner = dist <= max(3.0, radius * 0.38)
+    outer = (dist >= radius * 1.08) & (dist <= radius * 1.32)
+    ring_px = roi[ring]
+    inner_px = roi[inner]
+    outer_px = roi[outer]
+    if ring_px.shape[0] < 20 or inner_px.shape[0] < 8 or outer_px.shape[0] < 20:
+        return False
+    ring_mean = ring_px.astype(np.float32).mean(axis=0)
+    if float(ring_px.astype(np.float32).std(axis=0).mean()) > 18:
+        return False
+    inner_gap = float(np.linalg.norm(inner_px.astype(np.float32).mean(axis=0) - ring_mean))
+    edge_gap = float(np.linalg.norm(outer_px.astype(np.float32).mean(axis=0) - ring_mean))
+    return inner_gap > 36 and edge_gap > 80
+
+
+def _sits_in_badge(line: dict, marks: list | None) -> bool:
+    """True when this OCR box is a mark inside a filled circle, not a line beside one."""
+    rect = (line or {}).get("rect")
+    if not rect or not marks:
+        return False
+    x, y, bw, bh = [float(v) for v in rect[:4]]
+    if bw <= 0 or bh <= 0:
+        return False
+    cx = x + bw / 2.0
+    cy = y + bh / 2.0
+    for mark in marks:
+        if mark.get("kind") != "badge":
+            continue
+        radius = float(mark.get("radius") or 0)
+        if radius <= 0:
+            continue
+        dx = cx - float(mark.get("cx") or 0)
+        dy = cy - float(mark.get("cy") or 0)
+        if max(bw, bh) <= radius * 1.7 and dx * dx + dy * dy <= (radius * 0.9) ** 2:
+            return True
+    return False
+
+
+def _badge_protect(marks: list | None, height: int, width: int) -> np.ndarray:
+    protect = np.zeros((height, width), np.uint8)
+    for mark in marks or []:
+        if mark.get("kind") != "badge":
+            continue
+        cx, cy = int(round(float(mark["cx"]))), int(round(float(mark["cy"])))
+        radius = max(2, int(round(float(mark["radius"]))) + 2)
+        cv2.circle(protect, (cx, cy), radius, 255, -1)
+    return protect
+
+
+def _core_bgr(image: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    """Median of the stroke core. Anti-aliased edges are the ground bleeding in."""
+    pixels = image[keep]
+    if pixels.shape[0] < 4:
+        return np.array([0, 0, 0], np.float32)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    ink = gray[keep].astype(np.float32)
+    # Dark lettering: the darkest quarter of the ink. Light lettering: the brightest quarter.
+    if float(np.median(ink)) <= float(np.percentile(gray, 75)):
+        cut = float(np.percentile(ink, 25))
+        core = keep & (gray <= cut)
+    else:
+        cut = float(np.percentile(ink, 75))
+        core = keep & (gray >= cut)
+    if int(np.count_nonzero(core)) < 4:
+        return np.median(pixels, axis=0)
+    return np.median(image[core], axis=0)
 
 
 def _bgr_hex(colour) -> str:

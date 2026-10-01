@@ -480,12 +480,16 @@ def _single_character(text: str) -> bool:
     return len(_alnum(text)) <= 1
 
 
+# Dashes, quotes, a bullet, and @ are ordinary lettering, not junk.
+_WORD_EXTRA = "\u2010\u2011\u2012\u2013\u2014\u2018\u2019\u2022@"
+
+
 def _word_like(text: str) -> bool:
-    """A word or a short line, including prices and times such as 50% and 9AM."""
+    """A word or a short line, including prices, times, and an email address."""
     raw = " ".join(str(text or "").split())
     if not raw:
         return False
-    if re.fullmatch(r"[A-Za-z0-9%'.,!?&/\-:# ]+", raw) is None:
+    if re.fullmatch(r"[A-Za-z0-9%'.,!?&/\-:# " + _WORD_EXTRA + r"]+", raw) is None:
         return False
     core = _alnum(raw)
     letters = sum(1 for ch in core if ch.isalpha())
@@ -518,11 +522,23 @@ def _low_confidence(block: dict) -> bool:
     return score < MIN_WORD_SCORE
 
 
+def _is_contact(text: str) -> bool:
+    """An email or a phone number is lettering even when the score is low."""
+    raw = " ".join(str(text or "").split())
+    if re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", raw):
+        return True
+    digits = re.sub(r"\D", "", raw)
+    letters = sum(ch.isalpha() for ch in raw)
+    return 7 <= len(digits) <= 15 and letters <= 2
+
+
 def block_is_doubtful(block: dict) -> bool:
     """True when this OCR box must stay as the original pixels."""
     text = str((block or {}).get("text") or "").strip()
     if not text:
         return True
+    if _is_contact(text):
+        return False
     return (
         _single_character(text)
         or _very_large(block)

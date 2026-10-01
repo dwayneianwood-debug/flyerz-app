@@ -24,7 +24,7 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageCms, ImageDraw, ImageFont
 
 BLEED_MM = 5.0
 MIN_PPI = 400
@@ -78,6 +78,10 @@ ROLE_FONT = {
 }
 SCRIPT_KEYS = ("parisienne", "greatvibes", "allura", "pinyon")
 THICKEN = {"crimson", "libre"}
+# Stroke as a fraction of the font size. PyMuPDF's own stroke is 5%, which is too heavy.
+# Body copy matches the reference 1.3% stroke. Small script matches 1.2%.
+BODY_STROKE = 0.013
+SCRIPT_STROKE = 0.012
 
 _FONT_FILES = {key: os.path.join(FONT_DIR, name) for key, name, _role in FONTS}
 _FONT_ROLE = {key: role for key, _name, role in FONTS}
@@ -164,6 +168,19 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         else:
             raster_lines.append(decision)
     chosen = _harmonise(chosen, style)
+    from vector_plate import find_badges
+
+    page_badges = find_badges(bgr)
+    kept_chosen = []
+    for line in chosen:
+        if _inside_badge(line.get("rect"), page_badges):
+            record = dict(line)
+            record.update(mode="raster", font="", kept_on_purpose=True)
+            record["reason"] = "Lettering inside a circle stayed in the picture."
+            raster_lines.append(record)
+            continue
+        kept_chosen.append(line)
+    chosen = kept_chosen
 
     if not chosen:
         return _fail(
@@ -184,6 +201,8 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     _note(progress, "removing", "Removing the old lettering.")
     paint_started = time.perf_counter()
     marks = _source_marks(bgr, chosen)
+    for badge in page_badges:
+        marks.append({"kind": "badge", "cx": badge["cx"], "cy": badge["cy"], "radius": badge["radius"]})
     guide = _guide_boxes(bgr, blocks, chosen)
     from vector_plate import erase_text, map_rect, place_plate
 
@@ -531,6 +550,35 @@ def _is_numeral(text: str) -> bool:
     return raw.isdigit() and len(raw) <= 2
 
 
+def _inside_badge(rect, badges: list) -> bool:
+    """An OCR box that sits inside a filled circle. A long line beside one does not."""
+    if not rect or not badges:
+        return False
+    x, y, bw, bh = [float(v) for v in rect[:4]]
+    if bw <= 0 or bh <= 0:
+        return False
+    cx = x + bw / 2.0
+    cy = y + bh / 2.0
+    for badge in badges:
+        radius = float(badge.get("radius") or 0)
+        if radius <= 0:
+            continue
+        dx = cx - float(badge.get("cx") or 0)
+        dy = cy - float(badge.get("cy") or 0)
+        if max(bw, bh) <= radius * 1.7 and dx * dx + dy * dy <= (radius * 0.9) ** 2:
+            return True
+        corners = ((x, y), (x + bw, y), (x, y + bh), (x + bw, y + bh))
+        limit = (radius * 1.05) ** 2
+        if all((px - float(badge["cx"])) ** 2 + (py - float(badge["cy"])) ** 2 <= limit for px, py in corners):
+            return True
+    return False
+
+
+def _is_email(text: str) -> bool:
+    raw = " ".join(str(text or "").split())
+    return re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", raw) is not None
+
+
 def _is_phone(text: str) -> bool:
     raw = " ".join(str(text or "").split())
     digits = re.sub(r"\D", "", raw)
@@ -799,6 +847,14 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
     if _is_numeral(text) or rescued == "numeral":
         key = "poppins-regular" if style == "sans" else "crimson"
         record.update(mode="vector", font=key, role="numeral", match=0.5)
+        return record
+    if _is_email(text):
+        key = "poppins-regular" if style == "sans" else "crimson"
+        record.update(mode="vector", font=key, role="phone", match=0.8)
+        return record
+    if _is_phone(text) or rescued == "phone":
+        key = "poppins-regular" if style == "sans" else "crimson"
+        record.update(mode="vector", font=key, role="phone", match=0.5)
         return record
     try:
         ocr_score = float(block.get("score") or 0)
@@ -1600,7 +1656,7 @@ def _write_pdf(image, lines, bullets, output_pdf, trim_w, trim_h, bleed_mm) -> d
     qa = {"wrote": False, "cmyk": False, "boxes": False, "fonts": False, "ppi": False, "reason": ""}
     os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    cmyk = Image.fromarray(rgb).convert("CMYK")
+    cmyk = ImageCms.applyTransform(Image.fromarray(rgb), _press_cmyk())
     buffer = io.BytesIO()
     cmyk.save(buffer, format="TIFF", dpi=(MIN_PPI, MIN_PPI))
     width_pt = (trim_w + 2 * bleed_mm) * MM_TO_PT
@@ -1684,16 +1740,43 @@ def _draw_line(page, line: dict, sx: float, sy: float) -> None:
         cursor += font.text_length(ch, fontsize=size)
         if index < len(text) - 1:
             cursor += tracking
-    writer.write_text(page, color=colour, render_mode=0)
-    if line.get("font") in THICKEN:
-        writer_b = fitz.TextWriter(page.rect)
-        cursor = x * sx + 0.18
-        for index, ch in enumerate(text):
-            writer_b.append((cursor, baseline), ch, font=font, fontsize=size)
-            cursor += font.text_length(ch, fontsize=size)
-            if index < len(text) - 1:
-                cursor += tracking
-        writer_b.write_text(page, color=colour, render_mode=0)
+    stroke = _stroke_of(line)
+    writer.write_text(page, color=colour, render_mode=2 if stroke else 0)
+    if stroke:
+        _restroke(page, size, stroke)
+
+
+def _stroke_of(line: dict) -> float:
+    """Extra stroke for body and script. Caps and light ink stay at the file weight."""
+    font = str(line.get("font") or "")
+    role = str(line.get("role") or "")
+    red, green, blue = _hex_rgb(line.get("color") or "#222222")
+    if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72:
+        return 0.0
+    if "bold" in font or "semibold" in font:
+        return 0.0
+    if role == "script" or font in SCRIPT_KEYS:
+        return SCRIPT_STROKE
+    if font in THICKEN or (role in ("body", "phone", "numeral") and font.startswith("crimson")):
+        return BODY_STROKE
+    return 0.0
+
+
+def _restroke(page, size: float, factor: float) -> None:
+    """Replace PyMuPDF's 5% stroke with the press weight on the stream just written."""
+    doc = page.parent
+    xrefs = page.get_contents()
+    if not xrefs:
+        return
+    xref = xrefs[-1]
+    raw = doc.xref_stream(xref)
+    if not raw:
+        return
+    text = raw.decode("latin1")
+    width = f"{float(size) * float(factor):.4g}"
+    updated, count = re.subn(r"(?m)^([0-9]*\.?[0-9]+) w$", width + " w", text, count=1)
+    if count:
+        doc.update_stream(xref, updated.encode("latin1"))
 
 
 def _fit_width(font, text: str, box_w: float, box_h: float, role: str) -> tuple[float, float]:
@@ -1742,6 +1825,26 @@ def _hex_rgb(value: str) -> tuple[float, float, float]:
         return 0.1, 0.1, 0.1
 
 
+_PRESS_CMYK = None
+
+
+def _press_cmyk():
+    """sRGB to the press CMYK profile. Relative colorimetric, black point compensation."""
+    global _PRESS_CMYK
+    if _PRESS_CMYK is not None:
+        return _PRESS_CMYK
+    profile = "/usr/share/color/icc/ghostscript/default_cmyk.icc"
+    _PRESS_CMYK = ImageCms.buildTransform(
+        ImageCms.createProfile("sRGB"),
+        ImageCms.getOpenProfile(profile),
+        "RGB",
+        "CMYK",
+        renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+        flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+    )
+    return _PRESS_CMYK
+
+
 def _cmyk(rgb: tuple[float, float, float]) -> tuple[float, float, float, float]:
     red, green, blue = rgb
     # Dark neutral type is solid black. A grey K prints light on the press.
@@ -1750,13 +1853,11 @@ def _cmyk(rgb: tuple[float, float, float]) -> tuple[float, float, float, float]:
         return (0.0, 0.0, 0.0, 1.0)
     if max(red, green, blue) < 0.12 and max(red, green, blue) - min(red, green, blue) < 0.06:
         return (0.0, 0.0, 0.0, 1.0)
-    black = 1.0 - max(red, green, blue)
-    if black >= 0.999:
-        return (0.0, 0.0, 0.0, 1.0)
-    cyan = (1.0 - red - black) / (1.0 - black)
-    magenta = (1.0 - green - black) / (1.0 - black)
-    yellow = (1.0 - blue - black) / (1.0 - black)
-    return (cyan, magenta, yellow, black)
+    if min(red, green, blue) >= 0.96:
+        return (0.0, 0.0, 0.0, 0.0)
+    pixel = Image.new("RGB", (1, 1), tuple(int(round(channel * 255)) for channel in rgb))
+    converted = ImageCms.applyTransform(pixel, _press_cmyk()).getpixel((0, 0))
+    return tuple(channel / 255.0 for channel in converted)
 
 
 def _set_boxes(page, trim_w: float, trim_h: float, bleed_mm: float) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 
 import cv2
@@ -347,6 +348,89 @@ def test_erase_clears_the_original() -> None:
     check("erase-no-ghost", dark < 40, f"dark pixels {dark}")
 
 
+def test_core_ink_ignores_the_green_edge() -> None:
+    """The stroke core is the dark ink. The green fringe around it is not."""
+    from vector_plate import _core_bgr
+
+    image = np.full((48, 220, 3), 245, np.uint8)
+    cv2.rectangle(image, (20, 12), (200, 36), (20, 90, 30), -1)
+    cv2.rectangle(image, (24, 16), (196, 32), (8, 8, 8), -1)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keep = gray < 180
+    colour = _core_bgr(image, keep)
+    chroma = (float(colour.max()) - float(colour.min())) / 255.0
+    check("core-is-near-black", float(colour.max()) < 30 and chroma < 0.08, f"{colour.round(1)} chroma {chroma:.3f}")
+
+
+def test_step_circles_are_the_only_badges() -> None:
+    from vector_plate import find_badges
+
+    flyer = cv2.imread(os.path.join(os.path.dirname(__file__), "..", "tests/fixtures/medella/flyer_front.png"))
+    badges = find_badges(flyer)
+    centres = sorted((round(item["cx"]), round(item["cy"])) for item in badges)
+    check("four-step-circles", centres == [(711, 689), (711, 746), (711, 803), (711, 860)], str(centres))
+
+
+def test_badge_number_is_not_retyped() -> None:
+    image = Image.new("RGB", (800, 500), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((90, 90, 150, 150), fill=(36, 92, 58))
+    draw.text((108, 102), "4", font=ImageFont.truetype(font_path("crimson"), 28), fill=(255, 255, 255))
+    draw.text((200, 100), "You receive a plan", font=ImageFont.truetype(font_path("crimson"), 32), fill=(20, 28, 18))
+    blocks = [
+        _block("4", 106 / 800, 100 / 500, 28 / 800, 32 / 500, "#ffffff"),
+        _block("You receive a plan", 0.24, 0.18, 0.5, 0.12, "#141c12"),
+    ]
+    out = tempfile.mkdtemp(prefix="vector-step-")
+    pdf = os.path.join(out, "press.pdf")
+    result = rebuild_fitted(
+        image_bgr(image), 90, 50, pdf, blocks=blocks,
+        reocr=lambda _path: "You receive a plan",
+    )
+    check("step-job", result.get("ok") is True, str(result.get("reason")))
+    kept = [line for line in result.get("lines") or [] if line.get("text") == "4"]
+    check("step-stays-raster", bool(kept) and kept[0].get("mode") == "raster" and kept[0].get("reason", "").startswith("Lettering inside"), str(kept))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    text = doc[0].get_text("text") or ""
+    doc.close()
+    check("step-not-in-pdf", "4" not in text and "plan" in text.lower(), text[:200])
+
+
+def test_body_stroke_and_press_black() -> None:
+    """Body type is stroked at about 1.3% of the size, and a dark green plate keeps black ink."""
+    from vector_text_v2 import _cmyk
+
+    black = _cmyk((12 / 255, 11 / 255, 12 / 255))
+    check("near-black-is-k", black[3] > 0.95 and max(black[:3]) < 0.05, str(black))
+    green = _cmyk((15 / 255, 42 / 255, 27 / 255))
+    check("green-heading-keeps-chroma", green[1] > 0.05 or green[3] < 0.95, str(green))
+    image = Image.new("RGB", (720, 240), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 160, 719, 239), fill=(24, 70, 48))
+    draw.text((40, 40), "Early detection of imbalances", font=ImageFont.truetype(font_path("crimson"), 36), fill=(20, 24, 18))
+    blocks = [_block("Early detection of imbalances", 0.04, 0.12, 0.8, 0.28, "#141812")]
+    out = tempfile.mkdtemp(prefix="vector-stroke-")
+    pdf = os.path.join(out, "press.pdf")
+    result = rebuild_fitted(
+        image_bgr(image), 80, 30, pdf, blocks=blocks,
+        reocr=lambda _path: "Early detection of imbalances",
+    )
+    check("stroke-job", result.get("ok") is True, str(result.get("reason")))
+    import pymupdf as fitz
+    doc = fitz.open(pdf)
+    raw = ""
+    for xref in doc[0].get_contents():
+        raw += doc.xref_stream(xref).decode("latin1", errors="ignore") + "\n"
+    images = doc[0].get_images()
+    info = doc.extract_image(images[0][0]) if images else {}
+    doc.close()
+    check("stroke-render-mode", "2 Tr" in raw, raw[-400:])
+    widths = [float(item) for item in re.findall(r"([0-9]*\.?[0-9]+) w", raw)]
+    check("stroke-not-five-percent", bool(widths) and min(widths) < 0.4, str(widths))
+    check("plate-is-cmyk", info.get("colorspace") == 4, str(info.get("colorspace")))
+
+
 def test_numeral_mask_spares_the_circle() -> None:
     image = Image.new("RGB", (240, 180), (246, 241, 228))
     draw = ImageDraw.Draw(image)
@@ -543,6 +627,10 @@ def main() -> None:
     test_placement_matches_the_reference_fit()
     test_erase_clears_the_original()
     test_numeral_mask_spares_the_circle()
+    test_core_ink_ignores_the_green_edge()
+    test_step_circles_are_the_only_badges()
+    test_badge_number_is_not_retyped()
+    test_body_stroke_and_press_black()
     test_real_ocr_is_quick()
     test_medella_matches_approved_text()
     print("ALL PASS")
