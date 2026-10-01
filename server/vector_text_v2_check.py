@@ -227,8 +227,12 @@ def test_serif_page_is_consistent() -> None:
     check("serif-one-body", body_fonts == {"crimson"}, str(body_fonts))
     detox = next(line for line in vector if line["text"].startswith("Detox"))
     check("detox-not-script-face", detox.get("font") not in SCRIPT_KEYS, str(detox))
-    caps_line = next(line for line in vector if line["text"] == "SEE BEYOND")
-    check("caps-are-cinzel", caps_line.get("font") == "cinzel-600", str(caps_line))
+    caps_line = next(line for line in result.get("lines") or [] if line["text"] == "SEE BEYOND")
+    check(
+        "caps-are-cinzel-or-ink",
+        caps_line.get("mode") == "raster" or caps_line.get("font") in ("cinzel-500", "cinzel-600"),
+        str(caps_line),
+    )
     phone = next(line for line in result.get("lines") or [] if "073" in line["text"])
     name = next(line for line in result.get("lines") or [] if "hand" in line["text"].lower() or "Chand" in line["text"])
     check("phone-is-vector", phone.get("mode") == "vector" and phone.get("font") == "crimson", str(phone))
@@ -572,6 +576,32 @@ def test_small_script_gets_an_outline() -> None:
     check("light-script-unchanged", _stroke_for({"color": "#f4f1e4", "stroke": 0.0}, 10.0, "script") == 0.0)
 
 
+def test_heavy_caps_face_stays_ink() -> None:
+    """A caps line lighter than both Cinzel cuts stays in the picture."""
+    from vector_text_v2 import _choose_font
+
+    image = Image.new("RGB", (860, 90), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    cursor = 24
+    for word in ("SEE", "BEYOND"):
+        for ch in word:
+            draw.line((cursor, 58, cursor, 28), fill=(90, 96, 82), width=1)
+            cursor += 18
+        cursor += 36
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    decision = _choose_font(bgr, {
+        "text": "SEE BEYOND",
+        "bbox": [0.02, 0.15, 0.9, 0.6],
+        "score": 0.98,
+        "color_hex": "#5a6052",
+    }, "serif")
+    check(
+        "hairline-caps-stay-ink",
+        decision.get("mode") == "raster" and not decision.get("font"),
+        f"{decision.get('mode')} {decision.get('font')}",
+    )
+
+
 def test_stroke_follows_each_line() -> None:
     """A face that is already heavier than the ink gets no extra stroke."""
     from vector_text_v2 import _match_stroke, _render_ink
@@ -823,6 +853,7 @@ def main() -> None:
     test_symbol_beside_the_words_stays()
     test_spacing_assert_catches_a_joined_word()
     test_a_poor_body_match_stays_ink()
+    test_heavy_caps_face_stays_ink()
     test_small_script_gets_an_outline()
     test_stroke_follows_each_line()
     test_body_stroke_and_press_black()

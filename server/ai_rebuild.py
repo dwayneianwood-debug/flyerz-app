@@ -635,7 +635,7 @@ def measure_rhythm(bgr: np.ndarray, bbox: list, text: str) -> dict:
             else:
                 letter.append(float(gaps[gap_index]))
         track = float(np.median(letter)) / float(span) if letter else 0.0
-        if track * span < max(2.0, line_h * 0.08):
+        if track * span < max(2.0, line_h * 0.05):
             track = 0.0
         found["gaps"] = word
         found["track"] = track
@@ -653,6 +653,13 @@ def measure_rhythm(bgr: np.ndarray, bbox: list, text: str) -> dict:
             widths = [width for width, _gap in groups]
             unit = float(np.median(widths)) if widths else 0.0
             found["ratios"] = [float(frac) * float(group_span) / unit for frac in fracs] if unit > 0 else []
+            # Letters that did not line up one-to-one still have a smaller gap than the words.
+            letter = [gap for gap in gaps if not _word_gap(gap, gaps, line_h)]
+            if letter:
+                track = float(np.median(letter)) / float(span)
+                if track * span < max(2.0, line_h * 0.05):
+                    track = 0.0
+                found["track"] = track
             return found
     visible = any(_word_gap(gap, gaps, line_h) for gap in gaps) if gaps else False
     if " " in raw and visible:

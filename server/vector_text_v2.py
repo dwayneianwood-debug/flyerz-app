@@ -1138,21 +1138,16 @@ def _decorate(record: dict, bgr: np.ndarray, block: dict, ink: Optional[np.ndarr
     record["gaps"] = list(rhythm.get("gaps") or [])
     record["track"] = float(rhythm.get("track") or 0.0)
     key = str(record.get("font") or "")
-    # Widely tracked caps are a lighter cut. Cinzel SemiBold reads as a heavy word.
-    if key == "cinzel-600" and record["track"] >= 0.035 and ink is not None:
-        rendered = _render_ink(
-            str(record.get("text") or ""),
-            _FONT_FILES.get("cinzel-600") or "",
-            max(int(ink.shape[1]), 80),
-            max(int(ink.shape[0]), 24),
-            "spaced",
-        )
-        if rendered is not None and _rel_stroke(rendered) > _rel_stroke(ink) + 0.03:
-            record["font"] = "cinzel-500"
-            record["face_lock"] = True
-            key = "cinzel-500"
     red, green, blue = _hex_rgb(record.get("color") or "#222222")
-    if 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72:
+    light_ink = 0.2126 * red + 0.7152 * green + 0.0722 * blue > 0.72
+    # Cinzel SemiBold is heavier than most dark caps. Use the lighter cut when
+    # it is close, and leave the original pixels when even that cut is heavy.
+    # Light lettering on a dark ground is left to the face: its mask is the edge.
+    if key == "cinzel-600" and ink is not None and record.get("role") == "caps" and not light_ink:
+        key = _lighter_caps(record, ink) or ""
+        if record.get("mode") != "vector" or not key:
+            return record
+    if light_ink:
         return record
     if ink is not None and key:
         record["stroke"] = _match_stroke(ink, str(record.get("text") or ""), key)
@@ -2155,6 +2150,29 @@ def _stroke_of(line: dict) -> float:
         return max(0.0, float(line.get("stroke") or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _lighter_caps(record: dict, ink: np.ndarray) -> str:
+    """Return the caps face that is not heavier than this ink, or raster the line."""
+    text = str(record.get("text") or "")
+    height = max(int(ink.shape[0]), 28)
+    width = max(int(ink.shape[1]), 80)
+    ink_stroke = _rel_stroke(ink)
+    semi = _render_ink(text, _FONT_FILES.get("cinzel-600") or "", width, height, "spaced")
+    if semi is None or _rel_stroke(semi) <= ink_stroke + 0.03:
+        return "cinzel-600"
+    light = _render_ink(text, _FONT_FILES.get("cinzel-500") or "", width, height, "spaced")
+    # The mask of a real Cinzel line reads a little lighter than a fresh render.
+    # A larger gap means even the lighter cut is heavier than the ink.
+    if light is not None and _rel_stroke(light) <= ink_stroke + 0.05:
+        record["font"] = "cinzel-500"
+        record["face_lock"] = True
+        return "cinzel-500"
+    record["mode"] = "raster"
+    record["font"] = ""
+    record["face_lock"] = True
+    record["reason"] = "The caps face was heavier than this line, so it stayed in the picture."
+    return ""
 
 
 def _stroke_for(line: dict, size: float, role: str) -> float:
