@@ -508,6 +508,26 @@ def test_descenders_and_counters() -> None:
     gap[16:22, 8:22] = (236, 232, 226)
     gap_score = _min_glyph_iou(clean, gap)
     check("glyph-iou-missing-bar", gap_score < 0.85, f"{gap_score:.3f}")
+    # A short bar beside a digit is not a letter. It must not pull the line down.
+    mixed = np.full((90, 80, 3), (236, 232, 226), np.uint8)
+    _block_letter(mixed, 8, 16, (20, 18, 16))
+    _block_letter(mixed, 44, 16, (20, 18, 16))
+    mixed[72:78, 8:14] = (20, 18, 16)
+    check(
+        "glyph-iou-short-bar",
+        _min_glyph_iou(mixed, mixed.copy()) >= 0.85,
+        f"{_min_glyph_iou(mixed, mixed.copy()):.3f}",
+    )
+    # Under 12px, one pixel is a fifth of the stroke, so that edge is not judged.
+    tiny = np.full((28, 50, 3), (236, 232, 226), np.uint8)
+    tiny[8:18, 4:7] = (20, 18, 16)
+    tiny[8:11, 4:14] = (20, 18, 16)
+    tiny[8:18, 28:31] = (20, 18, 16)
+    tiny[8:11, 28:38] = (20, 18, 16)
+    thick = tiny.copy()
+    thick[8:18, 7:9] = (20, 18, 16)
+    tiny_score = _min_glyph_iou(tiny, thick)
+    check("glyph-iou-tiny-edge", tiny_score >= 0.85, f"{tiny_score:.3f}")
 
     src = np.full((80, 40, 3), paper, np.uint8)
     src[15:40, 8:28] = (16, 14, 12)

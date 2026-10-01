@@ -3045,6 +3045,15 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     ]
     if len(letters) < 2:
         return 1.0
+    # A short bar beside a digit is not a letter. The letters are the tall set.
+    tallest = max(part["h"] for part in letters)
+    tall = [part for part in letters if part["h"] >= 0.70 * tallest]
+    if len(tall) >= 2:
+        letters = tall
+    # On a letter shorter than 12px, one pixel is a fifth of the stroke.
+    # That edge is not a different glyph. The school N is well above this.
+    if float(np.median([part["h"] for part in letters])) < 12.0:
+        return 1.0
     radius = cv2.distanceTransform(source_ink.astype(np.uint8), cv2.DIST_L2, 3)
     stroke = float(np.median(radius[source_ink])) if int(source_ink.sum()) else 1.0
     ksize = int(round(1.6 * stroke)) * 2 + 1
@@ -3072,6 +3081,16 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
         # counter is inside the letter, so it still counts.
         ignore = extra & ~interior[y0:y1, x0:x1] & (outside[y0:y1, x0:x1] < 1.5)
         counted = extra & ~ignore
+        # A one-pixel nick inside a counter is the soft edge. A channel
+        # through an N is one piece, so it still counts.
+        inside = (counted & interior[y0:y1, x0:x1]).astype(np.uint8)
+        pieces, labels, stats, _centres = cv2.connectedComponentsWithStats(inside, 8)
+        if pieces > 1:
+            specks = np.zeros(inside.shape, np.bool_)
+            for index in range(1, pieces):
+                if int(stats[index, cv2.CC_STAT_AREA]) < 12:
+                    specks[labels == index] = True
+            counted = counted & ~specks
         missing = source_box & ~render_box
         near = near_render[y0:y1, x0:x1]
         # A one-pixel inset is the same hard edge. A gap that continues past
@@ -3085,8 +3104,9 @@ def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
         score = 0.0 if union == 0 else inter / float(union)
         if score < worst:
             worst = score
+    letter_h = float(np.median([part["h"] for part in letters]))
     for part in render_parts:
-        if part["area"] < floor or part["h"] < 0.55 * median_h:
+        if part["area"] < floor or part["h"] < 0.70 * letter_h:
             continue
         overlap = int(np.count_nonzero(part["pixels"] & source_ink))
         if overlap >= 0.35 * part["area"]:
