@@ -531,9 +531,11 @@ def test_a_wide_swash_is_not_traced() -> None:
     kept = _strip_flourish(descender)
     check("descender-stays", int(kept[50, 46]) == 255 and int(kept[20, 16]) == 255)
     swash = letters.copy()
-    swash[48:70, 15:130] = 255
+    for x in range(15, 150):
+        yy = 52 + int(8 + 7 * np.sin(x / 6.0))
+        swash[yy:yy + 2, x:x + 2] = 255
     stripped = _strip_flourish(swash)
-    check("swash-not-traced", int(stripped[55, 40]) == 0, str(int(stripped[48:].max())))
+    check("swash-not-traced", int(stripped[52:, :].max()) == 0, str(int(stripped[52:].max())))
     check("swash-letters-stay", int(stripped[20, 16]) == 255 and int(stripped[20, 46]) == 255)
 
 
@@ -856,13 +858,30 @@ def _check_medella_swash(card: dict) -> None:
     peak = int(body.max()) if body.size else 0
     baseline = body_top
     if peak >= 8:
-        heavy = body >= 0.45 * peak
-        y = int(np.argmax(body))
-        while y + 1 < heavy.size and heavy[y + 1]:
-            y += 1
-        baseline = min(cap, body_top + y + 4)
+        # The letter body is the long heavy run. A one-row spike lower down
+        # is the swash or the next line, not the baseline.
+        heavy = body >= 0.55 * peak
+        runs = []
+        index = 0
+        while index < heavy.size:
+            if not heavy[index]:
+                index += 1
+                continue
+            end = index
+            while end < heavy.size and heavy[end]:
+                end += 1
+            runs.append((index, end))
+            index = end
+        if runs:
+            start, end = max(runs, key=lambda run: run[1] - run[0])
+            baseline = min(cap, body_top + end + 2)
     y0 = min(cap, baseline)
     y1 = cap
+    # The traced stroke's 2px fringe, and the first pixels of the next line,
+    # are allowed to differ. The gap between them is not.
+    if y1 - y0 > 32:
+        y0 += 4
+        y1 -= 4
     detail = f"band {x0}:{x1},{y0}:{y1} cap {cap} baseline {baseline}"
     band_h = y1 - y0
     band_w = x1 - x0

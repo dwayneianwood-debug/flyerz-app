@@ -776,41 +776,44 @@ def _letter_erase_mask(mask: np.ndarray) -> np.ndarray:
 def _strip_flourish(mask: np.ndarray) -> np.ndarray:
     """Leave a word-wide swash in the picture.
 
-    The letter body is traced. A flourish wider than the letters, hanging below
-    that body, is not erased and not traced: a vector of it turns into bars,
-    and those bars sit inside the source-ink fringe so the page guard misses
-    them. A normal descender is about one letter wide and stays in the mask.
+    The letter body is the long heavy run of the mask. A flourish wider than
+    the letters, hanging below that body, is not erased and not traced: a
+    vector of it turns into bars, and those bars sit inside the source-ink
+    fringe so the page guard misses them. A normal descender is about one
+    letter wide and stays in the mask.
     """
     if mask is None or int(mask.max()) == 0:
         return mask
-    parts = _components(mask, 20)
-    letterlike = [part for part in parts if part["h"] >= 8 and part["w"] <= 2.5 * max(1, part["h"])]
-    baseline = None
-    median_w = 0.0
-    if len(letterlike) >= 2:
-        median_w = float(np.median([part["w"] for part in letterlike]))
-        baseline = int(np.median([part["y"] + part["h"] for part in letterlike])) + 2
-    else:
-        rows = (mask > 0).sum(axis=1)
-        peak = int(rows.max()) if rows.size else 0
-        if peak < 8:
-            return mask
-        heavy = rows >= 0.45 * peak
-        y = int(np.argmax(heavy))
-        while y + 1 < heavy.size and heavy[y + 1]:
-            y += 1
-        baseline = min(mask.shape[0], y + 3)
-        upper = np.zeros(mask.shape, np.uint8)
-        upper[:baseline] = mask[:baseline]
-        upper_parts = _components(upper, 20)
-        upper_letters = [part for part in upper_parts if part["w"] <= 2.5 * max(1, part["h"])]
-        if len(upper_letters) < 2:
-            return mask
-        median_w = float(np.median([part["w"] for part in upper_letters]))
-    if baseline is None or median_w <= 0 or baseline >= mask.shape[0] - 2:
+    rows = (mask > 0).sum(axis=1)
+    peak = int(rows.max()) if rows.size else 0
+    if peak < 8:
         return mask
-    if int((mask[baseline:] > 0).sum()) < 40:
+    heavy = rows >= 0.45 * peak
+    runs = []
+    index = 0
+    while index < heavy.size:
+        if not heavy[index]:
+            index += 1
+            continue
+        end = index
+        while end < heavy.size and heavy[end]:
+            end += 1
+        runs.append((index, end))
+        index = end
+    if not runs:
         return mask
+    _start, end = max(runs, key=lambda run: run[1] - run[0])
+    baseline = min(mask.shape[0], end + 2)
+    if baseline >= mask.shape[0] - 2 or int(rows[baseline:].sum()) < 40:
+        return mask
+    upper = np.zeros(mask.shape, np.uint8)
+    upper[:baseline] = mask[:baseline]
+    letterlike = [part for part in _components(upper, 20) if part["w"] <= 2.5 * max(1, part["h"])]
+    if len(letterlike) < 2:
+        return mask
+    median_w = float(np.median([part["w"] for part in letterlike]))
+    # Wider than the letters, and wide on the page. A descender is neither.
+    limit = max(2.8 * median_w, 80.0)
     tail = np.zeros(mask.shape, np.uint8)
     tail[baseline:] = mask[baseline:]
     count, _labels, stats, _cent = cv2.connectedComponentsWithStats((tail > 0).astype(np.uint8), 8)
@@ -818,7 +821,7 @@ def _strip_flourish(mask: np.ndarray) -> np.ndarray:
     for index in range(1, count):
         if int(stats[index, cv2.CC_STAT_AREA]) < 80:
             continue
-        if int(stats[index, cv2.CC_STAT_WIDTH]) > 1.6 * median_w:
+        if int(stats[index, cv2.CC_STAT_WIDTH]) > limit:
             wide = True
             break
     if not wide:
