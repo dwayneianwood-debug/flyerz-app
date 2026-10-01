@@ -540,6 +540,28 @@ def test_spacing_assert_catches_a_joined_word() -> None:
     check("gaps-none", gaps_hold([], []) is True)
 
 
+def test_a_poor_body_match_stays_ink() -> None:
+    """A line the body face does not resemble is not set in that serif."""
+    from vector_text_v2 import _choose_font
+    image = Image.new("RGB", (980, 160), (246, 241, 228))
+    draw = ImageDraw.Draw(image)
+    face = ImageFont.truetype(font_path("parisienne"), 72)
+    draw.text((40, 30), "feel your best, every day.", font=face, fill=(40, 48, 36))
+    bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    block = {
+        "text": "feel your best, every day.",
+        "bbox": [0.03, 0.15, 0.9, 0.55],
+        "score": 0.98,
+        "color_hex": "#283024",
+    }
+    decision = _choose_font(bgr, block, "serif")
+    check(
+        "script-tag-not-crimson",
+        decision.get("font") != "crimson",
+        f"{decision.get('mode')} {decision.get('font')} {decision.get('role')}",
+    )
+
+
 def test_small_script_gets_an_outline() -> None:
     from vector_text_v2 import _stroke_for
 
@@ -800,6 +822,7 @@ def main() -> None:
     test_tracked_caps_keep_letter_and_word_gaps()
     test_symbol_beside_the_words_stays()
     test_spacing_assert_catches_a_joined_word()
+    test_a_poor_body_match_stays_ink()
     test_small_script_gets_an_outline()
     test_stroke_follows_each_line()
     test_body_stroke_and_press_black()

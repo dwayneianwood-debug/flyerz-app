@@ -1114,7 +1114,9 @@ def _choose_font(bgr: np.ndarray, block: dict, style: str = "serif") -> dict:
         record["reason"] = "Script lettering was hard to read, so it stayed in the picture."
         return record
     script_ok = role == "script" and script_sure and (confident or ocr_score >= 0.55 or rescued == "name")
-    plain_ok = role != "script" and confident and score > -0.05
+    # A confident read is not enough when the face does not look like the ink.
+    # A script line that was not detected would otherwise be set in the body serif.
+    plain_ok = role != "script" and confident and score > 0
     if score < MATCH_FLOOR and rescued not in ("name", "phone", "letters") and not script_ok and not plain_ok:
         record["reason"] = "No font matched this line closely enough."
         return record
