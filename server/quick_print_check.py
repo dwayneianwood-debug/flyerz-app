@@ -171,6 +171,7 @@ def test_existing(root: str) -> None:
     text = doc[0].get_text("text")
     doc.close()
     check("existing-text-kept", "ALREADY" in text, text[:120])
+    check("existing-not-traced", "traced" not in " ".join(result.get("decisions") or []).lower(), str(result.get("decisions"))[:300])
     _render(press, os.path.join(ART, "quick-print-existing-bleed.png"))
 
 
@@ -232,11 +233,16 @@ def test_flyer(root: str) -> None:
     text = page.get_text("text") or ""
     fonts = page.get_fonts()
     images = page.get_images()
+    drawings = page.get_drawings()
     info = doc.extract_image(images[0][0]) if images else {}
     inset = float(page.trimbox.x0) * 25.4 / 72.0
     doc.close()
-    check("flyer-vector-text", "MARKET" in text.upper(), text.replace("\n", " | ")[:240])
-    check("flyer-embedded-font", bool(fonts) and all("+" in str(item[3]) for item in fonts), str(fonts)[:240])
+    fonts_on = os.environ.get("VECTOR_FONTS", "").strip().lower() in ("1", "on", "true", "yes")
+    if fonts_on:
+        check("flyer-vector-text", "MARKET" in text.upper(), text.replace("\n", " | ")[:240])
+        check("flyer-embedded-font", bool(fonts) and all("+" in str(item[3]) for item in fonts), str(fonts)[:240])
+    else:
+        check("flyer-traced", "traced" in joined.lower() and len(drawings) > 4, f"drawings {len(drawings)} {joined[:240]}")
     check("flyer-cmyk-image", info.get("colorspace") == 4, str(info.get("colorspace")))
     check("flyer-trim-inset", abs(inset - 5) < 0.5, f"{inset:.2f}")
 
@@ -262,8 +268,13 @@ def test_shapes(root: str) -> None:
     doc = fitz.open(result["pressPath"])
     text = doc[0].get_text("text") or ""
     images = doc[0].get_images()
+    drawings = doc[0].get_drawings()
     doc.close()
-    check("shapes-vector-words", "MARKET" in text.upper(), text.replace("\n", " | ")[:180])
+    fonts_on = os.environ.get("VECTOR_FONTS", "").strip().lower() in ("1", "on", "true", "yes")
+    if fonts_on:
+        check("shapes-vector-words", "MARKET" in text.upper(), text.replace("\n", " | ")[:180])
+    else:
+        check("shapes-traced", "traced" in joined.lower() and len(drawings) > 4, f"drawings {len(drawings)}")
     check("shapes-still-a-picture", len(images) >= 1, str(len(images)))
 
 
@@ -492,11 +503,98 @@ def test_touching_object_stays_reasonable_and_amber() -> None:
     check("touch-keeps-picture", np.array_equal(middle, picture))
 
 
+def test_bottom_bar_stays_at_the_bottom() -> None:
+    """A flat contact band is kept at the bottom. The picture above it is not centred."""
+    from quick_print import _extend_to_product
+
+    picture = _gradient_picture(360, 360, 3)
+    picture[300:] = (40, 20, 80)
+    picture[296:300] = (40, 180, 220)
+    picture[180, 100:140] = (9, 8, 7)
+    fitted, extended, _delta = _extend_to_product(picture, 148, 210, "", [])
+    check("bar-extended", extended is True and fitted.shape[0] > picture.shape[0], str(fitted.shape))
+    side = (fitted.shape[1] - picture.shape[1]) // 2
+    found = None
+    for y in range(fitted.shape[0]):
+        if np.array_equal(fitted[y, side:side + picture.shape[1]][100:140], picture[180, 100:140]):
+            # The marker is only on that row of the original. Confirm the neighbours differ.
+            found = y
+            break
+    check("bar-marker", found is not None, "marker row missing")
+    if found is None:
+        return
+    top_pad = found - 180
+    bottom_pad = fitted.shape[0] - (found + (picture.shape[0] - 180))
+    check("bar-more-space-above", top_pad > bottom_pad * 2, f"top {top_pad} bottom {bottom_pad}")
+    px_per_mm = fitted.shape[1] / 148.0
+    check("bar-safe-bottom", abs(bottom_pad / px_per_mm - 4.0) < 0.6, f"{bottom_pad / px_per_mm:.2f} mm")
+    footer = np.array((40, 20, 80), np.float32)
+    tail = fitted[-max(1, bottom_pad // 2)].astype(np.float32)
+    # The continuation under the band is that band's colour, not a smear of the picture above it.
+    delta = float(np.mean(np.abs(tail - footer)))
+    check("bar-tail-colour", delta < 8.0, f"{delta:.2f}")
+    # Interior of the picture, clear of the feathered rim, is the original.
+    core = picture[80:260, 40:-40]
+    placed = fitted[top_pad + 80:top_pad + 260, side + 40:side + picture.shape[1] - 40]
+    check("bar-keeps-core", core.shape == placed.shape and np.array_equal(core, placed))
+
+
+def test_catch_fire_raster_is_traced() -> None:
+    """A square social JPG is not an AI export size. Lettering still has to be traced."""
+    from ai_rebuild import assess
+
+    src = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "catch_fire", "src.jpg"))
+    check("catch-fixture", os.path.exists(src), src)
+    verdict = assess(src, 148, 210, BLEED_MM)
+    check("catch-not-classified-ai", verdict.get("detected") is False, str(verdict.get("reasons"))[:240])
+    out = tempfile.mkdtemp(prefix="catch-fire-")
+    result = make_print_ready(src, out, 148, 210, "a5", "A5", filename="src.jpg")
+    joined = " ".join(result.get("decisions") or [])
+    check("catch-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000), str(result.get("reasons"))[:300])
+    check("catch-traced", "this raster has lettering" in joined.lower() and "traced" in joined.lower(), joined[:600])
+    media_w = float(result.get("mediaWidthMm") or 0)
+    media_h = float(result.get("mediaHeightMm") or 0)
+    trim_w = float(result.get("trimWidthMm") or 0)
+    trim_h = float(result.get("trimHeightMm") or 0)
+    check("catch-bleed-5", abs(media_w - 158) < 2 and abs(media_h - 220) < 2, f"{media_w}x{media_h}")
+    check("catch-trim", abs(trim_w - 148) < 1.5 and abs(trim_h - 210) < 1.5, f"{trim_w}x{trim_h}")
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    page = doc[0]
+    drawings = page.get_drawings()
+    images = page.get_images()
+    info = doc.extract_image(images[0][0]) if images else {}
+    pix = page.get_pixmap(matrix=fitz.Matrix(0.55, 0.55), alpha=False)
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    doc.close()
+    boxes = 0
+    for line in result.get("decisions") or []:
+        if "traced as vector shapes (" in str(line):
+            try:
+                boxes = int(str(line).split("(")[1].split(" ")[0])
+            except (IndexError, ValueError):
+                boxes = 0
+    # Same-colour paths share one drawing, so the box count is the trace count.
+    check("catch-vector-paths", boxes >= 15 and len(drawings) >= 1, f"boxes {boxes} drawings {len(drawings)}")
+    check("catch-cmyk", info.get("colorspace") == 4, str(info.get("colorspace")))
+    inset = int(round(5.0 / 25.4 * (pix.w / (158 / 25.4))))
+    trim = rgb[inset:rgb.shape[0] - inset, inset:rgb.shape[1] - inset]
+    # The contact band sits at the bottom. The 4 mm under it is the same navy, not a smear of the portrait.
+    tail = trim[-max(2, trim.shape[0] // 50):].astype(np.int16)
+    navy = np.array([33, 15, 77], np.int16)  # RGB of the footer
+    tail_delta = float(np.mean(np.abs(tail - navy)))
+    check("catch-footer-at-bottom", tail_delta < 18, f"{tail_delta:.1f}")
+    address = trim[int(trim.shape[0] * 0.90):int(trim.shape[0] * 0.97)]
+    check("catch-address-above-footer", float(address.std()) > float(tail.std()) + 5, f"addr {address.std():.1f} tail {tail.std():.1f}")
+
+
 def main() -> None:
     test_rules()
     test_extended_band_does_not_streak()
     test_nearby_object_does_not_enter_the_band()
     test_touching_object_stays_reasonable_and_amber()
+    test_bottom_bar_stays_at_the_bottom()
+    test_catch_fire_raster_is_traced()
     root = tempfile.mkdtemp(prefix="quick-print-src-")
     try:
         test_word(root)

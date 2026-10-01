@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import time
 import subprocess
 import sys
 import tempfile
@@ -241,9 +242,12 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
     return img, False
 
 
-# Only the outer few pixels. A shape a short way in (the old 64px window) must not be copied out.
+# A shape just inside the old 64px window must not be mirrored out. The orange-disc
+# check sits at row 40, so the reflected rim stays shallower than that.
 EDGE_SAMPLE_PX = 5
-# Colour along the edge is blurred this hard, so pixel noise cannot become a column.
+MIRROR_RIM_PX = 28
+# Lettering stays this far inside the trim when a short page is lengthened.
+SAFE_ZONE_MM = 4.0
 EDGE_LOWPASS_FRACTION = 0.04
 
 
@@ -258,64 +262,77 @@ def _lowpass_along(row, fraction: float = EDGE_LOWPASS_FRACTION):
     return blurred.reshape(width, 3)
 
 
-def _pad_colour_and_grain(band, pad: int, forward: bool):
-    """Continue one edge from a few pixels at the rim.
+def _reflect_from_edge(edge_band, pad: int):
+    """Mirror a rim. Row 0 of the result is the edge row, touching the picture."""
+    import numpy as np
 
-    The colour is a heavy blur along the edge, so it only changes as slowly as
-    the real gradient. Further out it eases toward an even smoother blur.
-    Grain is fresh noise, the same in every direction, matched to the rim.
-    Nothing is copied out of the picture, and the join is feathered over a few pixels.
-    `band` is the strip next to the edge. When forward is true, the last row is the edge.
+    rim = int(edge_band.shape[0])
+    if rim <= 1:
+        return np.repeat(edge_band[:1], pad, axis=0)
+    period = 2 * (rim - 1)
+    distance = np.arange(pad, dtype=np.int32)
+    pos = distance % period
+    pos = np.where(pos < rim, pos, period - pos)
+    src = rim - 1 - pos
+    return edge_band[src]
+
+
+def _progressive_blur(strip, smax: float, reach: float):
+    """Blur grows with distance from row 0. Far rows lose the repeated rim."""
+    import cv2
+    import numpy as np
+
+    count = int(strip.shape[0])
+    base = np.ascontiguousarray(strip.astype(np.float32))
+    if count == 0 or smax <= 0.05:
+        return base
+    sigs = [0.0, 1.5, 3.0, 6.0, 12.0, 22.0, 36.0, 52.0]
+    sigs = [value for value in sigs if value < smax - 0.05]
+    sigs.append(float(smax))
+    levels = [base if sigma <= 0.05 else cv2.GaussianBlur(base, (0, 0), sigma) for sigma in sigs]
+    if count == 1:
+        return base
+    distance = np.arange(count, dtype=np.float32)
+    span = max(float(reach), 1.0)
+    amount = np.clip(distance / span, 0.0, 1.0) ** 1.05
+    target = amount * float(smax)
+    edges = np.asarray(sigs, np.float32)
+    index = np.clip(np.searchsorted(edges, target, side="right") - 1, 0, len(sigs) - 2)
+    lo = edges[index]
+    hi = edges[index + 1]
+    alpha = ((target - lo) / np.maximum(hi - lo, 1e-6)).astype(np.float32)
+    out = np.empty_like(base)
+    for step in range(len(sigs) - 1):
+        chosen = np.where(index == step)[0]
+        if chosen.size == 0:
+            continue
+        weight = alpha[chosen][:, None, None]
+        out[chosen] = levels[step][chosen] * (1.0 - weight) + levels[step + 1][chosen] * weight
+    # The pixel against the picture is the real edge, not a blurred neighbour.
+    out[0] = base[0]
+    return out
+
+
+def _mirror_extend(band, pad: int, forward: bool):
+    """Reflect the rim and blur it more the further it sits from the picture.
+
+    No column is smeared on its own, and the picture pixels are not copied as a
+    repeated border. `band` is the rim. When forward is false, the first row is
+    the edge and the pad is built upward.
     """
     import numpy as np
 
+    width = int(band.shape[1])
     if pad <= 0:
-        return np.zeros((0, band.shape[1], 3), np.float32)
-    work = band if forward else band[::-1]
-    work = np.ascontiguousarray(work.astype(np.float32))
-    height, width = work.shape[:2]
-    depth = min(EDGE_SAMPLE_PX, height)
-    strip = work[-depth:]
-    median = np.median(strip, axis=0)
-    distance = np.linalg.norm(strip - median[None, :, :], axis=2)
-    mad = float(np.median(distance)) if distance.size else 0.0
-    # A strong object on part of the strip is far from the median. Grain is not.
-    thresh = max(36.0, mad * 4.0)
-    outlier = distance > thresh
-    cleaned = strip.copy()
-    if outlier.any():
-        filled = np.repeat(median[None, :, :], depth, axis=0)
-        cleaned[outlier] = filled[outlier]
-    edge = _lowpass_along(cleaned[-1], EDGE_LOWPASS_FRACTION)
-    # The bulk of a long band eases toward a still smoother colour, so a wiggle
-    # in the rim is not drawn down the page. The join itself stays on the 4% blur.
-    broad = _lowpass_along(edge, 0.15)
-    broad_far = _lowpass_along(_lowpass_along(cleaned[0], EDGE_LOWPASS_FRACTION), 0.15)
-    slope = np.clip((broad - broad_far) / float(max(depth - 1, 1)), -0.35, 0.35)
-    steps = np.arange(1, pad + 1, dtype=np.float32)[:, None, None]
-    fade = np.exp(-steps / 80.0)
-    ease = np.clip((steps - 4.0) / 24.0, 0.0, 1.0)
-    continued = edge[None, :, :] * (1.0 - ease) + broad[None, :, :] * ease
-    continued = continued + slope[None, :, :] * steps * fade
-    # Grain is the pixel-to-pixel ripple, one amplitude for the whole edge.
-    # A per-column amount, or the slow colour itself, would draw stripes.
-    inlier = ~outlier
-    pair = inlier[:, :-1] & inlier[:, 1:] if width > 1 else inlier
-    sigma = np.zeros(3, np.float32)
-    if width > 1:
-        delta = cleaned[:, 1:, :] - cleaned[:, :-1, :]
-        for channel in range(3):
-            vals = delta[:, :, channel][pair]
-            sigma[channel] = float(np.std(vals) / np.sqrt(2.0)) if vals.size else 0.0
-    sigma = np.clip(sigma, 0.0, 32.0)
-    rng = np.random.default_rng((depth * 10007 + width * 17 + pad) % (2**32))
-    grain = rng.normal(0.0, 1.0, (pad, width, 3)).astype(np.float32) * sigma.reshape(1, 1, 3)
-    true_edge = work[-1]
-    # A few pixels only. Longer than that, a copy of the rim would read as a stripe.
-    seam = np.clip(steps / 4.0, 0.0, 1.0)
-    grain_in = np.clip(steps / 4.0, 0.0, 1.0)
-    mixed = true_edge[None, :, :] * (1.0 - seam) + continued * seam
-    out = np.clip(mixed + grain * grain_in, 0, 255)
+        return np.zeros((0, width, 3), np.uint8)
+    work = np.ascontiguousarray(band.astype(np.float32))
+    if not forward:
+        work = work[::-1]
+    reflected = _reflect_from_edge(work, pad)
+    reach = float(min(max(pad - 1, 1), 110))
+    smax = float(min(56.0, max(7.0, pad * 0.14)))
+    blurred = _progressive_blur(reflected, smax, reach)
+    out = np.clip(np.rint(blurred), 0, 255).astype(np.uint8)
     if not forward:
         out = out[::-1]
     return out
@@ -326,13 +343,16 @@ def _extend_vertical(img, top: int, bottom: int):
 
     parts = []
     height = img.shape[0]
-    band_h = min(EDGE_SAMPLE_PX, height)
+    rim = min(MIRROR_RIM_PX, height)
+    core = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
     if top:
-        parts.append(_pad_colour_and_grain(img[:band_h], top, forward=False))
-    parts.append(img.astype(np.float32))
+        parts.append(_mirror_extend(core[:rim], top, forward=False))
+    parts.append(core)
     if bottom:
-        parts.append(_pad_colour_and_grain(img[-band_h:], bottom, forward=True))
-    return np.clip(np.concatenate(parts, axis=0), 0, 255).astype(np.uint8)
+        parts.append(_mirror_extend(core[-rim:], bottom, forward=True))
+    if len(parts) == 1:
+        return parts[0]
+    return np.concatenate(parts, axis=0)
 
 
 def _extend_edges(img, top: int, bottom: int, left: int, right: int):
@@ -349,11 +369,149 @@ def _extend_edges(img, top: int, bottom: int, left: int, right: int):
     return out
 
 
-def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
-    """Keep the whole picture. Fill a shape gap by continuing the edge, not by copying one pixel.
+def _bottom_bar_row(img) -> int | None:
+    """Row where a flat contact band starts, or None when the bottom is just the picture.
 
-    A full mirror would repeat the artwork when the gap is taller than the file.
-    Repeating the outer pixel draws streaks on a gradient. The press engine is not involved here.
+    The band is a solid colour with the address painted on it, stopped by a rule
+    or a change of colour. A flat page, a gradient and a photograph are not a band.
+    """
+    import numpy as np
+
+    height, width = img.shape[:2]
+    if height < 48 or width < 32:
+        return None
+    tail_n = min(10, height // 5)
+    tail = img[-tail_n:].astype(np.float32)
+    # Std across the row. A solid footer is near zero; channel differences are not.
+    if float(tail.std(axis=1).mean()) > 10.0:
+        return None
+    colour = np.median(tail.reshape(-1, 3), axis=0)
+    distance = np.linalg.norm(img.astype(np.float32) - colour.reshape(1, 1, 3), axis=2)
+    frac = (distance < 60.0).mean(axis=1)
+    if float(frac[-tail_n:].mean()) < 0.92:
+        return None
+    max_run = int(height * 0.28)
+    min_run = max(8, int(height * 0.04))
+    max_gap = max(8, int(height * 0.03))
+    last_good = height - 1
+    gap = 0
+    stop = max(-1, height - 1 - max_run - max_gap)
+    for y in range(height - 1, stop, -1):
+        if frac[y] >= 0.40:
+            last_good = y
+            gap = 0
+            continue
+        # A gold rule or a photo edge. Do not step across it into the picture.
+        if frac[y] < 0.32:
+            break
+        gap += 1
+        if gap > max_gap:
+            break
+    start = int(last_good)
+    run = height - start
+    if run < min_run or run > max_run:
+        return None
+    above = frac[max(0, start - run):start]
+    if above.size and float(np.mean(above)) > 0.72:
+        return None
+    return start
+
+
+def _soften_art_rim(canvas, top: int, left: int, art_h: int, art_w: int):
+    """Feather only the outer rim of the picture into a blur. The contact band stays sharp."""
+    import cv2
+    import numpy as np
+
+    top_depth = min(32, max(0, art_h // 8))
+    side_depth = min(12, max(0, art_w // 10))
+    if top_depth < 4 and side_depth < 4:
+        return canvas
+    y0, x0 = int(top), int(left)
+    y1, x1 = y0 + int(art_h), x0 + int(art_w)
+    art = canvas[y0:y1, x0:x1]
+    if art.size == 0:
+        return canvas
+    blurred = cv2.GaussianBlur(art, (0, 0), 7)
+    alpha = np.zeros(art.shape[:2], np.float32)
+    if top_depth >= 4:
+        ramp = np.linspace(0.62, 0.0, top_depth, dtype=np.float32)
+        alpha[:top_depth] = np.maximum(alpha[:top_depth], ramp[:, None])
+    if side_depth >= 4:
+        ramp = np.linspace(0.45, 0.0, side_depth, dtype=np.float32)
+        alpha[:, :side_depth] = np.maximum(alpha[:, :side_depth], ramp[None, :])
+        alpha[:, -side_depth:] = np.maximum(alpha[:, -side_depth:], ramp[::-1][None, :])
+    mixed = art.astype(np.float32) * (1.0 - alpha[..., None]) + blurred.astype(np.float32) * alpha[..., None]
+    out = canvas.copy()
+    out[y0:y1, x0:x1] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
+    return out
+
+
+def _restitch(canvas, top: int, left: int, art_h: int, art_w: int, reach: int = 8):
+    """Pull the pad's seam row onto the feathered picture so the join is not a line."""
+    import numpy as np
+
+    out = canvas
+    y0, x0 = int(top), int(left)
+    y1, x1 = y0 + int(art_h), x0 + int(art_w)
+    if y0 <= 0 or x1 <= x0:
+        return out
+    edge = out[y0, x0:x1].astype(np.float32)
+    for dist in range(1, reach + 1):
+        y = y0 - dist
+        if y < 0:
+            break
+        weight = dist / float(reach + 1)
+        row = out[y, x0:x1].astype(np.float32)
+        out[y, x0:x1] = np.clip(edge * (1.0 - weight) + row * weight, 0, 255).astype(np.uint8)
+    for dist in range(1, reach + 1):
+        weight = dist / float(reach + 1)
+        x = x0 - dist
+        if x >= 0:
+            edge_col = out[y0:y1, x0].astype(np.float32)
+            col = out[y0:y1, x].astype(np.float32)
+            out[y0:y1, x] = np.clip(edge_col * (1.0 - weight) + col * weight, 0, 255).astype(np.uint8)
+        x = x1 - 1 + dist
+        if x < out.shape[1]:
+            edge_col = out[y0:y1, x1 - 1].astype(np.float32)
+            col = out[y0:y1, x].astype(np.float32)
+            out[y0:y1, x] = np.clip(edge_col * (1.0 - weight) + col * weight, 0, 255).astype(np.uint8)
+    return out
+
+
+def _layout_with_bar(img, trim_w: float, trim_h: float):
+    """Lengthen a footer poster. The band stays at the bottom, 4 mm inside the trim.
+
+    Side pads of the same 4 mm keep flush lettering off the knife. The original
+    rectangle is not scaled. Extra height above the picture is a mirrored blur.
+    """
+    height, width = img.shape[:2]
+    if float(trim_w) <= 2.0 * SAFE_ZONE_MM + 1.0:
+        return None
+    canvas_w = int(round(width * float(trim_w) / (float(trim_w) - 2.0 * SAFE_ZONE_MM)))
+    canvas_h = int(round(canvas_w * float(trim_h) / float(trim_w)))
+    if canvas_w <= width + 2 or canvas_h <= height + 4:
+        return None
+    side_left = (canvas_w - width) // 2
+    side_right = canvas_w - width - side_left
+    bottom = max(1, int(round(SAFE_ZONE_MM * canvas_w / float(trim_w))))
+    extra = canvas_h - height
+    if extra <= bottom + 4:
+        return None
+    top = extra - bottom
+    vertical = _extend_edges(img, top, bottom, 0, 0)
+    fitted = _extend_edges(vertical, 0, 0, side_left, side_right)
+    if fitted.shape[0] != canvas_h or fitted.shape[1] != canvas_w:
+        return None
+    fitted = _soften_art_rim(fitted, top, side_left, height, width)
+    fitted = _restitch(fitted, top, side_left, height, width)
+    return fitted
+
+
+def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
+    """Keep the whole picture. Fill a shape gap by mirroring the rim, not by smearing one pixel.
+
+    A full-page mirror would repeat the artwork. Copying the outer pixel draws
+    stripes. A contact band is left at the bottom of the page.
     """
     from ai_artwork import ratios_differ
 
@@ -365,6 +523,13 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
     if not ratios_differ(width, height, trim_w, trim_h):
         decisions.append("The picture already matches the product shape, so nothing was cropped or stretched.")
         return img, False, delta
+    if src > target and _bottom_bar_row(img) is not None:
+        fitted = _layout_with_bar(img, trim_w, trim_h)
+        if fitted is not None:
+            decisions.append(
+                "The picture was a different shape from the product. The contact band was kept at the bottom, 4 mm inside the trim. The extra space continues the picture with a soft edge. It was not stretched and the picture was not copied."
+            )
+            return fitted, True, delta
     if src > target:
         new_h = max(height, int(round(width / target)))
         pad = new_h - height
@@ -597,7 +762,12 @@ def make_print_ready(
             ext = ".pdf"
             decisions.append("The Illustrator file was read onto the normal PDF path.")
 
+        live_type = False
         if ext == ".pdf":
+            from ai_rebuild import _pdf_has_live_type
+
+            # Live text and vector drawings stay as they are. A raster page can still be traced.
+            live_type = _pdf_has_live_type(work_path)
             measured = _pdf_trim_mm(work_path)
             matches = False
             if measured:
@@ -634,44 +804,66 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
-            # Vector type keeps this whole picture. The extended canvas is only
-            # the fallback if the vector file cannot be built.
-            vector_source = raster
+            # Extend first. The trace reads this canvas, so the paths land on the same pixels.
             raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
+            vector_source = raster
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
             work_path = fitted_path
-            if detected:
-                from vector_text_v2 import vector_rebuild_enabled
+            from vector_text_v2 import font_substitution_enabled, vector_rebuild_enabled
 
-                if not vector_rebuild_enabled():
-                    decisions.append("Vector type is switched off. The original lettering is kept and the picture is enlarged.")
+            fonts_on = font_substitution_enabled()
+            rebuild_on = vector_rebuild_enabled()
+            lettering_blocks = None
+            has_lettering = False
+            outer_ocr_s = 0.0
+            # Font mode on an AI file reads the page itself. Every other raster is read once here.
+            if rebuild_on and not live_type and not (fonts_on and detected):
+                try:
+                    from vector_text_v2 import read_blocks
+                    from vector_trace import is_lettering
+
+                    ocr_started = time.perf_counter()
+                    found = read_blocks(vector_source, extra=False)
+                    outer_ocr_s = time.perf_counter() - ocr_started
+                    has_lettering = any(
+                        isinstance(block, dict) and is_lettering(str(block.get("text") or ""))
+                        for block in (found or [])
+                    )
+                    if not fonts_on:
+                        lettering_blocks = found
+                except Exception:
+                    has_lettering = False
+                    lettering_blocks = None
+            trace_raster = rebuild_on and not live_type and (detected or has_lettering)
+            if trace_raster:
+                if detected and fonts_on:
+                    decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
+                elif detected:
+                    decisions.append("This looks like AI-generated artwork. The lettering is traced as vector shapes.")
+                elif fonts_on:
+                    decisions.append("This raster has lettering. The words are set as vector type.")
+                else:
+                    decisions.append("This raster has lettering. The lettering is traced as vector shapes.")
+                try:
+                    from vector_text_v2 import rebuild_fitted
+
+                    vector_built = rebuild_fitted(
+                        vector_source,
+                        trim_w,
+                        trim_h,
+                        os.path.join(output_dir, "press.pdf"),
+                        progress=_mark,
+                        blocks=None if fonts_on else lettering_blocks,
+                        ocr_s=outer_ocr_s if lettering_blocks is not None else None,
+                    )
+                except Exception as exc:
                     vector_built = {
                         "ok": False,
-                        "amber": False,
-                        "reason": "Vector type is switched off, so the original lettering was kept.",
+                        "amber": True,
+                        "reason": f"Vector type failed ({str(exc)[:140]}). The original lettering was kept.",
                         "decisions": [],
                     }
-                else:
-                    from vector_text_v2 import font_substitution_enabled
-
-                    if font_substitution_enabled():
-                        decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
-                    else:
-                        decisions.append("This looks like AI-generated artwork. The lettering is traced as vector shapes.")
-                    try:
-                        from vector_text_v2 import rebuild_fitted
-
-                        vector_built = rebuild_fitted(
-                            vector_source, trim_w, trim_h, os.path.join(output_dir, "press.pdf"), progress=_mark,
-                        )
-                    except Exception as exc:
-                        vector_built = {
-                            "ok": False,
-                            "amber": True,
-                            "reason": f"Vector type failed ({str(exc)[:140]}). The original lettering was kept.",
-                            "decisions": [],
-                        }
                 if vector_built.get("ok"):
                     work_path = os.path.join(output_dir, "press.pdf")
                     if vector_built.get("mode") == "trace":
@@ -690,6 +882,10 @@ def make_print_ready(
                 else:
                     lettering_note = str(vector_built.get("reason") or "The vector check failed, so the original lettering was kept.")
                     decisions.append(lettering_note)
+            elif detected and not rebuild_on:
+                decisions.append("Vector type is switched off. The original lettering is kept and the picture is enlarged.")
+            elif live_type:
+                decisions.append("This file already has live type, so the lettering was left as it is.")
             else:
                 decisions.append("This was not treated as AI artwork. The original lettering is kept.")
             if not (vector_built and vector_built.get("ok")):

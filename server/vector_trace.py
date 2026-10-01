@@ -324,6 +324,7 @@ def trace_fitted(
     bleed_mm: float = 5.0,
     progress=None,
     blocks: list | None = None,
+    ocr_s: float | None = None,
 ) -> dict:
     """Enlarge the picture and trace its lettering. Never raises."""
     from vector_text_v2 import _fail, _note
@@ -332,13 +333,13 @@ def trace_fitted(
     try:
         return _trace(
             bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
-            float(bleed_mm), progress, blocks, started,
+            float(bleed_mm), progress, blocks, started, ocr_s,
         )
     except Exception as exc:
         return _fail(started, f"Vector trace failed ({str(exc)[:160]}). The original lettering was kept.")
 
 
-def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started) -> dict:
+def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started, ocr_already=None) -> dict:
     from vector_plate import place_plate
     from vector_text_v2 import MIN_PPI, _note, _rect, read_blocks
 
@@ -346,7 +347,9 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started)
     ocr_started = time.perf_counter()
     if blocks is None:
         blocks = read_blocks(bgr, extra=False)
-    ocr_s = time.perf_counter() - ocr_started
+        ocr_s = time.perf_counter() - ocr_started
+    else:
+        ocr_s = float(ocr_already or 0.0)
     guide = []
     for block in blocks or []:
         if not isinstance(block, dict) or not block.get("bbox"):
@@ -570,7 +573,8 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
     qa["colour_s"] = time.perf_counter() - colour_started
     compose_started = time.perf_counter()
     buffer = io.BytesIO()
-    cmyk.save(buffer, format="TIFF", dpi=(MIN_PPI, MIN_PPI))
+    # One CMYK conversion, then JPEG. TIFF plus garbage=4 was the slow part of the press file.
+    cmyk.save(buffer, format="JPEG", quality=90, subsampling=0, dpi=(MIN_PPI, MIN_PPI))
     width_pt = (trim_w + 2 * bleed_mm) * MM_TO_PT
     height_pt = (trim_h + 2 * bleed_mm) * MM_TO_PT
     doc = fitz.open()
@@ -580,10 +584,9 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
         img_h, img_w = plate.shape[:2]
         sx = page.rect.width / float(img_w)
         sy = page.rect.height / float(img_h)
-        for item in drawn:
-            _paint_paths(page, item["paths"], item["fill"], sx, sy, item["origin"][0], item["origin"][1])
+        _paint_drawn(page, drawn, sx, sy)
         _set_boxes(page, trim_w, trim_h, bleed_mm)
-        doc.save(output_pdf, deflate=True, garbage=4)
+        doc.save(output_pdf, deflate=True, garbage=1)
         qa["wrote"] = True
     finally:
         doc.close()
@@ -593,10 +596,7 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
     return qa
 
 
-def _paint_paths(page, paths, fill, sx, sy, origin_x, origin_y) -> None:
-    import pymupdf as fitz
-
-    shape = page.new_shape()
+def _draw_paths(shape, paths, sx, sy, origin_x, origin_y) -> bool:
     used = False
     for group in paths:
         for sub in group:
@@ -627,10 +627,37 @@ def _paint_paths(page, paths, fill, sx, sy, origin_x, origin_y) -> None:
                     shape.draw_line(_pt(cursor, sx, sy, origin_x, origin_y), _pt(start, sx, sy, origin_x, origin_y))
                     cursor = start
                     used = True
-    if not used:
+    return used
+
+
+def _paint_paths(page, paths, fill, sx, sy, origin_x, origin_y) -> None:
+    shape = page.new_shape()
+    if not _draw_paths(shape, paths, sx, sy, origin_x, origin_y):
         return
     shape.finish(color=None, fill=tuple(fill), width=0, even_odd=True, closePath=False)
     shape.commit()
+
+
+def _paint_drawn(page, drawn, sx, sy) -> None:
+    """One commit per ink colour. A page of black body text is a single drawing."""
+    order = []
+    groups: dict = {}
+    for item in drawn:
+        key = tuple(float(channel) for channel in item["fill"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+    for key in order:
+        shape = page.new_shape()
+        used = False
+        for item in groups[key]:
+            if _draw_paths(shape, item["paths"], sx, sy, item["origin"][0], item["origin"][1]):
+                used = True
+        if not used:
+            continue
+        shape.finish(color=None, fill=key, width=0, even_odd=True, closePath=False)
+        shape.commit()
 
 
 def _pt(point, sx, sy, origin_x, origin_y):
@@ -684,7 +711,8 @@ def _workers() -> int:
         count = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         count = os.cpu_count() or 2
-    return max(1, min(4, int(count or 1)))
+    # Every core the machine gives this process. Capped so a big host cannot spawn a crowd.
+    return max(1, min(8, int(count or 1)))
 
 
 def _trace_many(masks: list) -> list:
