@@ -1648,20 +1648,129 @@ def _glyph_owner(cx: float, cy: float, cores: list) -> int | None:
     return best
 
 
-def _keep_line_glyphs(mask: np.ndarray, left: int, top: int, owner: int, cores: list) -> np.ndarray | None:
-    """Ink components whose centroid sits in this line's baseline band."""
-    if mask is None or int(np.max(mask)) == 0 or owner < 0:
-        return None
+def _split_stacked_ink(mask: np.ndarray) -> np.ndarray:
+    """Cut a thin vertical streak that welds this line to the line above or below.
+
+    Light type on a dark ground grows a 2–3px bridge across the gap, and the
+    whole bridge becomes one component. The line below is then traced as a
+    drip under this line, and painting it out erases the tops of those letters.
+    A real stem or descender is wider than that bridge and stays. The same cut
+    is used for dark type on a light ground.
+    """
+    if mask is None or int(np.max(mask)) == 0:
+        return mask
     binary = (mask > 0).astype(np.uint8)
-    count, labels, _stats, cents = cv2.connectedComponentsWithStats(binary, 8)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
+    out = binary
+    changed = False
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if area < 40 or height < 18:
+            continue
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        window = labels[y:y + height, x:x + width]
+        comp = window == index
+        rows = comp.sum(axis=1).astype(np.int32)
+        peak = int(rows.max()) if rows.size else 0
+        if peak < 8:
+            continue
+        thin = max(3, int(round(0.16 * peak)))
+        body = rows >= int(round(0.45 * peak))
+        runs = []
+        cursor = 0
+        while cursor < height:
+            if not body[cursor]:
+                cursor += 1
+                continue
+            end = cursor
+            while end < height and body[end]:
+                end += 1
+            runs.append((cursor, end))
+            cursor = end
+        if not runs:
+            continue
+        clear = np.zeros(height, np.bool_)
+        first = runs[0][0]
+        if first >= 3 and int(rows[:first].max()) <= thin:
+            clear[:first] = True
+        last = runs[-1][1]
+        if last <= height - 3 and rows[last:].size and int(rows[last:].max()) <= thin:
+            clear[last:] = True
+        for (above_start, above_end), (below_start, below_end) in zip(runs, runs[1:]):
+            if above_end - above_start < 4 or below_end - below_start < 4:
+                continue
+            # The streak is a few pixels wide. The next letter's shoulder is
+            # wider, so only the thin run is cut. A one-row pinch is a letter.
+            cursor = above_end
+            while cursor < below_start:
+                if int(rows[cursor]) > thin:
+                    cursor += 1
+                    continue
+                end = cursor
+                while end < below_start and int(rows[end]) <= thin:
+                    end += 1
+                if end - cursor >= 3:
+                    clear[cursor:end] = True
+                cursor = end
+        if not bool(clear.any()):
+            continue
+        piece = out[y:y + height, x:x + width]
+        for row in np.where(clear)[0]:
+            piece[row, comp[row]] = 0
+        changed = True
+    if not changed:
+        return mask
+    return out * 255
+
+
+def _keep_line_glyphs(mask: np.ndarray, left: int, top: int, owner: int, cores: list) -> np.ndarray | None:
+    """Ink components whose centroid sits in this line's baseline band.
+
+    A streak that only touches the gap is not an ascender of this line. It
+    belongs to the line it actually touches, or it is a paint fragment and
+    stays out of both traces.
+    """
+    if mask is None or int(np.max(mask)) == 0 or owner < 0 or owner >= len(cores):
+        return None
+    mask = _split_stacked_ink(mask)
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, cents = cv2.connectedComponentsWithStats(binary, 8)
     owned = np.zeros(mask.shape[:2], np.uint8)
     for index in range(1, count):
-        if int(_stats[index, cv2.CC_STAT_AREA]) < 4:
+        if int(stats[index, cv2.CC_STAT_AREA]) < 4:
             continue
         cx = float(left) + float(cents[index][0])
         cy = float(top) + float(cents[index][1])
         if _glyph_owner(cx, cy, cores) == owner:
             owned[labels == index] = 255
+    if int(owned.max()) == 0:
+        return None
+    # A piece that never touches this line's own ink is the other line's edge.
+    core_x, core_y, core_w, core_h = [int(v) for v in cores[owner]]
+    band_top = max(0, core_y - int(top) - 2)
+    band_bot = min(owned.shape[0], core_y + core_h - int(top) + 2)
+    if band_bot <= band_top:
+        return owned
+    count, labels, stats, _cents = cv2.connectedComponentsWithStats((owned > 0).astype(np.uint8), 8)
+    anchored = np.zeros(count, np.bool_)
+    for index in range(1, count):
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if y < band_bot and y + height > band_top:
+            anchored[index] = True
+    if not bool(anchored.any()):
+        return owned
+    near = cv2.dilate(anchored[labels].astype(np.uint8), np.ones((11, 11), np.uint8)) > 0
+    for index in range(1, count):
+        if anchored[index]:
+            continue
+        component = labels == index
+        if bool((component & near).any()):
+            continue
+        owned[component] = 0
     if int(owned.max()) == 0:
         return None
     return owned
@@ -2822,10 +2931,18 @@ def _display_ink(gray: np.ndarray):
     border[:, -2:] = True
     if int(border.sum()) > 0 and float(ink[border].mean()) > 0.5:
         ink = ~ink
-    # A light letter is the solid core. Midtones belong to a logo or a blur
-    # and would glue that logo onto the last glyph.
+    # A light letter on a light or mixed ground is the solid core. Midtones
+    # belong to a logo or a blur and would glue that logo onto the last glyph.
+    # Gray type on a dark ground is the stroke itself: cutting it at 220
+    # deletes the bar and hides a drip, so the gate never sees the damage.
     if int(ink.sum()) > 20 and float(np.median(gray[ink])) >= 160.0:
-        ink = ink & (gray >= 220)
+        border_tone = float(np.median(gray[border])) if int(border.sum()) else 128.0
+        solid = ink & (gray >= 220)
+        if border_tone < 80.0 and int(solid.sum()) < 0.45 * int(ink.sum()):
+            level = border_tone + 0.50 * (float(np.median(gray[ink])) - border_tone)
+            ink = ink & (gray >= level)
+        else:
+            ink = solid
     fraction = float(ink.mean())
     if fraction < 0.02 or fraction > 0.55:
         return None

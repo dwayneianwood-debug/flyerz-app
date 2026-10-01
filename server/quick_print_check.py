@@ -819,6 +819,106 @@ def _save_footer_crop(trim: np.ndarray, gate: list, ppm: float) -> None:
     crop = trim[y0:y1, x0:x1]
     Image.fromarray(crop).save(os.path.join(ART, "catch_fire", "footer_600.png"), dpi=(600, 600))
     print(f"FOOTER CROP {crop.shape[1]}x{crop.shape[0]}")
+    _check_footer_lines(trim, gate, ppm)
+
+
+def _check_footer_lines(trim: np.ndarray, gate: list, ppm: float) -> None:
+    """Light type on the navy footer is one line, with no streak hanging under it.
+
+    '7640 EXT 11. BISHOP NKOANE STREET. EMBALENHLE', the footer
+    'GREATER HARVEST FAMILY CHURCH', and '(NEXT TO BASIZENI SPECIAL SCHOOL)'
+    were traced together with the line above. The crossbar and the bowl then
+    disappeared and a drip was drawn under the letter.
+    """
+    import cv2
+
+    phrases = (
+        "7640 EXT 11. BISHOP NKOANE STREET. EMBALENHLE",
+        "GREATER HARVEST FAMILY CHURCH",
+        "(NEXT TO BASIZENI SPECIAL SCHOOL)",
+    )
+    for phrase in phrases:
+        rows = [row for row in gate if row.get("text") == phrase and row.get("boxMm")]
+        if phrase == "GREATER HARVEST FAMILY CHURCH":
+            rows = [row for row in rows if float(row.get("y") or 0) >= 0.90]
+        check("footer-row-" + phrase[:18], len(rows) == 1, str(len(rows)))
+        if len(rows) != 1:
+            continue
+        gate_row = rows[0]
+        box = gate_row["boxMm"]
+        pad = int(round(1.2 * ppm))
+        x0 = max(0, int(np.floor(float(box[0]) * ppm)) - pad)
+        y0 = max(0, int(np.floor(float(box[1]) * ppm)) - pad)
+        x1 = min(trim.shape[1], int(np.ceil((float(box[0]) + float(box[2])) * ppm)) + pad)
+        y1 = min(trim.shape[0], int(np.ceil((float(box[1]) + float(box[3])) * ppm)) + pad)
+        crop = trim[y0:y1, x0:x1]
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        paper = float(np.median(gray))
+        # The solid stroke. A gray halo in the gap, or a thin slice of the
+        # line above at the crop edge, is not this line's letter.
+        if paper < 110.0:
+            bright = gray >= max(paper + 80.0, 150.0)
+        else:
+            bright = gray <= min(paper - 50.0, 130.0)
+        count, _labels, stats, _cent = cv2.connectedComponentsWithStats(bright.astype(np.uint8), 8)
+        parts = []
+        for index in range(1, count):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            if area < 40 or height < 8:
+                continue
+            parts.append(stats[index])
+        check("footer-glyphs-" + phrase[:18], len(parts) >= 8, str(len(parts)))
+        if len(parts) < 4:
+            continue
+        heights = np.array([int(part[cv2.CC_STAT_HEIGHT]) for part in parts], np.float32)
+        widths = np.array([int(part[cv2.CC_STAT_WIDTH]) for part in parts], np.float32)
+        letter_h = float(np.percentile(heights, 65))
+        letter_w = float(np.percentile(widths, 65))
+        letters = [
+            part for part in parts
+            if int(part[cv2.CC_STAT_HEIGHT]) >= 0.72 * letter_h
+            and int(part[cv2.CC_STAT_WIDTH]) >= 0.40 * max(8.0, letter_w)
+        ]
+        check("footer-letters-" + phrase[:18], len(letters) >= 6, str(len(letters)))
+        if len(letters) < 4:
+            continue
+        median_h = float(np.median([int(part[cv2.CC_STAT_HEIGHT]) for part in letters]))
+        # A letter welded to the line above is about as wide as its neighbours
+        # and much taller. A 10px sliver at the crop edge is the other line.
+        tall = [
+            int(part[cv2.CC_STAT_HEIGHT]) for part in letters
+            if int(part[cv2.CC_STAT_HEIGHT]) > 1.35 * median_h
+        ]
+        drips = 0
+        for part in letters:
+            x = int(part[cv2.CC_STAT_LEFT])
+            y = int(part[cv2.CC_STAT_TOP])
+            width = int(part[cv2.CC_STAT_WIDTH])
+            height = int(part[cv2.CC_STAT_HEIGHT])
+            if height > 1.35 * median_h:
+                continue
+            comp = bright[y:y + height, x:x + width]
+            # The component may include neighbours in the same columns. Use its own rows.
+            rows = comp.sum(axis=1)
+            peak = int(rows.max()) if rows.size else 0
+            if peak < 6:
+                continue
+            body = np.where(rows >= 0.45 * peak)[0]
+            if body.size == 0:
+                continue
+            tail = rows[int(body[-1]) + 1:]
+            thin = max(4, int(round(0.16 * peak)))
+            if tail.size >= 4 and int(tail.max()) <= thin:
+                drips += 1
+        label = phrase[:18]
+        check("footer-one-line-" + label, not tall, f"median {median_h:.0f} tall {tall}")
+        check("footer-no-drip-" + label, drips == 0, str(drips))
+        check(
+            "footer-vector-" + label,
+            gate_row.get("mode") == "vector" and gate_row.get("ok") is True,
+            str(gate_row.get("mode")),
+        )
 
 
 def _pad_for_detector(band: np.ndarray) -> np.ndarray:

@@ -629,6 +629,74 @@ def test_paint_follows_the_glyph_not_the_box() -> None:
     check("own-stroke-stays", int(cleaned[15, 14, 0]) < 40)
 
 
+def test_light_on_dark_stays_on_its_own_line() -> None:
+    """A streak under light type is not the next line, and gray type on navy still counts.
+
+    The same bridge is cut for dark type. The footer strings are the letters
+    this was eating: the address, the footer church name, and the school line.
+    """
+    from vector_trace import _display_ink, _keep_line_glyphs
+
+    mask = np.zeros((90, 80), np.uint8)
+    mask[12:36, 8:28] = 255
+    mask[12:36, 40:60] = 255
+    mask[36:52, 16:19] = 255
+    mask[36:48, 48:51] = 255
+    mask[52:76, 6:28] = 255
+    mask[52:76, 40:62] = 255
+    cores = [(4, 10, 70, 28), (4, 50, 70, 28)]
+    top = _keep_line_glyphs(mask, 0, 0, 0, cores)
+    bottom = _keep_line_glyphs(mask, 0, 0, 1, cores)
+    check("footer-bridge-stays-off-the-church-line", top is not None and int(top[64, 16]) == 0)
+    check("footer-drip-stays-off-the-church-line", top is not None and int(top[44, 49]) == 0)
+    check("footer-church-letter-stays", top is not None and int(top[20, 16]) == 255 and int(top[20, 48]) == 255)
+    check(
+        "footer-address-keeps-its-own-letter",
+        bottom is not None and int(bottom[64, 16]) == 255 and int(bottom[20, 16]) == 0,
+    )
+    navy = np.full((64, 90, 3), (32, 24, 48), np.uint8)
+    cv2.putText(navy, "T", (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (250, 250, 250), 2, cv2.LINE_AA)
+    light_mask, light_colour = segment_ink(navy)
+    check("light-t-separated", light_mask is not None and light_colour is not None and float(light_colour.mean()) > 180)
+    if light_mask is not None:
+        ys, xs = np.where(light_mask > 0)
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = max(1, int(xs.max() - xs.min()))
+        cap = light_mask[y0:y0 + max(2, (y1 - y0) // 5)] > 0
+        check("light-t-bar", int(cap.any(axis=0).sum()) >= int(0.65 * width), f"{int(cap.any(axis=0).sum())} of {width}")
+    cream = np.full((64, 90, 3), (236, 232, 224), np.uint8)
+    cv2.putText(cream, "T", (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (20, 16, 14), 2, cv2.LINE_AA)
+    dark_mask, dark_colour = segment_ink(cream)
+    check("dark-t-separated", dark_mask is not None and dark_colour is not None and float(dark_colour.mean()) < 80)
+    # The footer weld is not a uniform 3px gap. A run of 3px rows is followed
+    # by one wider shoulder, and that shoulder used to keep both letters.
+    shoulder = np.zeros((80, 40), np.uint8)
+    shoulder[4:30, 4:32] = 255
+    shoulder[30:31, 14:19] = 255
+    shoulder[31:40, 16:19] = 255
+    shoulder[40:41, 12:23] = 255
+    shoulder[41:68, 6:32] = 255
+    bands = [(0, 2, 40, 32), (0, 38, 40, 36)]
+    upper = _keep_line_glyphs(shoulder, 0, 0, 0, bands)
+    lower = _keep_line_glyphs(shoulder, 0, 0, 1, bands)
+    check(
+        "shoulder-bridge-leaves-the-upper-letter",
+        upper is not None and int(upper[16, 16]) == 255 and int(upper[50, 16]) == 0,
+    )
+    check(
+        "shoulder-bridge-keeps-the-lower-letter",
+        lower is not None and int(lower[50, 16]) == 255 and int(lower[16, 16]) == 0,
+    )
+    gray = np.full((36, 140), 27, np.uint8)
+    gray[10:26, 8:120] = 172
+    shown = _display_ink(gray)
+    check(
+        "school-line-gray-counts",
+        shown is not None and int((shown > 0).sum()) > 400,
+        str(None if shown is None else int((shown > 0).sum())),
+    )
+
+
 def test_a_line_is_not_half_traced() -> None:
     """One raster box pulls its own line. A paragraph drops only when two lines fall back."""
     from vector_trace import _keep_uniform
@@ -1310,6 +1378,7 @@ def main() -> None:
     test_swash_bars_are_not_exempt()
     test_glyphs_reject_a_changed_letter()
     test_paint_follows_the_glyph_not_the_box()
+    test_light_on_dark_stays_on_its_own_line()
     test_a_line_is_not_half_traced()
     test_comma_decimal_matches_the_dot_trace()
     test_env_report_names_the_stack()
