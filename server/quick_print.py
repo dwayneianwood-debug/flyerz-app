@@ -1506,6 +1506,7 @@ def make_print_ready(
             "qa": vector_built.get("qa") or {},
             "lines": vector_built.get("lines") or [],
             "textGate": vector_built.get("text_gate") or [],
+            "sourceGuard": bool(vector_built.get("source_guard")),
         }
     return _finish(result, output_dir)
 

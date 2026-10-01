@@ -1286,10 +1286,8 @@ def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
 def _raster_box(text: str, left: int, top: int, right: int, bottom: int, core=None, scope: str = "paragraph") -> dict:
     """A box that stayed in the picture.
 
-    `scope` is `line` when the box was never traced (the ink could not be
-    separated). That must not blank the paragraph above it. `paragraph` is a
-    trace that came out wrong, so the whole line and the lines stacked with it
-    stay together.
+    Any fallback pulls the other boxes on its own line. A paragraph goes
+    fully raster only when more than one of its lines falls back.
     """
     rect = (int(left), int(top), int(right - left), int(bottom - top))
     return {
@@ -1325,12 +1323,229 @@ def _same_line(left, right) -> bool:
     return _horizontal_gap(left, right) < 1.4 * max(left[3], right[3])
 
 
-def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
-    """A line, and a paragraph of lines, is all vector or all raster.
+def _same_paragraph(above, below) -> bool:
+    """Two stacked lines in one column, spaced within 1.6 times the line height."""
+    if max(above[3], below[3]) > 2.0 * max(1.0, min(above[3], below[3])):
+        return False
+    overlap = min(above[0] + above[2], below[0] + below[2]) - max(above[0], below[0])
+    if overlap < 0.45 * min(above[2], below[2]):
+        return False
+    spacing = below[1] - above[1]
+    if spacing < -0.35 * min(above[3], below[3]):
+        return False
+    return spacing <= 1.6 * max(above[3], below[3])
 
-    A box that could not be traced pulls the other boxes on its line, and the
-    lines stacked with it in the same column. Icons do not, because they are
-    not in `raster_boxes`.
+
+def _paragraph_roots(line_rects: dict) -> dict:
+    """Lines in one column, spaced within 1.6×, share a paragraph id."""
+    ids = list(line_rects)
+    parent = {line_id: line_id for line_id in ids}
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    ordered = sorted(ids, key=lambda line_id: (line_rects[line_id][1], line_rects[line_id][0]))
+    for pos, line_id in enumerate(ordered):
+        rect = line_rects[line_id]
+        limit = rect[1] + max(rect[3], 1.0) * 6.0
+        for other in ordered[pos + 1:]:
+            below = line_rects[other]
+            if below[1] > limit:
+                break
+            if _same_paragraph(rect, below):
+                parent[find(other)] = find(line_id)
+    return {line_id: find(line_id) for line_id in ids}
+
+
+def _glyph_owner(cx: float, cy: float, cores: list) -> int | None:
+    """The line this ink component belongs to.
+
+    A centroid inside a line's own box belongs to that line. A centroid in the
+    gap belongs to the nearer box edge: a descender stays with the line above,
+    and an ascender stays with the line below. The other line never receives it.
+    """
+    containing = []
+    for index, core in enumerate(cores):
+        x, y, w, h = core
+        if w <= 0 or h <= 0:
+            continue
+        if x <= cx <= x + w and y <= cy <= y + h:
+            containing.append(index)
+    if len(containing) == 1:
+        return containing[0]
+    if len(containing) > 1:
+        def center_dist(index: int) -> float:
+            x, y, w, h = cores[index]
+            return abs(cy - (y + 0.5 * h))
+
+        return min(containing, key=center_dist)
+    best = None
+    best_dist = 1e9
+    for index, core in enumerate(cores):
+        x, y, w, h = core
+        if w <= 0 or h <= 0:
+            continue
+        if cx < x - 0.25 * h or cx > x + w + 0.25 * h:
+            continue
+        if cy < y:
+            dist = y - cy
+            limit = 0.40 * h
+        elif cy > y + h:
+            dist = cy - (y + h)
+            limit = 0.50 * h
+        else:
+            if cx < x:
+                dist = x - cx
+            else:
+                dist = cx - (x + w)
+            limit = 0.25 * h
+        if dist > limit or dist >= best_dist:
+            continue
+        best_dist = dist
+        best = index
+    return best
+
+
+def _keep_line_glyphs(mask: np.ndarray, left: int, top: int, owner: int, cores: list) -> np.ndarray | None:
+    """Ink components whose centroid sits in this line's baseline band."""
+    if mask is None or int(np.max(mask)) == 0 or owner < 0:
+        return None
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, _stats, cents = cv2.connectedComponentsWithStats(binary, 8)
+    owned = np.zeros(mask.shape[:2], np.uint8)
+    for index in range(1, count):
+        if int(_stats[index, cv2.CC_STAT_AREA]) < 4:
+            continue
+        cx = float(left) + float(cents[index][0])
+        cy = float(top) + float(cents[index][1])
+        if _glyph_owner(cx, cy, cores) == owner:
+            owned[labels == index] = 255
+    if int(owned.max()) == 0:
+        return None
+    return owned
+
+
+def _restore_glyphs(plate: np.ndarray, pristine: np.ndarray, item: dict) -> None:
+    """Put this line's ink, and its 2px fringe, back from the clean upscale."""
+    ink = item.get("_ink")
+    origin = item.get("origin")
+    if ink is None or origin is None or pristine is None:
+        rect = item.get("rect")
+        if rect is not None and pristine is not None:
+            _restore_box(plate, pristine, rect)
+        return
+    fringe = _letter_erase_mask(ink)
+    left, top = int(origin[0]), int(origin[1])
+    height, width = fringe.shape[:2]
+    y0, x0 = max(0, top), max(0, left)
+    y1 = min(plate.shape[0], top + height)
+    x1 = min(plate.shape[1], left + width)
+    if y1 <= y0 or x1 <= x0:
+        return
+    piece = fringe[y0 - top:y0 - top + (y1 - y0), x0 - left:x0 - left + (x1 - x0)] > 0
+    plate[y0:y1, x0:x1][piece] = pristine[y0:y1, x0:x1][piece]
+
+
+def _stamp_fringe(canvas: np.ndarray, item: dict) -> None:
+    ink = item.get("_ink")
+    origin = item.get("origin")
+    if ink is None or origin is None:
+        return
+    fringe = _letter_erase_mask(ink)
+    left, top = int(origin[0]), int(origin[1])
+    height, width = fringe.shape[:2]
+    y0, x0 = max(0, top), max(0, left)
+    y1 = min(canvas.shape[0], top + height)
+    x1 = min(canvas.shape[1], left + width)
+    if y1 <= y0 or x1 <= x0:
+        return
+    piece = fringe[y0 - top:y0 - top + (y1 - y0), x0 - left:x0 - left + (x1 - x0)]
+    patch = canvas[y0:y1, x0:x1]
+    np.maximum(patch, piece, out=patch)
+
+
+def _source_leaks(plate: np.ndarray, pristine: np.ndarray, items: list, art_box: tuple) -> np.ndarray:
+    """Pixels of the original art that paint-out changed outside the glyph fringe."""
+    allowed = np.zeros(plate.shape[:2], np.uint8)
+    for item in items:
+        _stamp_fringe(allowed, item)
+    diff = np.max(np.abs(plate.astype(np.int16) - pristine.astype(np.int16)), axis=2)
+    ax, ay, aw, ah = [int(v) for v in art_box]
+    y0, x0 = max(0, ay), max(0, ax)
+    y1 = min(plate.shape[0], ay + ah)
+    x1 = min(plate.shape[1], ax + aw)
+    bad = np.zeros(plate.shape[:2], np.bool_)
+    if y1 > y0 and x1 > x0:
+        bad[y0:y1, x0:x1] = (diff[y0:y1, x0:x1] > 8) & (allowed[y0:y1, x0:x1] == 0)
+    return bad
+
+
+def _repair_source(plate, pristine, drawn, raster_lines, raster_boxes, art_box) -> tuple:
+    """A leak outside the glyph fringe is put back, and the line that caused it goes raster."""
+    bad = _source_leaks(plate, pristine, drawn, art_box)
+    if not bool(bad.any()):
+        return drawn, True
+    plate[bad] = pristine[bad]
+    drop = []
+    for item in drawn:
+        ink = item.get("_ink")
+        origin = item.get("origin")
+        if ink is None or origin is None:
+            continue
+        fringe = _letter_erase_mask(ink)
+        near = cv2.dilate((fringe > 0).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        left, top = int(origin[0]), int(origin[1])
+        height, width = near.shape[:2]
+        y0, x0 = max(0, top), max(0, left)
+        y1 = min(bad.shape[0], top + height)
+        x1 = min(bad.shape[1], left + width)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        window = bad[y0:y1, x0:x1]
+        piece = near[y0 - top:y0 - top + (y1 - y0), x0 - left:x0 - left + (x1 - x0)]
+        if int(np.count_nonzero(window & piece)) > 8:
+            drop.append(item)
+    if not drop:
+        return drawn, not bool(_source_leaks(plate, pristine, drawn, art_box).any())
+    kept = []
+    for item in drawn:
+        if item not in drop:
+            kept.append(item)
+            continue
+        _restore_glyphs(plate, pristine, item)
+        raster_lines.append(_line(
+            item.get("text") or "",
+            "raster",
+            "The paint reached past this line, so the line stayed in the picture.",
+        ))
+        core = item.get("core") or item.get("rect")
+        if core is not None:
+            raster_boxes.append({
+                "text": item.get("text") or "",
+                "rect": core,
+                "core": core,
+                "anchor": "line",
+            })
+    kept = _keep_uniform(kept, raster_lines, raster_boxes)
+    for item in drawn:
+        if item not in kept and item not in drop:
+            _restore_glyphs(plate, pristine, item)
+    still = _source_leaks(plate, pristine, kept, art_box)
+    if bool(still.any()):
+        plate[still] = pristine[still]
+    return kept, not bool(_source_leaks(plate, pristine, kept, art_box).any())
+
+
+def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
+    """A line is all vector or all raster.
+
+    One fallback in a paragraph leaves the other lines vector. Two or more
+    fallbacks put every line of that paragraph back in the picture, so a
+    column does not mix a bold vector line with a thin raster line. Icons
+    do not count, because they are not in `raster_boxes`.
     """
     if not drawn or not raster_boxes:
         return drawn
@@ -1381,50 +1596,29 @@ def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
         x1 = max(rect[0] + rect[2] for rect in rects)
         y1 = max(rect[1] + rect[3] for rect in rects)
         line_rect[line_id] = (x0, y0, x1 - x0, y1 - y0)
-    line_parent = {line_id: line_id for line_id in line_ids}
-
-    def find_line(node):
-        while line_parent[node] != node:
-            line_parent[node] = line_parent[line_parent[node]]
-            node = line_parent[node]
-        return node
-
-    def line_scope(line_id) -> str:
-        scopes = [records[member].get("scope") for member in lines[line_id] if records[member]["mode"] == "raster"]
-        if "paragraph" in scopes:
-            return "paragraph"
-        if scopes:
-            return "line"
-        return ""
-
-    ordered = sorted(line_ids, key=lambda line_id: line_rect[line_id][1])
-    for pos, line_id in enumerate(ordered):
-        rect = line_rect[line_id]
-        for other in ordered[pos + 1:pos + 4]:
-            below = line_rect[other]
-            # A box that was never traced only pulls its own line. A bad trace
-            # pulls the stacked lines of the same column. A short title does
-            # not join the much taller word underneath it.
-            if line_scope(line_id) != "paragraph" and line_scope(other) != "paragraph":
-                continue
-            if max(rect[3], below[3]) > 2.0 * max(1, min(rect[3], below[3])):
-                continue
-            gap = below[1] - (rect[1] + rect[3])
-            if gap > 0.65 * max(rect[3], below[3]):
-                break
-            overlap = min(rect[0] + rect[2], below[0] + below[2]) - max(rect[0], below[0])
-            if overlap >= 0.45 * min(rect[2], below[2]):
-                line_parent[find_line(other)] = find_line(line_id)
+    roots = _paragraph_roots(line_rect)
     groups = {}
-    for line_id, members in lines.items():
-        groups.setdefault(find_line(line_id), []).extend(members)
+    for line_id in line_ids:
+        groups.setdefault(roots[line_id], []).append(line_id)
     drop = set()
-    for members in groups.values():
+    for line_id, members in lines.items():
         if not any(records[member]["mode"] == "raster" for member in members):
             continue
         for member in members:
             if records[member]["mode"] == "vector" and records[member]["index"] is not None:
                 drop.add(records[member]["index"])
+    for grouped in groups.values():
+        fallback_lines = 0
+        for line_id in grouped:
+            members = lines[line_id]
+            if any(records[member]["mode"] == "raster" for member in members):
+                fallback_lines += 1
+        if fallback_lines <= 1:
+            continue
+        for line_id in grouped:
+            for member in lines[line_id]:
+                if records[member]["mode"] == "vector" and records[member]["index"] is not None:
+                    drop.add(records[member]["index"])
     if not drop:
         return drawn
     kept = []
@@ -1498,12 +1692,25 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     drawn = []
     raster_lines = []
     raster_boxes = []
-    choke = np.zeros(plate.shape[:2], np.uint8)
-    clear = np.zeros(plate.shape[:2], np.uint8)
     height, width = plate.shape[:2]
     pending = []
     letter_rects = _letter_rects(blocks, bgr.shape[1], bgr.shape[0])
     plate_ppi = float(placed.get("ppi") or MIN_PPI)
+    plate_cores = []
+    for block in blocks or []:
+        if not isinstance(block, dict) or not block.get("bbox"):
+            continue
+        if not is_lettering(str(block.get("text") or "")):
+            continue
+        raw = _rect(block, bgr.shape[1], bgr.shape[0])
+        inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
+        plate_cores.append((
+            inner_left,
+            inner_top,
+            max(1, inner_right - inner_left),
+            max(1, inner_bottom - inner_top),
+        ))
+    owner_cursor = 0
     for block in blocks or []:
         if not isinstance(block, dict) or not block.get("bbox"):
             continue
@@ -1511,6 +1718,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if not is_lettering(text):
             raster_lines.append(_line(text, "raster", "An icon was left in the picture."))
             continue
+        owner = owner_cursor
+        owner_cursor += 1
         raw = _rect(block, bgr.shape[1], bgr.shape[0])
         # A one-glyph speck under about 4 mm is a logo edge the reader called a letter.
         # Tracing it punches the picture and the trim does not read it back.
@@ -1553,6 +1762,17 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         mask, halo = split_solid_blobs(mask, gray)
         mask, colour = refine_ink(crop, mask)
+        if mask is None or colour is None:
+            raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            continue
+        # Only this line's ink. A neighbour's ascender in the expanded crop stays put.
+        owned = _keep_line_glyphs(mask, left, top, owner, plate_cores)
+        if owned is None:
+            raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
+            continue
+        mask, colour = refine_ink(crop, owned)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
@@ -1616,23 +1836,19 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "_clear": item.get("clear"),
         })
     drawn = _keep_uniform(drawn, raster_lines, raster_boxes)
+    pristine = plate.copy()
+    erase = np.zeros(plate.shape[:2], np.uint8)
     for item in drawn:
-        left, top, width_px, height_px = item["rect"]
-        right, bottom = left + width_px, top + height_px
-        mask = item.pop("_mask")
-        extra = item.pop("_clear", None)
-        item["_ink"] = mask
-        choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
-        if extra is not None and extra.shape[:2] == mask.shape[:2] and int(extra.max()) > 0:
-            clear[top:bottom, left:right] = cv2.bitwise_or(clear[top:bottom, left:right], extra)
-    pristine = plate.copy() if drawn else None
-    if int(choke.max()) > 0 or int(clear.max()) > 0:
-        # The raster letter, and the soft fringe just outside it, is painted out.
-        # A 1px choke leaves the stroke under the vector, which prints as a halo.
-        erase = _letter_erase_mask(choke) if int(choke.max()) > 0 else np.zeros(choke.shape, np.uint8)
-        if int(clear.max()) > 0:
-            erase = cv2.bitwise_or(erase, (clear > 0).astype(np.uint8) * 255)
+        mask = item.pop("_mask", None)
+        item.pop("_clear", None)
+        if mask is not None:
+            item["_ink"] = mask
+        # The source ink of this line, dilated 2px. Never the crop rectangle.
+        _stamp_fringe(erase, item)
+    if int(erase.max()) > 0:
         plate[:] = _fill_from_paper(plate, erase)
+    art_box = placed.get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
+    drawn, source_guard = _repair_source(plate, pristine, drawn, raster_lines, raster_boxes, art_box)
     trace_s = time.perf_counter() - trace_started
     if not drawn and not raster_lines:
         from vector_text_v2 import _fail
@@ -1652,9 +1868,9 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         return _fail(started, reason, provider=provider, qa=qa)
 
     gate_started = time.perf_counter()
-    text_gate, drawn, qa = _apply_text_gate(
-        blocks, drawn, raster_lines, plate, pristine, output_pdf,
-        trim_w, trim_h, bleed_mm, placed, qa, bgr.shape,
+    text_gate, drawn, qa, source_guard = _apply_text_gate(
+        blocks, drawn, raster_lines, raster_boxes, plate, pristine, output_pdf,
+        trim_w, trim_h, bleed_mm, placed, qa, bgr.shape, source_guard,
     )
     gate_s = time.perf_counter() - gate_started
     if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
@@ -1734,6 +1950,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "raster_lines": len(raster_lines),
         "mode": "trace",
         "text_gate": text_gate,
+        "source_guard": bool(source_guard),
     }
 
 
@@ -2637,8 +2854,8 @@ def _read_render_strip(crops: list, sources: list) -> list:
 
 
 def _apply_text_gate(
-    blocks, drawn, raster_lines, plate, pristine, output_pdf,
-    trim_w, trim_h, bleed_mm, placed, qa, source_shape,
+    blocks, drawn, raster_lines, raster_boxes, plate, pristine, output_pdf,
+    trim_w, trim_h, bleed_mm, placed, qa, source_shape, source_guard,
 ):
     """Case-sensitive render text against the source text already read.
 
@@ -2753,6 +2970,33 @@ def _apply_text_gate(
             for other in range(len(report)):
                 if find(other) == root and report[other]["_vector"]:
                     report[other]["_revert"] = True
+    line_members = {}
+    for index in range(len(report)):
+        line_members.setdefault(find(index), []).append(index)
+    line_rects = {}
+    for line_id, members in line_members.items():
+        rects = [report[member]["_core"] for member in members]
+        x0 = min(rect[0] for rect in rects)
+        y0 = min(rect[1] for rect in rects)
+        x1 = max(rect[0] + rect[2] for rect in rects)
+        y1 = max(rect[1] + rect[3] for rect in rects)
+        line_rects[line_id] = (x0, y0, x1 - x0, y1 - y0)
+    para_lines = {}
+    if line_rects:
+        for line_id, root in _paragraph_roots(line_rects).items():
+            para_lines.setdefault(root, []).append(line_id)
+    for grouped in para_lines.values():
+        fallback = 0
+        for line_id in grouped:
+            members = line_members[line_id]
+            if any((not report[i]["_vector"]) or report[i]["_revert"] for i in members):
+                fallback += 1
+        if fallback <= 1:
+            continue
+        for line_id in grouped:
+            for index in line_members[line_id]:
+                if report[index]["_vector"]:
+                    report[index]["_revert"] = True
     kept = []
     reverted = False
     if pristine is not None:
@@ -2764,12 +3008,22 @@ def _apply_text_gate(
             if row is None or not row.get("_revert"):
                 kept.append(item)
                 continue
-            _restore_box(plate, pristine, item["rect"])
+            _restore_glyphs(plate, pristine, item)
             if row.get("mismatch") or row.get("glyphFail"):
                 why = "The render did not read back as this line, so the line stayed in the picture."
-            else:
+            elif row.get("_pixelFail"):
                 why = "The render covered or clipped this line, so the line stayed in the picture."
+            else:
+                why = "This line stayed in the picture so it would not be half traced."
             raster_lines.append(_line(item["text"], "raster", why))
+            core = item.get("core") or item.get("rect")
+            if core is not None:
+                raster_boxes.append({
+                    "text": item.get("text") or "",
+                    "rect": core,
+                    "core": core,
+                    "anchor": "line",
+                })
             reverted = True
             row["mode"] = "raster"
             row["ok"] = False
@@ -2784,7 +3038,19 @@ def _apply_text_gate(
                 and float(row["ssim"]) >= SSIM_FLOOR
             )
             row["mode"] = "vector"
-    if reverted:
+    before = len(kept)
+    if pristine is not None:
+        art_box = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
+        kept, source_guard = _repair_source(plate, pristine, kept, raster_lines, raster_boxes, art_box)
+        source_guard = bool(source_guard)
+    else:
+        source_guard = True
+    alive = [item.get("rect") for item in kept]
+    for row in report:
+        if row.get("_vector") and not any(_rects_match(row.get("_rect"), rect) for rect in alive):
+            row["mode"] = "raster"
+            row["ok"] = False
+    if reverted or len(kept) != before:
         first_colour = float(qa.get("colour_s") or 0)
         first_compose = float(qa.get("compose_s") or 0)
         qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
@@ -2796,7 +3062,7 @@ def _apply_text_gate(
     for row in report:
         for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail"):
             row.pop(key, None)
-    return report, kept, qa
+    return report, kept, qa, source_guard
 
 
 def _points(height_px: int, ppi: int) -> float:

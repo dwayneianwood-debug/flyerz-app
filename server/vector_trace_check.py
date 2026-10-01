@@ -533,8 +533,50 @@ def test_glyphs_reject_a_changed_letter() -> None:
     check("glyphs-extra", glyphs_agree(mask, extra, min_area=12) is False)
 
 
+def test_paint_follows_the_glyph_not_the_box() -> None:
+    """A neighbour's ascender is not this line's ink, and a rectangular paint is put back."""
+    from vector_trace import _keep_line_glyphs, _repair_source, _source_leaks
+
+    mask = np.zeros((90, 100), np.uint8)
+    mask[14:32, 8:48] = 255
+    mask[32:46, 18:26] = 255
+    mask[42:54, 60:70] = 255
+    cores = [
+        (4, 10, 80, 24),
+        (4, 50, 80, 24),
+    ]
+    owned = _keep_line_glyphs(mask, 0, 0, 0, cores)
+    other = _keep_line_glyphs(mask, 0, 0, 1, cores)
+    check("owns-its-descender", owned is not None and int(owned[40, 22]) == 255)
+    check("spares-neighbour-ascender", owned is not None and int(owned[48, 64]) == 0)
+    check("neighbour-keeps-ascender", other is not None and int(other[48, 64]) == 255)
+    check("neighbour-spares-descender", other is not None and int(other[40, 22]) == 0)
+    erase = _letter_erase_mask(owned)
+    check("erase-not-a-rectangle", int(erase[4, 4]) == 0 and int(erase[20, 20]) == 255)
+
+    plate = np.full((100, 120, 3), 240, np.uint8)
+    plate[14:46, 8:48] = (20, 18, 16)
+    plate[42:54, 60:70] = (20, 18, 16)
+    pristine = plate.copy()
+    plate[0:90, 0:100] = (250, 250, 250)
+    item = {
+        "text": "g",
+        "_ink": owned,
+        "origin": (0, 0),
+        "rect": (0, 0, 100, 90),
+        "core": cores[0],
+        "paths": [[]],
+        "fill": (0, 0, 0, 1),
+        "iou": 0.9,
+    }
+    kept, ok = _repair_source(plate, pristine, [item], [], [], (0, 0, 120, 100))
+    leaks = _source_leaks(plate, pristine, kept, (0, 0, 120, 100))
+    check("source-guard-repairs", bool(ok) and not bool(leaks.any()), f"ok={ok} leaks={int(leaks.sum())}")
+    check("neighbour-ink-restored", np.array_equal(plate[48, 64], pristine[48, 64]), str(plate[48, 64]))
+
+
 def test_a_line_is_not_half_traced() -> None:
-    """One raster box on a line, or in a stacked paragraph, puts the rest back."""
+    """One raster box pulls its own line. A paragraph drops only when two lines fall back."""
     from vector_trace import _keep_uniform
 
     drawn = [
@@ -548,9 +590,20 @@ def test_a_line_is_not_half_traced() -> None:
     kept = _keep_uniform(drawn, raster_lines, raster_boxes)
     texts = [item["text"] for item in kept]
     check("line-all-raster", "Early" not in texts and "detection" not in texts, str(texts))
-    check("paragraph-follows", "Next line" not in texts, str(texts))
+    check("one-fallback-keeps-neighbours", "Next line" in texts, str(texts))
     check("distant-stays", "Far heading" in texts, str(texts))
     check("mixed-note", any("half traced" in str(line.get("reason")) for line in raster_lines))
+
+    column = [
+        {"text": "Alpha", "rect": (10, 10, 120, 20), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 10), "iou": 0.95},
+        {"text": "Delta", "rect": (10, 84, 120, 20), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 84), "iou": 0.95},
+    ]
+    two = [
+        {"text": "Beta", "rect": (10, 36, 120, 20), "anchor": "line"},
+        {"text": "Gamma", "rect": (10, 60, 120, 20), "anchor": "line"},
+    ]
+    cleared = [item["text"] for item in _keep_uniform(column, [], two)]
+    check("two-fallbacks-clear-the-paragraph", cleared == [], str(cleared))
 
     # A short title must not be blanked by the much taller word sitting under it.
     title = [
@@ -598,6 +651,7 @@ def test_card_back_body_is_traced() -> None:
     bad = _vector_reads_match(gate)
     check("card-back-letters", not bad, str(bad)[:400])
     check("card-back-count", int(result.get("vector_lines") or 0) >= 40, str(result.get("vector_lines")))
+    check("card-back-source", result.get("source_guard") is True, str(result.get("source_guard")))
     rasters = [line.get("text") for line in result.get("lines") or [] if line.get("mode") == "raster"]
     check("card-back-icons", {"+", "中", "♡"} <= set(rasters), str(rasters))
     timings = result.get("timings") or {}
@@ -623,6 +677,7 @@ def _trace_side(name: str, trim_w: float, trim_h: float, workers: str = "2") -> 
         "elapsed_s": built.get("elapsed_s"),
         "lines": built.get("lines") or [],
         "textGate": built.get("textGate") or [],
+        "source_guard": built.get("sourceGuard"),
         "light": result.get("light"),
     }
 
@@ -670,21 +725,25 @@ def test_medella_coverage_and_gate_speed() -> None:
     check("card-front-gate", float(timings.get("gate_s") or 99) < 6.0, str(timings))
     check("card-front-total", float(timings.get("total_s") or 99) <= 15.0, str(timings))
     check("card-front-letters", not _vector_reads_match(card.get("textGate")), str(_vector_reads_match(card.get("textGate")))[:400])
+    check("card-front-source", card.get("source_guard") is True, str(card.get("source_guard")))
     back = _trace_side("card_back", 90, 50)
     check("card-back-still", int(back.get("vector_lines") or 0) >= 40, str(back.get("vector_lines")))
     check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 6.0, str(back.get("timings")))
     check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 15.0, str(back.get("timings")))
     check("card-back-letters", not _vector_reads_match(back.get("textGate")), str(_vector_reads_match(back.get("textGate")))[:400])
+    check("card-back-source-guard", back.get("source_guard") is True, str(back.get("source_guard")))
     front = _trace_side("flyer_front", 148, 210)
     front_t = front.get("timings") or {}
     check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 8.0, str(front_t))
     check("flyer-front-total", float(front_t.get("total_s") or 99) <= 30.0, str(front_t))
     check("flyer-front-letters", not _vector_reads_match(front.get("textGate")), str(_vector_reads_match(front.get("textGate")))[:500])
+    check("flyer-front-source", front.get("source_guard") is True, str(front.get("source_guard")))
     flyer_back = _trace_side("flyer_back", 148, 210)
     back_t = flyer_back.get("timings") or {}
     check("flyer-back-gate", float(back_t.get("gate_s") or 99) < 8.0, str(back_t))
     check("flyer-back-total", float(back_t.get("total_s") or 99) <= 30.0, str(back_t))
     check("flyer-back-letters", not _vector_reads_match(flyer_back.get("textGate")), str(_vector_reads_match(flyer_back.get("textGate")))[:500])
+    check("flyer-back-source", flyer_back.get("source_guard") is True, str(flyer_back.get("source_guard")))
     gates = {"flyer_front": front.get("textGate") or [], "flyer_back": flyer_back.get("textGate") or []}
     for side, wanted in phrases.items():
         blob = "\n".join(str(row.get("text") or "") for row in gates[side])
@@ -786,6 +845,7 @@ def main() -> None:
     test_merged_or_split_glyphs_fail()
     test_descenders_and_counters()
     test_glyphs_reject_a_changed_letter()
+    test_paint_follows_the_glyph_not_the_box()
     test_a_line_is_not_half_traced()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()

@@ -1008,6 +1008,7 @@ def test_catch_fire_raster_is_traced() -> None:
     gate = (result.get("vectorText") or {}).get("textGate") or []
     vector_bad = [row for row in gate if row.get("mode") == "vector" and not row.get("ok")]
     check("catch-vector-lines-match", bool(gate) and not vector_bad, str(vector_bad)[:500])
+    check("catch-source-guard", (result.get("vectorText") or {}).get("sourceGuard") is True)
     stray = [row for row in gate if str(row.get("text") or "").strip() == "f" and row.get("mode") == "vector"]
     check("catch-small-glyph-stays-raster", not stray, str(stray)[:300])
     # These rows disagree with OCR and must still be the untouched source pixels.

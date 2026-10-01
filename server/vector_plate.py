@@ -283,6 +283,7 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         "scale_mm": scale_mm,
         "off_mm": (off_x_mm, off_y_mm),
         "ppi": ppi,
+        "art_box": (int(paste_x), int(paste_y), int(art_w), int(art_h)),
     }
 
 
