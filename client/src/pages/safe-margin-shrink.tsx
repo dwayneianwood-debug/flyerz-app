@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
+import { PRINT_TOOL_ACCEPT, PRINT_TOOL_TYPE_LABEL, isPrintToolFile } from "@/lib/accepted-artwork";
 import {
   ArrowLeft,
   Upload,
@@ -57,11 +58,10 @@ export default function SafeMarginShrink() {
     const selected = e.target.files?.[0];
     if (!selected) return;
 
-    const ext = selected.name.split(".").pop()?.toLowerCase();
-    if (!["pdf", "jpg", "jpeg", "png"].includes(ext || "")) {
+    if (!isPrintToolFile(selected.name)) {
       toast({
         title: "Unsupported file",
-        description: "Please upload a PDF, JPG, or PNG file.",
+        description: `Please upload a ${PRINT_TOOL_TYPE_LABEL} file.`,
         variant: "destructive",
       });
       return;
@@ -206,7 +206,7 @@ export default function SafeMarginShrink() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".pdf,.jpg,.jpeg,.png"
+                  accept={PRINT_TOOL_ACCEPT}
                   onChange={handleFileSelect}
                   className="hidden"
                   data-testid="input-file"

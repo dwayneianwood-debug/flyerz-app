@@ -36,6 +36,7 @@ def _try_build_job_report_html(output_path: str, template_path: str, context: di
         right_safety=context.get("rightSafety"),
         critical_safe_zone=context.get("criticalSafeZone"),
         ai_enhanced=context.get("aiEnhanced"),
+        ai_rebuild=context.get("aiRebuild") or context.get("ai_rebuild"),
     )
     with open(output_path, "wb") as out_f:
         status = pisa.CreatePDF(html, dest=out_f, encoding="utf-8")

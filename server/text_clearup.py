@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 
 from fai_temp_utils import init_fai_temp_dir
+from http_headers import external_headers
 
 FAI_TEMP_DIR = init_fai_temp_dir()
 if not os.path.isdir(FAI_TEMP_DIR):
@@ -75,7 +76,8 @@ def _call_gemini_json(bgr, prompt: str, max_output_tokens: int = 4096) -> tuple:
 
     vision_bgr, _ = _resize_for_vision(bgr)
     mime, b64 = _bgr_to_jpeg_b64(vision_bgr)
-    url = f"{GEMINI_API_URL}/models/gemini-2.0-flash:generateContent?key={key}"
+    from gemini_api import gemini_generate_content_url
+    url = gemini_generate_content_url(key)
     payload = json.dumps(
         {
             "contents": [
@@ -93,7 +95,9 @@ def _call_gemini_json(bgr, prompt: str, max_output_tokens: int = 4096) -> tuple:
             },
         }
     ).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=payload, headers=external_headers({"Content-Type": "application/json"})
+    )
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as resp:
             raw = json.loads(resp.read().decode("utf-8"))

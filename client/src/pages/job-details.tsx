@@ -29,7 +29,26 @@ import {
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
+import { ColourBorderPicker } from "@/components/colour-border-picker";
+import { AiUpscalePanel } from "@/components/ai-upscale-panel";
+import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
+import { AiRebuildPanel } from "@/components/ai-rebuild-panel";
+import { BleedSizeControl } from "@/components/bleed-size-control";
+import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline, shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
+import { proceedButtonState } from "@/lib/job-page-actions";
+import { displayPercent, formatElapsed } from "@shared/jobProgress";
+import { CoverCropNotice } from "@/components/cover-crop-notice";
+import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
+import { precompilePollDelayMs } from "@/lib/poll-backoff";
+import { normalizeBleedMm } from "@shared/bleed-size";
+import {
+  type ColourBorderChoice,
+  cmykToRgb,
+  loadColourBorderChoice,
+  saveColourBorderChoice,
+} from "@/lib/colour-border";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
+import { isIllustratorFile, isVectorArtwork } from "@/lib/accepted-artwork";
 
 /** Unwrap SQLite / double-JSON string blobs (same idea as server `unfoldJsonValue`). */
 function unfoldStringJson(val: unknown, maxDepth = 8): unknown {
@@ -93,6 +112,10 @@ const PHASE_LABELS = [
 ];
 
 const BLEED_METHOD_LABELS = {
+  auto: {
+    label: AUTOMATIC_BLEED_LABEL,
+    description: "The press-ready engine checks each edge and fills only the bleed. You can still pick a style yourself below.",
+  },
   bgExtract: {
     label: "Background Extract",
     description: "Extends only the background colour, ideal for artwork with text near the edge.",
@@ -118,6 +141,10 @@ const BLEED_METHOD_LABELS = {
     description:
       "Fast proxy inpainting extends bleed colors softly; your 300 DPI artwork stays pixel-perfect in the center.",
   },
+  colourBorder: {
+    label: "Colour Border",
+    description: "Keeps the artwork at trim size and fills the bleed with a solid colour you choose.",
+  },
 } as const;
 
 export default function JobDetails() {
@@ -129,6 +156,7 @@ export default function JobDetails() {
   const processJob = useProcessJob();
   
   const [progress, setProgress] = useState(0);
+  const [elapsedTick, setElapsedTick] = useState(0);
   const [proofChecked, setProofChecked] = useState(false);
   const [hasDownloaded, setHasDownloaded] = useState(false);
   const [shareEmail, setShareEmail] = useState('');
@@ -148,6 +176,13 @@ export default function JobDetails() {
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
   const [selectedBleedMethod, setSelectedBleedMethod] = useState<string>("auto");
+  const [bleedMm, setBleedMm] = useState(5);
+  const [autoEnhance, setAutoEnhance] = useState(false);
+  const [aiArtworkGate, setAiArtworkGate] = useState<{ ready: boolean; bleed?: string }>({ ready: false });
+  const [colourBorder, setColourBorder] = useState<ColourBorderChoice>(() => loadColourBorderChoice());
+  const colourBorderRef = useRef(colourBorder);
+  colourBorderRef.current = colourBorder;
+  const colourSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bleedMethodLoading, setBleedMethodLoading] = useState(false);
   const [compileTaskId, setCompileTaskId] = useState<string | null>(null);
   const [compileState, setCompileState] = useState<string | null>(null);
@@ -232,6 +267,12 @@ export default function JobDetails() {
 
 
   useEffect(() => {
+    if (job?.status !== "processing" && job?.status !== "pending") return;
+    const clock = setInterval(() => setElapsedTick((n) => n + 1), 1000);
+    return () => clearInterval(clock);
+  }, [job?.status]);
+
+  useEffect(() => {
     if (job && (job.status as string) === "queued") {
       const jobId = job.id;
       setProgress(0);
@@ -252,10 +293,6 @@ export default function JobDetails() {
       return () => clearInterval(pollQueue);
     } else if (job?.status === "processing") {
       window.dispatchEvent(new CustomEvent("glitchy:queue-dequeued"));
-      const interval = setInterval(() => {
-        setProgress(p => Math.min(p + Math.random() * 15, 95));
-      }, 500);
-      return () => clearInterval(interval);
     } else if (job?.status === "complete" || job?.status === "failed") {
       setProgress(100);
     } else {
@@ -363,7 +400,8 @@ export default function JobDetails() {
     if (job?.auditResults?.selectedBleedMethod) {
       setSelectedBleedMethod(job.auditResults.selectedBleedMethod);
     }
-  }, [job?.auditResults?.selectedBleedMethod]);
+    setBleedMm(normalizeBleedMm((job?.auditResults as { savedBleedOptions?: { bleedMm?: unknown } } | null)?.savedBleedOptions?.bleedMm));
+  }, [job?.auditResults?.selectedBleedMethod, job?.id]);
 
   useEffect(() => {
     const ai = (job?.auditResults as any)?.aiEnhancements;
@@ -392,22 +430,34 @@ export default function JobDetails() {
   const autoSelectTriggeredRef = useRef(false);
   const layoutGlitchyDispatchedForJobRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!job || job.status !== "complete" || autoSelectTriggeredRef.current) return;
-    if (selectedBleedMethod !== "auto") return;
-    const variants = job.auditResults?.bleedVariants;
-    const hasVariants = variants && Object.keys(variants).length > 0;
-    if (hasVariants) return;
-    const recommended = job.auditResults?.recommendedBleedMethod || "mirror";
+    const variants = job?.auditResults?.bleedVariants;
+    const hasVariants = !!(variants && Object.keys(variants).length > 0);
+    const canAssessArtwork = !!(job?.auditResults && (job.correctedPath || job.originalPath));
+    const hasExistingPress = Boolean(
+      job?.auditResults?.quickPrint?.pressPath
+      || job?.auditResults?.compiledPdfPath
+      || (job?.auditResults?.quickPrint && job?.correctedPath),
+    );
+    if (!shouldStartAutomaticCompile({
+      status: job?.status,
+      selected: selectedBleedMethod,
+      alreadyStarted: autoSelectTriggeredRef.current,
+      hasVariants,
+      canAssess: canAssessArtwork,
+      artworkGateReady: aiArtworkGate.ready,
+      pressStatus: job?.auditResults?.pressEngine?.status,
+      hasExistingPress,
+    })) return;
     autoSelectTriggeredRef.current = true;
-    handleBleedMethodSelect(recommended);
-  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, selectedBleedMethod]);
+    // Automatic is already the selected value, so this must force the first compile.
+    handleBleedMethodSelect("auto", true);
+  }, [job?.id, job?.status, job?.auditResults?.bleedVariants, job?.correctedPath, job?.originalPath, selectedBleedMethod, aiArtworkGate]);
 
   const noneCountRef = useRef(0);
   const compilingCountRef = useRef(0);
 
   useEffect(() => {
     if (!job || job.status !== "complete") return;
-    if (selectedBleedMethod === "auto") return;
     let cancelled = false;
     noneCountRef.current = 0;
     compilingCountRef.current = 0;
@@ -482,20 +532,35 @@ export default function JobDetails() {
         }
       } catch {}
     };
-    poll();
-    const interval = setInterval(poll, 2000);
-    return () => { cancelled = true; clearInterval(interval); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      await poll();
+      if (cancelled) return;
+      const delay = precompilePollDelayMs(
+        compilingCountRef.current > 0 ? "compiling" : "none",
+        compilingCountRef.current > 0 ? compilingCountRef.current : noneCountRef.current,
+      );
+      if (delay === false) return;
+      timer = setTimeout(() => { void tick(); }, delay);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [job?.id, job?.status, selectedBleedMethod]);
 
   useEffect(() => {
-    if (!job?.auditResults?.compiledPdfPath || compileTaskId) return;
-    if (selectedBleedMethod === "auto") return;
-    if (preCompileState !== "ready") return;
+    const quickPath = job?.auditResults?.quickPrint?.pressPath;
+    if ((!job?.auditResults?.compiledPdfPath && !quickPath) || compileTaskId) return;
+    if (preCompileState !== "ready" && !quickPath) return;
 
-    const dlUrl = `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+    const dlUrl = quickPath
+      ? `/api/jobs/${job.id}/download/press-ready`
+      : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
     setCompileState("COMPLETE");
     setCompileDownloadUrl(dlUrl);
-  }, [job?.auditResults?.compiledPdfPath, selectedBleedMethod, preCompileState]);
+  }, [job?.id, job?.auditResults?.compiledPdfPath, job?.auditResults?.quickPrint?.pressPath, selectedBleedMethod, preCompileState]);
 
   useEffect(() => {
     if (!compileTaskId || !job) return;
@@ -574,6 +639,7 @@ export default function JobDetails() {
           colorSpace: colorProfile,
           trimWidth: trimW,
           trimHeight: trimH,
+          bleedMm,
         },
         cropData: cropPayload,
         targetSize: { width: trimW, height: trimH },
@@ -592,109 +658,6 @@ export default function JobDetails() {
       return false;
     }
   };
-
-  const PREPRESS_OVERLAY_LABELS: Record<string, string> = {
-    tac_limit: "Ink Profile Updated",
-    trapping: "Trap Logic Applied",
-  };
-
-  const handleAiEnhancementToggle = async (enhancement: string, enabled: boolean) => {
-    if (!job || aiEnhanceLoading) return;
-
-    const setters: Record<string, (v: boolean) => void> = {
-      denoise: setAiDenoise,
-      sharpen_logos: setAiSharpenLogos,
-      spell_check: setAiSpellCheck,
-      tac_limit: setAiTacLimit,
-      trapping: setAiTrapping,
-      engagement_score: setAiEngagementScore,
-      background_remove: setAiBackgroundRemove,
-      text_reconstruct: setAiTextReconstruct,
-
-      expand_background: setAiExpandBackground,
-      identify_fonts: setAiIdentifyFonts,
-      test_design_style: setAiTestDesignStyle,
-    };
-
-    const isPrepressToggle = enhancement === "tac_limit" || enhancement === "trapping";
-
-    setters[enhancement]?.(enabled);
-    setAiEnhanceLoading(enhancement);
-
-    if (isPrepressToggle && enabled) {
-      setPrepressSpinnerActive(true);
-      setPrepressOverlay({ type: "loading", label: PREPRESS_OVERLAY_LABELS[enhancement] || enhancement });
-    }
-
-    try {
-      const res = await apiRequest("POST", `/api/jobs/${job.id}/ai-enhance`, {
-        enhancement,
-        enabled,
-        options: {},
-      });
-      const data = await res.json();
-
-      if (data.stub) {
-        setAiEnhanceMessages(prev => ({
-          ...prev,
-          [enhancement]: data.message || "Enhancement stub active — external API not yet connected.",
-        }));
-      } else {
-        setAiEnhanceMessages(prev => ({
-          ...prev,
-          [enhancement]: enabled ? "Enhancement applied." : "Reverted to original.",
-        }));
-      }
-
-      await queryClient.invalidateQueries({ queryKey: ["job", job.id] });
-      setProofRefreshKey(Date.now());
-      setComparisonRefreshKey(Date.now());
-
-      if (isPrepressToggle && enabled) {
-        const successLabel = PREPRESS_OVERLAY_LABELS[enhancement] || "Applied";
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        setPrepressOverlay({ type: "success", label: successLabel });
-        setTimeout(() => {
-          setPrepressOverlay(null);
-          setPrepressSpinnerActive(false);
-        }, 1200);
-      }
-    } catch (err: any) {
-      setters[enhancement]?.(false);
-      setPrepressOverlay(null);
-      setPrepressSpinnerActive(false);
-      toast({
-        title: "Enhancement Failed",
-        description: err.message || `Could not apply ${enhancement}`,
-        variant: "destructive",
-      });
-    } finally {
-      setAiEnhanceLoading(null);
-      setPrepressSpinnerActive(false);
-      setPrepressOverlay(null);
-    }
-  };
-
-  const PREMIUM_FEATURES: Record<string, string> = {
-    denoise: "Clean up photo grain",
-    sharpen_logos: "Sharpen blurry logos",
-    spell_check: "Check Spelling (SA Languages)",
-    background_remove: "Clean Background",
-    expand_background: "Expand Background",
-    identify_fonts: "Identify Fonts",
-    test_design_style: "Eye-Catching Score",
-  };
-
-  const handlePremiumToggle = (enhancement: string, checked: boolean) => {
-    handleAiEnhancementToggle(enhancement, checked);
-  };
-
-  const PremiumBadge = () => (
-    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded-full bg-gradient-to-r from-amber-100 to-yellow-100 dark:from-amber-500/20 dark:to-yellow-500/20 text-amber-700 dark:text-amber-300 border border-amber-300/40 dark:border-amber-500/30" data-testid="badge-premium">
-      <span>👑</span>
-      <span>Premium</span>
-    </span>
-  );
 
   const handleFastTrack = async () => {
     if (!job || fastTrackTriggered) return;
@@ -747,10 +710,21 @@ export default function JobDetails() {
     }));
 
     try {
+      const border = colourBorderRef.current;
       const res = await fetch(`/api/jobs/${job.id}/select-bleed-method`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ method }),
+        body: JSON.stringify({
+          method,
+          colourBorder: method === "colourBorder" ? {
+            c: border.c,
+            m: border.m,
+            y: border.y,
+            k: border.k,
+            label: border.label,
+            source: border.source,
+          } : undefined,
+        }),
       });
 
       const data = await res.json();
@@ -831,6 +805,66 @@ export default function JobDetails() {
     }
   };
 
+  const handleColourBorderChange = async (next: ColourBorderChoice) => {
+    let choice = next;
+    if (next.source === "edge" && job) {
+      try {
+        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0`);
+        const data = await res.json();
+        if (res.ok && data.success) {
+          choice = {
+            source: "edge",
+            presetId: "edge",
+            label: "Match artwork edge",
+            c: Number(data.c) || 0,
+            m: Number(data.m) || 0,
+            y: Number(data.y) || 0,
+            k: Number(data.k) || 0,
+            r: Number(data.r) || 0,
+            g: Number(data.g) || 0,
+            b: Number(data.b) || 0,
+          };
+        }
+      } catch {
+        toast({ title: "Could not sample the edge", description: "Try another colour.", variant: "destructive" });
+      }
+    }
+    setColourBorder(choice);
+    colourBorderRef.current = choice;
+    saveColourBorderChoice(choice);
+    if (selectedBleedMethod !== "colourBorder" || !job) return;
+    if (colourSaveTimer.current) clearTimeout(colourSaveTimer.current);
+    const jobId = job.id;
+    colourSaveTimer.current = setTimeout(() => {
+      const latest = colourBorderRef.current;
+      void fetch(`/api/jobs/${jobId}/select-bleed-method`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          method: "colourBorder",
+          colourBorder: {
+            c: latest.c,
+            m: latest.m,
+            y: latest.y,
+            k: latest.k,
+            label: latest.label,
+            source: latest.source,
+          },
+        }),
+      });
+    }, 400);
+  };
+
+  const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
+    ? {
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}`,
+        trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
+        trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
+        bleedMm,
+      }
+    : null;
+
   const handleTextClearupStartOcr = async () => {
     if (!job || textClearupBusy) return;
     setTextClearupBusy(true);
@@ -901,14 +935,15 @@ export default function JobDetails() {
     }
   };
 
-  const loadBleedPreview = async (strategy?: string) => {
+  const loadBleedPreview = async (strategy?: string, bleedOverride?: number) => {
     if (!job || !job.correctedPath) return;
     setBleedPreviewLoading(true);
     setBleedPreviewError(null);
 
     try {
-      const strategyParam = strategy && strategy !== "auto" ? `?strategy=${strategy}` : "";
-      const res = await fetch(`/api/jobs/${job.id}/bleed-preview${strategyParam}`);
+      const chosen = typeof strategy === "string" ? strategy : selectedBleedMethod;
+      const query = bleedPreviewQuery(chosen, bleedOverride ?? bleedMm);
+      const res = await fetch(`/api/jobs/${job.id}/bleed-preview${query}`);
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.message || "Failed to generate bleed preview");
@@ -963,12 +998,30 @@ export default function JobDetails() {
   const allReviewsChecked = bleedChecked && (hasComparison ? comparisonChecked : true) && !prepressSpinnerActive;
   const canDownload = isComplete && overallPassed && (hasProof ? proofChecked : true);
   const hasCorrectedFile = isComplete && overallPassed && job.correctedPath;
+  const quickPressReady = isComplete && Boolean(job.auditResults?.quickPrint?.pressPath || (job.auditResults?.quickPrint && job.correctedPath));
+  const pressDownloadHref = quickPressReady
+    ? `/api/jobs/${job.id}/download/press-ready`
+    : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+  const pressDownloadName = quickPressReady ? "Print Ready Artwork.pdf" : "Print Ready Artwork.zip";
 
   const currentBleedPage = bleedPreview?.previewUrls?.[bleedPreviewPage];
 
   const isFailed = job.status === "failed";
   const hasUserSelectedBleed = selectedBleedMethod !== "auto";
   const preCompileReady = preCompileState === "ready" || compileState === "COMPLETE";
+  const hasAutomaticPress = Boolean(
+    quickPressReady
+    || job.auditResults?.compiledPdfPath
+    || preCompileReady,
+  );
+  const proceed = proceedButtonState({
+    allReviewsChecked,
+    selectedBleedMethod,
+    prepressSpinnerActive,
+    preCompileState,
+    preCompileReady,
+    hasAutomaticPress,
+  });
   const fastTrackEligible = (() => {
     if (!isComplete || !overallPassed || !job.auditResults?.checks) return false;
     const checks = job.auditResults.checks;
@@ -1040,7 +1093,7 @@ export default function JobDetails() {
                 <span>{format(new Date(job.uploadedAt), "MMM d, h:mm a")}</span>
               </div>
             </div>
-            <StatusBadge status={job.status as any} overallPassed={job.auditResults?.overallPassed ?? null} />
+            <StatusBadge status={job.status as any} overallPassed={job.auditResults?.overallPassed === true && job.auditResults?.pressEngine?.passed === true} />
           </div>
         </Card>
 
@@ -1096,15 +1149,19 @@ export default function JobDetails() {
                 <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto" data-testid="text-processing-description">
                   {isQueued
                     ? "The press room is busy. Your file is in line and will be processed as soon as a slot opens."
-                    : "We're checking fonts, colors, bleeds, and more. This usually takes a few seconds."}
+                    : (job.progress?.note || "We're fitting the picture and building the press file. The original lettering is kept.")}
                 </p>
                 {!isQueued && (
-                  <div className="max-w-xs mx-auto">
+                  <div className="max-w-xs mx-auto" data-testid="job-progress">
                     <div className="flex justify-between text-xs font-medium mb-1 text-primary">
-                      <span>Processing</span>
-                      <span>{Math.round(progress)}%</span>
+                      <span data-testid="text-job-stage">{job.progress?.stage || "Starting…"}</span>
+                      <span data-testid="text-job-percent">{displayPercent(job.status, job.progress?.percent)}%</span>
                     </div>
-                    <Progress value={progress} className="h-2.5 bg-primary/10" />
+                    <Progress value={displayPercent(job.status, job.progress?.percent)} className="h-2.5 bg-primary/10" />
+                    <p className="text-xs text-muted-foreground mt-2" data-testid="text-job-elapsed">
+                      {formatElapsed(job.progress?.startedAt ? Math.max(0, Math.round((Date.now() - job.progress.startedAt) / 1000)) : job.progress?.elapsedSec)}
+                      <span className="sr-only">{elapsedTick}</span>
+                    </p>
                   </div>
                 )}
               </Card>
@@ -1133,6 +1190,48 @@ export default function JobDetails() {
                     : "We found a few things that could cause problems during printing. Hit the button below and we'll fix everything automatically."}
                 </p>
               </div>
+
+              {job.auditResults && (job.correctedPath || job.originalPath) && (
+                <div className="mb-6">
+                  <AiArtworkPanel
+                    jobId={job.id}
+                    trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                    trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                    onPlan={(plan: AiArtworkPlan) => {
+                      if (plan.bleed === "colourBorder" && plan.edge) {
+                        const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                        const choice: ColourBorderChoice = {
+                          source: "edge",
+                          presetId: "edge",
+                          label: "Match artwork edge",
+                          c: Number(plan.edge.c) || 0,
+                          m: Number(plan.edge.m) || 0,
+                          y: Number(plan.edge.y) || 0,
+                          k: Number(plan.edge.k) || 0,
+                          r: rgb.r,
+                          g: rgb.g,
+                          b: rgb.b,
+                        };
+                        colourBorderRef.current = choice;
+                        setColourBorder(choice);
+                        saveColourBorderChoice(choice);
+                      }
+                      setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                      setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                    }}
+                    onRefit={() => {
+                      if (selectedBleedMethod !== "auto") {
+                        void handleBleedMethodSelect(selectedBleedMethod, true);
+                      }
+                    }}
+                  />
+                  <AiRebuildPanel
+                    jobId={job.id}
+                    trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                    trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                  />
+                </div>
+              )}
 
               {job.auditResults && job.auditResults.checks.some(c => !c.passed) && (
                 <div className="grid gap-3 sm:grid-cols-2 mb-6">
@@ -1279,21 +1378,6 @@ export default function JobDetails() {
                 >
                   <Eye className="w-4 h-4" />
                   Review
-                </button>
-                <button
-                  onClick={() => setReviewTab("tools")}
-                  className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-md text-sm font-semibold transition-all ${
-                    reviewTab === "tools"
-                      ? "bg-white dark:bg-background shadow-sm text-foreground"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                  data-testid="tab-tools"
-                >
-                  <Wrench className="w-4 h-4" />
-                  Tools
-                  {(aiEnhanceLoading) && (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />
-                  )}
                 </button>
               </div>
 
@@ -1448,8 +1532,77 @@ export default function JobDetails() {
                       </LazyCollapsibleContent>
                     </Collapsible>
                   )}
-                  {job.auditResults && job.correctedPath && (
-                    <div className="p-4 sm:p-5 border-b border-border/30">
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="px-4 sm:px-5 pt-4">
+                      <AiArtworkPanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        onPlan={(plan: AiArtworkPlan) => {
+                          if (plan.bleed === "colourBorder" && plan.edge) {
+                            const rgb = cmykToRgb(Number(plan.edge.c) || 0, Number(plan.edge.m) || 0, Number(plan.edge.y) || 0, Number(plan.edge.k) || 0);
+                            const choice: ColourBorderChoice = {
+                              source: "edge",
+                              presetId: "edge",
+                              label: "Match artwork edge",
+                              c: Number(plan.edge.c) || 0,
+                              m: Number(plan.edge.m) || 0,
+                              y: Number(plan.edge.y) || 0,
+                              k: Number(plan.edge.k) || 0,
+                              r: rgb.r,
+                              g: rgb.g,
+                              b: rgb.b,
+                            };
+                            colourBorderRef.current = choice;
+                            setColourBorder(choice);
+                            saveColourBorderChoice(choice);
+                          }
+                          setAutoEnhance(!!plan.detected && !!plan.enhance && !plan.enhanceOverridden);
+                          setAiArtworkGate({ ready: true, bleed: plan.detected ? plan.bleed : undefined });
+                        }}
+                        onRefit={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
+                      />
+                      <AiRebuildPanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="p-4 sm:p-5 border-b border-border/30 space-y-4">
+                      <CoverCropNotice
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                      />
+                      <details className="text-sm" data-testid="advanced-bleed-size">
+                        <summary className="cursor-pointer text-xs text-muted-foreground">
+                          Advanced bleed size. A normal Flyerz job stays at 5 mm.
+                        </summary>
+                        <BleedSizeControl
+                          value={bleedMm}
+                          disabled={bleedMethodLoading || bleedPreviewLoading}
+                          onChange={(mm) => {
+                            const next = normalizeBleedMm(mm);
+                            setBleedMm(next);
+                            void fetch(`/api/jobs/${job.id}/bleed-size`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ bleedMm: next }),
+                            }).then(() => {
+                              void loadBleedPreview(selectedBleedMethod, next);
+                              if (selectedBleedMethod !== "auto") {
+                                void handleBleedMethodSelect(selectedBleedMethod, true);
+                              }
+                            });
+                          }}
+                        />
+                      </details>
                       <BleedMethodSelector
                         jobId={job.id}
                         variants={job.auditResults.bleedVariants ?? {}}
@@ -1457,6 +1610,40 @@ export default function JobDetails() {
                         selected={selectedBleedMethod}
                         onSelect={handleBleedMethodSelect}
                         loading={bleedMethodLoading}
+                        colourBorder={colourBorder}
+                        onColourBorderChange={handleColourBorderChange}
+                        pressEngine={job.auditResults.pressEngine}
+                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof` : null}
+                        afterUrl={bleedPreview?.previewUrls?.[0]?.url || null}
+                        pressDownloadHref={quickPressReady ? pressDownloadHref : null}
+                      />
+                    </div>
+                  )}
+                  {job.auditResults && (job.correctedPath || job.originalPath) && (
+                    <div className="px-4 sm:px-5 pb-5 border-b border-border/30">
+                      <AiUpscalePanel
+                        jobId={job.id}
+                        trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
+                        trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
+                        bleedMm={bleedMm}
+                        autoStart={autoEnhance && isComplete && !job.auditResults?.quickPrint}
+                        onEnhanceChoice={async (accepted) => {
+                          setAutoEnhance(accepted);
+                          try {
+                            await fetch(`/api/jobs/${job.id}/ai-artwork/choice`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ enhance: accepted, enhanceOverridden: true }),
+                            });
+                          } catch {
+                            /* The print job still continues. */
+                          }
+                        }}
+                        onApplied={() => {
+                          if (selectedBleedMethod !== "auto") {
+                            void handleBleedMethodSelect(selectedBleedMethod, true);
+                          }
+                        }}
                       />
                     </div>
                   )}
@@ -1489,6 +1676,7 @@ export default function JobDetails() {
                       currentBleedPage={currentBleedPage}
                       loadBleedPreview={loadBleedPreview}
                       enhancementLoading={aiEnhanceLoading}
+                      colourBorderPreview={colourBorderPreview}
                     />
                   </div>
                   <div className="px-4 sm:px-5 pb-4 sm:pb-5">
@@ -1584,344 +1772,9 @@ export default function JobDetails() {
 
               </div>
 
-              <Collapsible open={openSections.outpaint} onOpenChange={(open) => toggleSection("outpaint", open)}>
-                <div className="mt-6 rounded-xl border-2 border-sky-500/20 bg-gradient-to-br from-sky-50/30 to-blue-50/20 dark:from-sky-500/5 dark:to-blue-500/5 overflow-hidden" data-testid="section-expand-background-bleed">
-                  <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-outpaint">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-sky-500/15 flex items-center justify-center shrink-0">
-                        <Expand className="w-4 h-4 text-sky-600 dark:text-sky-400" />
-                      </div>
-                      <div className="flex-1 text-left">
-                        <h4 className="text-sm font-bold text-foreground">AI Outpaint Bleed</h4>
-                        <p className="text-xs text-muted-foreground">Use AI to extend your design edges seamlessly.</p>
-                      </div>
-                      <PremiumBadge />
-                      <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-sky-100 dark:bg-sky-500/15 text-sky-700 dark:text-sky-300" data-testid="badge-generative-bleed">
-                        Generative
-                      </span>
-                      <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.outpaint ? 'rotate-180' : ''}`} />
-                    </div>
-                  </CollapsibleTrigger>
-                  <LazyCollapsibleContent isOpen={!!openSections.outpaint} betaMode={betaMode} resetKey={id}>
-                    <div className="flex items-center justify-between px-4 sm:px-5 py-4 border-t border-border/20">
-                      <div className="flex-1 mr-4">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-semibold text-foreground">Expand Background</span>
-                          {aiEnhanceLoading === "expand_background" && <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-500" />}
-                        </div>
-                        <p className="text-xs text-muted-foreground mt-0.5">AI outpainting extends your artwork edges to fill the bleed area naturally — no cropping or stretching needed.</p>
-                        {aiEnhanceMessages.expand_background && aiExpandBackground && (
-                          <p className="text-[11px] text-sky-600 dark:text-sky-400 mt-1 italic" data-testid="text-expand-background-status">{aiEnhanceMessages.expand_background}</p>
-                        )}
-                      </div>
-                      <Switch
-                        checked={aiExpandBackground}
-                        onCheckedChange={(checked) => handlePremiumToggle("expand_background", checked)}
-                        disabled={!!aiEnhanceLoading}
-                        data-testid="switch-expand-background"
-                      />
-                    </div>
-                  </LazyCollapsibleContent>
-                </div>
-              </Collapsible>
-
-              {(() => {
-                const isPdfFile = job.filename?.toLowerCase().endsWith('.pdf');
-                return (
-                  <Collapsible open={openSections.prepress} onOpenChange={(open) => toggleSection("prepress", open)}>
-                  <div className="mt-6 rounded-xl border-2 border-blue-500/20 bg-gradient-to-br from-blue-50/30 to-slate-50/20 dark:from-blue-500/5 dark:to-slate-500/5 overflow-hidden" data-testid="section-prepress-refinements">
-                    <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-prepress">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-blue-500/15 flex items-center justify-center shrink-0">
-                          <Shield className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                        </div>
-                        <div className="flex-1 text-left">
-                          <h4 className="text-sm font-bold text-foreground" data-testid="text-prepress-title">Prepress Refinements</h4>
-                          <p className="text-xs text-muted-foreground">Press-specific fixes for your pixel data.</p>
-                        </div>
-                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-blue-100 dark:bg-blue-500/15 text-blue-700 dark:text-blue-300" data-testid="badge-prepress">
-                          Prepress
-                        </span>
-                        <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.prepress ? 'rotate-180' : ''}`} />
-                      </div>
-                    </CollapsibleTrigger>
-                    <LazyCollapsibleContent isOpen={!!openSections.prepress} betaMode={betaMode} resetKey={id}>
-                    <div className="divide-y divide-border/20">
-                      <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-tac-limit">
-                        <div className="flex-1 mr-4">
-                          <div className="flex items-center gap-2">
-                            <Droplets className="w-3.5 h-3.5 text-amber-500" />
-                            <span className="text-sm font-semibold text-foreground">Prevent soggy paper (Safe Ink limit)</span>
-                            {aiEnhanceLoading === "tac_limit" && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
-                          </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">Caps total ink coverage at 280% to prevent paper from getting too wet during litho printing.</p>
-                          {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
-                          )}
-                          {aiEnhanceMessages.tac_limit && aiTacLimit && (
-                            <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-tac-limit-status">{aiEnhanceMessages.tac_limit}</p>
-                          )}
-                        </div>
-                        <Switch
-                          checked={aiTacLimit}
-                          onCheckedChange={(checked) => handleAiEnhancementToggle("tac_limit", checked)}
-                          disabled={!!aiEnhanceLoading}
-                          data-testid="switch-tac-limit"
-                        />
-                      </div>
-                      <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-trapping">
-                        <div className="flex-1 mr-4">
-                          <div className="flex items-center gap-2">
-                            <Shield className="w-3.5 h-3.5 text-blue-500" />
-                            <span className="text-sm font-semibold text-foreground">Close white print gaps</span>
-                            {aiEnhanceLoading === "trapping" && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
-                          </div>
-                          <p className="text-xs text-muted-foreground mt-0.5">Adds tiny overlap between colours so white gaps don't appear if the press is slightly off-register.</p>
-                          {isPdfFile && (
-                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic">PDF detected — this tool works best on raster images (PNG/JPG). Results may be limited.</p>
-                          )}
-                          {aiEnhanceMessages.trapping && aiTrapping && (
-                            <p className="text-[11px] text-blue-600 dark:text-blue-400 mt-1 italic" data-testid="text-trapping-status">{aiEnhanceMessages.trapping}</p>
-                          )}
-                        </div>
-                        <Switch
-                          checked={aiTrapping}
-                          onCheckedChange={(checked) => handleAiEnhancementToggle("trapping", checked)}
-                          disabled={!!aiEnhanceLoading}
-                          data-testid="switch-trapping"
-                        />
-                      </div>
-                    </div>
-                    <div className="px-4 sm:px-5 py-3 bg-blue-50/50 dark:bg-blue-500/5 border-t border-border/20">
-                      <p className="text-[10px] text-muted-foreground text-center italic">
-                        Prepress operations modify pixel data directly using local processing. Your original artwork is preserved.
-                      </p>
-                    </div>
-                    </LazyCollapsibleContent>
-                  </div>
-                  </Collapsible>
-                );
-              })()}
 
               </>)}
 
-              {reviewTab === "tools" && (<>
-
-              <Collapsible open={openSections.aiEnhancements} onOpenChange={(open) => toggleSection("aiEnhancements", open)}>
-              <div className="rounded-xl border-2 border-violet-500/20 bg-gradient-to-br from-violet-50/30 to-purple-50/20 dark:from-violet-500/5 dark:to-purple-500/5 overflow-hidden" data-testid="section-ai-enhancements">
-                <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-ai-enhancements">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-violet-500/15 flex items-center justify-center shrink-0">
-                      <Sparkles className="w-4 h-4 text-violet-600 dark:text-violet-400" />
-                    </div>
-                    <div className="flex-1 text-left">
-                      <h3 className="text-base font-bold text-foreground" data-testid="text-ai-enhancements-title">AI Enhancements</h3>
-                      <p className="text-xs text-muted-foreground">Optional AI upgrades — your original is always preserved.</p>
-                    </div>
-                    <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-violet-100 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300" data-testid="badge-opt-in">
-                      Opt-In
-                    </span>
-                    <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.aiEnhancements ? 'rotate-180' : ''}`} />
-                  </div>
-                </CollapsibleTrigger>
-                <LazyCollapsibleContent isOpen={!!openSections.aiEnhancements} betaMode={betaMode} resetKey={id}>
-                <div className="divide-y divide-border/20">
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-denoise">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Clean up photo grain</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "denoise" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Reduce noise and grain from photos while preserving sharpness.</p>
-                      {aiEnhanceMessages.denoise && aiDenoise && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-denoise-status">{aiEnhanceMessages.denoise}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiDenoise}
-                      onCheckedChange={(checked) => handlePremiumToggle("denoise", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-denoise"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-sharpen-logos">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Sharpen blurry logos</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "sharpen_logos" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Detect and sharpen blurry logos using AI edge enhancement.</p>
-                      {aiEnhanceMessages.sharpen_logos && aiSharpenLogos && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-sharpen-status">{aiEnhanceMessages.sharpen_logos}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiSharpenLogos}
-                      onCheckedChange={(checked) => handlePremiumToggle("sharpen_logos", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-sharpen-logos"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-spell-check">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">Check spelling (SA Languages)</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "spell_check" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">OCR-based spell check for English, Afrikaans, Zulu, Xhosa, and Sotho.</p>
-                      {aiEnhanceMessages.spell_check && aiSpellCheck && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-spell-check-status">{aiEnhanceMessages.spell_check}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiSpellCheck}
-                      onCheckedChange={(checked) => handlePremiumToggle("spell_check", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-spell-check"
-                    />
-                  </div>
-                </div>
-                <div className="px-4 sm:px-5 py-3 bg-violet-50/50 dark:bg-violet-500/5 border-t border-border/20">
-                  <p className="text-[10px] text-muted-foreground text-center italic">
-                    All enhancements are non-destructive. Your original artwork is preserved and you can revert at any time by toggling off.
-                  </p>
-                </div>
-                </LazyCollapsibleContent>
-              </div>
-              </Collapsible>
-
-              <Collapsible open={openSections.marketing} onOpenChange={(open) => toggleSection("marketing", open)}>
-              <div className="mt-6 rounded-xl border-2 border-amber-500/20 bg-gradient-to-br from-amber-50/30 to-orange-50/20 dark:from-amber-500/5 dark:to-orange-500/5 overflow-hidden" data-testid="section-power-ups">
-                <CollapsibleTrigger className="w-full p-4 sm:p-5 cursor-pointer hover:bg-muted/20 transition-colors" data-testid="trigger-marketing">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-amber-500/15 flex items-center justify-center shrink-0">
-                      <Zap className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-                    </div>
-                    <div className="flex-1 text-left">
-                      <h3 className="text-base font-bold text-foreground" data-testid="text-power-ups-title">Marketing & Design</h3>
-                      <p className="text-xs text-muted-foreground">Advanced tools to level up your design.</p>
-                    </div>
-                    <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-full bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300" data-testid="badge-power-ups">
-                      Power-Ups
-                    </span>
-                    <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${openSections.marketing ? 'rotate-180' : ''}`} />
-                  </div>
-                </CollapsibleTrigger>
-                <LazyCollapsibleContent isOpen={!!openSections.marketing} betaMode={betaMode} resetKey={id}>
-                <div className="divide-y divide-border/20">
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-engagement-score">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Target className="w-3.5 h-3.5 text-rose-500" />
-                        <span className="text-sm font-semibold text-foreground">Check Eye-Catching Score</span>
-                        {aiEnhanceLoading === "engagement_score" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Get a score out of 100 showing how eye-catching your design is, with tips to improve it.</p>
-                      {aiEnhanceMessages.engagement_score && aiEngagementScore && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-engagement-score-status">{aiEnhanceMessages.engagement_score}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiEngagementScore}
-                      onCheckedChange={(checked) => handleAiEnhancementToggle("engagement_score", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-engagement-score"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-background-remove">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Eraser className="w-3.5 h-3.5 text-teal-500" />
-                        <span className="text-sm font-semibold text-foreground">Clean Background</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "background_remove" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Remove the background from your artwork, leaving just the main subject on a clean transparent layer.</p>
-                      {aiEnhanceMessages.background_remove && aiBackgroundRemove && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-background-remove-status">{aiEnhanceMessages.background_remove}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiBackgroundRemove}
-                      onCheckedChange={(checked) => handlePremiumToggle("background_remove", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-background-remove"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-text-reconstruct">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Type className="w-3.5 h-3.5 text-indigo-500" />
-                        <span className="text-sm font-semibold text-foreground">Make Text Razor Sharp</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "text_reconstruct" && <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Apply an unsharp mask to crisp up text edges and fine details for cleaner print output.</p>
-                      {aiEnhanceMessages.text_reconstruct && aiTextReconstruct && (
-                        <p className="text-[11px] text-violet-600 dark:text-violet-400 mt-1 italic" data-testid="text-reconstruct-status">{aiEnhanceMessages.text_reconstruct}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiTextReconstruct}
-                      onCheckedChange={(checked) => handleAiEnhancementToggle("text_reconstruct", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-text-reconstruct"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-identify-fonts">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <ScanSearch className="w-3.5 h-3.5 text-emerald-500" />
-                        <span className="text-sm font-semibold text-foreground">Identify Fonts</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "identify_fonts" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">Automatically detect and identify the fonts used in your artwork for accurate reproduction.</p>
-                      {aiEnhanceMessages.identify_fonts && aiIdentifyFonts && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-identify-fonts-status">{aiEnhanceMessages.identify_fonts}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiIdentifyFonts}
-                      onCheckedChange={(checked) => handlePremiumToggle("identify_fonts", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-identify-fonts"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between px-4 sm:px-5 py-4" data-testid="toggle-row-test-design-style">
-                    <div className="flex-1 mr-4">
-                      <div className="flex items-center gap-2">
-                        <Palette className="w-3.5 h-3.5 text-pink-500" />
-                        <span className="text-sm font-semibold text-foreground">Test Design Style</span>
-                        <PremiumBadge />
-                        {aiEnhanceLoading === "test_design_style" && <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />}
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">A/B test your design — find out if it reads as Club or Corporate, with tips to shift the vibe.</p>
-                      {aiEnhanceMessages.test_design_style && aiTestDesignStyle && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 italic" data-testid="text-test-design-style-status">{aiEnhanceMessages.test_design_style}</p>
-                      )}
-                    </div>
-                    <Switch
-                      checked={aiTestDesignStyle}
-                      onCheckedChange={(checked) => handlePremiumToggle("test_design_style", checked)}
-                      disabled={!!aiEnhanceLoading}
-                      data-testid="switch-test-design-style"
-                    />
-                  </div>
-                </div>
-                <div className="px-4 sm:px-5 py-3 bg-amber-50/50 dark:bg-amber-500/5 border-t border-border/20">
-                  <p className="text-[10px] text-muted-foreground text-center italic">
-                    These features will be powered by external AI services. Your original artwork is always preserved.
-                  </p>
-                </div>
-                </LazyCollapsibleContent>
-              </div>
-              </Collapsible>
-
-              </>)}
 
               <div className="mt-8 pt-6 border-t border-border/40">
                 <div className="text-center">
@@ -1939,7 +1792,13 @@ export default function JobDetails() {
                     <>
                       <p className="text-sm text-muted-foreground flex items-center justify-center gap-2 mb-3">
                         <AlertCircle className="w-4 h-4" />
-                        {prepressSpinnerActive ? "Processing prepress refinement..." : "Please review and confirm all sections above to proceed"}
+                        {proceed.spinning
+                          ? "Preparing artwork..."
+                          : proceed.label === "Choose a bleed method to continue"
+                            ? "Choose a bleed style above. Automatic is already selected, and it counts once the press file is ready."
+                            : prepressSpinnerActive
+                              ? "Processing prepress refinement..."
+                              : "Please review and confirm all sections above to proceed"}
                       </p>
                       <div className="flex items-center justify-center gap-3 mb-4">
                         <span className={`text-xs px-2 py-1 rounded-full ${bleedChecked ? 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}>
@@ -2054,11 +1913,11 @@ export default function JobDetails() {
                   <Button
                     size="lg"
                     className={`gap-2 transition-all duration-300 ${
-                      allReviewsChecked && hasUserSelectedBleed && preCompileReady
+                      !proceed.disabled
                         ? "bg-green-600 hover:bg-green-700 text-white shadow-lg shadow-green-500/20 hover-elevate"
                         : "bg-muted text-muted-foreground cursor-not-allowed"
                     }`}
-                    disabled={!allReviewsChecked || !hasUserSelectedBleed || !preCompileReady}
+                    disabled={proceed.disabled}
                     onClick={() => {
                       setProofChecked(true);
                       setPhase3Confirmed(true);
@@ -2067,7 +1926,7 @@ export default function JobDetails() {
                       const methodLabel = BLEED_METHOD_LABELS[selectedBleedMethod as keyof typeof BLEED_METHOD_LABELS]?.label || selectedBleedMethod;
                       const audit = job.auditResults?.jobAudit;
                       const auditResults = job.auditResults as any;
-                      const dlUrl = compileDownloadUrl || `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
+                      const dlUrl = compileDownloadUrl || pressDownloadHref;
 
                       window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
                         downloadUrl: dlUrl,
@@ -2085,12 +1944,12 @@ export default function JobDetails() {
                     }}
                     data-testid="button-proceed-to-download"
                   >
-                    {(prepressSpinnerActive || !hasUserSelectedBleed || (preCompileState === "compiling")) ? (
-                      <><Loader2 className="w-5 h-5 animate-spin" /> Preparing artwork...</>
-                    ) : !allReviewsChecked ? (
-                      <>Review required to proceed</>
-                    ) : (
+                    {proceed.spinning ? (
+                      <><Loader2 className="w-5 h-5 animate-spin" /> {proceed.label}</>
+                    ) : proceed.label === "Proceed to Download" ? (
                       <>Proceed to Download <ArrowRight className="w-5 h-5" /></>
+                    ) : (
+                      <>{proceed.label}</>
                     )}
                   </Button>
                 </div>
@@ -2126,7 +1985,13 @@ export default function JobDetails() {
                   transition={{ delay: 0.3 }}
                   className="text-3xl font-extrabold font-display mb-3" data-testid="text-phase3-title"
                 >
-                  Your artwork is <span className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-500">print-ready!</span>
+                  {job.auditResults?.pressEngine?.passed === true ? (
+                    <>Your artwork is <span className="text-transparent bg-clip-text bg-gradient-to-r from-green-600 to-emerald-500">print-ready!</span></>
+                  ) : job.auditResults?.pressEngine?.status === "needs-attention" ? (
+                    <>Needs attention</>
+                  ) : (
+                    <>Review the press check before printing.</>
+                  )}
                 </motion.h2>
               </div>
 
@@ -2236,8 +2101,8 @@ export default function JobDetails() {
                   {preCompileReady ? (
                     <>
                       <a
-                        href={`/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`}
-                        download="Print Ready Artwork.zip"
+                        href={pressDownloadHref}
+                        download={pressDownloadName}
                         target="_blank"
                         rel="noopener noreferrer"
                         onClick={() => { setHasDownloaded(true); }}
@@ -2338,15 +2203,15 @@ export default function JobDetails() {
                     </>
                   ) : (
                     <a
-                      href={hasUserSelectedBleed ? `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}` : "#"}
-                      download="Print Ready Artwork.zip"
+                      href={(hasUserSelectedBleed || quickPressReady) ? pressDownloadHref : "#"}
+                      download={pressDownloadName}
                       target="_blank"
                       rel="noopener noreferrer"
                       onClick={(e) => {
-                        if (!hasUserSelectedBleed) { e.preventDefault(); return; }
+                        if (!hasUserSelectedBleed && !quickPressReady) { e.preventDefault(); return; }
                         setHasDownloaded(true);
                       }}
-                      className={`w-full bg-green-600 hover:bg-green-700 text-white gap-2 shadow-md shadow-green-500/20 text-base py-5 inline-flex items-center justify-center rounded-md font-medium transition-colors ${!hasUserSelectedBleed ? 'opacity-50 pointer-events-none' : ''}`}
+                      className={`w-full bg-green-600 hover:bg-green-700 text-white gap-2 shadow-md shadow-green-500/20 text-base py-5 inline-flex items-center justify-center rounded-md font-medium transition-colors ${!hasUserSelectedBleed && !quickPressReady ? 'opacity-50 pointer-events-none' : ''}`}
                       data-testid="button-download-print-ready"
                     >
                       <Download className="w-5 h-5 mr-2" /> Download Print Ready Artwork
@@ -2479,7 +2344,7 @@ export default function JobDetails() {
 
 
 
-function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading }: {
+function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading, colourBorderPreview }: {
   bleedPreview: BleedPreviewData | null;
   bleedPreviewLoading: boolean;
   bleedPreviewError: string | null;
@@ -2488,7 +2353,50 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
   currentBleedPage: BleedPreviewPage | undefined;
   loadBleedPreview: () => void;
   enhancementLoading?: string | null;
+  colourBorderPreview?: { url: string; trimW: number; trimH: number; bleedMm: number } | null;
 }) {
+  if (colourBorderPreview) {
+    return (
+      <div className="space-y-3" data-testid="section-colour-border-preview">
+        <div className="relative bg-gray-900 rounded-xl border-2 border-red-500/30 overflow-hidden" data-testid="bleed-preview-image-container">
+          <img
+            src={colourBorderPreview.url}
+            alt="Colour border bleed preview"
+            className="w-full h-auto max-h-[500px] object-contain"
+            data-testid="img-colour-border-preview"
+          />
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Trim Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-trim-size">
+              {colourBorderPreview.trimW} × {colourBorderPreview.trimH}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Total Size</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-total-size">
+              {colourBorderPreview.trimW + colourBorderPreview.bleedMm * 2} × {colourBorderPreview.trimH + colourBorderPreview.bleedMm * 2}mm
+            </div>
+          </div>
+          <div className="bg-muted/40 rounded-lg p-2.5 border border-border/40 text-center">
+            <div className="text-[10px] text-muted-foreground mb-0.5">Bleed</div>
+            <div className="text-xs font-mono font-bold text-foreground" data-testid="text-bleed-amount">
+              {colourBorderPreview.bleedMm}mm
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] text-muted-foreground justify-center">
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-0.5 bg-red-500 inline-block rounded"></span> Cut line
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-2 inline-block rounded border border-black/10" style={{ backgroundColor: "currentColor" }}></span> Colour border
+          </span>
+        </div>
+      </div>
+    );
+  }
   if (bleedPreviewLoading) {
     return (
       <div className="flex flex-col items-center gap-3 py-8">
@@ -2503,7 +2411,7 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
       <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm text-red-700 dark:text-red-400">
         <AlertCircle className="w-5 h-5 shrink-0" />
         <span>{bleedPreviewError}</span>
-        <Button variant="ghost" size="sm" onClick={loadBleedPreview} className="ml-auto text-xs">Retry</Button>
+        <Button variant="ghost" size="sm" onClick={() => loadBleedPreview()} className="ml-auto text-xs" data-testid="button-retry-bleed-preview">Retry</Button>
       </div>
     );
   }
@@ -2513,7 +2421,7 @@ function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewErro
       <div className="text-center py-8">
         <Scissors className="w-10 h-10 text-muted-foreground/40 mx-auto mb-3" />
         <p className="text-sm text-muted-foreground mb-3">Preview showing trim/cut lines and bleed boundaries.</p>
-        <Button onClick={loadBleedPreview} className="hover-elevate" data-testid="button-generate-bleed-preview">
+        <Button onClick={() => loadBleedPreview()} className="hover-elevate" data-testid="button-generate-bleed-preview">
           <Eye className="w-4 h-4 mr-2" /> Generate Bleed View
         </Button>
       </div>
@@ -2848,18 +2756,33 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
   selected: string;
   onSelect: (method: string) => void;
   loading: boolean;
+  colourBorder: ColourBorderChoice;
+  onColourBorderChange: (next: ColourBorderChoice) => void;
+  pressEngine?: {
+    passed?: boolean;
+    status?: string;
+    headline?: string;
+    reason?: string;
+    fix?: string;
+    rescue?: { note?: string };
+    edges?: Array<{ side: string; note: string }>;
+  } | null;
+  beforeUrl?: string | null;
+  afterUrl?: string | null;
+  pressDownloadHref?: string | null;
 }) {
-  /** Always list every registered strategy; variant paths may be partial if generation skipped a tile. */
-  const methods = [...BLEED_STRATEGY_IDS];
-  const activeMethod = selected === "auto" ? recommended : selected;
+  /** Automatic is the default. The older styles stay as manual overrides. */
+  const methods = ["auto", ...BLEED_STRATEGY_IDS];
+  const activeMethod = selected || "auto";
   const activeInfo = activeMethod ? BLEED_METHOD_LABELS[activeMethod as keyof typeof BLEED_METHOD_LABELS] : null;
+  const engineAttention = pressEngine?.status === "needs-attention";
 
   if (methods.length === 0) return null;
 
@@ -2886,10 +2809,10 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
         >
           {methods.map((method) => {
             const info = BLEED_METHOD_LABELS[method as keyof typeof BLEED_METHOD_LABELS];
-            const isRecommended = method === recommended;
+            const isRecommended = method === "auto" || method === recommended;
             return (
               <option key={method} value={method} data-testid={`option-bleed-method-${method}`}>
-                {info?.label ?? method}{isRecommended ? " (Recommended)" : ""}
+                {info?.label ?? method}{method === "auto" ? "" : isRecommended && method === recommended ? " (manual)" : ""}
               </option>
             );
           })}
@@ -2899,10 +2822,47 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
             {activeInfo.description}
           </p>
         )}
-        {activeMethod && (
+        {activeMethod === "auto" && (
+          <div className="rounded-lg border border-border/60 bg-white dark:bg-background p-3 space-y-2" data-testid="panel-press-ready">
+            <p className={`text-sm font-semibold ${engineAttention ? "text-amber-700" : "text-green-700"}`} data-testid="text-press-ready-headline">
+              {pressReadyHeadline(pressEngine)}
+            </p>
+            {pressDownloadHref && (
+              <a href={pressDownloadHref} className="inline-flex text-sm font-semibold underline" data-testid="link-job-press-download">Download press PDF</a>
+            )}
+            {pressEngine?.reason && (
+              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-reason">{pressEngine.reason} {pressEngine.fix}</p>
+            )}
+            {pressEngine?.rescue?.note && (
+              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-rescue">{pressEngine.rescue.note}</p>
+            )}
+            <ul className="space-y-1" data-testid="list-press-ready-edges">
+              {(pressEngine?.edges || []).map((edge) => (
+                <li key={edge.side} className="text-xs text-foreground">{edge.note}</li>
+              ))}
+            </ul>
+            {(beforeUrl || afterUrl) && (
+              <div className="grid grid-cols-2 gap-2">
+                {beforeUrl && <img src={beforeUrl} alt="Artwork before bleed" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-before" />}
+                {afterUrl && <img src={afterUrl} alt="Artwork with bleed and cut line" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-after" />}
+              </div>
+            )}
+          </div>
+        )}
+        {activeMethod === "colourBorder" && (
+          <ColourBorderPicker value={colourBorder} onChange={onColourBorderChange} disabled={loading} />
+        )}
+        {activeMethod && activeMethod !== "auto" && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
             <div className="aspect-[16/9]">
-              {variants[activeMethod] ? (
+              {activeMethod === "colourBorder" ? (
+              <img
+                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`}
+                alt="Colour border preview"
+                className="w-full h-full object-contain"
+                data-testid="img-bleed-variant-colourBorder"
+              />
+              ) : variants[activeMethod] ? (
               <img
                 src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
                 alt={activeInfo?.label || activeMethod}

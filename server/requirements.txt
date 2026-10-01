@@ -6,9 +6,17 @@ opencv-python-headless>=4.8.0
 PyMuPDF>=1.23.0
 pikepdf>=8.0.0
 Pillow>=10.0.0
+img2pdf>=0.5.0
 reportlab>=4.0.0
 jinja2>=3.1.0
 xhtml2pdf>=0.2.15
 python-dotenv>=1.0.0
 requests>=2.31.0
 google-genai>=2.0.0
+# AI Rebuild local OCR.
+# rapidocr-onnxruntime 1.4.4 declares Requires-Python <3.13, so pip refuses it on
+# Python 3.14. rapidocr 3.x is a py3-none-any wheel. onnxruntime 1.30 publishes
+# Windows cp314 wheels. If this import fails, AI Rebuild still runs and records
+# that local OCR was unavailable, then tries Gemini.
+rapidocr>=3.4,<4
+onnxruntime>=1.24.0

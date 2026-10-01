@@ -17,6 +17,7 @@ Modes:
     -> Crops to (x,y,w,h) then scales to scale_percent%
 """
 
+from artwork_types import is_vector_type
 import sys
 import os
 import json
@@ -29,19 +30,13 @@ PREVIEW_MAX_PX = 1200
 
 
 def find_gs_binary():
-    gs = shutil.which("gs")
-    if gs:
-        return gs
-    import glob
-    matches = glob.glob("/nix/store/*/bin/gs")
-    if matches:
-        return matches[0]
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 def get_image_info(input_path, file_type):
     """Get dimensions and page count for crop UI."""
-    if file_type == "pdf":
+    if is_vector_type(file_type):
         import fitz
         doc = fitz.open(input_path)
         pages = []
@@ -75,7 +70,7 @@ def get_image_info(input_path, file_type):
 
 def generate_preview(input_path, output_path, file_type):
     """Generate a preview image for visual crop selection."""
-    if file_type == "pdf":
+    if is_vector_type(file_type):
         import fitz
         from PIL import Image as PILImage
         doc = fitz.open(input_path)
@@ -131,7 +126,7 @@ def crop_and_scale(input_path, output_path, file_type, x, y, width, height, scal
     """
     scale_percent = max(MIN_SCALE, min(MAX_SCALE, scale_percent))
 
-    if file_type == "pdf":
+    if is_vector_type(file_type):
         return _crop_pdf(input_path, output_path, x, y, width, height, scale_percent)
     else:
         return _crop_image(input_path, output_path, x, y, width, height, scale_percent)

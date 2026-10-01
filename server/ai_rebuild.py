@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+"""Rebuild likely AI-generated raster artwork into press-ready type.
+
+The picture stays a picture. Words found by OCR are removed, the background is
+enlarged to 300 DPI at trim plus the Flyerz 5mm bleed, and the words are put
+back as real vector text in a bundled open-licence font (Liberation Sans).
+
+Replicate is used for inpainting and upscaling only when the account accepts
+the call. A missing token, HTTP 402, or any other failure uses the local
+OpenCV inpaint and Lanczos path. This module never raises out of assess() or
+rebuild(); the print job continues either way.
+
+The existing Press-Ready Engine is not modified. The PDF written here is trim
+plus 5mm bleed with a trim box, so Automatic bleed can keep that ring.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import sys
+import tempfile
+import traceback
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from http_headers import external_headers
+
+BLEED_MM = 5.0
+SAFE_ZONE_MM = 3.0
+TARGET_DPI = 300
+# Same bar as the quick-mode spelling glance. Below this, the word is left alone.
+MIN_WORD_SCORE = 0.55
+# A line of type is wide. A circle or badge is large in both directions.
+BLOB_MIN_SIDE = 0.12
+BLOB_MAX_ASPECT = 2.0
+DOUBTFUL_REASON = (
+    "Some marks did not look like real words, so they were left unchanged. Glance at the picture."
+)
+MAX_LONG_EDGE = 4500
+MM_TO_PT = 72.0 / 25.4
+
+# Official object-removal model. White mask pixels are removed.
+# The old unversioned stability-ai/stable-diffusion-inpainting slug is not an
+# official Replicate model, and its fixed ~512px picture was discarded.
+# https://replicate.com/bria/eraser/versions/2757d1ac2f1291af219f5f10e8ecba15e92e7c05253e2841295f3ba6bff6adc4
+INPAINT_MODEL_OWNER = "bria"
+INPAINT_MODEL_NAME = "eraser"
+INPAINT_MODEL_VERSION = "2757d1ac2f1291af219f5f10e8ecba15e92e7c05253e2841295f3ba6bff6adc4"
+
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_REGULAR = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
+FONT_BOLD = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
+
+EXTRA_META = (
+    "gemini",
+    "google imagen",
+    "imagen",
+    "midjourney",
+    "chatgpt",
+    "openai",
+    "c2pa",
+    "jumbf",
+    "content credentials",
+)
+
+OcrFn = Callable[[np.ndarray], list]
+InpaintFn = Callable[[np.ndarray, np.ndarray], np.ndarray]
+UpscaleFn = Callable[[np.ndarray, int, int], np.ndarray]
+AccountFn = Callable[[], str]
+
+_OCR: Optional[OcrFn] = None
+_INPAINT: Optional[InpaintFn] = None
+_UPSCALE: Optional[UpscaleFn] = None
+_ACCOUNT: Optional[AccountFn] = None
+
+
+def set_providers(
+    ocr: Optional[OcrFn] = None,
+    inpaint: Optional[InpaintFn] = None,
+    upscale: Optional[UpscaleFn] = None,
+    account: Optional[AccountFn] = None,
+) -> None:
+    """Test hooks. Pass None to restore the real reader, local tools, and account check."""
+    global _OCR, _INPAINT, _UPSCALE, _ACCOUNT
+    _OCR = ocr
+    _INPAINT = inpaint
+    _UPSCALE = upscale
+    _ACCOUNT = account
+
+
+def reset_providers() -> None:
+    set_providers(None, None, None, None)
+
+
+def replicate_credit_status() -> str:
+    """ok, none, 402, or error. Never raises."""
+    if _ACCOUNT is not None:
+        try:
+            status = str(_ACCOUNT() or "error")
+        except Exception:
+            return "error"
+        if status in ("ok", "none", "402", "error"):
+            return status
+        return "error"
+    token = (os.environ.get("REPLICATE_API_TOKEN") or "").strip()
+    if not token:
+        return "none"
+    try:
+        req = urllib.request.Request(
+            "https://api.replicate.com/v1/account",
+            headers=external_headers({"Authorization": f"Bearer {token}"}),
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return "ok" if getattr(resp, "status", 200) == 200 else "error"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 402:
+            return "402"
+        return "error"
+    except Exception:
+        return "error"
+
+
+def _credit_note(status: str) -> str:
+    if status == "402":
+        return "Replicate returned 402 (no credit). Local fallback used."
+    if status == "none":
+        return "No Replicate token. Local fallback used."
+    if status != "ok":
+        return "Replicate was not reachable. Local fallback used."
+    return ""
+
+
+def _load_bgr(path: str) -> np.ndarray:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        import pymupdf as fitz
+
+        doc = fitz.open(path)
+        try:
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            return cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+        finally:
+            doc.close()
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("Could not read artwork")
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+        bgr = img[:, :, :3].astype(np.float32)
+        white = np.full_like(bgr, 255.0)
+        return (bgr * alpha + white * (1.0 - alpha)).astype(np.uint8)
+    return img[:, :, :3]
+
+
+def _pdf_has_live_type(path: str) -> bool:
+    if os.path.splitext(path)[1].lower() != ".pdf":
+        return False
+    try:
+        import pymupdf as fitz
+
+        doc = fitz.open(path)
+    except Exception:
+        return False
+    try:
+        if doc.page_count < 1:
+            return False
+        page = doc[0]
+        text = (page.get_text("text") or "").strip()
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            drawings = []
+        return len(text) >= 2 or len(drawings) >= 8
+    finally:
+        doc.close()
+
+
+def _meta_blob(path: str) -> str:
+    parts: list[str] = []
+    try:
+        with Image.open(path) as im:
+            for value in (im.info or {}).values():
+                if isinstance(value, str):
+                    parts.append(value)
+                elif isinstance(value, bytes):
+                    parts.append(value.decode("latin-1", errors="ignore"))
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as handle:
+            parts.append(handle.read(400_000).decode("latin-1", errors="ignore"))
+    except Exception:
+        pass
+    return "\n".join(parts).lower()
+
+
+def _target_pixels(trim_w_mm: float, trim_h_mm: float, bleed_mm: float = BLEED_MM) -> tuple[int, int]:
+    width = int(math.ceil((float(trim_w_mm) + 2.0 * float(bleed_mm)) / 25.4 * TARGET_DPI))
+    height = int(math.ceil((float(trim_h_mm) + 2.0 * float(bleed_mm)) / 25.4 * TARGET_DPI))
+    width = max(32, width)
+    height = max(32, height)
+    long_edge = max(width, height)
+    if long_edge > MAX_LONG_EDGE:
+        scale = MAX_LONG_EDGE / float(long_edge)
+        width = max(32, int(round(width * scale)))
+        height = max(32, int(round(height * scale)))
+    return width, height
+
+
+def effective_dpi(px_w: int, px_h: int, trim_w_mm: float, trim_h_mm: float, bleed_mm: float = BLEED_MM) -> int:
+    width_in = (float(trim_w_mm) + 2.0 * float(bleed_mm)) / 25.4
+    height_in = (float(trim_h_mm) + 2.0 * float(bleed_mm)) / 25.4
+    if width_in <= 0 or height_in <= 0 or px_w <= 0 or px_h <= 0:
+        return 0
+    return int(min(px_w / width_in, px_h / height_in))
+
+
+def assess(path: str, trim_w_mm: float = 148, trim_h_mm: float = 210, bleed_mm: float = BLEED_MM) -> dict:
+    """Flag likely AI raster artwork. A normal photo or a vector PDF is not flagged."""
+    try:
+        return _assess(path, trim_w_mm, trim_h_mm, bleed_mm)
+    except Exception as exc:
+        return {
+            "success": True,
+            "detected": False,
+            "autoRebuild": False,
+            "reasons": [],
+            "message": f"AI artwork check skipped: {str(exc)[:180]}",
+        }
+
+
+def _assess(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> dict:
+    from ai_artwork import detect_ai_artwork
+
+    live_type = _pdf_has_live_type(path)
+    if live_type:
+        return {
+            "success": True,
+            "detected": False,
+            "autoRebuild": False,
+            "rasterOnly": False,
+            "reasons": ["This file already has vector or text layers, so AI Rebuild stays off."],
+            "recommendation": "",
+        }
+    bgr = _load_bgr(path)
+    src_h, src_w = bgr.shape[:2]
+    try:
+        base = detect_ai_artwork(path, bgr)
+    except Exception:
+        base = {
+            "detected": False,
+            "reasons": [],
+            "src_w": src_w,
+            "src_h": src_h,
+        }
+    blob = _meta_blob(path)
+    extra = [phrase for phrase in EXTRA_META if phrase in blob and phrase not in " ".join(base.get("reasons") or []).lower()]
+    reasons = list(base.get("reasons") or [])
+    for phrase in extra:
+        if phrase in ("c2pa", "jumbf", "content credentials"):
+            line = "file has content-credentials metadata"
+        else:
+            line = f"file metadata mentions {phrase}"
+        if line not in reasons:
+            reasons.append(line)
+    dpi_now = effective_dpi(src_w, src_h, trim_w_mm, trim_h_mm, bleed_mm)
+    if dpi_now and dpi_now < TARGET_DPI:
+        reasons.append(f"about {dpi_now} DPI at the print size including 5mm bleed")
+    detected = (not live_type) and bool(
+        base.get("detected")
+        or extra
+        or (base.get("src_w") and dpi_now < 200 and any("AI image size" in r for r in reasons))
+    )
+    if live_type:
+        detected = False
+        reasons = ["This file already has vector or text layers, so AI Rebuild stays off."]
+    elif not detected:
+        reasons = []
+    return {
+        "success": True,
+        "detected": detected,
+        "autoRebuild": detected,
+        "rasterOnly": not live_type,
+        "reasons": reasons,
+        "src_w": int(base.get("src_w") or src_w),
+        "src_h": int(base.get("src_h") or src_h),
+        "effective_dpi": dpi_now,
+        "recommendation": (
+            "This looks like AI-generated artwork. Rebuild is on: words are retyped crisp and the picture is enlarged for the press."
+            if detected
+            else ""
+        ),
+    }
+
+
+def _rapid_blocks(bgr: np.ndarray) -> list:
+    from ocr_reader import local_rows
+
+    result = local_rows(bgr)
+    if not result:
+        return []
+    height, width = bgr.shape[:2]
+    blocks = []
+    for index, item in enumerate(result):
+        box, text, score = item[0], str(item[1] or "").strip(), float(item[2] if len(item) > 2 else 0)
+        if not text:
+            continue
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        bw = max(2.0, x1 - x0)
+        bh = max(2.0, y1 - y0)
+        blocks.append(_block(index, text, x0, y0, bw, bh, width, height, bgr, score))
+    return _space_blocks(blocks, bgr)
+
+
+def _block(index: int, text: str, x: float, y: float, w: float, h: float, width: int, height: int, bgr: np.ndarray, score: float = 1) -> dict:
+    x = max(0.0, min(float(x), width - 1))
+    y = max(0.0, min(float(y), height - 1))
+    w = max(2.0, min(float(w), width - x))
+    h = max(2.0, min(float(h), height - y))
+    return {
+        "id": f"t{index + 1}",
+        "text": text,
+        "bbox": [round(x / width, 4), round(y / height, 4), round(w / width, 4), round(h / height, 4)],
+        "color_hex": _text_hex(bgr, int(x), int(y), int(w), int(h)),
+        "bold": _looks_bold(bgr, int(x), int(y), int(w), int(h)),
+        "score": round(score, 3),
+    }
+
+
+def _text_hex(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> str:
+    roi = bgr[y:y + h, x:x + w]
+    if roi.size == 0:
+        return "#111111"
+    flat = roi.reshape(-1, 3).astype(np.float32)
+    if flat.shape[0] > 2500:
+        flat = flat[:: max(1, flat.shape[0] // 2500)]
+    border = np.concatenate([
+        roi[0, :, :],
+        roi[-1, :, :],
+        roi[:, 0, :],
+        roi[:, -1, :],
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    dist = np.linalg.norm(flat - bg, axis=1)
+    # Antialiased edges sit between the ink and the panel. Keep only the farthest pixels.
+    cutoff = float(np.percentile(dist, 90))
+    ink = flat[dist >= max(cutoff, 18)] if np.any(dist >= 18) else flat
+    colour = np.median(ink, axis=0)
+    rgb = (int(colour[2]), int(colour[1]), int(colour[0]))
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def _word_group_widths(bgr: np.ndarray, bbox: list) -> list:
+    """Pixel widths of words inside one OCR line. Large gaps are the spaces OCR dropped."""
+    height, width = bgr.shape[:2]
+    x, y, bw, bh = [float(v) for v in bbox[:4]]
+    x0 = max(0, int(round(x * width)))
+    y0 = max(0, int(round(y * height)))
+    x1 = min(width, int(round((x + bw) * width)))
+    y1 = min(height, int(round((y + bh) * height)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []
+    roi = bgr[y0:y1, x0:x1]
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    dist = np.linalg.norm(roi.astype(np.float32) - bg, axis=2)
+    columns = (dist > 28).any(axis=0)
+    runs: list = []
+    start = None
+    for index, on in enumerate(columns):
+        if on and start is None:
+            start = index
+        elif not on and start is not None:
+            runs.append([start, index - 1])
+            start = None
+    if start is not None:
+        runs.append([start, len(columns) - 1])
+    merged: list = []
+    for run in runs:
+        if merged and run[0] - merged[-1][1] <= 2:
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+    if len(merged) < 2:
+        return []
+    gaps = [merged[i + 1][0] - merged[i][1] - 1 for i in range(len(merged) - 1)]
+    threshold = max(float(np.median(gaps)) * 2.4, (y1 - y0) * 0.32)
+    groups = [[merged[0][0], merged[0][1]]]
+    for gap, run in zip(gaps, merged[1:]):
+        if gap >= threshold:
+            groups.append([run[0], run[1]])
+        else:
+            groups[-1][1] = run[1]
+    if len(groups) < 2:
+        return []
+    return [group[1] - group[0] + 1 for group in groups]
+
+
+def _allocate_chars(count: int, weights: list) -> list:
+    if count <= 0 or not weights:
+        return []
+    if len(weights) == 1:
+        return [count]
+    total = float(sum(weights)) or 1.0
+    raw = [count * weight / total for weight in weights]
+    base = [int(value) for value in raw]
+    if count >= len(weights):
+        for index, value in enumerate(base):
+            if value <= 0:
+                base[index] = 1
+        while sum(base) > count:
+            largest = max(range(len(base)), key=lambda item: base[item])
+            if base[largest] <= 1:
+                break
+            base[largest] -= 1
+    leftover = count - sum(base)
+    order = sorted(range(len(base)), key=lambda item: raw[item] - int(raw[item]), reverse=True)
+    step = 0
+    while leftover > 0:
+        base[order[step % len(order)]] += 1
+        leftover -= 1
+        step += 1
+    return base
+
+
+def restore_spaces(text: str, bgr: np.ndarray, bbox: list) -> str:
+    """Put back spaces OCR swallowed, using the gaps between glyphs."""
+    compact = "".join(str(text or "").split())
+    if len(compact) < 2:
+        return str(text or "").strip()
+    weights = _word_group_widths(bgr, bbox)
+    if len(weights) < 2:
+        return str(text or "").strip()
+    counts = _allocate_chars(len(compact), weights)
+    if sum(counts) != len(compact) or any(count <= 0 for count in counts):
+        return str(text or "").strip()
+    parts = []
+    cursor = 0
+    for count in counts:
+        parts.append(compact[cursor:cursor + count])
+        cursor += count
+    return " ".join(parts)
+
+
+def _space_blocks(blocks: list, bgr: np.ndarray) -> list:
+    spaced = []
+    for block in blocks:
+        item = dict(block)
+        item["text"] = restore_spaces(str(item.get("text") or ""), bgr, item.get("bbox") or [0, 0, 1, 0.1])
+        if item["text"]:
+            spaced.append(item)
+    return spaced
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", str(text or ""))
+
+
+def _single_character(text: str) -> bool:
+    return len(_alnum(text)) <= 1
+
+
+def _word_like(text: str) -> bool:
+    """A word or a short line, including prices and times such as 50% and 9AM."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return False
+    if re.fullmatch(r"[A-Za-z0-9%'.,!?&/\-:# ]+", raw) is None:
+        return False
+    core = _alnum(raw)
+    letters = sum(1 for ch in core if ch.isalpha())
+    if letters < 2 or len(core) < 2:
+        return False
+    if len(set(core.upper())) == 1:
+        return False
+    return True
+
+
+def _very_large(block: dict) -> bool:
+    box = block.get("bbox") or [0, 0, 0, 0]
+    if len(box) < 4:
+        return False
+    width, height = float(box[2]), float(box[3])
+    shorter = min(width, height)
+    longer = max(width, height)
+    if shorter <= 0:
+        return False
+    return shorter >= BLOB_MIN_SIDE and (longer / shorter) < BLOB_MAX_ASPECT
+
+
+def _low_confidence(block: dict) -> bool:
+    if "score" not in block or block.get("score") is None:
+        return False
+    try:
+        score = float(block.get("score"))
+    except (TypeError, ValueError):
+        return False
+    return score < MIN_WORD_SCORE
+
+
+def block_is_doubtful(block: dict) -> bool:
+    """True when this OCR box must stay as the original pixels."""
+    text = str((block or {}).get("text") or "").strip()
+    if not text:
+        return True
+    return (
+        _single_character(text)
+        or _very_large(block)
+        or _low_confidence(block)
+        or not _word_like(text)
+    )
+
+
+def keep_word_blocks(blocks: list) -> tuple[list, list]:
+    """Split OCR into words we may retype, and marks we must leave alone."""
+    kept: list = []
+    dropped: list = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        if block_is_doubtful(block):
+            dropped.append(block)
+        else:
+            kept.append(block)
+    return kept, dropped
+
+
+def _keep_only_words(blocks: list, note: str) -> tuple[list, str]:
+    kept, dropped = keep_word_blocks(blocks)
+    if dropped:
+        note = f"{note} {DOUBTFUL_REASON}".strip()
+    return kept, note
+
+
+def _looks_bold(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
+    roi = bgr[y:y + h, x:x + w]
+    if roi.size == 0 or h < 8:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _thr, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    if binary.mean() < 8:
+        return False
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    stroke = float(dist.max()) * 2.0
+    return stroke >= max(3.0, h * 0.16)
+
+
+def _gemini_blocks(bgr: np.ndarray) -> tuple[list, str]:
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        return [], ""
+    try:
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return [], "Gemini image encode failed"
+        import base64
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": (
+                        "OCR this artwork. Return JSON {\"blocks\":[{\"text\",\"bbox\":[x,y,w,h] as fractions 0-1, "
+                        "\"color_hex\",\"bold\"}]}. Transcribe the spelling you see. Do not invent words."
+                    )},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(buf.tobytes()).decode("ascii")}},
+                ]
+            }],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        }
+        from gemini_api import gemini_generate_content_url
+
+        req = urllib.request.Request(
+            gemini_generate_content_url(key),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=external_headers({"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        height, width = bgr.shape[:2]
+        blocks = []
+        for index, item in enumerate(parsed.get("blocks") or []):
+            raw = str(item.get("text") or "").strip()
+            if not raw:
+                continue
+            box = item.get("bbox") or [0, 0, 0.2, 0.05]
+            x, y, bw, bh = [float(v) for v in box[:4]]
+            blocks.append(_block(index, raw, x * width, y * height, bw * width, bh * height, width, height, bgr))
+            if item.get("color_hex"):
+                blocks[-1]["color_hex"] = str(item["color_hex"])[:7]
+            if "bold" in item:
+                blocks[-1]["bold"] = bool(item["bold"])
+        return blocks, ""
+    except Exception as exc:
+        return [], str(exc)[:180]
+
+
+def read_text_blocks(bgr: np.ndarray) -> tuple[list, str, str]:
+    """Return blocks, engine name, note. Engine is hook, local, gemini, or none."""
+    if _OCR is not None:
+        try:
+            blocks = _OCR(bgr) or []
+            made = [_normalise_hook_block(b, i, bgr) for i, b in enumerate(blocks)]
+            kept, note = _keep_only_words(_space_blocks(made, bgr), "OCR used the supplied reader.")
+            return kept, "hook", note
+        except Exception as exc:
+            return [], "none", f"OCR reader failed: {str(exc)[:160]}"
+    try:
+        blocks = _rapid_blocks(bgr)
+        if blocks:
+            kept, note = _keep_only_words(blocks, "OCR used RapidOCR on this computer.")
+            return kept, "local", note
+    except Exception as exc:
+        rapid_err = str(exc)[:160]
+    else:
+        rapid_err = ""
+    blocks, gem_err = _gemini_blocks(bgr)
+    if blocks:
+        kept, note = _keep_only_words(_space_blocks(blocks, bgr), "OCR used Gemini because local RapidOCR found no text.")
+        return kept, "gemini", note
+    note = "No text was read."
+    if rapid_err:
+        note = f"Local OCR was not available ({rapid_err})."
+    if gem_err:
+        note = note + f" Gemini: {gem_err}"
+    return [], "none", note
+
+
+def _normalise_hook_block(block: dict, index: int, bgr: np.ndarray) -> dict:
+    height, width = bgr.shape[:2]
+    bbox = block.get("bbox") or [0.1, 0.1, 0.4, 0.1]
+    if max(bbox) > 1.5:
+        x, y, bw, bh = [float(v) for v in bbox[:4]]
+    else:
+        x, y, bw, bh = float(bbox[0]) * width, float(bbox[1]) * height, float(bbox[2]) * width, float(bbox[3]) * height
+    made = _block(index, str(block.get("text") or ""), x, y, bw, bh, width, height, bgr, float(block.get("score") or 1))
+    if block.get("id"):
+        made["id"] = str(block["id"])
+    if block.get("color_hex"):
+        made["color_hex"] = str(block["color_hex"])[:7]
+    if "bold" in block:
+        made["bold"] = bool(block["bold"])
+    return made
+
+
+def _ink_and_background(roi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Median ink colour and the flat colour behind it."""
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    flat = roi.reshape(-1, 3).astype(np.float32)
+    dist = np.linalg.norm(flat - bg, axis=1)
+    cutoff = float(np.percentile(dist, 88))
+    ink_px = flat[dist >= max(cutoff, 20)]
+    ink = np.median(ink_px, axis=0) if ink_px.size else bg
+    return ink, bg
+
+
+def _mask_from_blocks(bgr: np.ndarray, blocks: list) -> np.ndarray:
+    """Glyph pixels only, including the soft edge, then a small dilate.
+
+    The search is the original OCR box plus a few pixels, so a halo that sits
+    just outside the box is still removed. A pixel counts only when it is the
+    ink colour (or a blend toward it), so a border next to the line is left alone.
+    """
+    height, width = bgr.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for block in blocks:
+        x, y, bw, bh = [float(v) for v in block["bbox"][:4]]
+        x0 = max(0, int(round(x * width)))
+        y0 = max(0, int(round(y * height)))
+        x1 = min(width, int(round((x + bw) * width)))
+        y1 = min(height, int(round((y + bh) * height)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        ink, _border_bg = _ink_and_background(bgr[y0:y1, x0:x1])
+        # The box edge often cuts through the letters, so the background colour
+        # is taken from the ring just outside the original glyphs.
+        pad = 14
+        X0 = max(0, x0 - pad)
+        Y0 = max(0, y0 - pad)
+        X1 = min(width, x1 + pad)
+        Y1 = min(height, y1 + pad)
+        ring = np.ones((Y1 - Y0, X1 - X0), dtype=bool)
+        ring[(y0 - Y0):(y1 - Y0), (x0 - X0):(x1 - X0)] = False
+        outer = bgr[Y0:Y1, X0:X1]
+        if ring.any():
+            bg = np.median(outer[ring], axis=0).astype(np.float32)
+        else:
+            bg = _border_bg
+        roi = outer.astype(np.float32)
+        axis = ink - bg
+        rel = roi - bg
+        scale = float(np.dot(axis, axis)) or 1.0
+        # 0 = background colour, 1 = the ink colour. Soft edges sit between them.
+        blend = np.clip((rel * axis).sum(axis=2) / scale, 0.0, 1.0)
+        closest = bg + blend[..., None] * axis
+        residual = np.linalg.norm(roi - closest, axis=2)
+        glyph = ((residual < 28) & (blend > 0.06)).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        grown = cv2.dilate(glyph, kernel, iterations=2)
+        # Keep the extra pixels on the same ink, so a border beside the line stays.
+        grown[(residual > 38) & (glyph == 0)] = 0
+        mask[Y0:Y1, X0:X1] = np.maximum(mask[Y0:Y1, X0:X1], grown)
+    return mask
+
+
+def _local_inpaint(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if not mask.any():
+        return bgr
+    return cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
+
+
+def _canvas_placement(src_w: int, src_h: int, target_w: int, target_h: int) -> tuple[float, int, int]:
+    """Where a pixel of the original artwork lands on the print canvas.
+
+    The upscaler may hand back a 2× or 4× picture. Word boxes are still measured
+    on the original, so every enlarge path uses this same mapping.
+    """
+    src_w = max(int(src_w), 1)
+    src_h = max(int(src_h), 1)
+    scale = max(float(target_w) / float(src_w), float(target_h) / float(src_h))
+    new_w = max(int(target_w), int(math.ceil(src_w * scale - 1e-9)))
+    new_h = max(int(target_h), int(math.ceil(src_h * scale - 1e-9)))
+    x0 = max(0, (new_w - int(target_w)) // 2)
+    y0 = max(0, (new_h - int(target_h)) // 2)
+    return new_w / float(src_w), x0, y0
+
+
+def _cover(bgr: np.ndarray, target_w: int, target_h: int, sharpen: bool) -> tuple[np.ndarray, float, int, int]:
+    """Scale with cover (the larger ratio) and crop the overflow. Never stretch or letterbox."""
+    height, width = bgr.shape[:2]
+    scale = max(target_w / float(width), target_h / float(height))
+    new_w = max(target_w, int(math.ceil(width * scale - 1e-9)))
+    new_h = max(target_h, int(math.ceil(height * scale - 1e-9)))
+    resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    if sharpen:
+        from ai_upscale import light_sharpen_bgr
+        resized = light_sharpen_bgr(resized)
+    x0 = max(0, (new_w - target_w) // 2)
+    y0 = max(0, (new_h - target_h) // 2)
+    crop = resized[y0:y0 + target_h, x0:x0 + target_w]
+    if crop.shape[0] != target_h or crop.shape[1] != target_w:
+        fitted = cv2.copyMakeBorder(
+            crop,
+            0,
+            max(0, target_h - crop.shape[0]),
+            0,
+            max(0, target_w - crop.shape[1]),
+            cv2.BORDER_REPLICATE,
+        )
+        crop = fitted[:target_h, :target_w]
+    return crop, new_w / float(width), x0, y0
+
+
+def _cap_ratio(fontfile: Optional[str]) -> float:
+    """Cap height of H as a fraction of the em size."""
+    if not fontfile or not os.path.exists(fontfile):
+        return 0.72
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype(fontfile, 200)
+        box = font.getbbox("H")
+        ratio = (float(box[3]) - float(box[1])) / 200.0
+        if 0.45 < ratio < 0.95:
+            return ratio
+    except Exception:
+        pass
+    return 0.72
+
+
+def _flat_container(bgr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> Optional[tuple]:
+    """Interior of a flat panel the line sits on, inset so type does not touch the border."""
+    height, width = bgr.shape[:2]
+    x0 = max(0, min(width - 1, x0))
+    x1 = max(x0 + 1, min(width, x1))
+    y0 = max(0, min(height - 1, y0))
+    y1 = max(y0 + 1, min(height, y1))
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    _ink, bg = _ink_and_background(roi)
+    border = np.concatenate([
+        roi[0].reshape(-1, 3),
+        roi[-1].reshape(-1, 3),
+        roi[:, 0],
+        roi[:, -1],
+    ]).astype(np.float32)
+    if float(np.std(border)) > 18:
+        return None
+
+    def scan(fixed: int, start: int, step: int, limit: int, horizontal: bool) -> Optional[int]:
+        extent = width if horizontal else height
+        pos = start
+        skipped = 0
+        while 0 <= pos < extent and skipped < 16:
+            pixel = bgr[fixed, pos] if horizontal else bgr[pos, fixed]
+            if float(np.linalg.norm(pixel.astype(np.float32) - bg)) <= 26:
+                break
+            pos += step
+            skipped += 1
+        else:
+            return None
+        clear = 0
+        last = pos
+        while 0 <= pos < extent:
+            pixel = bgr[fixed, pos] if horizontal else bgr[pos, fixed]
+            if float(np.linalg.norm(pixel.astype(np.float32) - bg)) > 26:
+                return last if clear >= 5 else None
+            last = pos
+            clear += 1
+            pos += step
+            if clear >= limit:
+                return None
+        return None
+
+    mid_y = (y0 + y1) // 2
+    mid_x = (x0 + x1) // 2
+    left = scan(mid_y, x0, -1, x0 + 1, True)
+    right = scan(mid_y, x1 - 1, 1, width - x1 + 1, True)
+    top = scan(mid_x, y0, -1, y0 + 1, False)
+    bottom = scan(mid_x, y1 - 1, 1, height - y1 + 1, False)
+    if left is None and right is None and top is None and bottom is None:
+        return None
+    inset = 3
+    box = (
+        0 if left is None else left + inset,
+        0 if top is None else top + inset,
+        width - 1 if right is None else right - inset,
+        height - 1 if bottom is None else bottom - inset,
+    )
+    if box[2] <= box[0] + 4 or box[3] <= box[1] + 4:
+        return None
+    return box
+
+
+def _hex_rgb(value: str) -> tuple[float, float, float]:
+    raw = (value or "#111111").lstrip("#")
+    if len(raw) != 6:
+        raw = "111111"
+    try:
+        r, g, b = int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
+    except Exception:
+        r, g, b = 17, 17, 17
+    return r / 255.0, g / 255.0, b / 255.0
+
+
+def _apply_edits(blocks: list, edits: list) -> list:
+    if not edits:
+        return blocks
+    by_id = {str(item.get("id")): item for item in edits if isinstance(item, dict)}
+    merged = []
+    for block in blocks:
+        edit = by_id.get(str(block.get("id")))
+        if edit and "text" in edit:
+            block = dict(block)
+            block["text"] = str(edit.get("text") or "")
+        if str(block.get("text") or "").strip():
+            merged.append(block)
+    known = {str(block.get("id")) for block in blocks}
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        if str(edit.get("id")) in known:
+            continue
+        text = str(edit.get("text") or "").strip()
+        if text:
+            merged.append(edit)
+    return merged
+
+
+def _write_preview(path: str, bgr: np.ndarray, max_px: int = 900) -> None:
+    height, width = bgr.shape[:2]
+    long_edge = max(height, width, 1)
+    if long_edge > max_px:
+        scale = max_px / float(long_edge)
+        bgr = cv2.resize(
+            bgr,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(path, format="PNG", dpi=(TARGET_DPI, TARGET_DPI))
+
+
+def _page_rect(px: float, py: float, pw: float, ph: float, canvas_w: int, canvas_h: int, media_w: float, media_h: float):
+    import pymupdf as fitz
+    return fitz.Rect(
+        px / canvas_w * media_w,
+        py / canvas_h * media_h,
+        (px + pw) / canvas_w * media_w,
+        (py + ph) / canvas_h * media_h,
+    )
+
+
+def _fit_line(face, text, rect, media_w, media_h, src_w, src_h, scale, off_x, off_y, canvas_w, canvas_h, source_bgr, x, y, bw, bh, fontfile):
+    """Match the OCR cap height, then keep the line no wider than that box.
+
+    The line also stays inside the 3 mm safe zone and inside a flat panel when
+    the original words sat on one.
+    """
+    import pymupdf as fitz
+
+    cap = _cap_ratio(fontfile)
+    size = max(4.0, rect.height / cap)
+    natural = face.text_length(text, fontsize=size) if face is not None else rect.width
+    safe_pt = (BLEED_MM + SAFE_ZONE_MM) * MM_TO_PT
+    safe = fitz.Rect(safe_pt, safe_pt, media_w - safe_pt, media_h - safe_pt)
+    allowed = rect & safe
+    if source_bgr is not None:
+        sx0 = int(round(x * src_w))
+        sy0 = int(round(y * src_h))
+        sx1 = int(round((x + bw) * src_w))
+        sy1 = int(round((y + bh) * src_h))
+        container = _flat_container(source_bgr, sx0, sy0, sx1, sy1)
+        if container is not None:
+            cx0 = container[0] * scale - off_x
+            cy0 = container[1] * scale - off_y
+            cw = (container[2] - container[0]) * scale
+            ch = (container[3] - container[1]) * scale
+            panel = _page_rect(cx0, cy0, cw, ch, canvas_w, canvas_h, media_w, media_h)
+            clipped = allowed & panel
+            if clipped.width > 4 and clipped.height > 2:
+                allowed = clipped
+    if allowed.width < 2 or allowed.height < 2:
+        allowed = rect & safe if (rect & safe).width > 2 else rect
+    origin_x = max(rect.x0, allowed.x0)
+    baseline = min(rect.y1, allowed.y1)
+    top = max(rect.y0, allowed.y0)
+    if baseline - size * cap < top:
+        size = max(4.0, (baseline - top) / cap)
+        natural = face.text_length(text, fontsize=size) if face is not None else natural
+    max_w = min(rect.width * 1.01, max(1.0, allowed.x1 - origin_x))
+    hscale = 1.0
+    if natural > max_w and natural > 0:
+        hscale = max_w / natural
+    return origin_x, baseline, size, hscale
+
+
+def _typeset(background: np.ndarray, blocks: list, out_pdf: str, trim_w_mm: float, trim_h_mm: float, src_shape: tuple, scale: float, off_x: int, off_y: int, source_bgr: Optional[np.ndarray] = None) -> None:
+    import pymupdf as fitz
+
+    canvas_h, canvas_w = background.shape[:2]
+    src_h, src_w = src_shape[:2]
+    media_w = (float(trim_w_mm) + 2.0 * BLEED_MM) * MM_TO_PT
+    media_h = (float(trim_h_mm) + 2.0 * BLEED_MM) * MM_TO_PT
+    doc = fitz.open()
+    page = doc.new_page(width=media_w, height=media_h)
+    ok, buf = cv2.imencode(".png", background)
+    if not ok:
+        raise RuntimeError("Could not encode the rebuilt background")
+    page.insert_image(page.rect, stream=buf.tobytes())
+    regular = FONT_REGULAR if os.path.exists(FONT_REGULAR) else None
+    bold = FONT_BOLD if os.path.exists(FONT_BOLD) else regular
+    if regular:
+        page.insert_font(fontname="FlyerzSans", fontfile=regular)
+    if bold:
+        page.insert_font(fontname="FlyerzSansBold", fontfile=bold)
+    for block in blocks:
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        x, y, bw, bh = [float(v) for v in block["bbox"][:4]]
+        sx, sy = x * src_w, y * src_h
+        sw, sh = bw * src_w, bh * src_h
+        cx = sx * scale - off_x
+        cy = sy * scale - off_y
+        cw = sw * scale
+        ch = sh * scale
+        # Page coordinates start at the top left, the same way as the pixels.
+        rect = fitz.Rect(
+            cx / canvas_w * media_w,
+            cy / canvas_h * media_h,
+            (cx + cw) / canvas_w * media_w,
+            (cy + ch) / canvas_h * media_h,
+        )
+        if rect.width < 2 or rect.height < 2:
+            continue
+        use_bold = bool(block.get("bold") and bold)
+        fontname = "FlyerzSansBold" if use_bold else "FlyerzSans" if regular else "helv"
+        fontfile = bold if use_bold else regular
+        face = fitz.Font(fontfile=fontfile) if fontfile else None
+        colour = _hex_rgb(str(block.get("color_hex") or "#111111"))
+        origin_x, baseline, size, hscale = _fit_line(
+            face, text, rect, media_w, media_h, src_w, src_h, scale, off_x, off_y,
+            canvas_w, canvas_h, source_bgr, x, y, bw, bh, fontfile,
+        )
+        if hscale < 0.999:
+            page.insert_text(
+                (origin_x, baseline),
+                text,
+                fontname=fontname,
+                fontsize=size,
+                color=colour,
+                morph=(fitz.Point(origin_x, baseline), fitz.Matrix(hscale, 1)),
+            )
+        else:
+            page.insert_text((origin_x, baseline), text, fontname=fontname, fontsize=size, color=colour)
+    bleed_pt = BLEED_MM * MM_TO_PT
+    trim = fitz.Rect(bleed_pt, bleed_pt, media_w - bleed_pt, media_h - bleed_pt)
+    page.set_mediabox(page.rect)
+    page.set_trimbox(trim)
+    page.set_bleedbox(page.rect)
+    page.set_cropbox(page.rect)
+    os.makedirs(os.path.dirname(out_pdf) or ".", exist_ok=True)
+    doc.save(out_pdf, deflate=True, garbage=4)
+    doc.close()
+
+
+def _render_page(pdf_path: str, max_px: int = 900) -> np.ndarray:
+    import pymupdf as fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[0]
+        long_pt = max(page.rect.width, page.rect.height, 1)
+        scale = min(2.0, (max_px / long_pt))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        return cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+    finally:
+        doc.close()
+
+
+def rebuild(path: str, options: Optional[dict] = None) -> dict:
+    """Run OCR, inpaint, upscale, and vector typeset. Always returns a dict."""
+    try:
+        return _rebuild(path, options or {})
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        return {
+            "success": False,
+            "detected": False,
+            "message": f"AI Rebuild could not finish, so the original artwork will be used. {str(exc)[:180]}",
+            "steps": [{"name": "AI Rebuild", "engine": "local", "ok": False, "note": str(exc)[:180]}],
+            "blocks": [],
+            "ocrText": "",
+        }
+
+
+def _remove_text(bgr: np.ndarray, mask: np.ndarray, credit: str) -> tuple[np.ndarray, str, str]:
+    note = _credit_note(credit)
+    if credit == "ok" and mask.any():
+        if _INPAINT is not None:
+            try:
+                filled = _INPAINT(bgr, mask)
+                if filled is not None and getattr(filled, "shape", None) == bgr.shape:
+                    return harmonize_fill(bgr, filled, mask), "replicate", "Text was removed with Replicate inpainting."
+            except Exception as exc:
+                note = f"Replicate inpaint failed ({str(exc)[:120]}). Local fallback used."
+        else:
+            remote, err = _replicate_inpaint(bgr, mask)
+            if remote is not None:
+                return remote, "replicate", "Text was removed with Replicate inpainting (bria/eraser)."
+            note = f"{err} Local fallback used." if err else (note or "Replicate inpaint was not available. Local fallback used.")
+    filled = _local_inpaint(bgr, mask)
+    engine = "local"
+    detail = "Text was removed with OpenCV inpaint on this computer."
+    if note:
+        detail = f"{note} {detail}"
+    return filled, engine, detail
+
+
+def _as_bgr(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] > 3:
+        return image[:, :, :3]
+    return image
+
+
+def _soft_cover(mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Dilate the letter mask and feather the edge so the fill does not sit in a hard hole."""
+    cover = mask[:, :, 0] if mask.ndim == 3 else mask
+    if cover.shape[0] != height or cover.shape[1] != width:
+        cover = cv2.resize(cover, (width, height), interpolation=cv2.INTER_NEAREST)
+    binary = np.where(cover > 16, 255, 0).astype(np.uint8)
+    if not binary.any():
+        return binary
+    radius = max(2, min(7, int(round(min(height, width) * 0.008))))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    sigma = max(1.2, radius * 0.55)
+    return cv2.GaussianBlur(dilated, (0, 0), sigma)
+
+
+def _continued_colour(original: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Low-frequency colour with the letters taken out, so a gradient keeps going."""
+    low = cv2.GaussianBlur(original, (0, 0), 3.2)
+    paint = np.where(hole > 16, 255, 0).astype(np.uint8)
+    if not paint.any():
+        return low
+    return cv2.inpaint(low, paint, 4, cv2.INPAINT_TELEA)
+
+
+def _matched_grain(original: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Grain taken from the ring around the letters and scattered into the hole."""
+    low = cv2.GaussianBlur(original, (0, 0), 1.7)
+    residual = original.astype(np.float32) - low.astype(np.float32)
+    hole_bool = hole > 16
+    residual[hole_bool] = 0
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    wide = cv2.dilate(hole_bool.astype(np.uint8) * 255, kernel, iterations=1) > 0
+    ring = wide & ~hole_bool
+    samples = residual[ring]
+    grain = np.zeros_like(residual)
+    count = int(hole_bool.sum())
+    if samples.shape[0] < 8 or count == 0:
+        return grain
+    rng = np.random.default_rng(7)
+    grain[hole_bool] = samples[rng.integers(0, samples.shape[0], size=count)]
+    softened = cv2.GaussianBlur(grain, (0, 0), 0.45)
+    target = np.std(samples, axis=0)
+    current = np.std(softened[hole_bool], axis=0)
+    scale = target / np.maximum(current, 1e-3)
+    grain[hole_bool] = softened[hole_bool] * scale
+    return grain
+
+
+def harmonize_fill(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Paste a fill back so the hole keeps the local colour and the local grain.
+
+    A smooth eraser result on a noisy gradient leaves a letter-shaped shadow.
+    The edge is feathered, the colour is pulled toward the surrounding picture
+    when the fill disagrees with it, and grain from next to the letters is
+    laid into the hole. Pixels outside that feather stay exactly as they were.
+    """
+    base = _as_bgr(original)
+    paint = _as_bgr(filled)
+    height, width = base.shape[:2]
+    if paint.shape[0] != height or paint.shape[1] != width:
+        paint = cv2.resize(paint, (width, height), interpolation=cv2.INTER_LANCZOS4)
+    soft = _soft_cover(mask, height, width)
+    if soft is None or not soft.any():
+        return base.copy()
+    local = _continued_colour(base, soft).astype(np.float32)
+    model = cv2.GaussianBlur(paint, (0, 0), 1.1).astype(np.float32)
+    delta = np.linalg.norm(model - local, axis=2)
+    trust = np.clip(1.0 - (delta - 8.0) / 36.0, 0.0, 1.0)
+    colour = model * trust[..., None] + local * (1.0 - trust[..., None])
+    painted = np.clip(colour + _matched_grain(base, soft), 0, 255)
+    alpha = (soft.astype(np.float32) / 255.0)[..., None]
+    out = np.clip(np.rint(base.astype(np.float32) * (1.0 - alpha) + painted * alpha), 0, 255).astype(np.uint8)
+    out[soft == 0] = base[soft == 0]
+    return out
+
+
+def composite_inpaint(original: np.ndarray, filled: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Scale a model picture back to the artwork and keep only the masked area.
+
+    The model often returns a different size. Unmasked pixels outside the
+    feather stay exact. The hole is blended so it does not show a hard edge.
+    """
+    return harmonize_fill(original, filled, mask)
+
+
+def _replicate_inpaint(bgr: np.ndarray, mask: np.ndarray) -> tuple[Optional[np.ndarray], str]:
+    folder = ""
+    try:
+        from ai_enhancements import _call_replicate, _to_data_uri
+
+        folder = tempfile.mkdtemp(prefix="ai-rebuild-inpaint-")
+        image_path = os.path.join(folder, "image.png")
+        mask_path = os.path.join(folder, "mask.png")
+        cv2.imwrite(image_path, bgr)
+        cv2.imwrite(mask_path, mask)
+        out, err = _call_replicate(
+            "ai_rebuild_inpaint",
+            INPAINT_MODEL_OWNER,
+            INPAINT_MODEL_NAME,
+            {
+                "image": _to_data_uri(image_path),
+                "mask": _to_data_uri(mask_path),
+                "preserve_alpha": False,
+                "content_moderation": False,
+            },
+            version=INPAINT_MODEL_VERSION,
+        )
+        if err or not out or not os.path.exists(str(out)):
+            return None, err or "Replicate inpaint was not available."
+        loaded = cv2.imread(str(out), cv2.IMREAD_COLOR)
+        if loaded is None:
+            return None, "Replicate inpaint returned an unreadable image."
+        return composite_inpaint(bgr, loaded, mask), ""
+    except Exception as exc:
+        return None, f"Replicate inpaint failed ({str(exc)[:180]})."
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def _enlarge(clean: np.ndarray, target_w: int, target_h: int, credit: str) -> tuple[np.ndarray, str, str, float, int, int]:
+    note = _credit_note(credit)
+    # Word boxes are on the picture before any upscaler. Fit that picture, not
+    # the 4× result, or the type lands at a quarter of the size in the corner.
+    place_scale, place_x, place_y = _canvas_placement(clean.shape[1], clean.shape[0], target_w, target_h)
+    if credit == "ok":
+        if _UPSCALE is not None:
+            try:
+                bigger = _UPSCALE(clean, target_w, target_h)
+                if bigger is not None:
+                    fitted, _scale, _x0, _y0 = _cover(bigger, target_w, target_h, sharpen=False)
+                    return fitted, "replicate", "Background enlarged with the Replicate upscaler.", place_scale, place_x, place_y
+            except Exception as exc:
+                note = f"Replicate upscale failed ({str(exc)[:120]}). Local fallback used."
+        else:
+            remote, err = _replicate_upscale(clean, target_w, target_h)
+            if remote is not None:
+                fitted, _scale, _x0, _y0 = _cover(remote, target_w, target_h, sharpen=False)
+                return fitted, "replicate", "Background enlarged with the Replicate upscaler.", place_scale, place_x, place_y
+            note = f"{err} Local fallback used." if err else (note or "Replicate upscale was not available. Local fallback used.")
+    fitted, _scale, _x0, _y0 = _cover(clean, target_w, target_h, sharpen=True)
+    detail = "Background enlarged with Lanczos and a light sharpen on this computer."
+    if note:
+        detail = f"{note} {detail}"
+    return fitted, "local", detail, place_scale, place_x, place_y
+
+
+def _replicate_upscale(bgr: np.ndarray, target_w: int, target_h: int) -> tuple[Optional[np.ndarray], str]:
+    folder = ""
+    try:
+        from ai_enhancements import _call_replicate, _to_data_uri
+        from ai_upscale import UPSCALE_MODEL_NAME, UPSCALE_MODEL_OWNER, UPSCALE_MODEL_VERSION
+
+        folder = tempfile.mkdtemp(prefix="ai-rebuild-upscale-")
+        image_path = os.path.join(folder, "image.png")
+        cv2.imwrite(image_path, bgr)
+        scale = 2 if max(target_w / max(bgr.shape[1], 1), target_h / max(bgr.shape[0], 1)) <= 2.2 else 4
+        out, err = _call_replicate(
+            "ai_rebuild_upscale",
+            UPSCALE_MODEL_OWNER,
+            UPSCALE_MODEL_NAME,
+            {"image": _to_data_uri(image_path), "scale": scale, "face_enhance": False},
+            version=UPSCALE_MODEL_VERSION,
+        )
+        if err or not out or not os.path.exists(str(out)):
+            return None, err or "Replicate upscale was not available."
+        loaded = cv2.imread(str(out), cv2.IMREAD_COLOR)
+        if loaded is None:
+            return None, "Replicate upscale returned an unreadable image."
+        return loaded, ""
+    except Exception as exc:
+        return None, f"Replicate upscale failed ({str(exc)[:180]})."
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def _rebuild(path: str, options: dict) -> dict:
+    trim_w = float(options.get("trim_w_mm") or 148)
+    trim_h = float(options.get("trim_h_mm") or 210)
+    verdict = assess(path, trim_w, trim_h, BLEED_MM)
+    if options.get("force") is not True and not verdict.get("detected") and not options.get("blocks"):
+        return {
+            "success": True,
+            "detected": False,
+            "skipped": False,
+            "message": "This artwork was not rebuilt because it does not look like an AI raster.",
+            "steps": [],
+            "blocks": [],
+            "ocrText": "",
+            "reasons": verdict.get("reasons") or [],
+        }
+
+    source = _load_bgr(path)
+    credit = replicate_credit_status()
+    steps: list[dict] = []
+    edits = options.get("blocks") if isinstance(options.get("blocks"), list) else None
+    clean_path = options.get("clean_path") or ""
+
+    if edits and clean_path and os.path.exists(clean_path):
+        clean = _load_bgr(clean_path)
+        # Edits reuse the already cleaned full-page background. It is already at print size.
+        blocks = []
+        for index, item in enumerate(edits):
+            if not isinstance(item, dict):
+                continue
+            made = dict(item)
+            made.setdefault("id", f"t{index + 1}")
+            blocks.append(made)
+        steps.append({"name": "OCR", "engine": "review", "ok": True, "note": "Staff spelling was used. OCR was not run again."})
+        steps.append({"name": "Remove text", "engine": "review", "ok": True, "note": "The cleaned background from the last rebuild was kept."})
+        background = clean
+        if background.shape[1] != _target_pixels(trim_w, trim_h)[0] or background.shape[0] != _target_pixels(trim_w, trim_h)[1]:
+            background, _scale, _x0, _y0 = _cover(clean, *_target_pixels(trim_w, trim_h), sharpen=False)
+        scale = background.shape[1] / float(source.shape[1])
+        off_x = 0
+        off_y = 0
+        # Blocks are fractions of the original. Cover-fit them onto the print canvas.
+        fitted, scale, off_x, off_y = _cover(source, background.shape[1], background.shape[0], sharpen=False)
+        del fitted
+        up_engine = "review"
+        steps.append({"name": "Upscale", "engine": "review", "ok": True, "note": "Print-size background kept from the last rebuild."})
+        doubtful = False
+    else:
+        blocks, ocr_engine, ocr_note = read_text_blocks(source)
+        doubtful = DOUBTFUL_REASON in (ocr_note or "")
+        blocks = _apply_edits(blocks, edits or [])
+        steps.append({"name": "OCR", "engine": "local" if ocr_engine in ("local", "hook") else ocr_engine, "ok": True, "note": ocr_note})
+        if options.get("opt_in"):
+            from rebuild_policy import retype_refusal
+
+            refused = retype_refusal(blocks, source)
+            if refused:
+                return {
+                    "success": False,
+                    "detected": True,
+                    "refused": True,
+                    "discarded": True,
+                    "pdfPath": "",
+                    "blocks": blocks,
+                    "steps": steps,
+                    "reasons": refused,
+                    "message": refused[0],
+                    "note": " ".join(refused),
+                }
+        mask = _mask_from_blocks(source, blocks)
+        clean, inpaint_engine, inpaint_note = _remove_text(source, mask, credit)
+        steps.append({"name": "Remove text", "engine": inpaint_engine, "ok": True, "note": inpaint_note})
+        target_w, target_h = _target_pixels(trim_w, trim_h)
+        background, up_engine, up_note, scale, off_x, off_y = _enlarge(clean, target_w, target_h, credit)
+        steps.append({"name": "Upscale", "engine": up_engine, "ok": True, "note": up_note})
+        if options.get("clean_path"):
+            _write_preview(options["clean_path"], background, max_px=max(background.shape[:2]))
+
+    out_pdf = options.get("output_pdf") or os.path.join(tempfile.gettempdir(), "ai-rebuild.pdf")
+    _typeset(background, blocks, out_pdf, trim_w, trim_h, source.shape, scale, off_x, off_y, source)
+    font_note = "Words were typeset with bundled Liberation Sans." if os.path.exists(FONT_REGULAR) else "Words were typeset with a built-in font."
+    steps.append({"name": "Retypeset", "engine": "local", "ok": True, "note": font_note})
+
+    before_path = options.get("before_path") or ""
+    after_path = options.get("after_path") or ""
+    if before_path:
+        _write_preview(before_path, source)
+    rendered_page = _render_page(out_pdf) if os.path.exists(out_pdf) else None
+    if after_path and rendered_page is not None:
+        _write_preview(after_path, rendered_page)
+    if options.get("opt_in") and rendered_page is not None:
+        from rebuild_policy import design_damage_reason
+
+        baseline, _base_scale, _base_x, _base_y = _cover(source, background.shape[1], background.shape[0], sharpen=False)
+        mapped = []
+        src_h, src_w = source.shape[:2]
+        canvas_h, canvas_w = background.shape[:2]
+        for block in blocks:
+            box = block.get("bbox") or [0, 0, 0, 0]
+            x, y, bw, bh = [float(v) for v in box[:4]]
+            cx = x * src_w * scale - off_x
+            cy = y * src_h * scale - off_y
+            cw = bw * src_w * scale
+            ch = bh * src_h * scale
+            mapped.append({
+                **block,
+                "bbox": [cx / canvas_w, cy / canvas_h, cw / canvas_w, ch / canvas_h],
+            })
+        compared = rendered_page
+        if compared.shape[0] != canvas_h or compared.shape[1] != canvas_w:
+            compared = cv2.resize(compared, (canvas_w, canvas_h), interpolation=cv2.INTER_AREA)
+        damage = design_damage_reason(baseline, compared, mapped)
+        if damage:
+            try:
+                os.remove(out_pdf)
+            except OSError:
+                pass
+            return {
+                "success": False,
+                "detected": True,
+                "refused": True,
+                "discarded": True,
+                "damaged": True,
+                "pdfPath": "",
+                "blocks": blocks,
+                "steps": steps,
+                "reasons": [damage],
+                "message": damage,
+                "note": damage,
+            }
+
+    ocr_text = " | ".join(str(block.get("text") or "").strip() for block in blocks if str(block.get("text") or "").strip())
+    engines = ", ".join(f"{step['name']} {step['engine']}" for step in steps)
+    return {
+        "success": True,
+        "detected": True,
+        "autoRebuild": True,
+        "skipped": False,
+        "pdfPath": out_pdf,
+        "blocks": blocks,
+        "ocrText": ocr_text,
+        "steps": steps,
+        "reasons": verdict.get("reasons") or [],
+        "recommendation": verdict.get("recommendation") or "",
+        "effective_dpi": effective_dpi(background.shape[1], background.shape[0], trim_w, trim_h, BLEED_MM),
+        "src_w": int(source.shape[1]),
+        "src_h": int(source.shape[0]),
+        "out_w": int(background.shape[1]),
+        "out_h": int(background.shape[0]),
+        "bleed_mm": BLEED_MM,
+        "replicate": credit,
+        "message": f"AI Rebuild finished. {engines}.",
+        "note": f"AI Rebuild. {engines}. Text: {ocr_text or '(none)'}.",
+        "doubtful": doubtful,
+        "doubtfulReason": DOUBTFUL_REASON if doubtful else "",
+    }
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        print(json.dumps({"success": False, "message": "Usage: ai_rebuild.py <assess|rebuild> <image> [options_json]"}))
+        return
+    action = sys.argv[1]
+    path = sys.argv[2]
+    options = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
+    if action == "assess":
+        result = assess(path, float(options.get("trim_w_mm", 148)), float(options.get("trim_h_mm", 210)))
+    elif action == "rebuild":
+        result = rebuild(path, options)
+    else:
+        result = {"success": False, "message": f"Unknown action: {action}"}
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

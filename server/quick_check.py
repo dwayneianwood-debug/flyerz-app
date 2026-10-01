@@ -27,17 +27,23 @@ import fitz  # PyMuPDF
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pdf_geometry_sanitize import sanitize_pdf_geometry_inplace
+from illustrator_intake import illustrator_audit_checks
+from artwork_types import is_illustrator_type, is_vector_type
+from vector_resolution import placed_raster_samples
+
+
+def _pdf_like(file_type):
+    """PDF, and Illustrator/EPS files that have already been normalised to PDF bytes."""
+    return is_vector_type(file_type)
+
+
+def _illustrator_source(file_type):
+    return is_illustrator_type(file_type)
 
 
 def find_gs_binary():
-    gs_path = shutil.which("gs")
-    if gs_path:
-        return gs_path
-    nix_matches = globmod.glob("/nix/store/*/bin/gs")
-    for p in sorted(nix_matches, reverse=True):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 GS_BIN = find_gs_binary()
 BLEED_TARGET_MM = 5.0
@@ -52,23 +58,67 @@ def _px_to_mm(px_val, dpi):
     return round(px_val * 25.4 / dpi, 2)
 
 
+def _dpi_from_pil(img):
+    try:
+        dpi_info = img.info.get("dpi")
+        if dpi_info:
+            return float(max(dpi_info))
+        exif_data = img._getexif() if hasattr(img, '_getexif') and img._getexif() else {}
+        if exif_data:
+            x_res = exif_data.get(282)
+            if x_res:
+                if hasattr(x_res, 'numerator'):
+                    return float(x_res.numerator / x_res.denominator)
+                return float(x_res)
+    except Exception:
+        pass
+    return 72.0
+
+
 def detect_dpi_from_image(img_path):
     try:
         from PIL import Image
         with Image.open(img_path) as img:
-            dpi_info = img.info.get("dpi")
-            if dpi_info:
-                return float(max(dpi_info))
-            exif_data = img._getexif() if hasattr(img, '_getexif') and img._getexif() else {}
-            if exif_data:
-                x_res = exif_data.get(282)
-                if x_res:
-                    if hasattr(x_res, 'numerator'):
-                        return float(x_res.numerator / x_res.denominator)
-                    return float(x_res)
+            return _dpi_from_pil(img)
     except Exception:
         pass
     return 72.0
+
+
+def _alpha_issue_from_pil(img):
+    """Same wording as the transparency check, from an image that is already open."""
+    if img.mode not in ("RGBA", "LA", "PA"):
+        return ""
+    alpha = np.array(img.split()[-1])
+    if not np.any(alpha < 255):
+        return ""
+    non_opaque = int(np.sum(alpha < 255))
+    total = alpha.size
+    pct = round(non_opaque / total * 100, 1)
+    return f"Image has alpha channel with {pct}% semi-transparent pixels"
+
+
+def _write_list_thumb(img_bgr):
+    dest = os.environ.get("FLYERZ_THUMB_PATH", "").strip()
+    if not dest or img_bgr is None:
+        return
+    try:
+        height, width = img_bgr.shape[:2]
+        longest = max(height, width, 1)
+        thumb = img_bgr
+        if longest > 320:
+            scale = 320.0 / float(longest)
+            thumb = cv2.resize(
+                img_bgr,
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        folder = os.path.dirname(dest)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        cv2.imwrite(dest, thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+    except Exception as exc:
+        sys.stderr.write(f"[FAI] Thumbnail skipped: {exc}\n")
 
 
 def detect_artwork_size(doc, img_bgr, dpi, file_type):
@@ -87,7 +137,7 @@ def detect_artwork_size(doc, img_bgr, dpi, file_type):
         "document_height_mm": 0,
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         doc_w = round(media.width * 25.4 / 72, 1)
@@ -196,7 +246,7 @@ def check_bleed(doc, img_bgr, dpi, file_type):
         "severity": "CRITICAL"
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         try:
@@ -229,12 +279,21 @@ def check_bleed(doc, img_bgr, dpi, file_type):
         else:
             w_mm = round(media.width * 25.4 / 72, 1)
             h_mm = round(media.height * 25.4 / 72, 1)
-            result["message"] = f"No TrimBox defined — cannot verify bleed. Document is {w_mm} x {h_mm}mm."
-            result["details"] = (
-                f"The PDF has no TrimBox set. This means the artwork boundary is unknown. "
-                f"For proper bleed: keep actual content at trim size, extend backgrounds {BLEED_TARGET_MM}mm outward, "
-                f"and center the artwork on the page."
-            )
+            if _illustrator_source(file_type):
+                result["message"] = (
+                    f"No TrimBox on the artboard — cannot verify bleed. Artboard is {w_mm} x {h_mm}mm."
+                )
+                result["details"] = (
+                    f"The artboard has no bleed. Extend the background {BLEED_TARGET_MM}mm beyond the artboard "
+                    f"on all sides in Illustrator (File > Document Setup > Bleed), then save again."
+                )
+            else:
+                result["message"] = f"No TrimBox defined — cannot verify bleed. Document is {w_mm} x {h_mm}mm."
+                result["details"] = (
+                    f"The PDF has no TrimBox set. This means the artwork boundary is unknown. "
+                    f"For proper bleed: keep actual content at trim size, extend backgrounds {BLEED_TARGET_MM}mm outward, "
+                    f"and center the artwork on the page."
+                )
     else:
         h, w = img_bgr.shape[:2]
         w_mm = _px_to_mm(w, dpi)
@@ -276,7 +335,7 @@ def check_bleed(doc, img_bgr, dpi, file_type):
     return result
 
 
-def check_cmyk(doc, file_type, input_path):
+def check_cmyk(doc, file_type, input_path, image_mode=None):
     """Check if artwork is in CMYK color space."""
     result = {
         "id": "cmyk",
@@ -288,7 +347,7 @@ def check_cmyk(doc, file_type, input_path):
         "severity": "HIGH"
     }
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         rgb_found = False
         cmyk_found = False
 
@@ -316,6 +375,14 @@ def check_cmyk(doc, file_type, input_path):
             except Exception:
                 pass
 
+            if _illustrator_source(file_type):
+                try:
+                    content = page.read_contents() or b""
+                except Exception:
+                    content = b""
+                if b" rg" in content or b"\nrg" in content or content.startswith(b"rg") or b" RG" in content or b"\nRG" in content:
+                    rgb_found = True
+
         if cmyk_found and not rgb_found:
             result["passed"] = True
             result["message"] = "Artwork is in CMYK color space — print ready"
@@ -328,23 +395,25 @@ def check_cmyk(doc, file_type, input_path):
             result["details"] = "No explicit color space declarations found. Run through CMYK conversion to ensure print fidelity."
     else:
         try:
-            from PIL import Image
-            with Image.open(input_path) as img:
-                mode = img.mode
-                if mode == "CMYK":
-                    result["passed"] = True
-                    result["message"] = "Image is in CMYK color space — print ready"
-                    result["severity"] = "PASS"
-                else:
-                    result["message"] = f"Image is in {mode} color space — must convert to CMYK for litho printing"
-                    result["details"] = f"Current mode: {mode}. CMYK conversion required for accurate litho color reproduction."
+            mode = image_mode
+            if not mode:
+                from PIL import Image
+                with Image.open(input_path) as img:
+                    mode = img.mode
+            if mode == "CMYK":
+                result["passed"] = True
+                result["message"] = "Image is in CMYK color space — print ready"
+                result["severity"] = "PASS"
+            else:
+                result["message"] = f"Image is in {mode} color space — must convert to CMYK for litho printing"
+                result["details"] = f"Current mode: {mode}. CMYK conversion required for accurate litho color reproduction."
         except Exception as e:
             result["message"] = f"Could not determine color space: {str(e)}"
 
     return result
 
 
-def check_transparency(doc, file_type, input_path):
+def check_transparency(doc, file_type, input_path, alpha_issue=None):
     """Check for transparency, lenses, and drop shadows."""
     result = {
         "id": "transparency",
@@ -358,7 +427,7 @@ def check_transparency(doc, file_type, input_path):
 
     issues = []
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         for page_num in range(len(doc)):
             page = doc[page_num]
             try:
@@ -386,18 +455,18 @@ def check_transparency(doc, file_type, input_path):
                 except Exception:
                     pass
     else:
-        try:
-            from PIL import Image
-            with Image.open(input_path) as img:
-                if img.mode in ("RGBA", "LA", "PA"):
-                    alpha = np.array(img.split()[-1])
-                    if np.any(alpha < 255):
-                        non_opaque = np.sum(alpha < 255)
-                        total = alpha.size
-                        pct = round(non_opaque / total * 100, 1)
-                        issues.append(f"Image has alpha channel with {pct}% semi-transparent pixels")
-        except Exception:
-            pass
+        if alpha_issue is not None:
+            if alpha_issue:
+                issues.append(alpha_issue)
+        else:
+            try:
+                from PIL import Image
+                with Image.open(input_path) as img:
+                    issue = _alpha_issue_from_pil(img)
+                    if issue:
+                        issues.append(issue)
+            except Exception:
+                pass
 
     if issues:
         result["passed"] = False
@@ -408,13 +477,42 @@ def check_transparency(doc, file_type, input_path):
     return result
 
 
-def check_resolution(doc, img_bgr, dpi, file_type, input_path):
+def _fmt_mm(value):
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def _chosen_trim_mm(target_w_mm, target_h_mm):
+    """Customer print size, when both sides were supplied. Never invent A4."""
+    try:
+        width = float(target_w_mm)
+        height = float(target_h_mm)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0 or width > 3000 or height > 3000:
+        return None
+    return width, height
+
+
+def _raster_pixel_size(input_path, img_bgr):
+    try:
+        from PIL import Image as _PILImg
+        with _PILImg.open(input_path) as _tmp:
+            return _tmp.size
+    except Exception:
+        height, width = img_bgr.shape[:2]
+        return width, height
+
+
+def check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm=None, target_h_mm=None, raster=None):
     """Check if artwork is 300 DPI or higher.
-    
-    For images (JPG/PNG): EXIF metadata DPI is often unreliable — phone cameras
-    (especially iPhones) embed 72 or 144 DPI regardless of actual pixel density.
-    We calculate the effective DPI at a common print size (A4) based on pixel
-    dimensions, which gives a true measure of print quality.
+
+    Raster files are judged against the print size the customer chose.
+    Effective DPI is the lower of the two axes (cover fit): the side that
+    runs out of pixels first. The file's own DPI tag does not override that.
+    When no print size was supplied, the file's DPI tag is used on its own.
+    Vector artwork with no placed images stays resolution-independent.
     """
     result = {
         "id": "resolution",
@@ -428,81 +526,58 @@ def check_resolution(doc, img_bgr, dpi, file_type, input_path):
 
     effective_dpi = dpi
     dpi_sources = []
+    size_label = ""
 
-    if file_type == "pdf" and doc is not None:
-        page = doc[0]
-        images = page.get_images(full=True)
-        min_img_dpi = 999999
-
-        for img_info in images:
-            img_xref = img_info[0]
-            try:
-                base_img = doc.extract_image(img_xref)
-                if base_img:
-                    img_w = base_img.get("width", 0)
-                    img_h = base_img.get("height", 0)
-
-                    page_w_pt = page.rect.width
-                    page_h_pt = page.rect.height
-
-                    if page_w_pt > 0 and img_w > 0:
-                        img_dpi_x = img_w / (page_w_pt / 72)
-                        img_dpi_y = img_h / (page_h_pt / 72)
-                        img_dpi = min(img_dpi_x, img_dpi_y)
-                        min_img_dpi = min(min_img_dpi, img_dpi)
-                        dpi_sources.append(f"Embedded image: {img_w}x{img_h}px = ~{img_dpi:.0f} DPI")
-            except Exception:
-                pass
-
-        if min_img_dpi < 999999:
-            effective_dpi = min_img_dpi
-        else:
-            effective_dpi = 300
-            dpi_sources.append("Vector PDF — resolution independent (300+ DPI equivalent)")
+    if _pdf_like(file_type) and doc is not None:
+        samples = placed_raster_samples(doc)
+        if not samples:
+            result["passed"] = True
+            result["message"] = "Vector artwork, resolution independent"
+            result["details"] = "No placed raster images. Vector paths do not have a pixel resolution."
+            result["severity"] = "PASS"
+            return result
+        worst = min(samples, key=lambda sample: sample["dpi"])
+        effective_dpi = worst["dpi"]
+        dpi_sources.extend(
+            f"Placed image on page {sample['page']}: {sample['width']}x{sample['height']}px at ~{sample['dpi']:.0f} DPI"
+            for sample in samples
+        )
     else:
-        metadata_dpi = detect_dpi_from_image(input_path)
-        try:
-            from PIL import Image as _PILImg
-            with _PILImg.open(input_path) as _tmp:
-                orig_w, orig_h = _tmp.size
-        except Exception:
-            orig_h, orig_w = img_bgr.shape[:2]
-
-        a4_w_in = 210 / 25.4
-        a4_h_in = 297 / 25.4
-        px_long = max(orig_w, orig_h)
-        px_short = min(orig_w, orig_h)
-        eff_dpi_long = px_long / a4_h_in
-        eff_dpi_short = px_short / a4_w_in
-        print_effective_dpi = min(eff_dpi_long, eff_dpi_short)
-
-        is_phone_dpi = metadata_dpi in (72, 96, 144, 150, 180, 200)
-
-        if is_phone_dpi and print_effective_dpi >= MIN_DPI:
-            effective_dpi = print_effective_dpi
-            dpi_sources.append(
-                f"Image: {orig_w}x{orig_h}px (metadata: {metadata_dpi:.0f} DPI, "
-                f"effective at A4: {print_effective_dpi:.0f} DPI — pixel count sufficient for print)"
-            )
-        elif not is_phone_dpi and metadata_dpi >= MIN_DPI:
-            effective_dpi = metadata_dpi
-            dpi_sources.append(f"Image: {orig_w}x{orig_h}px at {metadata_dpi:.0f} DPI")
+        if raster:
+            metadata_dpi = float(raster["dpi"])
+            orig_w, orig_h = int(raster["width"]), int(raster["height"])
         else:
-            effective_dpi = max(metadata_dpi, print_effective_dpi)
+            metadata_dpi = detect_dpi_from_image(input_path)
+            orig_w, orig_h = _raster_pixel_size(input_path, img_bgr)
+        trim = _chosen_trim_mm(target_w_mm, target_h_mm)
+        if trim:
+            trim_w, trim_h = trim
+            dpi_w = orig_w / (trim_w / 25.4)
+            dpi_h = orig_h / (trim_h / 25.4)
+            effective_dpi = min(dpi_w, dpi_h)
+            size_label = f" at {_fmt_mm(trim_w)} x {_fmt_mm(trim_h)} mm"
             dpi_sources.append(
-                f"Image: {orig_w}x{orig_h}px (metadata: {metadata_dpi:.0f} DPI, "
-                f"effective at A4: {print_effective_dpi:.0f} DPI)"
+                f"Image: {orig_w}x{orig_h}px — {effective_dpi:.0f} DPI on the chosen "
+                f"{_fmt_mm(trim_w)} x {_fmt_mm(trim_h)} mm print size "
+                f"(file tag: {metadata_dpi:.0f} DPI)"
+            )
+        else:
+            effective_dpi = metadata_dpi
+            dpi_sources.append(
+                f"Image: {orig_w}x{orig_h}px at {metadata_dpi:.0f} DPI. "
+                "No print size was supplied, so the file's own DPI tag is used."
             )
 
-    if effective_dpi >= MIN_DPI:
+    shown_dpi = int(round(effective_dpi))
+    if shown_dpi >= MIN_DPI:
         result["passed"] = True
-        result["message"] = f"Resolution: {effective_dpi:.0f} DPI (minimum: {MIN_DPI} DPI)"
+        result["message"] = f"Resolution: {shown_dpi} DPI{size_label} (minimum: {MIN_DPI} DPI)"
         result["severity"] = "PASS"
     else:
-        result["message"] = f"Resolution too low: {effective_dpi:.0f} DPI (minimum: {MIN_DPI} DPI)"
+        result["message"] = f"Resolution too low: {shown_dpi} DPI{size_label} (minimum: {MIN_DPI} DPI)"
         result["details"] = (
             f"Litho printing requires {MIN_DPI} DPI minimum for sharp output. "
-            f"Current effective resolution is {effective_dpi:.0f} DPI. "
+            f"Current effective resolution is {shown_dpi} DPI. "
             f"Re-export from source at higher resolution, or use the Precision Resizer tool."
         )
 
@@ -527,7 +602,7 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
     issues = []
     info = []
 
-    if file_type == "pdf" and doc is not None:
+    if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
         w_mm = round(media.width * 25.4 / 72, 1)
@@ -551,21 +626,22 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
         except Exception:
             pass
 
-        fonts = doc.get_page_fonts(0, full=True)
-        embedded_count = 0
-        not_embedded = []
-        for font in fonts:
-            font_name = font[3] if len(font) > 3 else "Unknown"
-            font_file = font[4] if len(font) > 4 else ""
-            if font_file:
-                embedded_count += 1
-            else:
-                not_embedded.append(font_name)
+        if not _illustrator_source(file_type):
+            fonts = doc.get_page_fonts(0, full=True)
+            embedded_count = 0
+            not_embedded = []
+            for font in fonts:
+                font_name = font[3] if len(font) > 3 else "Unknown"
+                font_file = font[4] if len(font) > 4 else ""
+                if font_file:
+                    embedded_count += 1
+                else:
+                    not_embedded.append(font_name)
 
-        if not_embedded:
-            issues.append(f"{len(not_embedded)} font(s) not embedded: {', '.join(not_embedded[:3])}")
-        elif fonts:
-            info.append(f"{embedded_count} font(s) embedded")
+            if not_embedded:
+                issues.append(f"{len(not_embedded)} font(s) not embedded: {', '.join(not_embedded[:3])}")
+            elif fonts:
+                info.append(f"{embedded_count} font(s) embedded")
 
         page_count = len(doc)
         if page_count > 1:
@@ -579,7 +655,7 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
 
         standard_sizes = [
             ("A6", 105, 148), ("A5", 148, 210), ("A4", 210, 297), ("A3", 297, 420),
-            ("DL", 99, 210), ("Business Card", 90, 55),
+            ("DL", 99, 210), ("Business Card", 90, 50),
         ]
         for name, sw, sh in standard_sizes:
             if (abs(w_mm - sw) < 15 and abs(h_mm - sh) < 15) or \
@@ -596,6 +672,40 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
         result["details"] = " | ".join(info) if info else ""
 
     return result
+
+
+def apply_print_ready_gate(checks):
+    """A green print-ready tick is only honest when bleed, colour, and resolution passed."""
+    failed = []
+    for check in checks:
+        if check.get("passed"):
+            continue
+        check_id = str(check.get("id") or "").lower()
+        name = str(check.get("name") or "").lower()
+        blob = f"{check_id} {name}"
+        if check_id == "bleed" or "bleed" in blob:
+            label = "bleed"
+        elif check_id == "cmyk" or "cmyk" in blob or "colour" in blob or "color" in blob:
+            label = "colour"
+        elif check_id == "resolution" or "resolution" in blob or "dpi" in blob:
+            label = "resolution"
+        else:
+            continue
+        if label not in failed:
+            failed.append(label)
+    if not failed:
+        return checks
+    listed = ", ".join(failed)
+    for check in checks:
+        if check.get("id") != "print_ready" and check.get("name") != "Print Readiness":
+            continue
+        extra = check.get("details") or ""
+        check["passed"] = False
+        check["severity"] = "HIGH"
+        check["message"] = f"Not print-ready yet — {listed} still need attention"
+        note = f"Print readiness stays failed while these checks have not passed: {listed}."
+        check["details"] = (note + (" | " + extra if extra else "")).strip(" | ")
+    return checks
 
 
 PROXY_MAX_PX = 1000
@@ -632,14 +742,17 @@ def _make_proxy(img_bgr, dpi):
     return proxy, proxy_dpi
 
 
-def run_quick_check(input_path, file_type):
+def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
     """Main entry point: run all 5 quick checks and return results."""
     doc = None
     img_bgr = None
     dpi = 300.0
+    image_mode = None
+    alpha_issue = None
+    raster_meta = None
 
     try:
-        if file_type == "pdf":
+        if _pdf_like(file_type):
             try:
                 if sanitize_pdf_geometry_inplace(input_path):
                     sys.stderr.write(
@@ -660,8 +773,11 @@ def run_quick_check(input_path, file_type):
         else:
             from PIL import Image as PILImage
             with PILImage.open(input_path) as pil_img:
-                orig_dpi = detect_dpi_from_image(input_path)
+                orig_dpi = _dpi_from_pil(pil_img)
                 w, h = pil_img.size
+                image_mode = pil_img.mode
+                raster_meta = {"dpi": orig_dpi, "width": w, "height": h}
+                alpha_issue = _alpha_issue_from_pil(pil_img)
                 if max(w, h) > PROXY_MAX_PX:
                     pil_img.thumbnail((PROXY_MAX_PX, PROXY_MAX_PX), PILImage.LANCZOS)
                     scale = pil_img.size[0] / w
@@ -681,13 +797,24 @@ def run_quick_check(input_path, file_type):
 
         checks = [
             check_bleed(doc, img_bgr, dpi, file_type),
-            check_cmyk(doc, file_type, input_path),
-            check_transparency(doc, file_type, input_path),
-            check_resolution(doc, img_bgr, dpi, file_type, input_path),
+            check_cmyk(doc, file_type, input_path, image_mode),
+            check_transparency(doc, file_type, input_path, alpha_issue),
+            check_resolution(doc, img_bgr, dpi, file_type, input_path, target_w_mm, target_h_mm, raster_meta),
             check_print_readiness(doc, img_bgr, dpi, file_type, input_path),
         ]
+        _write_list_thumb(img_bgr)
+
+        page_count = len(doc) if doc is not None else 1
+        if _illustrator_source(file_type) and doc is not None:
+            try:
+                with open(input_path, "rb") as raw_f:
+                    raw = raw_f.read()
+            except Exception:
+                raw = b""
+            checks.extend(illustrator_audit_checks(doc, raw, page_count))
 
         checks = strip_cropbox_not_in_mediabox_items(checks)
+        checks = apply_print_ready_gate(checks)
         all_passed = all(c["passed"] for c in checks)
 
         return {
@@ -696,6 +823,7 @@ def run_quick_check(input_path, file_type):
             "passCount": sum(1 for c in checks if c["passed"]),
             "failCount": sum(1 for c in checks if not c["passed"]),
             "artworkSize": artwork_size,
+            "pageCount": page_count,
         }
 
     except Exception as e:
@@ -714,8 +842,10 @@ if __name__ == "__main__":
     input_path = sys.argv[1]
     file_type = sys.argv[2]
     result_file = sys.argv[3]
+    target_w_mm = sys.argv[4] if len(sys.argv) >= 6 else None
+    target_h_mm = sys.argv[5] if len(sys.argv) >= 6 else None
 
-    result = run_quick_check(input_path, file_type)
+    result = run_quick_check(input_path, file_type, target_w_mm, target_h_mm)
     try:
         with open(result_file, "w") as f:
             json.dump(result, f)

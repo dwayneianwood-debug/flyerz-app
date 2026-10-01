@@ -1,37 +1,13 @@
+import "./loadEnv";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
+import { compressResponses } from "./httpCompression";
 import { createServer } from "http";
 import os from "os";
 import path from "path";
 import fs from "fs";
 import { execSync } from "child_process";
-
-/** Sync load project `.env` before any env-dependent constants (no dotenv dependency). */
-(() => {
-  try {
-    const envPath = path.join(process.cwd(), ".env");
-    if (!fs.existsSync(envPath)) return;
-    const raw = fs.readFileSync(envPath, "utf8");
-    for (const line of raw.split(/\r?\n/)) {
-      const t = line.trim();
-      if (!t || t.startsWith("#")) continue;
-      const eq = t.indexOf("=");
-      if (eq <= 0) continue;
-      const k = t.slice(0, eq).trim();
-      let v = t.slice(eq + 1).trim();
-      if (
-        (v.startsWith('"') && v.endsWith('"')) ||
-        (v.startsWith("'") && v.endsWith("'"))
-      ) {
-        v = v.slice(1, -1);
-      }
-      if (process.env[k] === undefined) process.env[k] = v;
-    }
-  } catch {
-    /* ignore malformed .env */
-  }
-})();
 
 let sighupCount = 0;
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
@@ -115,6 +91,8 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+app.use(compressResponses);
 
 /** Prefer office LAN IPs over VPN/tunnel adapters when printing the team share link. */
 function flyerzFirstNonInternalIpv4(): string | null {
@@ -282,7 +260,7 @@ const listenHost = flyerzResolveListenHost();
       port,
       host: listenHost,
     },
-    () => {
+    async () => {
       log(`Server listening on ${listenHost}:${port}`);
       flyerzPrintTeamSharingBanner(port, listenHost);
 
@@ -310,6 +288,8 @@ const listenHost = flyerzResolveListenHost();
         console.log("[GATEKEEPER] Skipped because SKIP_GATEKEEPER=1.");
         gatekeeperPassed = true;
         log("app fully initialized");
+        const { startJobCleanup } = await import("./jobCleanup");
+        startJobCleanup();
         return;
       }
 
@@ -327,6 +307,8 @@ const listenHost = flyerzResolveListenHost();
         console.log("[GATEKEEPER] All gates passed — application cleared to start.");
         gatekeeperPassed = true;
         log("app fully initialized");
+        const { startJobCleanup } = await import("./jobCleanup");
+        startJobCleanup();
       } catch (err: any) {
         console.error(
           "\n╔══════════════════════════════════════════════════════════╗"

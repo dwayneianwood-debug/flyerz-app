@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
+import { ARTWORK_DROPZONE_ACCEPT, ARTWORK_TYPE_LABEL } from "@/lib/accepted-artwork";
 import {
   UploadCloud, AlertCircle, Loader2, CheckCircle2, XCircle,
   Wrench, Wand2, ChevronDown, ChevronUp, Search, Ruler
@@ -67,9 +68,15 @@ export function QuickCheck() {
   }, [result]);
 
   const quickCheckMutation = useMutation({
-    mutationFn: async (file: File) => {
+    mutationFn: async ({ file, widthMm, heightMm }: { file: File; widthMm: string; heightMm: string }) => {
       const formData = new FormData();
       formData.append("file", file);
+      const width = parseFloat(widthMm);
+      const height = parseFloat(heightMm);
+      if (width > 0 && height > 0) {
+        formData.append("targetWidthMm", String(width));
+        formData.append("targetHeightMm", String(height));
+      }
       const res = await fetch("/api/quick-check", {
         method: "POST",
         body: formData,
@@ -138,18 +145,22 @@ export function QuickCheck() {
     setFixingItems(new Set());
     setDetectedWidth(null);
     setDetectedHeight(null);
-    quickCheckMutation.mutate(file);
-  }, [quickCheckMutation, toast]);
+    quickCheckMutation.mutate({ file, widthMm: targetWidth, heightMm: targetHeight });
+  }, [quickCheckMutation, toast, targetWidth, targetHeight]);
 
   const { getRootProps, getInputProps, isDragActive, isDragReject } = useDropzone({
     onDrop,
     maxFiles: 1,
-    accept: {
-      "application/pdf": [".pdf"],
-      "image/jpeg": [".jpg", ".jpeg"],
-      "image/png": [".png"],
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
-      "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
+    accept: ARTWORK_DROPZONE_ACCEPT,
+    onDropRejected: (rejections) => {
+      const name = rejections[0]?.file?.name;
+      toast({
+        title: "File not supported",
+        description: name
+          ? `${name} isn't a file we can check. Use ${ARTWORK_TYPE_LABEL}.`
+          : `Use ${ARTWORK_TYPE_LABEL}.`,
+        variant: "destructive",
+      });
     },
   });
 
@@ -325,6 +336,8 @@ export function QuickCheck() {
             {!isProcessing && (
               <div className="mt-5 flex gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground/70">
                 <span className="bg-muted px-2 py-1 rounded">PDF</span>
+                <span className="bg-muted px-2 py-1 rounded">AI</span>
+                <span className="bg-muted px-2 py-1 rounded">EPS</span>
                 <span className="bg-muted px-2 py-1 rounded">JPG/PNG</span>
                 <span className="bg-muted px-2 py-1 rounded">DOCX/PPTX</span>
               </div>

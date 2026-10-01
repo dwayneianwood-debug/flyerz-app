@@ -12,6 +12,7 @@ Generates a high-resolution preview image of the corrected artwork showing:
 Output: PNG image ready for client review or download.
 """
 
+from artwork_types import is_vector_type
 import sys
 import json
 import os
@@ -21,18 +22,12 @@ import traceback
 
 import cv2
 import numpy as np
-import fitz
+import pymupdf as fitz
 
 
 def find_gs_binary() -> str:
-    gs_path = shutil.which("gs")
-    if gs_path:
-        return gs_path
-    nix_matches = globmod.glob("/nix/store/*/bin/gs")
-    for p in sorted(nix_matches, reverse=True):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 GS_BIN = find_gs_binary()
@@ -429,7 +424,7 @@ if __name__ == "__main__":
     target_h = float(sys.argv[6]) if len(sys.argv) > 6 else 0
 
     try:
-        if file_type == "pdf":
+        if is_vector_type(file_type):
             result = generate_bleed_preview_pdf(input_path, output_path, bleed_mm,
                                                  target_width_mm=target_w, target_height_mm=target_h)
         else:

@@ -13,6 +13,7 @@ import {
 import { useState, useRef, useCallback, useEffect } from "react";
 import { Link } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
+import { PRINT_TOOL_ACCEPT, PRINT_TOOL_TYPE_LABEL } from "@/lib/accepted-artwork";
 
 interface PreviewData {
   pages: Array<{
@@ -34,6 +35,7 @@ interface PreviewData {
   storedFilename: string;
   previewFilename: string;
   fileType: string;
+  sourceFormat?: string;
 }
 
 interface CropRect {
@@ -978,7 +980,7 @@ export default function ManualCrop({ embedded = false, onCropApply, sourceImageU
                       </div>
                       <div>
                         <p className="text-lg font-semibold text-foreground mb-1">Drop your file here or click to browse</p>
-                        <p className="text-sm text-muted-foreground">PDF, JPG, PNG — up to 50MB</p>
+                        <p className="text-sm text-muted-foreground">{PRINT_TOOL_TYPE_LABEL} — up to 50MB</p>
                       </div>
                     </div>
                   )}
@@ -986,7 +988,7 @@ export default function ManualCrop({ embedded = false, onCropApply, sourceImageU
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".pdf,.jpg,.jpeg,.png"
+                    accept={PRINT_TOOL_ACCEPT}
                     className="hidden"
                     onChange={(e) => {
                       const file = e.target.files?.[0];
@@ -1342,7 +1344,7 @@ export default function ManualCrop({ embedded = false, onCropApply, sourceImageU
                     <div className="space-y-1 text-xs">
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">Type</span>
-                        <span className="font-mono uppercase">{previewData.fileType}</span>
+                        <span className="font-mono uppercase">{previewData.sourceFormat || previewData.fileType}</span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">Pages</span>

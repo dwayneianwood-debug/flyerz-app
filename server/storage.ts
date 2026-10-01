@@ -2,7 +2,8 @@ import fs from "fs";
 import path from "path";
 import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
-import type { FileJobResponse, CreateFileJobRequest, UpdateFileJobRequest } from "@shared/schema";
+import { backupDatabaseFile } from "./jobCleanup";
+import type { FileJobResponse, CreateFileJobRequest, UpdateFileJobRequest, JobListItem, JobListPage, JobStatus } from "@shared/schema";
 
 export interface IStorage {
   getJobs(): Promise<FileJobResponse[]>;
@@ -13,10 +14,10 @@ export interface IStorage {
 }
 
 const dataDir = path.join(process.cwd(), "data");
-const dbPath = path.join(dataDir, "flyerz.sqlite");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
+const dbPath = process.env.FLYERZ_DB_PATH
+  ? path.resolve(process.env.FLYERZ_DB_PATH)
+  : path.join(dataDir, "flyerz.sqlite");
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 const sqlite = new DatabaseSync(dbPath);
 sqlite.exec(`
@@ -33,6 +34,10 @@ sqlite.exec(`
     audit_results TEXT,
     error_message TEXT
   )
+`);
+sqlite.exec(`
+  CREATE INDEX IF NOT EXISTS idx_file_jobs_uploaded_at ON file_jobs (uploaded_at);
+  CREATE INDEX IF NOT EXISTS idx_file_jobs_status_uploaded_at ON file_jobs (status, uploaded_at);
 `);
 
 type JobRow = {
@@ -183,7 +188,135 @@ function mapRowToResponse(row: JobRow): FileJobResponse {
   };
 }
 
+export function passedFlag(value: unknown): boolean | null {
+  if (value === true || value === 1 || value === "1" || value === "true") return true;
+  if (value === false || value === 0 || value === "0" || value === "false") return false;
+  return null;
+}
+
+type ListRow = {
+  id: number;
+  filename: string;
+  status: string;
+  uploaded_at: string;
+  file_size: number;
+  file_type: string;
+  has_corrected: number;
+  overall_passed: unknown;
+  press_passed: unknown;
+  quick_light: unknown;
+};
+
 export class DatabaseStorage implements IStorage {
+  async countJobs(): Promise<number> {
+    const row = sqlite.prepare("SELECT COUNT(*) AS n FROM file_jobs").get() as { n: number };
+    return Number(row?.n || 0);
+  }
+
+  async listJobs(options: { limit: number; offset: number; status?: string; attention?: boolean }): Promise<JobListPage> {
+    const limit = Math.min(100, Math.max(1, Math.floor(options.limit)));
+    const offset = Math.max(0, Math.floor(options.offset));
+    const status = options.status;
+    const clauses: string[] = [];
+    const args: unknown[] = [];
+    if (status) {
+      clauses.push("status = ?");
+      args.push(status);
+    }
+    if (options.attention) {
+      clauses.push("json_extract(audit_results, '$.quickPrint.light') IN ('amber', 'red')");
+      clauses.push("COALESCE(json_extract(audit_results, '$.quickPrint.approved'), 0) != 1");
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const totalRow = sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM file_jobs ${where}`)
+      .get(...args) as { n: number };
+    const rows = sqlite
+      .prepare(
+        `SELECT id, filename, status, uploaded_at, file_size, file_type,
+                CASE WHEN corrected_path IS NOT NULL AND corrected_path != '' THEN 1 ELSE 0 END AS has_corrected,
+                json_extract(audit_results, '$.overallPassed') AS overall_passed,
+                json_extract(audit_results, '$.pressEngine.passed') AS press_passed,
+                json_extract(audit_results, '$.quickPrint.light') AS quick_light
+         FROM file_jobs
+         ${where}
+         ORDER BY uploaded_at DESC, id DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(...args, limit, offset) as ListRow[];
+    const jobs: JobListItem[] = rows.map((row) => {
+      const overallPassed = passedFlag(row.overall_passed);
+      const pressPassed = passedFlag(row.press_passed);
+      const uploaded = new Date(row.uploaded_at);
+      const quickLight = row.quick_light === "green" || row.quick_light === "amber" || row.quick_light === "red"
+        ? row.quick_light
+        : null;
+      return {
+        id: row.id,
+        filename: row.filename,
+        status: row.status as JobStatus,
+        uploadedAt: Number.isNaN(uploaded.getTime()) ? String(row.uploaded_at) : uploaded.toISOString(),
+        fileSize: row.file_size,
+        fileType: row.file_type,
+        thumbnailUrl: null,
+        overallPassed,
+        hasCorrectedFile: row.has_corrected === 1,
+        printReady: row.status === "complete" && overallPassed === true && pressPassed === true,
+        quickLight,
+      };
+    });
+    const total = Number(totalRow?.n || 0);
+    return {
+      jobs,
+      total,
+      limit,
+      offset,
+      hasMore: offset + jobs.length < total,
+    };
+  }
+
+  async listQuickPrint(limit: number): Promise<{ id: number }[]> {
+    const cap = Math.min(24, Math.max(1, Math.floor(limit)));
+    return sqlite
+      .prepare(
+        `SELECT id FROM file_jobs
+         WHERE json_extract(audit_results, '$.quickPrint.light') IN ('green', 'amber', 'red')
+         ORDER BY uploaded_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(cap) as { id: number }[];
+  }
+
+  async getJobStatus(id: number): Promise<{ id: number; status: string; errorMessage: string | null } | undefined> {
+    const row = sqlite
+      .prepare("SELECT id, status, error_message FROM file_jobs WHERE id = ?")
+      .get(id) as { id: number; status: string; error_message: string | null } | undefined;
+    if (!row) return undefined;
+    return { id: row.id, status: row.status, errorMessage: row.error_message };
+  }
+
+  async getJobAuditStamp(id: number): Promise<{ status: string; bytes: number } | undefined> {
+    const row = sqlite
+      .prepare("SELECT status, length(COALESCE(audit_results, '')) AS bytes FROM file_jobs WHERE id = ?")
+      .get(id) as { status: string; bytes: number } | undefined;
+    return row;
+  }
+
+  async getCompiledStrategy(id: number): Promise<string | null> {
+    const row = sqlite
+      .prepare("SELECT json_extract(audit_results, '$.compiledStrategy') AS strategy FROM file_jobs WHERE id = ?")
+      .get(id) as { strategy: string | null } | undefined;
+    if (!row || row.strategy == null || row.strategy === "") return null;
+    return String(row.strategy);
+  }
+
+  listIndexNames(): string[] {
+    const rows = sqlite
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'")
+      .all() as { name: string }[];
+    return rows.map((row) => row.name);
+  }
+
   async getJobs(): Promise<FileJobResponse[]> {
     const rows = sqlite
       .prepare(
@@ -266,3 +399,11 @@ export class DatabaseStorage implements IStorage {
 }
 
 export const storage = new DatabaseStorage();
+
+export function databaseFilePath(): string {
+  return dbPath;
+}
+
+export function backupDatabaseTo(dest: string): boolean {
+  return backupDatabaseFile((sql) => sqlite.exec(sql), dest);
+}

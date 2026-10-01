@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""End-to-end checks for sales quick mode. Engines are called, not rewritten."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+import zipfile
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from quick_print import BLEED_MM, decide_light, make_print_ready, too_small
+
+ART = os.environ.get("QUICK_PRINT_ARTIFACTS", "/opt/cursor/artifacts")
+FONT = os.path.join(os.path.dirname(__file__), "fonts", "LiberationSans-Bold.ttf")
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL {message}")
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    if not ok:
+        fail(f"{name} — {detail}")
+    print(f"PASS {name}")
+
+
+def _font(size: int):
+    if os.path.exists(FONT):
+        return ImageFont.truetype(FONT, size)
+    return ImageFont.load_default()
+
+
+def _docx(path: str) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            "<?xml version='1.0' encoding='UTF-8'?>"
+            "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>"
+            "<Default Extension='xml' ContentType='application/xml'/></Types>",
+        )
+        archive.writestr(
+            "word/document.xml",
+            "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+            "<w:body><w:p><w:r><w:t>Please print this</w:t></w:r></w:p></w:body></w:document>",
+        )
+
+
+def _flyer(path: str) -> None:
+    image = Image.new("RGB", (1024, 1024), (24, 72, 140))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((620, 80, 940, 400), fill=(240, 120, 20))
+    draw.rounded_rectangle((120, 460, 900, 900), radius=36, fill=(12, 28, 70), outline=(210, 170, 90), width=8)
+    draw.text((180, 560), "MARKET DAY", font=_font(72), fill=(255, 236, 180))
+    draw.text((180, 700), "SATURDAY", font=_font(54), fill=(255, 255, 255))
+    image.save(path, format="PNG")
+
+
+def _wide(path: str) -> None:
+    image = Image.new("RGB", (1800, 700), (240, 240, 240))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 120, 700), fill=(220, 20, 20))
+    draw.rectangle((1680, 0, 1800, 700), fill=(20, 40, 220))
+    draw.rectangle((800, 250, 1000, 450), fill=(20, 180, 60))
+    image.save(path, format="PNG")
+
+
+def _bled_pdf(path: str) -> None:
+    import pymupdf as fitz
+
+    mm = 72.0 / 25.4
+    bleed = 5 * mm
+    trim_w = 148 * mm
+    trim_h = 210 * mm
+    doc = fitz.open()
+    page = doc.new_page(width=trim_w + 2 * bleed, height=trim_h + 2 * bleed)
+    page.draw_rect(page.rect, color=None, fill=(0.75, 0.08, 0.08))
+    page.draw_rect(fitz.Rect(bleed, bleed, bleed + trim_w, bleed + trim_h), color=None, fill=(0.1, 0.55, 0.2))
+    page.insert_text((bleed + 36, bleed + 80), "ALREADY BLEED", fontsize=28, fontname="helv", color=(1, 1, 1))
+    trim = fitz.Rect(bleed, bleed, bleed + trim_w, bleed + trim_h)
+    page.set_trimbox(trim)
+    page.set_bleedbox(page.rect)
+    page.set_cropbox(page.rect)
+    doc.save(path)
+    doc.close()
+
+
+def _render(path: str, dest: str) -> np.ndarray:
+    import cv2
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    page = doc[0]
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    cv2.imwrite(dest, bgr)
+    doc.close()
+    return bgr
+
+
+def _run(src: str, name: str, product: str = "a5") -> dict:
+    out = tempfile.mkdtemp(prefix=f"quick-{name}-")
+    return make_print_ready(src, out, 148, 210, product, "A5", filename=os.path.basename(src))
+
+
+def test_rules() -> None:
+    office = decide_light({"kind": "office"})
+    check("word-rule", office["light"] == "red" and "Word" in office["clientMessage"])
+    small = decide_light({"tooSmall": True, "tooSmallMessage": "too small please"})
+    check("small-rule", small["light"] == "red" and "too small" in small["clientMessage"])
+    green = decide_light({"compiled": True, "enginePassed": True, "upscale": 1.2, "aspectDelta": 0.01})
+    check("green-rule", green["light"] == "green" and green["reasons"] == [])
+    amber = decide_light({"compiled": True, "enginePassed": True, "aspectExtended": True, "aspectDelta": 0.4, "upscale": 1})
+    check("amber-rule", amber["light"] == "amber" and any("extended" in line for line in amber["reasons"]))
+    quiet = decide_light({"compiled": True, "enginePassed": True, "aspectExtended": True, "aspectDelta": 0.03, "upscale": 1.4})
+    check("small-aspect-stays-green", quiet["light"] == "green", str(quiet))
+    doubtful = decide_light({
+        "compiled": True,
+        "enginePassed": True,
+        "upscale": 1,
+        "ocrDoubtful": True,
+        "ocrDoubtfulReason": "Some marks did not look like real words, so they were left unchanged. Glance at the picture.",
+    })
+    check("doubtful-amber", doubtful["light"] == "amber" and any("left unchanged" in line for line in doubtful["reasons"]), str(doubtful))
+    check("a5-80px-too-small", too_small(80, 80, 148, 210))
+    check("a5-1024-not-too-small", not too_small(1024, 1024, 148, 210))
+    check("bleed-constant", BLEED_MM == 5)
+
+
+def test_word(root: str) -> None:
+    path = os.path.join(root, "brief.docx")
+    _docx(path)
+    result = _run(path, "word")
+    check("word-red", result["light"] == "red", result["light"])
+    check("word-message", "Word" in result["clientMessage"] and "PDF" in result["clientMessage"], result["clientMessage"])
+    check("word-no-press", not result.get("pressPath"))
+
+
+def test_corrupt(root: str) -> None:
+    path = os.path.join(root, "broken.jpg")
+    with open(path, "wb") as handle:
+        handle.write(b"this is not a jpeg file at all, it is just text")
+    result = _run(path, "corrupt")
+    check("corrupt-red", result["light"] == "red" and not result.get("pressPath"), result["light"])
+
+
+def test_too_small(root: str) -> None:
+    path = os.path.join(root, "tiny.png")
+    Image.new("RGB", (80, 80), (200, 20, 20)).save(path)
+    result = _run(path, "tiny")
+    check("tiny-red", result["light"] == "red" and "small" in result["clientMessage"].lower(), result["clientMessage"])
+    check("tiny-no-press", not result.get("pressPath"))
+
+
+def test_existing(root: str) -> None:
+    path = os.path.join(root, "already.pdf")
+    _bled_pdf(path)
+    result = _run(path, "existing")
+    check("existing-green", result["light"] == "green", f"{result['light']} {result.get('reasons')}")
+    media = float(result.get("mediaWidthMm") or 0)
+    check("existing-bleed-not-doubled", 156 <= media <= 161, str(result.get("mediaWidthMm")))
+    check("existing-not-20mm", abs(media - 168) > 4, str(media))
+    check("existing-kept", result.get("existingBleedKept") is True or any("not added again" in line for line in result["decisions"]), str(result["decisions"]))
+    press = result["pressPath"]
+    import pymupdf as fitz
+    doc = fitz.open(press)
+    text = doc[0].get_text("text")
+    doc.close()
+    check("existing-text-kept", "ALREADY" in text, text[:120])
+    _render(press, os.path.join(ART, "quick-print-existing-bleed.png"))
+
+
+def test_wide(root: str) -> None:
+    path = os.path.join(root, "banner.png")
+    _wide(path)
+    result = _run(path, "wide")
+    check("wide-amber", result["light"] == "amber", f"{result['light']} {result.get('reasons')}")
+    check("wide-reason", any("extended" in line.lower() for line in result["reasons"]), str(result["reasons"]))
+    check("wide-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
+    check("wide-bleed", abs(float(result.get("mediaWidthMm") or 0) - 158) < 3, str(result.get("mediaWidthMm")))
+    rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-wrong-aspect.png"))
+    check("wide-portrait", rendered.shape[0] > rendered.shape[1], str(rendered.shape))
+    rgb = rendered[:, :, ::-1].astype(np.int16)
+    red = (rgb[:, :, 0] > 140) & (rgb[:, :, 0] > rgb[:, :, 1] + 40) & (rgb[:, :, 0] > rgb[:, :, 2] + 40)
+    blue = (rgb[:, :, 2] > 70) & (rgb[:, :, 2] > rgb[:, :, 0] + 15) & (rgb[:, :, 2] > rgb[:, :, 1] + 10)
+    green = (rgb[:, :, 1] > 90) & (rgb[:, :, 1] > rgb[:, :, 0] + 30) & (rgb[:, :, 1] > rgb[:, :, 2] + 20)
+    check("wide-keeps-both-ends", int(red.sum()) > 30 and int(blue.sum()) > 30, f"red {int(red.sum())} blue {int(blue.sum())}")
+    import cv2
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(green.astype(np.uint8), 8)
+    big = [stats[i] for i in range(1, count) if stats[i][cv2.CC_STAT_AREA] > 40]
+    check("wide-has-centre", len(big) == 1, f"{len(big)} green marks")
+    blob = big[0]
+    ratio = float(blob[cv2.CC_STAT_WIDTH]) / float(max(1, blob[cv2.CC_STAT_HEIGHT]))
+    check(
+        "wide-not-stretched",
+        0.8 <= ratio <= 1.25,
+        f"{int(blob[cv2.CC_STAT_WIDTH])}x{int(blob[cv2.CC_STAT_HEIGHT])} ratio {ratio:.2f}",
+    )
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    images = doc[0].get_images()
+    doc.close()
+    check("wide-one-image", len(images) == 1, str(len(images)))
+
+
+def test_flyer(root: str) -> None:
+    path = os.path.join(root, "ai-flyer.png")
+    _flyer(path)
+    result = _run(path, "flyer")
+    check("flyer-light", result["light"] in ("green", "amber"), f"{result['light']} {result.get('reasons')}")
+    check("flyer-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
+    media_w = float(result.get("mediaWidthMm") or 0)
+    media_h = float(result.get("mediaHeightMm") or 0)
+    trim_w = float(result.get("trimWidthMm") or 0)
+    trim_h = float(result.get("trimHeightMm") or 0)
+    check("flyer-trim", abs(trim_w - 148) < 2 and abs(trim_h - 210) < 2, f"{trim_w}x{trim_h}")
+    check("flyer-bleed-5", abs(media_w - 158) < 3 and abs(media_h - 220) < 3, f"{media_w}x{media_h}")
+    check("flyer-not-doubled", abs(media_w - 168) > 4, str(media_w))
+    rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-ai-flyer.png"))
+    check("flyer-not-blank", float(rendered.std()) > 12, str(rendered.std()))
+    if result.get("proofPng") and os.path.exists(result["proofPng"]):
+        shutil.copyfile(result["proofPng"], os.path.join(ART, "quick-print-ai-flyer-proof.png"))
+    joined = " ".join(result.get("decisions") or [])
+    check("flyer-records-decisions", "5 mm" in joined and "lettering" in joined.lower() and "not retyped" in joined.lower(), joined[:500])
+
+
+def test_shapes(root: str) -> None:
+    """Square flyer. Quick mode keeps the circle and the original lettering. It does not retype."""
+    from ai_rebuild_check import _draw_shape_flyer, _orange_disc
+
+    path = os.path.join(root, "shapes.png")
+    _draw_shape_flyer(path)
+    out = tempfile.mkdtemp(prefix="quick-shapes-")
+    result = make_print_ready(path, out, 148, 148, "custom", "148 × 148 mm", filename="shapes.png")
+    check("shapes-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
+    joined = " ".join(result.get("decisions") or [])
+    check("shapes-keeps-lettering", "not retyped" in joined.lower(), joined[:400])
+    rendered = _render(result["pressPath"], os.path.join(ART, "quick-print-shape-circle.png"))
+    disc = _orange_disc(rendered)
+    check("shapes-circle", disc is not None, "" if disc else "no orange disc")
+    if disc is not None:
+        area, aspect, fill = disc
+        check("shapes-circle-round", 0.8 <= aspect <= 1.25 and fill >= 0.6 and area > 2000, f"area {area} aspect {aspect:.2f} fill {fill:.2f}")
+    import pymupdf as fitz
+    doc = fitz.open(result["pressPath"])
+    text = doc[0].get_text("text") or ""
+    images = doc[0].get_images()
+    doc.close()
+    check("shapes-not-retyped", "MARKET DAY" not in text and "SATURDAY" not in text, text.replace("\n", " | ")[:180])
+    check("shapes-still-a-picture", len(images) >= 1, str(len(images)))
+
+
+def _column_variance(strip: np.ndarray) -> float:
+    import cv2
+
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if gray.shape[0] < 2:
+        return 0.0
+    return float(np.mean(np.var(gray, axis=0)))
+
+
+def _streak(strip: np.ndarray, outward_axis: int) -> float:
+    """How much the band is striped along the edge.
+
+    Average along the outward direction, remove the slow gradient, and report
+    the std of what is left. Column-shaped noise survives that average.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if gray.shape[outward_axis] < 1 or gray.size == 0:
+        return 0.0
+    profile = gray.mean(axis=outward_axis)
+    length = int(profile.shape[0])
+    if length < 8:
+        return float(np.std(profile))
+    sigma = max(8.0, 0.04 * length)
+    smooth = cv2.GaussianBlur(profile.reshape(1, -1), (0, 0), sigma).ravel()
+    return float(np.std(profile - smooth))
+
+
+def _no_more_streak_than_the_edge(name: str, band: np.ndarray, edge: np.ndarray, outward_axis: int, seam_at_end: bool = True) -> None:
+    # The few pixels against the picture repeat the real rim. The stripes a
+    # customer would see are the rest of the band.
+    drop = 6
+    if band.shape[outward_axis] > drop + 8:
+        if outward_axis == 0:
+            band = band[:-drop] if seam_at_end else band[drop:]
+        else:
+            band = band[:, :-drop] if seam_at_end else band[:, drop:]
+    depth = min(band.shape[outward_axis], edge.shape[outward_axis])
+    if outward_axis == 0:
+        band_part = band[:depth]
+        edge_part = edge[:depth]
+    else:
+        band_part = band[:, :depth]
+        edge_part = edge[:, :depth]
+    band_s = _streak(band_part, outward_axis)
+    edge_s = _streak(edge_part, outward_axis)
+    check(
+        f"{name}-no-columns",
+        band_s <= edge_s * 1.05 + 0.25,
+        f"band {band_s:.3f} edge {edge_s:.3f}",
+    )
+
+
+def _gradient_picture(width: int, height: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    yy = np.linspace(0, 1, height)[:, None]
+    xx = np.linspace(0, 1, width)[None, :]
+    field = yy * 0.65 + xx * 0.35
+    picture = np.zeros((height, width, 3), np.float32)
+    picture[..., 0] = 30 + field * 90
+    picture[..., 1] = 24 + field * 40
+    picture[..., 2] = 90 + (1.0 - field) * 100
+    picture += rng.normal(0, 9, picture.shape)
+    return np.clip(picture, 0, 255).astype(np.uint8)
+
+
+def _texture_picture(width: int, height: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    picture = rng.normal(110, 28, (height, width, 3))
+    import cv2
+    picture = cv2.GaussianBlur(picture.astype(np.float32), (0, 0), 1.1)
+    return np.clip(picture, 0, 255).astype(np.uint8)
+
+
+def _flat_picture(width: int, height: int) -> np.ndarray:
+    return np.full((height, width, 3), (40, 90, 160), np.uint8)
+
+
+def _photo_picture(width: int, height: int, seed: int) -> np.ndarray:
+    """Slow patches plus fine grain, the way a photograph looks at a small size."""
+    import cv2
+
+    rng = np.random.default_rng(seed)
+    coarse = rng.normal(0, 1, (max(2, height // 10), max(2, width // 10), 3)).astype(np.float32)
+    coarse = cv2.resize(coarse, (width, height), interpolation=cv2.INTER_CUBIC)
+    coarse = cv2.GaussianBlur(coarse, (0, 0), 1.6)
+    fine = rng.normal(0, 1, (height, width, 3)).astype(np.float32)
+    return np.clip(118 + coarse * 16 + fine * 7, 0, 255).astype(np.uint8)
+
+
+def test_extended_band_does_not_streak() -> None:
+    """The shape gap must not turn edge noise into columns, or repeat one row."""
+    import cv2
+    from quick_print import _extend_to_product
+
+    for name, picture in (
+        ("gradient", _gradient_picture(360, 360, 5)),
+        ("texture", _texture_picture(360, 360, 9)),
+        ("flat", _flat_picture(360, 360)),
+        ("photo", _photo_picture(360, 360, 13)),
+    ):
+        fitted, extended, _delta = _extend_to_product(picture, 148, 210, "", [])
+        check(f"{name}-extended", extended is True and fitted.shape[0] > picture.shape[0], str(fitted.shape))
+        pad = (fitted.shape[0] - picture.shape[0]) // 2
+        check(f"{name}-pad", pad >= 8, str(pad))
+        band = fitted[:pad]
+        neighbour = picture[:pad]
+        _no_more_streak_than_the_edge(name, band, neighbour, outward_axis=0)
+        bottom = fitted[-pad:]
+        _no_more_streak_than_the_edge(f"{name}-bottom", bottom, picture[-pad:], outward_axis=0, seam_at_end=False)
+        if name in ("gradient", "texture", "photo"):
+            band_var = _column_variance(band)
+            old = cv2.copyMakeBorder(picture, pad, fitted.shape[0] - picture.shape[0] - pad, 0, 0, cv2.BORDER_REPLICATE)
+            old_var = _column_variance(old[:pad])
+            check(
+                f"{name}-not-a-copied-row",
+                band_var > old_var + 0.5,
+                f"band {band_var:.2f} copied-row {old_var:.2f}",
+            )
+        middle = fitted[pad:pad + picture.shape[0]]
+        check(f"{name}-keeps-picture", middle.shape == picture.shape and np.array_equal(middle, picture))
+
+    # Portrait picture on a landscape product: the gap is at the sides.
+    portrait = _photo_picture(240, 420, 21)
+    fitted, extended, _delta = _extend_to_product(portrait, 210, 148, "", [])
+    check("side-extended", extended is True and fitted.shape[1] > portrait.shape[1], str(fitted.shape))
+    side = (fitted.shape[1] - portrait.shape[1]) // 2
+    check("side-pad", side >= 8, str(side))
+    _no_more_streak_than_the_edge("side-left", fitted[:, :side], portrait[:, :side], outward_axis=1)
+    _no_more_streak_than_the_edge("side-right", fitted[:, -side:], portrait[:, -side:], outward_axis=1, seam_at_end=False)
+    middle = fitted[:, side:side + portrait.shape[1]]
+    check("side-keeps-picture", middle.shape == portrait.shape and np.array_equal(middle, portrait))
+
+
+def _orange(bgr: np.ndarray) -> np.ndarray:
+    """The test disc is pure magenta, which this gradient never is."""
+    rgb = bgr[:, :, ::-1].astype(np.int16)
+    return (rgb[:, :, 0] > 220) & (rgb[:, :, 2] > 220) & (rgb[:, :, 1] < 40)
+
+
+def _disc_picture(top: int, size: int = 360) -> np.ndarray:
+    """Gradient with a strong orange disc. `top` is the disc's top row (negative overlaps the edge)."""
+    picture = _gradient_picture(size, size, 4)
+    radius = 70
+    cy = top + radius
+    cx = int(size * 0.72)
+    yy, xx = np.ogrid[:size, :size]
+    disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+    picture[disc] = (255, 0, 255)
+    return picture
+
+
+def _top_band(picture: np.ndarray):
+    from quick_print import _extend_to_product, decide_light
+
+    fitted, extended, delta = _extend_to_product(picture, 148, 210, "", [])
+    pad = (fitted.shape[0] - picture.shape[0]) // 2
+    band = fitted[:pad]
+    info = decide_light({
+        "compiled": True,
+        "enginePassed": True,
+        "aspectExtended": extended,
+        "aspectDelta": delta,
+        "upscale": 1,
+    })
+    return band, pad, info, fitted, picture
+
+
+def test_nearby_object_does_not_enter_the_band() -> None:
+    """A strong colour just inside the old 64px window must not stain the new edge."""
+    import cv2
+
+    picture = _disc_picture(40)
+    check("near-inside-old-window", bool(_orange(picture[:64]).any()))
+    check("near-outside-thin-edge", not bool(_orange(picture[:5]).any()))
+    band, pad, info, fitted, picture = _top_band(picture)
+    check("near-pad", pad >= 8, str(pad))
+    check("near-no-orange", int(_orange(band).sum()) == 0, str(int(_orange(band).sum())))
+    smooth = cv2.GaussianBlur(band, (0, 0), 3)
+    hot = (np.max(np.abs(band.astype(np.float32) - smooth), axis=2) > 45).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(hot, 8)
+    blobs = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] > 6]
+    check("near-no-patches", not blobs, str(blobs[:6]))
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    second = np.diff(gray.mean(axis=1), n=2)
+    check("near-smooth", float(np.max(np.abs(second))) < 2.5, f"{float(np.max(np.abs(second))):.2f}")
+    middle = fitted[pad:pad + picture.shape[0]]
+    check("near-keeps-picture", np.array_equal(middle, picture))
+    check("near-amber", info["light"] == "amber" and any("extended" in line for line in info["reasons"]), str(info))
+
+
+def test_touching_object_stays_reasonable_and_amber() -> None:
+    """A colour that does touch the edge may continue, but only as that edge, and the job stays amber."""
+    import cv2
+
+    picture = _disc_picture(-30)
+    check("touch-on-edge", bool(_orange(picture[:1]).any()))
+    band, _pad, info, fitted, picture = _top_band(picture)
+    edge_orange = _orange(picture[:1])[0]
+    cols = np.where(edge_orange)[0]
+    check("touch-has-span", cols.size > 10, str(cols.size))
+    # The edge colour is blurred along the rim, so the object softens sideways.
+    spread = int(round(0.04 * picture.shape[1] * 3)) + 8
+    lo = int(cols.min()) - spread
+    hi = int(cols.max()) + spread
+    band_orange = _orange(band)
+    stray = [int(x) for x in np.where(band_orange.any(axis=0))[0] if x < lo or x > hi]
+    check("touch-orange-stays-with-object", not stray, str(stray[:8]))
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(band_orange.astype(np.uint8), 8)
+    floating = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < 12:
+            continue
+        top = int(stats[index, cv2.CC_STAT_TOP])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if top + height < band.shape[0] - 1:
+            floating.append((area, int(stats[index, cv2.CC_STAT_WIDTH]), height))
+    check("touch-no-floating-dashes", not floating, str(floating))
+    check("touch-amber", info["light"] == "amber" and any("extended" in line for line in info["reasons"]), str(info))
+    middle = fitted[(fitted.shape[0] - picture.shape[0]) // 2:][:picture.shape[0]]
+    check("touch-keeps-picture", np.array_equal(middle, picture))
+
+
+def main() -> None:
+    test_rules()
+    test_extended_band_does_not_streak()
+    test_nearby_object_does_not_enter_the_band()
+    test_touching_object_stays_reasonable_and_amber()
+    root = tempfile.mkdtemp(prefix="quick-print-src-")
+    try:
+        test_word(root)
+        test_corrupt(root)
+        test_too_small(root)
+        test_existing(root)
+        test_wide(root)
+        test_flyer(root)
+        test_shapes(root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("ALL QUICK PRINT CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()

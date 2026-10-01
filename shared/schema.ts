@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -12,11 +12,14 @@ export const fileJobs = sqliteTable("file_jobs", {
   uploadedAt: integer("uploaded_at", { mode: "timestamp_ms" }).$defaultFn(() => new Date()).notNull(),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   fileSize: integer("file_size").notNull(),
-  fileType: text("file_type").notNull(), // pdf, jpg, png, docx, pptx
+  fileType: text("file_type").notNull(), // pdf, jpg, png, docx, pptx, ai, eps
   // SQLite has no native JSONB; store JSON as text via Drizzle's JSON mode.
   auditResults: text("audit_results", { mode: "json" }).$type<Record<string, any> | null>(),
   errorMessage: text("error_message"),
-});
+}, (table) => [
+  index("idx_file_jobs_uploaded_at").on(table.uploadedAt),
+  index("idx_file_jobs_status_uploaded_at").on(table.status, table.uploadedAt),
+]);
 
 // === BASE SCHEMAS ===
 export const insertFileJobSchema = createInsertSchema(fileJobs).omit({ 
@@ -31,7 +34,7 @@ export const insertFileJobSchema = createInsertSchema(fileJobs).omit({
 export type JobStatus = "pending" | "processing" | "complete" | "failed";
 
 // File types supported
-export type FileType = "pdf" | "jpg" | "png" | "docx" | "pptx";
+export type FileType = "pdf" | "jpg" | "png" | "docx" | "pptx" | "ai" | "eps";
 
 // Individual audit check result
 export interface AuditCheck {
@@ -88,6 +91,10 @@ export interface AuditResults {
     document_height_mm: number;
   };
   savedBleedOptions?: Record<string, any>;
+  /** Illustrator/EPS intake: artboard count after the file is read as a PDF. */
+  pageCount?: number;
+  /** Original container when an .ai or .eps file was normalised onto the PDF pipeline. */
+  sourceFormat?: "ai" | "eps";
   originalDpi?: number;
   showLowDpiWarning?: boolean;
   aiEnhanced?: boolean;
@@ -99,9 +106,87 @@ export interface AuditResults {
     replicate?: string;
     upscale?: string;
     ai_outpaint?: string;
+    colourBorder?: string;
   };
-  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint";
-  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "auto";
+  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder";
+  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
+  /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */
+  colourBorder?: { c: number; m: number; y: number; k: number; label?: string; source?: string };
+  /** Optional AI upscale accepted after the bleed choice. Applied to the artwork before bleed. */
+  aiUpscale?: {
+    accepted?: boolean;
+    provider?: "replicate" | "basic" | "stub" | "original";
+    model?: string;
+    version?: string;
+    scale?: number;
+    enhancedPath?: string;
+    note?: string;
+    message?: string;
+    effectiveDpi?: number;
+    enhancedDpi?: number;
+    kind?: string;
+  };
+  /** Auto defaults for likely AI-generated images. Every field is overridable. */
+  aiArtwork?: {
+    detected?: boolean;
+    reasons?: string[];
+    mismatch?: boolean;
+    fit?: "crop" | "extend" | "border" | "none";
+    offset?: number;
+    bleed?: string;
+    bleedOverridden?: boolean;
+    edge?: { c: number; m: number; y: number; k: number };
+    enhance?: boolean;
+    enhanceOverridden?: boolean;
+    effectiveDpi?: number;
+    bright?: boolean;
+    brightMessage?: string;
+    textStatus?: "warning" | "clear" | "unavailable";
+    textWarnings?: Array<{ word: string; suggestion?: string }>;
+    textMessage?: string;
+    applied?: string[];
+    note?: string;
+    blocked?: boolean;
+    srcW?: number;
+    srcH?: number;
+  };
+  /** Automatic rebuild of likely AI raster artwork. Absent means not assessed. */
+  aiRebuild?: {
+    detected?: boolean;
+    assessed?: boolean;
+    skipped?: boolean;
+    autoRebuild?: boolean;
+    accepted?: boolean;
+    success?: boolean;
+    reasons?: string[];
+    recommendation?: string;
+    blocks?: Array<{ id: string; text: string; bbox?: number[]; color_hex?: string; bold?: boolean }>;
+    ocrText?: string;
+    steps?: Array<{ name: string; engine: string; ok?: boolean; note?: string }>;
+    pdfPath?: string;
+    note?: string;
+    message?: string;
+    replicate?: string;
+    effectiveDpi?: number | null;
+  };
+  /** One-step sales quick mode. Absent on ordinary jobs. */
+  quickPrint?: {
+    light?: "green" | "amber" | "red";
+    approved?: boolean;
+    reasons?: string[];
+    decisions?: string[];
+    clientMessage?: string;
+    pressPath?: string;
+    proofPng?: string;
+    proofPdf?: string;
+    productId?: string;
+    productLabel?: string;
+    quantity?: number | null;
+    notes?: string;
+    bleedMm?: number;
+    existingBleedKept?: boolean;
+    upscale?: number;
+  };
   rightSafety?: "CRITICAL" | "SAFE";
   criticalSafeZone?: boolean;
   preBleedPath?: string;
@@ -145,6 +230,21 @@ export interface AuditResults {
     resolution_and_lenses?: { action_taken: string };
   };
   jobAudit?: JobAudit;
+  /** Press-Ready Engine: per-edge choice and the press-file check. */
+  pressEngine?: {
+    passed?: boolean;
+    status?: "ready" | "needs-attention" | "planned";
+    headline?: string;
+    reason?: string;
+    fix?: string;
+    contentKind?: string;
+    existingBleed?: boolean;
+    safeZoneMm?: number;
+    replicate?: string;
+    resolutionNote?: string;
+    rescue?: { applied?: boolean; scale?: number; note?: string; safeZoneMm?: number };
+    edges?: Array<{ side: string; kind: string; method: string; note: string }>;
+  };
   /** Present when Shrink & Re-Bleed auto-heal fired during bleed generation (image path). */
   autoHealEvent?: {
     applied: boolean;
@@ -164,6 +264,7 @@ export const BLEED_STRATEGY_IDS = [
   "replicate",
   "upscale",
   "ai_outpaint",
+  "colourBorder",
 ] as const;
 
 export type BleedStrategyId = (typeof BLEED_STRATEGY_IDS)[number];
@@ -197,9 +298,43 @@ export interface UpdateFileJobRequest {
 // Response types
 export interface FileJobResponse extends Omit<FileJob, 'auditResults'> {
   auditResults: AuditResults | null;
+  /** Live stage while a run is going. Absent once the file is gone. */
+  progress?: {
+    stage: string;
+    stageId?: string;
+    percent: number;
+    startedAt: number;
+    updatedAt: number;
+    note?: string;
+    elapsedSec?: number;
+  } | null;
 }
 
-export type FileJobsListResponse = FileJobResponse[];
+/** Home-page row. Audit JSON stays on the single-job route. */
+export interface JobListItem {
+  id: number;
+  filename: string;
+  status: JobStatus;
+  uploadedAt: string;
+  fileSize: number;
+  fileType: string;
+  thumbnailUrl: string | null;
+  overallPassed: boolean | null;
+  hasCorrectedFile: boolean;
+  printReady: boolean;
+  /** Set when the job was made by sales quick mode. */
+  quickLight?: "green" | "amber" | "red" | null;
+}
+
+export interface JobListPage {
+  jobs: JobListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export type FileJobsListResponse = JobListPage;
 
 // Bleed adjustment options
 export interface BleedOptions {

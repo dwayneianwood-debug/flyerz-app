@@ -27,6 +27,7 @@ import urllib.error
 import base64
 
 from fai_temp_utils import init_fai_temp_dir
+from http_headers import external_headers
 
 FAI_TEMP_DIR = init_fai_temp_dir()
 if not os.path.isdir(FAI_TEMP_DIR):
@@ -38,9 +39,36 @@ if not os.path.isdir(FAI_TEMP_DIR):
 
 REPLICATE_API_URL = "https://api.replicate.com/v1"
 REPLICATE_POLL_INTERVAL_S = 2
-REPLICATE_TIMEOUT_S = 25
+# One step (create, rate-limit waits, and poll). Cold starts need more than 25s.
+REPLICATE_TIMEOUT_S = 90
+# Prefer: wait can hold the create call. Keep that socket inside the step budget.
+REPLICATE_CREATE_TIMEOUT_S = 60
+# Low credit: prediction creation is limited to about one burst every 10 seconds.
+REPLICATE_RATE_LIMIT_RETRIES = 3
+REPLICATE_RATE_LIMIT_WAIT_S = 10
 DOWNLOAD_CHUNK_SIZE = 65536
 MAX_UPLOAD_BYTES = 20_000_000
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(max(0.0, float(seconds)))
+
+
+def _retry_after_seconds(headers) -> float:
+    raw = ""
+    try:
+        if headers is not None:
+            raw = headers.get("Retry-After") or headers.get("retry-after") or ""
+    except Exception:
+        raw = ""
+    text = str(raw).strip()
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        return float(REPLICATE_RATE_LIMIT_WAIT_S)
+    if seconds < 0:
+        return float(REPLICATE_RATE_LIMIT_WAIT_S)
+    return seconds
 
 
 def _get_replicate_token() -> str:
@@ -69,7 +97,8 @@ def _call_gemini_vision(image_path: str, prompt: str) -> tuple:
     mime_type = parts[0].split(":")[1].split(";")[0]
     b64_data = parts[1]
 
-    url = f"{GEMINI_API_URL}/models/gemini-2.0-flash:generateContent?key={key}"
+    from gemini_api import gemini_generate_content_url
+    url = gemini_generate_content_url(key)
     payload = json.dumps({
         "contents": [{
             "parts": [
@@ -84,9 +113,9 @@ def _call_gemini_vision(image_path: str, prompt: str) -> tuple:
         }
     }).encode("utf-8")
 
-    req = urllib.request.Request(url, data=payload, headers={
+    req = urllib.request.Request(url, data=payload, headers=external_headers({
         "Content-Type": "application/json",
-    })
+    }))
 
     try:
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_S) as resp:
@@ -133,29 +162,72 @@ def _to_data_uri(image_path: str) -> str:
 
 
 def _replicate_create_prediction(model_owner: str, model_name: str,
-                                  model_input: dict, token: str) -> dict:
-    url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
-    payload = json.dumps({"input": model_input}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Prefer": "wait",
-    })
-    with urllib.request.urlopen(req, timeout=min(REPLICATE_TIMEOUT_S, 30)) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+                                  model_input: dict, token: str, version: str = "",
+                                  deadline: float = None) -> dict:
+    if version:
+        url = f"{REPLICATE_API_URL}/predictions"
+        body = {"version": version, "input": model_input}
+    else:
+        url = f"{REPLICATE_API_URL}/models/{model_owner}/{model_name}/predictions"
+        body = {"input": model_input}
+    payload = json.dumps(body).encode("utf-8")
+    if deadline is None:
+        deadline = time.time() + REPLICATE_TIMEOUT_S
+    last_error = None
+    for attempt in range(REPLICATE_RATE_LIMIT_RETRIES + 1):
+        remaining = deadline - time.time()
+        if remaining <= 0.05:
+            if last_error is not None:
+                raise last_error
+            raise TimeoutError("AI service is busy, please try again")
+        req = urllib.request.Request(url, data=payload, headers=external_headers({
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "wait",
+        }))
+        timeout = min(REPLICATE_CREATE_TIMEOUT_S, remaining)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code != 429 or attempt >= REPLICATE_RATE_LIMIT_RETRIES:
+                raise
+            wait = _retry_after_seconds(getattr(exc, "headers", None))
+            try:
+                exc.read()
+            except Exception:
+                pass
+            if wait > (deadline - time.time()) - 1.0:
+                raise
+            _pause(wait)
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError("AI service is busy, please try again")
 
 
 def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> dict:
     while time.time() < deadline:
-        time.sleep(REPLICATE_POLL_INTERVAL_S)
-        req = urllib.request.Request(poll_url, headers={
+        _pause(REPLICATE_POLL_INTERVAL_S)
+        req = urllib.request.Request(poll_url, headers=external_headers({
             "Authorization": f"Bearer {token}",
-        })
+        }))
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("status") in ("succeeded", "failed", "canceled"):
                     return data
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                wait = _retry_after_seconds(getattr(exc, "headers", None))
+                try:
+                    exc.read()
+                except Exception:
+                    pass
+                if wait > deadline - time.time():
+                    return None
+                _pause(wait)
+            continue
         except Exception:
             continue
     return None
@@ -164,9 +236,9 @@ def _replicate_poll_prediction(poll_url: str, token: str, deadline: float) -> di
 def _replicate_cancel(cancel_url: str, token: str):
     try:
         if cancel_url:
-            req = urllib.request.Request(cancel_url, method="POST", headers={
+            req = urllib.request.Request(cancel_url, method="POST", headers=external_headers({
                 "Authorization": f"Bearer {token}",
-            })
+            }))
             urllib.request.urlopen(req, timeout=3)
     except Exception:
         pass
@@ -177,7 +249,7 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
     out_path = fd.name
     fd.close()
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=external_headers())
         with urllib.request.urlopen(req, timeout=15) as resp:
             with open(out_path, "wb") as f:
                 while True:
@@ -195,7 +267,7 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
 
 
 def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
-                     model_input: dict) -> tuple:
+                     model_input: dict, version: str = "") -> tuple:
     token = _get_replicate_token()
     if not token:
         return None, "REPLICATE_API_TOKEN not configured — enhancement requires API access"
@@ -204,11 +276,13 @@ def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
 
     try:
         prediction = _replicate_create_prediction(
-            model_owner, model_name, model_input, token
+            model_owner, model_name, model_input, token, version=version, deadline=deadline,
         )
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:200]
+        body = e.read().decode("utf-8", errors="replace")[:240]
         return None, f"API error {e.code}: {body}"
+    except TimeoutError:
+        return None, "AI service is busy, please try again"
     except Exception as e:
         if "timed out" in str(e).lower() or "timeout" in str(e).lower():
             return None, "AI service is busy, please try again"
@@ -249,6 +323,7 @@ def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
         "sharpen_logos": "_sharpened.png",
         "background_remove": "_bg_removed.png",
         "expand_background": "_expanded.png",
+        "ai_upscale": "_upscaled.png",
     }
     try:
         out_path = _download_to_ramdisk(
@@ -1090,6 +1165,35 @@ if __name__ == "__main__":
         result = apply_identify_fonts(input_path)
     elif action == "test_design_style":
         result = apply_test_design_style(input_path)
+    elif action == "ai_upscale":
+        from ai_upscale import apply_ai_upscale
+        result = apply_ai_upscale(input_path, options)
+    elif action == "ai_upscale_assess":
+        from ai_upscale import assess_artwork
+        result = assess_artwork(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+            float(options.get("bleed_mm", 5)),
+        )
+    elif action == "ai_artwork_assess":
+        from ai_artwork import plan_artwork
+        result = plan_artwork(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+            options,
+        )
+    elif action == "ai_rebuild_assess":
+        from ai_rebuild import assess as assess_ai_rebuild
+        result = assess_ai_rebuild(
+            input_path,
+            float(options.get("trim_w_mm", 148)),
+            float(options.get("trim_h_mm", 210)),
+        )
+    elif action == "ai_rebuild":
+        from ai_rebuild import rebuild as rebuild_ai_artwork
+        result = rebuild_ai_artwork(input_path, options)
     else:
         result = {"error": f"Unknown action: {action}"}
         sys.exit(1)

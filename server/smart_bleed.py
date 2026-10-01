@@ -38,6 +38,8 @@ import cv2
 cv2.setNumThreads(4)
 import numpy as np
 import fitz  # PyMuPDF
+from artwork_types import is_vector_extension, is_vector_type
+from vector_resolution import minimum_placed_dpi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,18 +67,8 @@ def _timer_log(label: str, t0: float) -> None:
 
 
 def find_gs_binary() -> str:
-    # Windows installers ship gswin64c.exe / gswin64.exe; Unix typically provides "gs".
-    for cmd in ("gs", "gswin64c", "gswin64"):
-        gs_path = shutil.which(cmd)
-        if gs_path:
-            return gs_path
-
-    nix_matches = globmod.glob("/nix/store/*/bin/gs")
-    for p in sorted(nix_matches, reverse=True):
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-
-    return "gs"
+    from gs_binary import find_gs_binary as resolve_gs
+    return resolve_gs()
 
 
 GS_BIN = find_gs_binary()
@@ -430,6 +422,8 @@ def add_clean_bleed(img_array, dpi=300):
 
     actual_dpi = dpi if dpi and dpi > 0 else 300
     ch, cw = cropped_img.shape[:2]
+    # Honour the bleed the customer chose. FINAL_BLEED_MM is only the 5mm default.
+    remaining_px = _mm_to_px(float(BLEED_TARGET_MM), actual_dpi)
     final_img = pixel_drift_bleed_expand(
         cropped_img, remaining_px, remaining_px, remaining_px, remaining_px, actual_dpi
     )
@@ -465,24 +459,9 @@ def detect_dpi_from_image(img_path: str) -> float:
 def get_original_pdf_dpi(pdf_path: str) -> int:
     try:
         doc = fitz.open(pdf_path)
-        min_dpi = 999
-        found_image = False
-
-        for page in doc:
-            img_info = page.get_image_info(xrefs=True)
-            for info in img_info:
-                width_pts = info['bbox'][2] - info['bbox'][0]
-                height_pts = info['bbox'][3] - info['bbox'][1]
-
-                if width_pts > 0 and height_pts > 0:
-                    dpi_x = (info['width'] / width_pts) * 72
-                    dpi_y = (info['height'] / height_pts) * 72
-                    current_dpi = min(dpi_x, dpi_y)
-                    min_dpi = min(min_dpi, current_dpi)
-                    found_image = True
-
+        dpi = minimum_placed_dpi(doc)
         doc.close()
-        return int(min_dpi) if found_image else 300
+        return 300 if dpi is None else int(round(dpi))
     except Exception:
         return 300
 
@@ -490,7 +469,7 @@ def get_original_pdf_dpi(pdf_path: str) -> int:
 def get_effective_asset_dpi(file_path: str, target_width_mm: float = 148, target_height_mm: float = 210) -> int:
     ext = os.path.splitext(file_path)[1].lower()
 
-    if ext == '.pdf':
+    if is_vector_extension(ext):
         return get_original_pdf_dpi(file_path)
     else:
         try:
@@ -649,7 +628,7 @@ def standardize_input(input_path: str, dpi: int = 300) -> tuple:
     temp_tiff = None
 
     try:
-        if ext == ".pdf":
+        if is_vector_extension(ext):
             scan = detect_rgb_alpha_emergency(input_path)
             complexity = check_pdf_complexity(input_path)
 
@@ -1518,7 +1497,7 @@ def generate_signoff_comparison(original_path: str, corrected_path: str,
             return images
 
         ext = os.path.splitext(original_path)[1].lower()
-        is_pdf = ext == ".pdf" or (file_type and file_type.lower() == "pdf")
+        is_pdf = is_vector_extension(ext) or is_vector_type(file_type or "")
         if is_pdf:
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=2) as _ex:
@@ -1620,7 +1599,7 @@ def generate_bleed_report_proof(original_path: str, fixed_path: str, output_png_
 
         def _load_as_bgr(fpath):
             ext = os.path.splitext(fpath)[1].lower()
-            if ext == ".pdf":
+            if is_vector_extension(ext):
                 doc = fitz.open(fpath)
                 page = doc[0]
                 zoom = 150 / 72.0
@@ -1702,7 +1681,7 @@ def _get_pdf_page_dimensions_mm(file_path: str) -> list:
     dims = []
     ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext == ".pdf":
+        if is_vector_extension(ext):
             doc = fitz.open(file_path)
             for page in doc:
                 w_mm = page.rect.width * 25.4 / 72.0
@@ -3565,6 +3544,7 @@ BLEED_STRATEGY_MIRROR = "mirror"
 BLEED_STRATEGY_REPLICATE = "replicate"
 BLEED_STRATEGY_UPSCALE = "upscale"
 BLEED_STRATEGY_AI_OUTPAINT = "ai_outpaint"
+BLEED_STRATEGY_COLOUR_BORDER = "colourBorder"
 BLEED_STRATEGY_GRADIENT_EXTRAPOLATE = "gradient_extrapolate"
 BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
 
@@ -7032,8 +7012,238 @@ def composite_ghost_frame_pullback(
     return canvas, meta
 
 
+_FACE_CASCADE = None
+
+
+def _face_near_edge(bgr: np.ndarray, dpi: float) -> bool:
+    """True when a face sits in the outer 8mm. Mirror would copy that face into the bleed and can drag it back over the cut."""
+    global _FACE_CASCADE
+    if bgr is None or bgr.size == 0:
+        return False
+    try:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    except Exception:
+        return False
+    if not os.path.isfile(cascade_path):
+        return False
+    if _FACE_CASCADE is None:
+        _FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
+    if _FACE_CASCADE.empty():
+        return False
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    proxy, scale = _make_proxy(gray, max_dim=800)
+    faces = _FACE_CASCADE.detectMultiScale(proxy, scaleFactor=1.1, minNeighbors=4)
+    if faces is None or len(faces) == 0:
+        return False
+    margin = max(4, _mm_to_px(8.0, dpi if dpi and dpi > 0 else 300.0))
+    height, width = bgr.shape[:2]
+    inv = 1.0 / scale if scale > 0 else 1.0
+    for (x, y, fw, fh) in faces:
+        x0 = int(x * inv)
+        y0 = int(y * inv)
+        x1 = int((x + fw) * inv)
+        y1 = int((y + fh) * inv)
+        if x0 < margin or y0 < margin or x1 > width - margin or y1 > height - margin:
+            return True
+    return False
+
+
+def choose_automatic_bleed_api(img_bgr: np.ndarray, dpi: float = 300.0) -> str:
+    """
+    One method for the whole sheet.
+    Flat edges get a colour border that matches the edge (an extend).
+    Photographs get mirror, or background extract when text or a face is at the edge.
+    """
+    from ai_artwork import FLAT_EDGE_STD, edge_std
+
+    plane = img_bgr
+    if plane is None or plane.size == 0:
+        return "mirror"
+    if plane.ndim == 2:
+        plane = cv2.cvtColor(plane, cv2.COLOR_GRAY2BGR)
+    elif plane.shape[2] == 4:
+        plane = cv2.cvtColor(plane, cv2.COLOR_BGRA2BGR)
+    flat = edge_std(plane) <= FLAT_EDGE_STD
+    text = any(_detect_text_near_edge(plane, side) for side in ("top", "bottom", "left", "right"))
+    face = _face_near_edge(plane, dpi)
+    if text or face:
+        if flat:
+            print("[BLEED][AUTO] text or a face on a flat edge → colour border (no mirror)")
+            return "colourBorder"
+        print("[BLEED][AUTO] text or a face at the edge → background extract (no mirror)")
+        return "bgExtract"
+    if flat:
+        print("[BLEED][AUTO] flat edge → colour border matched to the edge")
+        return "colourBorder"
+    print("[BLEED][AUTO] photographic edge → mirror")
+    return "mirror"
+
+
+def _bleed_dict_from_image_dpi(img: np.ndarray, dpi: float, trim_w_mm: float, trim_h_mm: float) -> dict | None:
+    """A centred file whose millimetre size is trim plus a uniform 2–25mm margin already has bleed."""
+    if img is None or dpi is None or dpi < 150 or trim_w_mm <= 0 or trim_h_mm <= 0:
+        return None
+    height, width = img.shape[:2]
+    doc_w = width / float(dpi) * 25.4
+    doc_h = height / float(dpi) * 25.4
+    extra_w = doc_w - float(trim_w_mm)
+    extra_h = doc_h - float(trim_h_mm)
+    if extra_w < 4.0 or extra_h < 4.0:
+        return None
+    left = right = extra_w / 2.0
+    top = bottom = extra_h / 2.0
+    if abs(left - top) > 1.5:
+        return None
+    if min(left, top) < 2.0 or max(left, top) > 25.0:
+        return None
+    return {
+        "top": top,
+        "bottom": bottom,
+        "left": left,
+        "right": right,
+        "trim_w_mm": float(trim_w_mm),
+        "trim_h_mm": float(trim_h_mm),
+    }
+
+
+def crop_to_trim_box(img: np.ndarray, info: dict) -> np.ndarray:
+    """Cut the trim rectangle out of a raster that already includes bleed."""
+    height, width = img.shape[:2]
+    full_w = float(info["trim_w_mm"]) + float(info["left"]) + float(info["right"])
+    full_h = float(info["trim_h_mm"]) + float(info["top"]) + float(info["bottom"])
+    if full_w <= 0 or full_h <= 0:
+        return img
+    x0 = int(round(float(info["left"]) / full_w * width))
+    y0 = int(round(float(info["top"]) / full_h * height))
+    x1 = int(round((float(info["left"]) + float(info["trim_w_mm"])) / full_w * width))
+    y1 = int(round((float(info["top"]) + float(info["trim_h_mm"])) / full_h * height))
+    x0 = max(0, min(x0, width - 2))
+    y0 = max(0, min(y0, height - 2))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
+    return img[y0:y1, x0:x1].copy()
+
+
+def _fit_outer_pixels(img: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Pad or crop the outside so the canvas is exact. The middle is not resampled."""
+    height_now, width_now = img.shape[:2]
+    if width_now == width and height_now == height:
+        return img
+    if width_now > width or height_now > height:
+        x0 = max(0, (width_now - width) // 2)
+        y0 = max(0, (height_now - height) // 2)
+        return img[y0:y0 + height, x0:x0 + width].copy()
+    pad_y = height - height_now
+    pad_x = width - width_now
+    top = pad_y // 2
+    left = pad_x // 2
+    return cv2.copyMakeBorder(
+        img, top, pad_y - top, left, pad_x - left, borderType=cv2.BORDER_REPLICATE,
+    )
+
+
+def apply_existing_bleed(
+    img: np.ndarray,
+    info: dict,
+    target_trim_w_mm: float,
+    target_trim_h_mm: float,
+    target_bleed_mm: float,
+    strategy: str,
+    dpi: float,
+    border_cmyk: tuple | None = None,
+) -> tuple:
+    """
+    Keep bleed that is already in the file. Returns (canvas, report).
+    canvas is None when the trim size does not match: report['trim_crop'] is the
+    trim only, so the caller cover-scales that instead of the old bleed.
+    """
+    trim_w = float(info.get("trim_w_mm") or 0)
+    trim_h = float(info.get("trim_h_mm") or 0)
+    matches = (
+        abs(trim_w - float(target_trim_w_mm)) <= 2.0
+        and abs(trim_h - float(target_trim_h_mm)) <= 2.0
+    )
+    if not matches:
+        return None, {"mismatch": True, "trim_crop": crop_to_trim_box(img, info)}
+
+    dpi_f = float(dpi) if dpi and dpi > 0 else 300.0
+    ppm = dpi_f / 25.4
+    keep = {}
+    add = {}
+    for side in ("top", "bottom", "left", "right"):
+        have = float(info.get(side) or 0)
+        keep[side] = min(have, float(target_bleed_mm))
+        add[side] = max(0.0, float(target_bleed_mm) - have)
+
+    height, width = img.shape[:2]
+    full_w = trim_w + float(info["left"]) + float(info["right"])
+    full_h = trim_h + float(info["top"]) + float(info["bottom"])
+    crop_top = int(round((float(info["top"]) - keep["top"]) / full_h * height))
+    crop_bot = int(round((float(info["bottom"]) - keep["bottom"]) / full_h * height))
+    crop_left = int(round((float(info["left"]) - keep["left"]) / full_w * width))
+    crop_right = int(round((float(info["right"]) - keep["right"]) / full_w * width))
+    crop_top = max(0, crop_top)
+    crop_bot = max(0, crop_bot)
+    crop_left = max(0, crop_left)
+    crop_right = max(0, crop_right)
+    cropped = img[crop_top:height - crop_bot or None, crop_left:width - crop_right or None]
+    if cropped.size == 0:
+        cropped = img
+    kept_w = max(1, int(round((trim_w + keep["left"] + keep["right"]) * ppm)))
+    kept_h = max(1, int(round((trim_h + keep["top"] + keep["bottom"]) * ppm)))
+    if cropped.shape[1] != kept_w or cropped.shape[0] != kept_h:
+        cropped = cv2.resize(cropped, (kept_w, kept_h), interpolation=cv2.INTER_AREA)
+
+    add_px = {side: int(round(add[side] * ppm)) for side in add}
+    if any(add_px.values()):
+        api = (strategy or "auto").strip()
+        if api == "auto":
+            api = choose_automatic_bleed_api(crop_to_trim_box(img, info), dpi_f)
+        if api == "colourBorder" and border_cmyk is None:
+            from colour_border import sample_edge_cmyk
+            border_cmyk = sample_edge_cmyk(crop_to_trim_box(img, info))
+        # Extend only the missing millimetres. The existing ring stays put.
+        if api == "mirror":
+            cropped = mirror_blend_bleed_expand(
+                cropped, add_px["top"], add_px["bottom"], add_px["left"], add_px["right"], dpi_f,
+            )
+        elif api == "bgExtract":
+            cropped = background_extract_bleed_expand(
+                cropped, add_px["top"], add_px["bottom"], add_px["left"], add_px["right"], dpi_f,
+            )
+        elif api == "colourBorder":
+            from colour_border import apply_colour_border_bgr
+            ink = border_cmyk if border_cmyk is not None else (0.0, 0.0, 0.0, 0.0)
+            # Uniform colour border helper needs equal sides. Pad each short side on its own.
+            colour = None
+            from colour_border import cmyk_to_bgr
+            colour = cmyk_to_bgr(ink)
+            cropped = cv2.copyMakeBorder(
+                cropped,
+                add_px["top"], add_px["bottom"], add_px["left"], add_px["right"],
+                borderType=cv2.BORDER_CONSTANT,
+                value=colour,
+            )
+        else:
+            cropped = pixel_drift_bleed_expand(
+                cropped, add_px["top"], add_px["bottom"], add_px["left"], add_px["right"], dpi_f,
+            )
+
+    out_w = max(1, int(round((float(target_trim_w_mm) + 2.0 * float(target_bleed_mm)) * ppm)))
+    out_h = max(1, int(round((float(target_trim_h_mm) + 2.0 * float(target_bleed_mm)) * ppm)))
+    canvas = _fit_outer_pixels(cropped, out_w, out_h)
+    report = {
+        "mismatch": False,
+        "preserved": all(value == 0 for value in add_px.values()),
+        "added_mm": {side: round(add[side], 2) for side in add},
+        "existing_mm": {side: round(float(info[side]), 2) for side in ("top", "bottom", "left", "right")},
+    }
+    return canvas, report
+
+
 def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
-                           bleed_strategy: str = "auto", dpi: float = 300.0):
+                           bleed_strategy: str = "auto", dpi: float = 300.0,
+                           border_cmyk: tuple | None = None):
     """
     Unified bleed entry: strict geometric safe-zone clamp (SAFE_ZONE_MM vs trim), INTER_CUBIC resize,
     centered full-trim canvas with BORDER_REPLICATE margins; then validate_safe_zone; Elastic Anchor
@@ -7085,6 +7295,7 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         "replicate": BLEED_STRATEGY_REPLICATE,
         "upscale": BLEED_STRATEGY_UPSCALE,
         "ai_outpaint": BLEED_STRATEGY_AI_OUTPAINT,
+        "colourborder": BLEED_STRATEGY_COLOUR_BORDER,
         "gradient": BLEED_STRATEGY_GRADIENT_EXTRAPOLATE,
         "gradientextrapolate": BLEED_STRATEGY_GRADIENT_EXTRAPOLATE,
         "frequencyseparated": BLEED_STRATEGY_FREQUENCY_SEPARATED,
@@ -7120,17 +7331,26 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         )
 
     if api_key == "auto" or api_key not in strategy_map_lc:
-        out = add_clean_bleed(work, int(round(dpi_f)))
-        out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
-        return out, meta
+        chosen = choose_automatic_bleed_api(val_plane, dpi_f)
+        meta["automaticChoice"] = chosen
+        api_key = chosen.strip().lower().replace("-", "").replace("_", "")
+        if api_key == "colourborder" and border_cmyk is None:
+            from colour_border import sample_edge_cmyk
+            border_cmyk = sample_edge_cmyk(val_plane)
+            meta["automaticBorder"] = [float(channel) for channel in border_cmyk]
+        if api_key not in strategy_map_lc:
+            api_key = "stretch"
 
     internal = strategy_map_lc[api_key]
-    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f)
+    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk)
+    if internal == BLEED_STRATEGY_COLOUR_BORDER:
+        meta["colourBorder"] = True
+        return out, meta
     out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
     return out, meta
 
 
-def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0) -> np.ndarray:
+def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0, border_cmyk: tuple | None = None) -> np.ndarray:
     orig_h, orig_w = img.shape[:2]
 
     def _bleed_tic_if_match(out_img: np.ndarray) -> np.ndarray:
@@ -7188,6 +7408,16 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             mirror_blend_bleed_expand(img, bleed_px, bleed_px, bleed_px, bleed_px, dpi)
         )
 
+    if strategy == BLEED_STRATEGY_COLOUR_BORDER:
+        from colour_border import apply_colour_border_bgr
+
+        ink = border_cmyk if border_cmyk is not None else (0.0, 0.0, 0.0, 0.0)
+        sys.stderr.write(
+            f"[BLEED][ROUTING] colourBorder → solid CMYK border "
+            f"C{ink[0]} M{ink[1]} Y{ink[2]} K{ink[3]} ({bleed_px}px, trim copied)\n"
+        )
+        return _bleed_tic_if_match(apply_colour_border_bgr(img, bleed_px, ink))
+
     if strategy == BLEED_STRATEGY_UPSCALE:
         sys.stderr.write(
             "[BLEED][ROUTING] upscale → _apply_smart_upscale_bleed "
@@ -7235,6 +7465,7 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         (BLEED_STRATEGY_BG_EXTRACT, "bgextract"),
         (BLEED_STRATEGY_UPSCALE, "upscale"),
         (BLEED_STRATEGY_AI_OUTPAINT, "ai_outpaint"),
+        (BLEED_STRATEGY_COLOUR_BORDER, "colourBorder"),
     ]
     api_for_suffix = {
         "stretch": "stretch",
@@ -7245,6 +7476,7 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         "bgextract": "bgExtract",
         "upscale": "upscale",
         "ai_outpaint": "ai_outpaint",
+        "colourBorder": "colourBorder",
     }
     for _strategy_internal, suffix in all_strategies:
         try:
@@ -7706,6 +7938,12 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
 
     safety_status_val = variant_result.get("safetyStatus", "SAFE")
 
+    press_plan = None
+    try:
+        from press_ready_engine import plan_artwork
+        press_plan = plan_artwork(img, float(original_dpi or 150))
+    except Exception as plan_err:
+        sys.stderr.write(f"[BLEED] Press-ready plan skipped: {plan_err}\n")
     del img
     if bleed_img is not None:
         del bleed_img
@@ -7743,6 +7981,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         "finalTic": 0,
         "autoHealEvent": auto_heal_event,
         "crop_box": full_page_crop_box,
+        "pressEngine": press_plan,
     }
     if variant_result.get("paths"):
         result["bleedVariants"] = variant_result["paths"]
@@ -9049,7 +9288,7 @@ def main():
             })
             _attach_proof(result)
 
-        elif file_type == "pdf":
+        elif is_vector_type(file_type):
             result = apply_smart_bleed_to_pdf(input_path, output_path, bleed_opts)
 
         elif file_type in ("jpg", "jpeg", "png"):

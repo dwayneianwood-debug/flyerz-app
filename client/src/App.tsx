@@ -5,8 +5,9 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/dashboard";
+import PrintReady from "@/pages/print-ready";
 import JobDetails from "@/pages/job-details";
-import ManualCrop from "@/pages/manual-crop";
+import PureCrop from "@/pages/pure-crop";
 import SafeMarginShrink from "@/pages/safe-margin-shrink";
 import GlitchyAdmin from "@/pages/glitchy-admin";
 import ArProof from "@/pages/ar-proof";
@@ -20,8 +21,9 @@ function Router() {
     <Switch>
       <Route path="/dashboard/rules" component={DashboardRules}/>
       <Route path="/" component={Dashboard}/>
+      <Route path="/print-ready" component={PrintReady}/>
       <Route path="/job/:id" component={JobDetails}/>
-      <Route path="/crop" component={ManualCrop}/>
+      <Route path="/crop" component={PureCrop}/>
       <Route path="/shrink" component={SafeMarginShrink}/>
       <Route path="/glitchy-admin" component={GlitchyAdmin}/>
       <Route path="/ar-proof/:jobId" component={ArProof}/>

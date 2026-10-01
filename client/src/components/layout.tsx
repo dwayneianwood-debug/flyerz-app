@@ -2,6 +2,7 @@ import { ReactNode, useState, useRef, useEffect } from "react";
 import { Link, useLocation } from "wouter";
 import { Settings, History, HelpCircle, Smartphone, Scissors, Wrench, Shrink, Maximize2, Crop, ChevronDown, FileText, Download, Undo2, ScanLine } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { usePwaInstall } from "@/hooks/use-pwa-install";
 import logoPath from "@assets/flyerz_logo.png";
 import { useBeta } from "@/lib/beta-flag";
@@ -48,6 +49,43 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
   }, [toolsOpen, helpOpen, settingsOpen]);
 
   const canGoBack = currentPhase && currentPhase > 1 && onStepBack;
+  const [clearOldJobs, setClearOldJobs] = useState(true);
+  const [clearOldJobsReady, setClearOldJobsReady] = useState(false);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let cancelled = false;
+    fetch("/api/job-cleanup/settings", { credentials: "include" })
+      .then((res) => res.json())
+      .then((body: { enabled?: boolean }) => {
+        if (!cancelled) setClearOldJobs(body.enabled !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setClearOldJobs(true);
+      })
+      .finally(() => {
+        if (!cancelled) setClearOldJobsReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsOpen]);
+
+  async function toggleClearOldJobs(enabled: boolean) {
+    setClearOldJobs(enabled);
+    try {
+      const res = await fetch("/api/job-cleanup/settings", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      const body = await res.json();
+      setClearOldJobs(body.enabled !== false);
+    } catch {
+      setClearOldJobs(!enabled);
+    }
+  }
   const maxStepsBack = canGoBack ? Math.min(currentPhase! - 1, 3) : 0;
 
   const isToolsPage = location === "/crop" || location === "/shrink";
@@ -88,6 +126,16 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 Dashboard
               </Button>
             </Link>
+            <Link href="/print-ready">
+              <Button
+                variant={location === "/print-ready" ? "secondary" : "ghost"}
+                size="sm"
+                className="font-medium rounded-full"
+                data-testid="nav-print-ready"
+              >
+                Print-ready
+              </Button>
+            </Link>
 
             <div className="relative" ref={toolsRef}>
               <Button 
@@ -113,7 +161,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                         </div>
                         <div>
                           <p className="text-sm font-semibold text-foreground leading-tight">Manual Crop</p>
-                          <p className="text-[11px] text-muted-foreground">Draw or type exact crop dimensions</p>
+                          <p className="text-[11px] text-muted-foreground">Crop any size, save PDF or JPG</p>
                         </div>
                       </div>
                     </Link>
@@ -159,7 +207,24 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 <Settings className="w-4 h-4" />
               </Button>
               {settingsOpen && (
-                <div className="absolute right-0 top-full mt-2 w-64 rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
+                <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
+                  <div className="flex items-start gap-3 p-3" data-testid="setting-clear-old-jobs">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-foreground leading-tight">Clear old jobs overnight</p>
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        {clearOldJobs
+                          ? "On. Yesterday's jobs are removed after midnight. Today's artwork stays."
+                          : "Off. Old jobs are kept until this is turned on."}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={clearOldJobs}
+                      disabled={!clearOldJobsReady}
+                      onCheckedChange={(checked) => { void toggleClearOldJobs(checked); }}
+                      data-testid="switch-clear-old-jobs"
+                      aria-label="Clear old jobs overnight"
+                    />
+                  </div>
                   {canGoBack ? (
                     <>
                       <p className="px-3 pt-2 pb-1 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Go Back</p>
@@ -249,7 +314,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 pb-24 sm:p-6 sm:pb-6 lg:p-8">
         {children}
       </main>
       
