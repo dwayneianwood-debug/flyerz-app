@@ -817,6 +817,50 @@ def _save_footer_crop(trim: np.ndarray, gate: list, ppm: float) -> None:
     print(f"FOOTER CROP {crop.shape[1]}x{crop.shape[0]}")
 
 
+def _pad_for_detector(band: np.ndarray) -> np.ndarray:
+    """A thin pad is repeated with nearest pixels so the stripe detector can see it."""
+    import cv2
+
+    if band is None or band.ndim != 3 or band.shape[0] < 8 or band.shape[1] < 4:
+        return band
+    width = band.shape[1] * 3 if band.shape[1] < 80 else band.shape[1]
+    height = band.shape[0]
+    if width == band.shape[1]:
+        return band
+    return cv2.resize(band, (width, height), interpolation=cv2.INTER_NEAREST)
+
+
+def test_product_edges_are_not_striped() -> None:
+    """The flyer top-right and the poster right edge must not be stripes or bands."""
+    import cv2
+    from quick_print import SAFE_ZONE_MM, _extend_to_product, vertical_streaks_dominate
+
+    flyer_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "flyer_front.png"))
+    poster_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "catch_fire", "src.jpg"))
+    flyer = cv2.imread(flyer_path)
+    poster = cv2.imread(poster_path)
+    check("edge-fixtures", flyer is not None and poster is not None)
+    fitted, extended, _delta = _extend_to_product(flyer, 148, 210, "", [])
+    check("flyer-edge-extended", extended is True and fitted.shape[1] > flyer.shape[1])
+    extra = fitted.shape[1] - flyer.shape[1]
+    right_w = extra - extra // 2
+    top_right = fitted[: max(120, fitted.shape[0] // 5), -right_w:]
+    probed = _pad_for_detector(top_right)
+    turned = np.ascontiguousarray(np.transpose(probed, (1, 0, 2)))
+    check("flyer-top-right-no-stripes", vertical_streaks_dominate(probed) is False, "flyer top-right is striped")
+    check("flyer-top-right-no-bands", vertical_streaks_dominate(turned) is False, "flyer top-right is banded")
+
+    laid, extended, _delta = _extend_to_product(poster, 148, 210, "", [])
+    check("poster-edge-extended", extended is True and laid.shape[1] > poster.shape[1])
+    canvas_w = int(round(poster.shape[1] * 148.0 / (148.0 - 2.0 * SAFE_ZONE_MM)))
+    side = canvas_w - poster.shape[1] - (canvas_w - poster.shape[1]) // 2
+    right_edge = laid[:, -max(side, 1):]
+    probed = _pad_for_detector(right_edge)
+    turned = np.ascontiguousarray(np.transpose(probed, (1, 0, 2)))
+    check("poster-right-no-stripes", vertical_streaks_dominate(probed) is False, "poster right edge is striped")
+    check("poster-right-no-bands", vertical_streaks_dominate(turned) is False, "poster right edge is banded")
+
+
 def test_large_block_join_is_soft() -> None:
     """A tall extension meets the picture without a hard line or a pale row.
 
@@ -947,11 +991,17 @@ def test_catch_fire_raster_is_traced() -> None:
     # These rows disagree with OCR and must still be the untouched source pixels.
     for label, key in (
         ("f", "f"),
-        ("catch-fre", "CATCH-FRE"),
+        ("catch-fre", "CATCHFRE"),
         ("guest", "PGuest Spesker"),
         ("hosts", "our Hosts"),
     ):
-        hit = [row for row in gate if row.get("text") == key]
+        # The laid-out page is read as CATCHFRE. The raw file was CATCH-FRE.
+        # Either reading is the same picture, and it has to stay the picture.
+        want = "".join(ch for ch in key.upper() if ch.isalnum())
+        hit = [
+            row for row in gate
+            if "".join(ch for ch in str(row.get("text") or "").upper() if ch.isalnum()) == want
+        ]
         detail = str(hit)[:400]
         check(
             "catch-source-raster-" + label,
@@ -986,6 +1036,7 @@ def main() -> None:
     test_touching_object_stays_reasonable_and_amber()
     test_bottom_bar_stays_at_the_bottom()
     test_tall_extension_is_not_striped()
+    test_product_edges_are_not_striped()
     test_large_block_join_is_soft()
     test_catch_fire_raster_is_traced()
     root = tempfile.mkdtemp(prefix="quick-print-src-")

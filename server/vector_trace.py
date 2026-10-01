@@ -360,6 +360,10 @@ def _halo_of(salvaged: np.ndarray, cleaned: np.ndarray) -> np.ndarray:
 # alone: its glyphs are too small for a shape compare to be meaningful.
 GLYPH_MIN_H = 16.0
 GLYPH_IOU_MIN = 0.72
+# An ascender is about 1.6× the x-height. A logo welded into the line is about
+# twice as tall, or nearly three letters wide. Only that second kind is severe.
+SEVERE_HEIGHT_RATIO = 1.85
+SEVERE_WIDTH_RATIO = 2.8
 
 
 def harmonise_pending(pending: list) -> None:
@@ -393,10 +397,17 @@ def harmonise_pending(pending: list) -> None:
             welded = _halo_hit(part, halo)
             # A spurred letter is only a little taller than the line. A component
             # twice as tall is a different object and must not be rebuilt.
-            modest = (
-                not _glyph_clean(part, rec["median_h"], rec["median_top"])
-                and 0.70 * rec["median_h"] <= part["h"] <= 1.35 * rec["median_h"]
-            )
+            # Only a copy that is taller or shorter than the other copies of
+            # that same letter. A normal ascender is not rebuilt.
+            siblings = [
+                other for other_index, other in enumerate(rec["parts"])
+                if other_index != index and rec["letters"][other_index] == rec["letters"][index]
+            ]
+            modest = False
+            if siblings and 0.70 * rec["median_h"] <= part["h"] <= 1.35 * rec["median_h"]:
+                sibling_h = float(np.median([other["h"] for other in siblings]))
+                # A 2px body-copy wobble is not a different letter. The spurred T is.
+                modest = abs(part["h"] - sibling_h) > max(4.0, 0.18 * sibling_h)
             if not welded and not modest:
                 continue
             donor = _sibling_donor(donors.get(rec["letters"][index], []), rec, part)
@@ -410,13 +421,14 @@ def harmonise_pending(pending: list) -> None:
         for index, part in enumerate(rec["parts"]):
             if index in replacements:
                 continue
-            if part["h"] > 1.45 * rec["median_h"] or part["w"] > 2.2 * rec["median_w"]:
+            tall = part["h"] > SEVERE_HEIGHT_RATIO * rec["median_h"]
+            wide = part["w"] > SEVERE_WIDTH_RATIO * rec["median_w"]
+            if tall or wide:
                 severe.append(index)
         cleared = set()
         if severe:
-            for group in _word_groups(rec["parts"], rec["median_w"]):
-                if any(index in severe for index in group):
-                    cleared.update(group)
+            # One broken piece takes the whole line. A line is not half vector.
+            cleared.update(range(len(rec["parts"])))
         if not replacements and not cleared:
             continue
         updated = np.zeros(item["mask"].shape[:2], np.uint8)
@@ -436,7 +448,8 @@ def harmonise_pending(pending: list) -> None:
                 clear[cv2.dilate(part["pixels"].astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = 255
                 continue
             updated[part["pixels"]] = 255
-        if int(updated.max()) == 0:
+        item["changed"] = True
+        if int(updated.max()) == 0 or cleared:
             # The whole line was unusable. Leave the picture untouched.
             item["mask"] = np.zeros(item["mask"].shape[:2], np.uint8)
             item["clear"] = np.zeros(item["mask"].shape[:2], np.uint8)
@@ -780,14 +793,23 @@ def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner
     zone[y0:y1, x0:x1] = 1
     traced_bin = traced > 0
     source_bin = source > 0
-    for part in _components(traced, 20):
+    traced_parts = _components(traced, 20)
+    if traced_parts:
+        median_area = float(np.median([part["area"] for part in traced_parts]))
+    else:
+        median_area = 80.0
+    # A pad speck is not a wrong letter. A piece as big as a letter is.
+    significant = max(36, int(round(0.12 * median_area)))
+    for part in traced_parts:
+        if part["area"] < significant:
+            continue
         pixels = part["pixels"]
         area = part["area"]
         inside = int(np.count_nonzero(pixels & (zone > 0)))
-        if inside < int(0.50 * area):
-            return "The trace added a fragment outside the letters, so this box stayed in the picture."
         overlap = int(np.count_nonzero(pixels & source_bin))
-        if overlap < int(0.35 * area):
+        if inside < int(0.50 * area) and overlap < int(0.35 * area):
+            return "The trace added a fragment outside the letters, so this box stayed in the picture."
+        if overlap < int(0.18 * area):
             return "The trace picked up background that is not the letter, so this box stayed in the picture."
     # A solid block much taller than the letters is a logo filled in as a rectangle.
     source_parts = _components(source, 20)
@@ -815,7 +837,11 @@ def shape_gate(crop: np.ndarray, seg_mask: np.ndarray, traced: np.ndarray, inner
                 return "The trace dropped part of a letter, so this box stayed in the picture."
             continue
         if _hole_count(pixels) != _hole_count(best["pixels"]):
-            return "The trace closed or opened a counter, so this box stayed in the picture."
+            union = part["area"] + best["area"] - best_overlap
+            # A 1px paint closes a hairline counter and still covers the stroke.
+            # A 9 filled into an 8 does not: the hole is a real share of the glyph.
+            if union > 0 and best_overlap / float(union) < 0.36:
+                return "The trace closed or opened a counter, so this box stayed in the picture."
     return ""
 
 
@@ -839,6 +865,163 @@ def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
         fitted = cv2.resize(fitted, (width, height), interpolation=cv2.INTER_AREA)
     canvas[fitted < 200] = 255
     return canvas
+
+
+def _raster_box(text: str, left: int, top: int, right: int, bottom: int, core=None, scope: str = "paragraph") -> dict:
+    """A box that stayed in the picture.
+
+    `scope` is `line` when the box was never traced (the ink could not be
+    separated). That must not blank the paragraph above it. `paragraph` is a
+    trace that came out wrong, so the whole line and the lines stacked with it
+    stay together.
+    """
+    rect = (int(left), int(top), int(right - left), int(bottom - top))
+    return {
+        "text": text,
+        "rect": rect,
+        "core": core or rect,
+        "anchor": scope,
+    }
+
+
+def _horizontal_gap(left, right) -> float:
+    lx, _ly, lw, _lh = left
+    rx, _ry, rw, _rh = right
+    if lx + lw < rx:
+        return float(rx - (lx + lw))
+    if rx + rw < lx:
+        return float(lx - (rx + rw))
+    return 0.0
+
+
+def _vertical_overlap(left, right) -> float:
+    _lx, ly, _lw, lh = left
+    _rx, ry, _rw, rh = right
+    top = max(ly, ry)
+    bottom = min(ly + lh, ry + rh)
+    return float(bottom - top)
+
+
+def _same_line(left, right) -> bool:
+    overlap = _vertical_overlap(left, right)
+    if overlap < 0.55 * min(left[3], right[3]):
+        return False
+    return _horizontal_gap(left, right) < 1.4 * max(left[3], right[3])
+
+
+def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
+    """A line, and a paragraph of lines, is all vector or all raster.
+
+    A box that could not be traced pulls the other boxes on its line, and the
+    lines stacked with it in the same column. Icons do not, because they are
+    not in `raster_boxes`.
+    """
+    if not drawn or not raster_boxes:
+        return drawn
+    records = []
+    for index, item in enumerate(drawn):
+        records.append({
+            "index": index,
+            "mode": "vector",
+            "rect": item.get("core") or item["rect"],
+            "scope": "",
+        })
+    for box in raster_boxes:
+        scope = box.get("anchor")
+        if scope is True:
+            scope = "paragraph"
+        if not scope:
+            continue
+        records.append({
+            "index": None,
+            "mode": "raster",
+            "rect": box.get("core") or box["rect"],
+            "scope": scope,
+        })
+    parent = list(range(len(records)))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left, right):
+        parent[find(left)] = find(right)
+
+    for i in range(len(records)):
+        for j in range(i + 1, len(records)):
+            if _same_line(records[i]["rect"], records[j]["rect"]):
+                union(i, j)
+    lines = {}
+    for index, record in enumerate(records):
+        lines.setdefault(find(index), []).append(index)
+    line_ids = list(lines)
+    line_rect = {}
+    for line_id, members in lines.items():
+        rects = [records[member]["rect"] for member in members]
+        x0 = min(rect[0] for rect in rects)
+        y0 = min(rect[1] for rect in rects)
+        x1 = max(rect[0] + rect[2] for rect in rects)
+        y1 = max(rect[1] + rect[3] for rect in rects)
+        line_rect[line_id] = (x0, y0, x1 - x0, y1 - y0)
+    line_parent = {line_id: line_id for line_id in line_ids}
+
+    def find_line(node):
+        while line_parent[node] != node:
+            line_parent[node] = line_parent[line_parent[node]]
+            node = line_parent[node]
+        return node
+
+    def line_scope(line_id) -> str:
+        scopes = [records[member].get("scope") for member in lines[line_id] if records[member]["mode"] == "raster"]
+        if "paragraph" in scopes:
+            return "paragraph"
+        if scopes:
+            return "line"
+        return ""
+
+    ordered = sorted(line_ids, key=lambda line_id: line_rect[line_id][1])
+    for pos, line_id in enumerate(ordered):
+        rect = line_rect[line_id]
+        for other in ordered[pos + 1:pos + 4]:
+            below = line_rect[other]
+            # A box that was never traced only pulls its own line. A bad trace
+            # pulls the stacked lines of the same column. A short title does
+            # not join the much taller word underneath it.
+            if line_scope(line_id) != "paragraph" and line_scope(other) != "paragraph":
+                continue
+            if max(rect[3], below[3]) > 2.0 * max(1, min(rect[3], below[3])):
+                continue
+            gap = below[1] - (rect[1] + rect[3])
+            if gap > 0.65 * max(rect[3], below[3]):
+                break
+            overlap = min(rect[0] + rect[2], below[0] + below[2]) - max(rect[0], below[0])
+            if overlap >= 0.45 * min(rect[2], below[2]):
+                line_parent[find_line(other)] = find_line(line_id)
+    groups = {}
+    for line_id, members in lines.items():
+        groups.setdefault(find_line(line_id), []).extend(members)
+    drop = set()
+    for members in groups.values():
+        if not any(records[member]["mode"] == "raster" for member in members):
+            continue
+        for member in members:
+            if records[member]["mode"] == "vector" and records[member]["index"] is not None:
+                drop.add(records[member]["index"])
+    if not drop:
+        return drawn
+    kept = []
+    for index, item in enumerate(drawn):
+        if index not in drop:
+            kept.append(item)
+            continue
+        raster_lines.append(_line(
+            item["text"],
+            "raster",
+            "This line stayed in the picture so it would not be half traced.",
+        ))
+    return kept
 
 
 def trace_fitted(
@@ -898,6 +1081,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     trace_started = time.perf_counter()
     drawn = []
     raster_lines = []
+    raster_boxes = []
     choke = np.zeros(plate.shape[:2], np.uint8)
     clear = np.zeros(plate.shape[:2], np.uint8)
     height, width = plate.shape[:2]
@@ -919,23 +1103,33 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         rect = _padded(raw, bgr.shape[1], bgr.shape[0])
         left, top, right, bottom = _mapped_bounds(placed["map"], rect, width, height)
         inner_left, inner_top, inner_right, inner_bottom = _mapped_bounds(placed["map"], raw, width, height)
+        core = (
+            inner_left,
+            inner_top,
+            max(1, inner_right - inner_left),
+            max(1, inner_bottom - inner_top),
+        )
         if right - left < 4 or bottom - top < 4:
             raster_lines.append(_line(text, "raster", "The box was too small to trace."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         crop = plate[top:bottom, left:right]
         mask, colour = segment_ink(crop)
         if mask is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         mask = ink_touching(mask, (
             inner_left - left, inner_top - top, inner_right - left, inner_bottom - top,
         ))
         if mask is None:
             raster_lines.append(_line(text, "raster", "The ink sat outside this box, so it stayed in the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         mask, colour = refine_ink(crop, mask)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         # A logo in the same box is not a letter. A letter touching it stays.
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -943,6 +1137,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         mask, colour = refine_ink(crop, mask)
         if mask is None or colour is None:
             raster_lines.append(_line(text, "raster", "The ink could not be separated from the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "line"))
             continue
         pending.append({
             "text": text,
@@ -952,6 +1147,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "top": top,
             "right": right,
             "bottom": bottom,
+            "core": core,
             "crop": crop,
             "inner": (inner_left - left, inner_top - top, inner_right - left, inner_bottom - top),
             "clear": halo,
@@ -962,16 +1158,20 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         text = item["text"]
         mask = item["mask"]
         left, top, right, bottom = item["left"], item["top"], item["right"], item["bottom"]
+        core = item.get("core")
         if not paths:
             raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
         score, accepted, painted = _accept_trace(mask, paths)
         if not accepted:
             raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
         reason = shape_gate(item["crop"], mask, painted, item["inner"])
         if reason:
             raster_lines.append(_line(text, "raster", reason))
+            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph"))
             continue
         fill = _trace_fill(item["colour"])
         drawn.append({
@@ -981,9 +1181,21 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "origin": (left, top),
             "iou": round(score, 3),
             "rect": (left, top, right - left, bottom - top),
+            "core": core,
+            "painted": painted,
+            "colour": item["colour"],
+            "changed": bool(item.get("changed")),
+            "_mask": mask,
+            "_clear": item.get("clear"),
         })
+    drawn = _keep_uniform(drawn, raster_lines, raster_boxes)
+    for item in drawn:
+        left, top, width_px, height_px = item["rect"]
+        right, bottom = left + width_px, top + height_px
+        mask = item.pop("_mask")
+        item.pop("core", None)
+        extra = item.pop("_clear", None)
         choke[top:bottom, left:right] = cv2.bitwise_or(choke[top:bottom, left:right], mask)
-        extra = item.get("clear")
         if extra is not None and extra.shape[:2] == mask.shape[:2] and int(extra.max()) > 0:
             clear[top:bottom, left:right] = cv2.bitwise_or(clear[top:bottom, left:right], extra)
     pristine = plate.copy() if drawn else None
@@ -1206,6 +1418,82 @@ WHITE_LUMA = 232.0
 WHITE_STD = 12.0
 WHITE_FRACTION = 0.30
 EDGE_PX = 2
+# Pixel checks run on this longest side. A full-page 300 dpi render is not required.
+MODEST_EDGE = 96
+
+
+def _numpy_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian. The gate's pixel checks stay on numpy."""
+    sigma = float(sigma)
+    values = np.asarray(image, np.float64)
+    if sigma <= 0.05 or values.size == 0:
+        return values
+    radius = max(1, int(round(sigma * 3.0)))
+    axis = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (axis / sigma) ** 2)
+    kernel /= kernel.sum()
+
+    def blur_last(plane):
+        pad = radius
+        padded = np.pad(plane, ((0, 0), (pad, pad)), mode="edge")
+        windows = np.lib.stride_tricks.sliding_window_view(padded, kernel.size, axis=1)
+        return np.tensordot(windows, kernel, axes=(2, 0))
+
+    flat = values if values.ndim == 2 else values.reshape(-1, values.shape[-2], values.shape[-1])
+    if values.ndim == 2:
+        blurred = blur_last(values)
+        blurred = blur_last(blurred.T).T
+        return blurred
+    # Colour is not used. Callers pass a grey plane.
+    return values
+
+
+def _box_mean(gray: np.ndarray, radius: int) -> np.ndarray:
+    radius = int(radius)
+    if radius < 1:
+        return gray.astype(np.float64)
+    padded = np.pad(gray.astype(np.float64), radius, mode="edge")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant")
+    integral = integral.cumsum(0).cumsum(1)
+    span = radius * 2 + 1
+    total = (
+        integral[span:, span:]
+        - integral[:-span, span:]
+        - integral[span:, :-span]
+        + integral[:-span, :-span]
+    )
+    return total / float(span * span)
+
+
+def _erode_square(binary: np.ndarray, radius: int) -> np.ndarray:
+    radius = int(radius)
+    if radius < 1:
+        return binary
+    span = radius * 2 + 1
+    padded = np.pad(binary.astype(bool), radius, mode="constant", constant_values=False)
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (span, span))
+    return windows.all(axis=(-1, -2))
+
+
+def _modest(image: np.ndarray, limit: int = MODEST_EDGE) -> np.ndarray:
+    """Shrink a crop so the pixel checks stay cheap. Area-average, in numpy."""
+    if image is None or image.size == 0:
+        return image
+    height, width = image.shape[:2]
+    long_edge = max(height, width)
+    if long_edge <= limit or long_edge < 2:
+        return image
+    step = int(np.ceil(long_edge / float(limit)))
+    height -= height % step
+    width -= width % step
+    if height < step or width < step:
+        return image
+    cropped = image[:height, :width]
+    if cropped.ndim == 2:
+        blocks = cropped.reshape(height // step, step, width // step, step)
+        return blocks.mean(axis=(1, 3))
+    blocks = cropped.reshape(height // step, step, width // step, step, cropped.shape[2])
+    return blocks.mean(axis=(1, 3))
 
 
 def _match_scale(source: np.ndarray, render: np.ndarray) -> np.ndarray:
@@ -1217,17 +1505,24 @@ def _match_scale(source: np.ndarray, render: np.ndarray) -> np.ndarray:
     return source
 
 
+def _gray(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return image.astype(np.float64)
+    plane = image.astype(np.float64)
+    return plane[..., 0] * 0.114 + plane[..., 1] * 0.587 + plane[..., 2] * 0.299
+
+
 def _ssim_luma(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     """Mean SSIM of the luminance. The two crops are already the same size."""
     if source_bgr is None or render_bgr is None or source_bgr.size == 0 or render_bgr.size == 0:
         return 0.0
     height, width = render_bgr.shape[:2]
-    left = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    right = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    # The plate and the 300 dpi trim are the same picture through two resamplers.
+    left = _gray(source_bgr)
+    right = _gray(render_bgr)
+    # The plate and the traced fill are the same picture through two samplers.
     # A one-pixel blur on both lets SSIM see the letters rather than that resample.
-    left = cv2.GaussianBlur(left, (0, 0), 1.0)
-    right = cv2.GaussianBlur(right, (0, 0), 1.0)
+    left = _numpy_blur(left, 1.0)
+    right = _numpy_blur(right, 1.0)
     win = 11
     if min(height, width) < win:
         win = min(height, width)
@@ -1238,19 +1533,19 @@ def _ssim_luma(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     sigma = 1.5 if win >= 11 else 0.8
     c1 = (0.01 * 255.0) ** 2
     c2 = (0.03 * 255.0) ** 2
-    mu1 = cv2.GaussianBlur(left, (win, win), sigma)
-    mu2 = cv2.GaussianBlur(right, (win, win), sigma)
-    sigma1 = cv2.GaussianBlur(left * left, (win, win), sigma) - mu1 * mu1
-    sigma2 = cv2.GaussianBlur(right * right, (win, win), sigma) - mu2 * mu2
-    sigma12 = cv2.GaussianBlur(left * right, (win, win), sigma) - mu1 * mu2
+    mu1 = _numpy_blur(left, sigma)
+    mu2 = _numpy_blur(right, sigma)
+    sigma1 = _numpy_blur(left * left, sigma) - mu1 * mu1
+    sigma2 = _numpy_blur(right * right, sigma) - mu2 * mu2
+    sigma12 = _numpy_blur(left * right, sigma) - mu1 * mu2
     score = ((2 * mu1 * mu2 + c1) * (2 * sigma12 + c2)) / ((mu1 * mu1 + mu2 * mu2 + c1) * (sigma1 + sigma2 + c2))
     return float(np.clip(score.mean(), 0.0, 1.0))
 
 
 def _flat_white(gray: np.ndarray) -> np.ndarray:
-    luma = gray.astype(np.float32)
-    mean = cv2.blur(luma, (5, 5))
-    var = cv2.blur(luma * luma, (5, 5)) - mean * mean
+    luma = gray.astype(np.float64)
+    mean = _box_mean(luma, 2)
+    var = _box_mean(luma * luma, 2) - mean * mean
     std = np.sqrt(np.maximum(var, 0.0))
     return (luma >= WHITE_LUMA) & (std <= WHITE_STD)
 
@@ -1273,18 +1568,17 @@ def _novel_white_block(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
     """
     if source_bgr is None or render_bgr is None or render_bgr.size == 0:
         return False
-    src_gray = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
-    dst_gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
-    novel = (_flat_white(dst_gray) & ~_flat_white(src_gray)).astype(np.uint8) * 255
-    if int(novel.max()) == 0:
+    src_gray = _gray(source_bgr)
+    dst_gray = _gray(render_bgr)
+    novel = _flat_white(dst_gray) & ~_flat_white(src_gray)
+    if not bool(novel.any()):
         return False
     # Thickness, not the bounding box: a 1px halo around a letter is as wide as
-    # the word, but it is not a solid block. A disk of 30% of the glyph height
+    # the word, but it is not a solid block. A square of 30% of the glyph height
     # has to fit inside the new white region.
     limit = WHITE_FRACTION * _glyph_height(src_gray)
     radius = max(1, int(round(limit * 0.5)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
-    return int(cv2.erode(novel, kernel).max()) > 0
+    return bool(_erode_square(novel, radius).any())
 
 
 def _edge_clipped(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
@@ -1294,8 +1588,8 @@ def _edge_clipped(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
     height, width = render_bgr.shape[:2]
     if width < 8 or height < 8:
         return False
-    src = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
-    dst = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+    src = _gray(source_bgr)
+    dst = _gray(render_bgr)
     med_src = float(np.median(src))
     med_dst = float(np.median(dst))
     need = max(4, int(round(0.22 * height)))
@@ -1652,46 +1946,122 @@ def _restore_box(plate, pristine, rect) -> None:
     plate[top:bottom, left:right] = pristine[top:bottom, left:right]
 
 
+def _paint_trace(plate_crop: np.ndarray, item: dict) -> np.ndarray:
+    """The crop as the press file shows it: choked paper with the trace filled in."""
+    render = np.array(plate_crop, copy=True)
+    painted = item.get("painted")
+    colour = item.get("colour")
+    if painted is None or colour is None or painted.shape[:2] != render.shape[:2]:
+        return render
+    render[painted > 0] = np.clip(np.rint(colour), 0, 255).astype(np.uint8)
+    return render
+
+
+def _score_modest(source: np.ndarray, render: np.ndarray, source_text: str, render_text: str) -> dict:
+    """SSIM, white-block and clip on a small numpy copy of one box."""
+    source = _modest(source)
+    render = _modest(render)
+    if source is None or render is None or source.size == 0 or render.size == 0:
+        return _score_pair(source, render, source_text, render_text)
+    height = min(source.shape[0], render.shape[0])
+    width = min(source.shape[1], render.shape[1])
+    return _score_pair(source[:height, :width], render[:height, :width], source_text, render_text)
+
+
 def _apply_text_gate(
     blocks, drawn, raster_lines, plate, pristine, output_pdf,
     trim_w, trim_h, bleed_mm, placed, qa, source_shape,
 ):
     """Exact per-box reading, then the pixels of that same box.
 
-    A footer that repeats the line cannot pass the copy above it. A vector box
-    with a white block, a clipped glyph, or a changed letter (9AM read as 8AM)
-    is put back as pixels and the file is written again. The row still fails
-    when luminance SSIM is under 0.85.
+    The first OCR pass is reused. SSIM, the white-block test and the clip test
+    run on the cropped box at a modest scale. A second read happens only for a
+    box whose geometry changed or whose pixels look wrong. A vector box with a
+    white block, a clipped glyph, or a changed letter (9AM read as 8AM) is put
+    back as pixels and the file is written again.
     """
-    from vector_text_v2 import read_blocks
-
     plate_shape = plate.shape if pristine is None else pristine.shape
     base = pristine if pristine is not None else plate
-    try:
-        trim = _trim_bgr(output_pdf, bleed_mm, 300)
-        rows = read_blocks(trim, extra=False)
-    except Exception as exc:
-        sys.stderr.write(f"[vector-trace] text gate skipped ({exc})\n")
-        report = []
-        for block in blocks or []:
-            if isinstance(block, dict) and is_lettering(str(block.get("text") or "")):
-                report.append({
-                    "text": str(block.get("text") or ""),
-                    "ok": False,
-                    "render": "",
-                    "mode": "unread",
-                    "ssim": 0.0,
-                    "whiteBlock": False,
-                    "clipped": False,
-                    "y": 0.0,
-                    "boxMm": [0, 0, 0, 0],
-                })
-        return report, drawn, qa
-
-    report = _measure_boxes(
-        blocks, drawn, trim, base, plate_shape, source_shape, placed,
-        trim_w, trim_h, bleed_mm, rows,
-    )
+    by_rect = []
+    for item in drawn:
+        by_rect.append(item)
+    report = []
+    kept_flags = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text") or "")
+        if not is_lettering(text):
+            continue
+        rect = _plate_rect(block, source_shape, placed, plate_shape, padded=True)
+        inner = _plate_rect(block, source_shape, placed, plate_shape, padded=False)
+        item = next((candidate for candidate in by_rect if _rects_match(candidate.get("rect"), rect)), None)
+        vector = item is not None
+        source = _plate_crop(base, rect)
+        render = _plate_crop(plate, rect)
+        if vector:
+            render = _paint_trace(render, item)
+        # The pad can contain the next icon. Judge the letters, not that neighbour.
+        x = max(0, int(inner[0]) - int(rect[0]))
+        y = max(0, int(inner[1]) - int(rect[1]))
+        if source is not None and source.size and render is not None and render.size:
+            source = source[y:y + int(inner[3]), x:x + int(inner[2])]
+            render = render[y:y + int(inner[3]), x:x + int(inner[2])]
+        # Trust the first read until this box is suspicious.
+        render_text = _norm_text(text)
+        score = _score_modest(source, render, text, render_text)
+        glyph_view = render
+        if vector and render is not None and render.size and max(render.shape[:2]) > 480:
+            glyph_view = np.clip(np.rint(_modest(render, 480)), 0, 255).astype(np.uint8)
+        glyph_fail = bool(
+            vector and int(rect[3]) >= 56 and _vector_glyphs_disagree(glyph_view, text)
+        )
+        if glyph_fail:
+            score["pixelFail"] = True
+            score["ok"] = False
+        # A low SSIM does not by itself get a second read. That read is for a
+        # box whose geometry changed, or whose pixels show a block, a clip, or
+        # a glyph that does not belong.
+        changed = False
+        # Geometry changes are re-read. A white block, a clip, or a mismatched
+        # glyph is already enough to put the box back, without another OCR pass.
+        if (
+            vector
+            and item.get("changed")
+            and not score["pixelFail"]
+            and not glyph_fail
+            and int(rect[3]) >= 44
+            and float(score["ssim"]) < 0.90
+        ):
+            original = _ocr_crop(source)
+            rendered = _ocr_crop(render)
+            if original and rendered:
+                # A faithful trace still scores high. Crop OCR noise is not a letter change.
+                changed = bool(
+                    score["ssim"] < 0.90
+                    and len(_norm_text(original)) == len(_norm_text(rendered))
+                    and not _texts_equal(original, rendered)
+                )
+                if changed:
+                    render_text = rendered
+                    score = _score_modest(source, render, text, render_text)
+                    score["ok"] = False
+        bbox = block.get("bbox") or [0, 0, 0, 0]
+        report.append({
+            "text": text,
+            "ok": score["ok"] and not changed,
+            "render": render_text,
+            "mode": "vector" if vector else "raster",
+            "ssim": score["ssim"],
+            "whiteBlock": score["whiteBlock"],
+            "clipped": score["clipped"],
+            "y": round(float(bbox[1]) if len(bbox) > 1 else 0.0, 4),
+            "boxMm": _box_mm(rect, plate_shape, trim_w, trim_h, bleed_mm),
+            "_rect": rect,
+            "_revert": bool(vector and (score["pixelFail"] or changed)),
+            "_why": "changed" if changed else "pixels",
+        })
+        kept_flags.append(not (vector and (score["pixelFail"] or changed)))
     kept = []
     reverted = False
     if pristine is not None:
@@ -1700,22 +2070,24 @@ def _apply_text_gate(
                 (candidate for candidate in report if _rects_match(candidate.get("_rect"), item.get("rect"))),
                 None,
             )
-            damaged = bool(row and row.get("_pixelFail"))
-            changed = bool(row and row.get("_changed"))
-            if changed and not damaged:
-                original = _ocr_crop(row.get("_source"))
-                rendered = _ocr_crop(row.get("_render"))
-                changed = bool(original and rendered and not _texts_equal(original, rendered))
-            if not damaged and not changed:
+            if row is None or not row.get("_revert"):
                 kept.append(item)
                 continue
             _restore_box(plate, pristine, item["rect"])
-            if changed and not damaged:
+            if row.get("_why") == "changed":
                 why = "The render changed a letter, so the box stayed in the picture."
             else:
                 why = "The render covered or clipped this line, so the box stayed in the picture."
             raster_lines.append(_line(item["text"], "raster", why))
             reverted = True
+            row["mode"] = "raster"
+            row["render"] = _norm_text(row["text"])
+            restored = _plate_crop(plate, item["rect"])
+            fresh = _score_modest(_plate_crop(base, item["rect"]), restored, row["text"], row["render"])
+            row["ssim"] = fresh["ssim"]
+            row["whiteBlock"] = fresh["whiteBlock"]
+            row["clipped"] = fresh["clipped"]
+            row["ok"] = fresh["ok"]
     else:
         kept = list(drawn)
     if reverted:
@@ -1724,22 +2096,11 @@ def _apply_text_gate(
         qa = _write_pdf(plate, kept, output_pdf, trim_w, trim_h, bleed_mm, placed)
         qa["colour_s"] = first_colour + float(qa.get("colour_s") or 0)
         qa["compose_s"] = first_compose + float(qa.get("compose_s") or 0)
-        try:
-            trim = _trim_bgr(output_pdf, bleed_mm, 300)
-            rows = read_blocks(trim, extra=False)
-            report = _measure_boxes(
-                blocks, kept, trim, base, plate_shape, source_shape, placed,
-                trim_w, trim_h, bleed_mm, rows,
-            )
-        except Exception as exc:
-            sys.stderr.write(f"[vector-trace] text gate rescore skipped ({exc})\n")
     drawn = kept
     for row in report:
         row.pop("_rect", None)
-        row.pop("_pixelFail", None)
-        row.pop("_changed", None)
-        row.pop("_source", None)
-        row.pop("_render", None)
+        row.pop("_revert", None)
+        row.pop("_why", None)
     return report, drawn, qa
 
 
@@ -1965,6 +2326,9 @@ def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
 
 
 def _workers() -> int:
+    raw = os.environ.get("VECTOR_TRACE_WORKERS", "").strip()
+    if raw.isdigit():
+        return max(1, min(8, int(raw)))
     try:
         count = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):

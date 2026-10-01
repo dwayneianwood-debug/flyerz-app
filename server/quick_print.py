@@ -704,46 +704,91 @@ def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = 
     }
 
 
+def _colour_pad(band, pad: int, forward: bool):
+    """Continue one edge from its own colour. Nothing from inside the picture is copied out.
+
+    A mirrored photograph, blurred on a coarse grid, stretches into blocky streaks.
+    The colour here is a blur along the rim, plus a little grain that is the same
+    in every direction, so it cannot become a stripe.
+    `band` row 0 is the picture edge when forward is false.
+    """
+    import numpy as np
+
+    width = int(band.shape[1])
+    if pad <= 0:
+        return np.zeros((0, width, 3), np.uint8)
+    work = np.ascontiguousarray(band.astype(np.float32))
+    if not forward:
+        work = work[::-1]
+    height = int(work.shape[0])
+    depth = min(5, height)
+    strip = work[-depth:]
+    median = np.median(strip, axis=0)
+    distance = np.linalg.norm(strip - median[None, :, :], axis=2)
+    mad = float(np.median(distance)) if distance.size else 0.0
+    thresh = max(36.0, mad * 4.0)
+    outlier = distance > thresh
+    cleaned = strip.copy()
+    if outlier.any():
+        filled = np.repeat(median[None, :, :], depth, axis=0)
+        cleaned[outlier] = filled[outlier]
+    edge = _lowpass_along(cleaned[-1], EDGE_LOWPASS_FRACTION)
+    broad = _lowpass_along(edge, 0.15)
+    broad_far = _lowpass_along(_lowpass_along(cleaned[0], EDGE_LOWPASS_FRACTION), 0.15)
+    slope = np.clip((broad - broad_far) / float(max(depth - 1, 1)), -0.35, 0.35)
+    steps = np.arange(1, pad + 1, dtype=np.float32)[:, None, None]
+    fade = np.exp(-steps / 80.0)
+    ease = np.clip((steps - 4.0) / 24.0, 0.0, 1.0)
+    continued = edge[None, :, :] * (1.0 - ease) + broad[None, :, :] * ease
+    continued = continued + slope[None, :, :] * steps * fade
+    inlier = ~outlier
+    pair = inlier[:, :-1] & inlier[:, 1:] if width > 1 else inlier
+    sigma = np.zeros(3, np.float32)
+    if width > 1:
+        delta = cleaned[:, 1:, :] - cleaned[:, :-1, :]
+        for channel in range(3):
+            vals = delta[:, :, channel][pair]
+            sigma[channel] = float(np.std(vals) / np.sqrt(2.0)) if vals.size else 0.0
+    sigma = np.clip(sigma, 0.0, 8.0)
+    rng = np.random.default_rng((depth * 10007 + width * 17 + pad) % (2**32))
+    grain = rng.normal(0.0, 1.0, (pad, width, 3)).astype(np.float32) * sigma.reshape(1, 1, 3)
+    true_edge = work[-1]
+    seam = np.clip(steps / 4.0, 0.0, 1.0)
+    grain_in = np.clip(steps / 4.0, 0.0, 1.0)
+    mixed = true_edge[None, :, :] * (1.0 - seam) + continued * seam
+    out = np.clip(np.rint(mixed + grain * grain_in), 0, 255).astype(np.uint8)
+    if not forward:
+        out = out[::-1]
+    return out
+
+
 def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None):
     import numpy as np
 
     ppm = float(px_per_mm) if px_per_mm else (300.0 / 25.4)
     parts = []
     height = img.shape[0]
-    rim = min(MIRROR_RIM_PX, height)
     core = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
     art = core
-    ramp = _mm_px(TALL_RAMP_MM, ppm, 8)
     match_depth = _mm_px(6.0, ppm, 4)
+    sample = min(5, height)
 
-    def strong_pad(forward: bool, pad: int, block: int):
+    def colour_pad(forward: bool, pad: int):
         nonlocal art
-        source = core[-block:] if forward else core[:block]
-        protect = _protect_rows(core, ppm, from_end=forward)
+        source = core[-sample:] if forward else core[:sample]
+        built = _colour_pad(source, pad, forward=forward)
+        if pad < TALL_PAD_PX:
+            return built
         overlap = _join_overlap(core, ppm, from_end=forward)
         if art is core:
             art = np.ascontiguousarray(core)
-        built = _mirror_extend(
-            source, pad, forward=forward, strong=True, ramp_px=ramp, protect_px=protect,
-        )
-        # The pad's first row touches the picture when the pad is below it.
         at_end = not forward
         built = _match_join_colour(built, art, at_end=at_end, depth=max(match_depth, overlap))
         art = _feather_into_art(built, art, overlap, at_end=at_end)
         return built
 
-    top_part = None
-    bottom_part = None
-    if top:
-        if top >= TALL_PAD_PX:
-            top_part = strong_pad(False, top, min(top, height))
-        else:
-            top_part = _mirror_extend(core[:rim], top, forward=False, strong=False)
-    if bottom:
-        if bottom >= TALL_PAD_PX:
-            bottom_part = strong_pad(True, bottom, min(bottom, height))
-        else:
-            bottom_part = _mirror_extend(core[-rim:], bottom, forward=True, strong=False)
+    top_part = colour_pad(False, top) if top else None
+    bottom_part = colour_pad(True, bottom) if bottom else None
     if top_part is not None:
         parts.append(top_part)
     parts.append(art)
@@ -1215,9 +1260,15 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
-            # Extend first. The trace reads this canvas, so the paths land on the same pixels.
+            picture = raster
+            # A contact band is laid out first so the trace sits on that page and
+            # the band stays at the bottom. A plain side pad is not part of the
+            # read: the smaller scale was dropping small marks such as a card's "7".
             raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
-            vector_source = raster
+            if aspect_extended and _bottom_bar_row(picture) is not None:
+                vector_source = raster
+            else:
+                vector_source = picture
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
             work_path = fitted_path

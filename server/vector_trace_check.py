@@ -313,9 +313,7 @@ def test_a_bad_glyph_is_rebuilt_from_its_sibling() -> None:
     broken[2:70, 128:140] = 255
     word = {"text": "ABCDEFGH", "mask": broken, "clear": np.zeros_like(broken)}
     harmonise_pending([word])
-    kept = _components(word["mask"], 20)
-    check("broken-word-dropped", len(kept) == 4, str([(part["x"], part["h"]) for part in kept]))
-    check("other-word-kept", kept and kept[0]["x"] < 30 and kept[-1]["x"] < 90, str([part["x"] for part in kept]))
+    check("broken-line-raster", int(word["mask"].max()) == 0, "a line with one broken word stayed partly traced")
 
 
 def test_vector_line_flags_a_soft_glyph() -> None:
@@ -390,6 +388,44 @@ def test_glyphs_reject_a_changed_letter() -> None:
     check("glyphs-extra", glyphs_agree(mask, extra, min_area=12) is False)
 
 
+def test_a_line_is_not_half_traced() -> None:
+    """One raster box on a line, or in a stacked paragraph, puts the rest back."""
+    from vector_trace import _keep_uniform
+
+    drawn = [
+        {"text": "Early", "rect": (10, 40, 80, 20), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 40), "iou": 0.95},
+        {"text": "detection", "rect": (100, 40, 110, 20), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (100, 40), "iou": 0.95},
+        {"text": "Next line", "rect": (10, 66, 140, 18), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 66), "iou": 0.95},
+        {"text": "Far heading", "rect": (10, 200, 120, 24), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 200), "iou": 0.95},
+    ]
+    raster_lines = []
+    raster_boxes = [{"text": "issues", "rect": (220, 40, 70, 20), "anchor": True}]
+    kept = _keep_uniform(drawn, raster_lines, raster_boxes)
+    texts = [item["text"] for item in kept]
+    check("line-all-raster", "Early" not in texts and "detection" not in texts, str(texts))
+    check("paragraph-follows", "Next line" not in texts, str(texts))
+    check("distant-stays", "Far heading" in texts, str(texts))
+    check("mixed-note", any("half traced" in str(line.get("reason")) for line in raster_lines))
+
+    # A short title must not be blanked by the much taller word sitting under it.
+    title = [
+        {"text": "CHURCH", "rect": (80, 20, 160, 30), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (80, 20), "iou": 0.95},
+    ]
+    hero = [{"text": "CATCH", "rect": (10, 40, 300, 140), "anchor": "paragraph"}]
+    kept_title = _keep_uniform(title, [], hero)
+    check("title-not-pulled", [item["text"] for item in kept_title] == ["CHURCH"], str(kept_title))
+
+    # A box whose ink could not be separated only pulls its own line.
+    column = [
+        {"text": "9", "rect": (10, 10, 40, 36), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 10), "iou": 0.95},
+        {"text": "6PM", "rect": (10, 52, 36, 22), "paths": [[]], "fill": (0, 0, 0, 1), "origin": (10, 52), "iou": 0.95},
+    ]
+    unread = [{"text": "11AM", "rect": (56, 52, 40, 22), "anchor": "line"}]
+    kept_column = _keep_uniform(column, [], unread)
+    column_texts = [item["text"] for item in kept_column]
+    check("unread-keeps-the-row-above", column_texts == ["9"], str(column_texts))
+
+
 def test_card_back_body_is_traced() -> None:
     """Small card-back lines clear the 4× score. A changed letter still stays raster."""
     os.environ.pop("VECTOR_FONTS", None)
@@ -422,6 +458,63 @@ def test_card_back_body_is_traced() -> None:
     check("card-back-timing", "Timing:" in joined and "colour" in joined, joined[-240:])
     check("card-back-time", float(result.get("elapsed_s") or 999) < 120, str(timings))
     print("TIMING", timings)
+
+
+def _trace_side(name: str, trim_w: float, trim_h: float, workers: str = "2") -> dict:
+    """The production path, at a fixed worker count. This is what the press file uses."""
+    os.environ["VECTOR_TRACE_WORKERS"] = workers
+    from quick_print import make_print_ready
+
+    src = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", f"{name}.png")
+    out = tempfile.mkdtemp(prefix=f"medella-{name}-")
+    result = make_print_ready(src, out, trim_w, trim_h, "proof", name, filename=f"{name}.png")
+    built = result.get("vectorText") or {}
+    return {
+        "ok": bool(built.get("ok")),
+        "vector_lines": built.get("vectorLines") or 0,
+        "timings": built.get("timings") or {},
+        "elapsed_s": built.get("elapsed_s"),
+        "lines": built.get("lines") or [],
+        "light": result.get("light"),
+    }
+
+
+def test_medella_coverage_and_gate_speed() -> None:
+    """The checks that rejected good Medella traces stay inside the 1f3b29e counts.
+
+    Two threads. The gate is the cropped numpy check, so it stays under 5s.
+    """
+    card = _trace_side("card_front", 90, 50)
+    check("card-front-count", int(card.get("vector_lines") or 0) >= 9, str(card.get("vector_lines")))
+    timings = card.get("timings") or {}
+    check("card-front-gate", float(timings.get("gate_s") or 99) < 5.0, str(timings))
+    check("card-front-total", float(timings.get("total_s") or 99) <= 18.0, str(timings))
+    back = _trace_side("card_back", 90, 50)
+    check("card-back-still", int(back.get("vector_lines") or 0) >= 63, str(back.get("vector_lines")))
+    check("card-back-gate", float((back.get("timings") or {}).get("gate_s") or 99) < 5.0, str(back.get("timings")))
+    check("card-back-total", float((back.get("timings") or {}).get("total_s") or 99) <= 18.0, str(back.get("timings")))
+    front = _trace_side("flyer_front", 148, 210)
+    check("flyer-front-count", int(front.get("vector_lines") or 0) >= 85, str(front.get("vector_lines")))
+    front_t = front.get("timings") or {}
+    check("flyer-front-gate", float(front_t.get("gate_s") or 99) < 5.0, str(front_t))
+    check("flyer-front-total", float(front_t.get("total_s") or 99) <= 35.0, str(front_t))
+    flyer_back = _trace_side("flyer_back", 148, 210)
+    check("flyer-back-count", int(flyer_back.get("vector_lines") or 0) >= 85, str(flyer_back.get("vector_lines")))
+    back_t = flyer_back.get("timings") or {}
+    check("flyer-back-gate", float(back_t.get("gate_s") or 99) < 5.0, str(back_t))
+    check("flyer-back-total", float(back_t.get("total_s") or 99) <= 35.0, str(back_t))
+    print("MEDELLA", {
+        "card_front": card.get("vector_lines"),
+        "card_back": back.get("vector_lines"),
+        "flyer_front": front.get("vector_lines"),
+        "flyer_back": flyer_back.get("vector_lines"),
+        "timings": {
+            "card_front": timings,
+            "card_back": back.get("timings"),
+            "flyer_front": front_t,
+            "flyer_back": back_t,
+        },
+    })
 
 
 def test_paths_and_local_plate() -> None:
@@ -491,8 +584,10 @@ def main() -> None:
     test_vector_line_flags_a_soft_glyph()
     test_gate_is_exact_and_sees_a_white_block()
     test_glyphs_reject_a_changed_letter()
+    test_a_line_is_not_half_traced()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()
+    test_medella_coverage_and_gate_speed()
     print("ALL PASS")
 
 
