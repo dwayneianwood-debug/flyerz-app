@@ -3190,6 +3190,75 @@ def _ghost_double_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
     return ghosts >= 2
 
 
+def _double_edge_fails(source_bgr: np.ndarray, render_bgr: np.ndarray) -> bool:
+    """True when dark type has a second edge just outside the picture's stroke.
+
+    On the small card lines the copy sits closer than the ghost test looks,
+    so the picture and the vector both show. A one-pixel harder edge stays
+    inside the ring and does not count. Light type on a dark ground is a
+    different fault and is left to the halo check.
+    """
+    pair = _gray_pair(source_bgr, render_bgr)
+    if pair is None:
+        return False
+    source, render = pair
+    border = np.concatenate([
+        source[:2, :].ravel(), source[-2:, :].ravel(),
+        source[:, :2].ravel(), source[:, -2:].ravel(),
+    ])
+    if border.size < 8:
+        return False
+    paper = float(np.median(border))
+    # Cream card stock. Navy and photo grounds are not this defect.
+    if paper < 160.0:
+        return False
+    ink = source < (paper - 28.0)
+    ink_n = int(np.count_nonzero(ink))
+    if ink_n < 80:
+        return False
+    parts = _components(ink.astype(np.uint8) * 255, 8)
+    heights = [part["h"] for part in parts if part["area"] >= 8 and part["h"] >= 4]
+    # Headings are taller than this. The doubled copy is the small body type.
+    if len(heights) < 2 or float(np.median(heights)) >= 11.0:
+        return False
+    outside = cv2.distanceTransform((~ink).astype(np.uint8), cv2.DIST_L2, 3)
+    ring = (outside >= 1.2) & (outside < 2.6)
+    # The vector is darker than the picture in that ring: a second stroke.
+    count = int(np.count_nonzero(ring & ((source - render) > 16.0)))
+    return count >= 40 and count >= 0.10 * ink_n
+
+
+def _short_faint_fails(source_bgr: np.ndarray, ssim: float) -> bool:
+    """True when a short line on cream paper only barely matches.
+
+    Letters under 12px are not scored glyph by glyph, because one pixel is
+    a fifth of the stroke. The footer words are that short and the trace is
+    visibly thinner, so a modest score sends the whole line back to the picture.
+    """
+    if ssim >= 0.92:
+        return False
+    pair = _gray_pair(source_bgr, source_bgr)
+    if pair is None:
+        return False
+    source = pair[0]
+    border = np.concatenate([
+        source[:2, :].ravel(), source[-2:, :].ravel(),
+        source[:, :2].ravel(), source[:, -2:].ravel(),
+    ])
+    if border.size < 8:
+        return False
+    paper = float(np.median(border))
+    if paper < 160.0:
+        return False
+    ink = source < (paper - 28.0)
+    parts = _components(ink.astype(np.uint8) * 255, 8)
+    heights = [part["h"] for part in parts if part["area"] >= 8 and part["h"] >= 4]
+    if len(heights) < 2:
+        return False
+    median_h = float(np.median(heights))
+    return 4.0 <= median_h < 12.0
+
+
 def _min_glyph_iou(source_bgr: np.ndarray, render_bgr: np.ndarray) -> float:
     """Lowest IoU of one source glyph against the render in that same place.
 
@@ -3774,9 +3843,17 @@ def _apply_text_gate(
         glyph_iou = _min_glyph_iou(row["_source"], row["_render"])
         halo = _paint_halo_fails(row["_source"], row["_render"])
         ghost = _ghost_double_fails(row["_source"], row["_render"])
+        # A second edge, or a short line the glyph check does not judge.
+        doubled = _double_edge_fails(row["_source"], row["_render"])
+        faint = _short_faint_fails(row["_source"], float(score["ssim"]))
         judged["glyphIou"] = round(float(glyph_iou), 3)
-        judged["haloFail"] = bool(halo or ghost)
-        judged["glyphFail"] = bool(glyph_iou < 0.85 or halo or ghost)
+        judged["haloFail"] = bool(halo or ghost or doubled)
+        judged["glyphFail"] = bool(glyph_iou < 0.85 or halo or ghost or doubled or faint)
+        # A doubled small line goes back to the picture on its own. It does not
+        # pull the rest of the paragraph, or one blotchy line blanks the column.
+        judged["lineOnly"] = bool(
+            doubled and glyph_iou >= 0.85 and not halo and not ghost and not faint
+        )
         return judged
 
     judged_rows = _run_parallel(_judge_row, report)
@@ -3794,18 +3871,28 @@ def _apply_text_gate(
             continue
         if judged.get("glyphFail"):
             row["glyphFail"] = True
+        if judged.get("lineOnly"):
+            row["_lineOnly"] = True
     # A line the mask already accepted does not need a second read. Copying
     # the source text keeps the letter check honest. Only a rejected line is
     # read back, so the gate can say what the vector actually showed.
     accepted = []
     rejected = []
+    # A line sent back only because of a second edge does not need a second
+    # read. The picture is what prints. Reading it again is most of the gate.
+    quiet = []
     for row in vector_slots:
         low_ssim = float(row["ssim"]) < SSIM_FLOOR
-        if row["glyphFail"] or row["_pixelFail"] or low_ssim:
+        if row.get("_lineOnly"):
+            quiet.append(row)
+        elif row["glyphFail"] or row["_pixelFail"] or low_ssim:
             rejected.append(row)
         else:
             accepted.append(row)
     for row in accepted:
+        row["render"] = _norm_text(row["text"])
+        row["mismatch"] = False
+    for row in quiet:
         row["render"] = _norm_text(row["text"])
         row["mismatch"] = False
     readings = _read_render_strip(
@@ -3861,7 +3948,11 @@ def _apply_text_gate(
         fallback = 0
         for line_id in grouped:
             members = line_members[line_id]
-            if any(report[i]["_revert"] or report[i].get("_paragraph") for i in members):
+            if any(
+                (report[i]["_revert"] or report[i].get("_paragraph"))
+                and not report[i].get("_lineOnly")
+                for i in members
+            ):
                 fallback += 1
         if fallback <= 1:
             continue
@@ -3938,7 +4029,7 @@ def _apply_text_gate(
         item.pop("_ink", None)
         item.pop("core", None)
     for row in report:
-        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph"):
+        for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly"):
             row.pop(key, None)
     return report, kept, qa, source_guard
 

@@ -46,6 +46,8 @@ from vector_trace import (
     _min_glyph_iou,
     _paint_halo_fails,
     _ghost_double_fails,
+    _double_edge_fails,
+    _short_faint_fails,
     ABOVE_FRAC,
     BELOW_FRAC,
 )
@@ -568,6 +570,54 @@ def test_descenders_and_counters() -> None:
     stem = np.any(small.astype(int) < 80, axis=2).astype(np.uint8)
     bold[cv2.dilate(stem, np.ones((3, 3), np.uint8)) > 0] = (30, 28, 26)
     check("ghost-one-pixel", _ghost_double_fails(small, bold) is False)
+    # The card's small type doubles closer than three pixels. The picture's
+    # stroke stays, and a second stroke sits just outside it. Headings are taller.
+    body = np.full((22, 180, 3), (236, 232, 226), np.uint8)
+    for x in range(8, 160, 16):
+        body[7:15, x:x + 2] = (30, 28, 26)
+        body[7:9, x:x + 7] = (30, 28, 26)
+    near = body.copy()
+    near_shift = np.full_like(body, (236, 232, 226))
+    near_shift[:, 2:] = body[:, :-2]
+    near_ink = np.any(near_shift.astype(int) < 80, axis=2)
+    near[near_ink] = (30, 28, 26)
+    check("double-edge-copy", _double_edge_fails(body, near) is True)
+    body_bold = body.copy()
+    body_stem = np.any(body.astype(int) < 80, axis=2)
+    fringe = cv2.distanceTransform((~body_stem).astype(np.uint8), cv2.DIST_L2, 3)
+    # Inside 1.2px is the hard edge. The check starts outside that.
+    body_bold[(fringe > 0) & (fringe < 1.15)] = (30, 28, 26)
+    check("double-edge-one-pixel", _double_edge_fails(body, body_bold) is False)
+    heading = np.full((40, 180, 3), (236, 232, 226), np.uint8)
+    for x in range(8, 160, 28):
+        heading[6:28, x:x + 4] = (30, 28, 26)
+        heading[6:12, x:x + 14] = (30, 28, 26)
+    heading_near = heading.copy()
+    heading_shift = np.full_like(heading, (236, 232, 226))
+    heading_shift[:, 2:] = heading[:, :-2]
+    heading_ink = np.any(heading_shift.astype(int) < 80, axis=2)
+    heading_near[heading_ink] = (30, 28, 26)
+    check("double-edge-heading", _double_edge_fails(heading, heading_near) is False)
+    navy_line = np.full((26, 180, 3), (28, 22, 16), np.uint8)
+    for x in range(8, 160, 16):
+        navy_line[6:18, x:x + 3] = (90, 180, 215)
+        navy_line[6:9, x:x + 8] = (90, 180, 215)
+    navy_stem = np.max(navy_line.astype(int), axis=2) > 80
+    navy_fringe = navy_line.copy()
+    navy_fringe[cv2.dilate(navy_stem.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = (120, 200, 230)
+    navy_fringe[navy_stem] = navy_line[navy_stem]
+    check("double-edge-on-navy", _double_edge_fails(navy_line, navy_fringe) is False)
+    faint_line = np.full((22, 160, 3), (236, 232, 226), np.uint8)
+    for x in range(6, 150, 14):
+        faint_line[7:15, x:x + 2] = (40, 36, 30)
+        faint_line[7:9, x:x + 7] = (40, 36, 30)
+    check("short-faint-footer", _short_faint_fails(faint_line, 0.89) is True)
+    check("short-faint-sharp", _short_faint_fails(faint_line, 0.96) is False)
+    tall_line = np.full((48, 180, 3), (236, 232, 226), np.uint8)
+    for x in range(8, 160, 28):
+        tall_line[8:36, x:x + 6] = (30, 28, 26)
+        tall_line[8:14, x:x + 16] = (30, 28, 26)
+    check("short-faint-tall", _short_faint_fails(tall_line, 0.89) is False)
 
     wide = np.full((1000, 1700, 3), (230, 226, 220), np.uint8)
     wide[400:460, 200:260] = (16, 14, 12)
