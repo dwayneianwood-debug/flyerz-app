@@ -1189,6 +1189,19 @@ def test_one_potrace_covers_the_page() -> None:
     check("batch-second-ink", int(other.max()) > 0)
 
 
+def test_gate_image_keeps_a_word_whole() -> None:
+    """A thin crop is not stretched until its short side is 736, and a page strip stays under 960."""
+    from ocr_reader import _gate_image
+
+    thin = _gate_image(np.full((76, 490, 3), 255, np.uint8))
+    check("gate-thin-long", max(thin.shape[:2]) <= 960, str(thin.shape))
+    check("gate-thin-not-blown", min(thin.shape[:2]) < 400, str(thin.shape))
+    card = _gate_image(np.full((452, 584, 3), 255, np.uint8))
+    check("gate-card-short", min(card.shape[:2]) >= 620, str(card.shape))
+    page = _gate_image(np.full((1135, 1172, 3), 255, np.uint8))
+    check("gate-page-long", max(page.shape[:2]) <= 970, str(page.shape))
+
+
 def test_column_style_follows_the_majority() -> None:
     """Same size and colour in one column follows whichever mode is in the majority."""
     from vector_trace import _keep_uniform
@@ -1250,6 +1263,7 @@ def main() -> None:
     test_paint_follows_the_glyph_not_the_box()
     test_a_line_is_not_half_traced()
     test_one_potrace_covers_the_page()
+    test_gate_image_keeps_a_word_whole()
     test_column_style_follows_the_majority()
     test_paths_and_local_plate()
     test_card_back_body_is_traced()
