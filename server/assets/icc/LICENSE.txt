@@ -1,0 +1,16 @@
+The two profiles in this folder are from Ghostscript's iccprofiles directory.
+
+  default_cmyk.icc  Artifex CMYK SWOP profile
+  srgb.icc          Artifex Software sRGB ICC profile
+
+Copyright 2011 Artifex Software, Inc.
+
+They are distributed under the GNU Affero General Public License,
+version 3, the same licence as Ghostscript. The terms are at
+https://www.gnu.org/licenses/agpl-3.0.html
+
+default_cmyk.icc is the same file already stored as
+server/profiles/CoatedFOGRA39.icc. Bundling both profiles lets a Windows
+install open them without a Linux colour directory. A Ghostscript
+install folder (C:\Program Files\gs\gs*\iccprofiles) is still searched
+when these copies are missing.

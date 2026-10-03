@@ -991,10 +991,15 @@ def convert_cmyk_keep_text(src: str, dest: str) -> None:
     ]
     if os.path.isfile(icc):
         cmd.insert(cmd.index("-f"), f"-sDefaultCMYKProfile={icc}")
-    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
-    if os.path.isfile(srgb):
+    from host_paths import c_numeric_env, icc_file
+
+    try:
+        srgb = icc_file("srgb.icc")
+    except FileNotFoundError:
+        srgb = ""
+    if srgb and os.path.isfile(srgb):
         cmd.insert(cmd.index("-f"), f"-sDefaultRGBProfile={srgb}")
-    subprocess.run(cmd, check=True, timeout=90, capture_output=True)
+    subprocess.run(cmd, check=True, timeout=90, capture_output=True, env=c_numeric_env())
 
 
 def _page_proxy(page, max_px: int = 500) -> np.ndarray:

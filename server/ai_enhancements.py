@@ -267,12 +267,13 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
 
 
 def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
-                     model_input: dict, version: str = "") -> tuple:
+                     model_input: dict, version: str = "", timeout_s: float | None = None) -> tuple:
     token = _get_replicate_token()
     if not token:
         return None, "REPLICATE_API_TOKEN not configured — enhancement requires API access"
 
-    deadline = time.time() + REPLICATE_TIMEOUT_S
+    budget = REPLICATE_TIMEOUT_S if timeout_s is None else max(1.0, float(timeout_s))
+    deadline = time.time() + budget
 
     try:
         prediction = _replicate_create_prediction(

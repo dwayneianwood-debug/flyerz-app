@@ -60,8 +60,55 @@ def engine_name() -> str:
     return _ENGINE_NAME
 
 
-def local_rows(bgr):
+def _gate_image(bgr):
+    """Big enough that a word stays one word, small enough that the short side is not blown up to 736."""
+    import cv2
+
+    height, width = bgr.shape[:2]
+    short = min(height, width)
+    long = max(height, width)
+    if short < 1 or long < 1:
+        return bgr
+    scale = 640.0 / float(short) if short < 640 else 1.0
+    # 736 is the detector's own long-side limit, so recognition crops are not larger than detection.
+    if long * scale > 736.0:
+        scale = 736.0 / float(long)
+    if abs(scale - 1.0) < 0.02:
+        return bgr
+    return cv2.resize(
+        bgr,
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def local_rows(bgr, fast=False):
+    """Read one picture.
+
+    fast is the text-gate strip. Upright type skips the angle check, and the
+    detector must not enlarge a thin crop until its short side is 736. The
+    page read leaves both on.
+    """
     global _ENGINE, _ENGINE_NAME
     if _ENGINE is None:
         _ENGINE, _ENGINE_NAME = _load()
-    return rows_from_output(_ENGINE(bgr))
+    if not fast:
+        return rows_from_output(_ENGINE(bgr))
+    image = _gate_image(bgr)
+    detector = _ENGINE.text_det
+    previous = detector.limit_type
+    detector.limit_type = "max"
+    try:
+        rows = rows_from_output(_ENGINE(image, use_cls=False))
+    finally:
+        detector.limit_type = previous
+    if image is bgr or not rows:
+        return rows
+    sx = float(bgr.shape[1]) / float(image.shape[1])
+    sy = float(bgr.shape[0]) / float(image.shape[0])
+    scaled = []
+    for item in rows:
+        box = [[float(point[0]) * sx, float(point[1]) * sy] for point in item[0]]
+        score = item[2] if len(item) > 2 else 1.0
+        scaled.append([box, item[1], score])
+    return scaled

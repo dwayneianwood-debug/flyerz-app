@@ -387,7 +387,12 @@ def _lab_delta(left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
 def _proof_bgr(pdf_path: str, dest_png: str) -> np.ndarray:
     """RGB proof of a press PDF through the same FOGRA39 profile."""
     icc = os.path.join(os.path.dirname(__file__), "profiles", "CoatedFOGRA39.icc")
-    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
+    from host_paths import icc_file
+
+    try:
+        srgb = icc_file("srgb.icc")
+    except FileNotFoundError:
+        srgb = ""
     cmd = [
         "gs", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m",
         f"-sOutputFile={dest_png}", "-r110",
@@ -458,6 +463,51 @@ def test_restore_spaces_from_gaps() -> None:
     bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
     text = restore_spaces("50%OFFPRINTS", bgr, [0.0, 0.1, 0.98, 0.75])
     check("gap-spaces", text == "50% OFF PRINTS", text)
+
+
+def test_phone_groups_and_dotted_caps() -> None:
+    """OCR spaces stay put, and a glued dot is split when the pixels have a gap."""
+    from PIL import Image, ImageDraw, ImageFont
+    from ai_rebuild import digit_groups, restore_spaces, spacing_matches
+
+    canvas = Image.new("RGB", (860, 120), (236, 232, 220))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.truetype(os.path.join(os.path.dirname(__file__), "fonts", "v2", "CrimsonText-Regular.ttf"), 42)
+    x = 30
+    for word, gap in (("073", 28), ("703", 10), ("0766", 0)):
+        draw.text((x, 34), word, font=font, fill=(20, 36, 24))
+        x += int(draw.textlength(word, font=font)) + gap
+    bgr = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
+    kept = restore_spaces("073 703 0766", bgr, [0.0, 0.12, 0.96, 0.7])
+    check("phone-groups", digit_groups(kept) == ["073", "703", "0766"], kept)
+    check("phone-spacing", spacing_matches("073 703 0766", kept), kept)
+    check("merged-phone-rejected", spacing_matches("073 703 0766", "073 7030766") is False)
+
+    caps = Image.new("RGB", (980, 90), (20, 50, 36))
+    draw = ImageDraw.Draw(caps)
+    face = ImageFont.truetype(os.path.join(os.path.dirname(__file__), "fonts", "v2", "Cinzel-600.ttf"), 28)
+    cursor = 24
+    for word in ("HOLISTIC", "·", "NATURAL", "·", "PROFESSIONAL"):
+        draw.text((cursor, 28), word, font=face, fill=(230, 236, 228))
+        cursor += int(draw.textlength(word, font=face)) + (22 if word != "PROFESSIONAL" else 0)
+    dotted = cv2.cvtColor(np.array(caps), cv2.COLOR_RGB2BGR)
+    ocr = "HOLISTIC · NATURAL· PROFESSIONAL"
+    spaced = restore_spaces(ocr, dotted, [0.0, 0.08, 0.98, 0.8])
+    check("dot-spaces", spaced == "HOLISTIC · NATURAL · PROFESSIONAL", spaced)
+    check("dot-matches-ocr", spacing_matches(ocr, spaced), spaced)
+
+
+def test_dotted_caps_are_words() -> None:
+    """A middot is lettering. A second read may not drop it or the spaces around it."""
+    from ai_rebuild import _word_like, keep_word_blocks, keeps_grouping
+
+    text = "HOLISTIC · NATURAL · PROFESSIONAL"
+    glued = "HOLISTIC · NATURAL· PROFESSIONAL"
+    check("middot-word", _word_like(text) and _word_like(glued))
+    kept, dropped = keep_word_blocks([{"text": text, "bbox": [0.1, 0.2, 0.7, 0.04], "score": 0.97}])
+    check("middot-kept", [item["text"] for item in kept] == [text], str([item["text"] for item in dropped]))
+    check("middot-grouping", keeps_grouping(text, "HOLISTIC NATURAL PROFESSIONAL") is False)
+    check("phone-grouping", keeps_grouping("073 703 0766", "073 7030766") is False)
 
 
 def test_press_pdf_shows_the_words() -> None:
@@ -625,6 +675,34 @@ def test_doubtful_marks_are_not_retyped() -> None:
     check(
         "drops-doubtful",
         [item["text"] for item in dropped] == ["O", "HELLO", "MARKET DAY", "###", "A"],
+        str([item["text"] for item in dropped]),
+    )
+
+
+def test_contacts_and_dashes_are_words() -> None:
+    """An en dash, an email, and a phone number are lettering."""
+    from ai_rebuild import _word_like, keep_word_blocks
+
+    dash = "Invest in your health today \u2013"
+    email = "medella.lba@gmail.com"
+    phone = "073 703 0766"
+    check("dash-word", _word_like(dash) and _word_like("Save \u2014 today") and _word_like("Tom\u2019s \u2022 list"))
+    check("email-word", _word_like(email))
+    kept, dropped = keep_word_blocks([
+        {"text": dash, "bbox": [0.1, 0.3, 0.5, 0.04], "score": 0.91},
+        {"text": email, "bbox": [0.1, 0.4, 0.5, 0.04], "score": 0.2},
+        {"text": phone, "bbox": [0.1, 0.5, 0.4, 0.04], "score": 0.3},
+        {"text": "###", "bbox": [0.1, 0.1, 0.2, 0.05], "score": 0.9},
+        {"text": "MARKET DAY", "bbox": [0.1, 0.7, 0.4, 0.06], "score": 0.4},
+    ])
+    check(
+        "keeps-dash-email-phone",
+        [item["text"] for item in kept] == [dash, email, phone],
+        str([item["text"] for item in kept]),
+    )
+    check(
+        "still-drops-faint-and-junk",
+        [item["text"] for item in dropped] == ["###", "MARKET DAY"],
         str([item["text"] for item in dropped]),
     )
 
@@ -840,8 +918,11 @@ if __name__ == "__main__":
     test_provider_crash_falls_back()
     test_real_local_ocr()
     test_restore_spaces_from_gaps()
+    test_phone_groups_and_dotted_caps()
+    test_dotted_caps_are_words()
     test_inpaint_removes_the_letters()
     test_doubtful_marks_are_not_retyped()
+    test_contacts_and_dashes_are_words()
     test_upscaled_text_matches_local_placement()
     test_fill_matches_noisy_gradient()
     test_circle_stays_a_circle()

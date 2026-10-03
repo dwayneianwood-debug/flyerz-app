@@ -9,6 +9,9 @@ export function pythonChildEnv(): Record<string, string> {
     PYTHONIOENCODING: "utf-8",
     PYTHONUTF8: "1",
   };
+  // en-ZA uses a decimal comma. LC_ALL would hide LC_NUMERIC from potrace and Ghostscript.
+  delete env.LC_ALL;
+  env.LC_NUMERIC = "C";
   if (!env.FAI_TEMP_DIR?.trim()) {
     env.FAI_TEMP_DIR = getFlyerzTempRoot();
   }

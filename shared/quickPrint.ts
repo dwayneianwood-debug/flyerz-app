@@ -18,6 +18,13 @@ export function quickPrintProduct(id: string | null | undefined): QuickPrintProd
   return QUICK_PRINT_PRODUCTS.find((product) => product.id === id);
 }
 
+export interface QuickCheckItem {
+  id: string;
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
 export interface QuickPrintCard {
   id: number;
   filename: string;
@@ -25,6 +32,7 @@ export interface QuickPrintCard {
   light: QuickLight | null;
   reasons: string[];
   decisions: string[];
+  checklist?: QuickCheckItem[];
   clientMessage: string;
   approved: boolean;
   hasPress: boolean;
