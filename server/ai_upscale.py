@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from typing import Callable, Optional
 
 import cv2
@@ -119,6 +120,67 @@ def light_sharpen_bgr(bgr: np.ndarray) -> np.ndarray:
     blurred = cv2.GaussianBlur(bgr, (0, 0), 0.7)
     sharp = cv2.addWeighted(bgr, 1.28, blurred, -0.28, 0)
     return np.clip(sharp, 0, 255).astype(np.uint8)
+
+
+def photo_unsharp(bgr: np.ndarray) -> np.ndarray:
+    """Lanczos plate, then a mild unsharp. The radius stays about one pixel."""
+    blurred = cv2.GaussianBlur(bgr, (0, 0), 1.15)
+    sharp = cv2.addWeighted(bgr, 1.45, blurred, -0.45, 0)
+    return np.clip(sharp, 0, 255).astype(np.uint8)
+
+
+def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.ndarray]:
+    """Real-ESRGAN of the whole picture, or None when credit or the network is missing.
+
+    The frame is not cover-cropped. The caller fits it onto the press plate.
+    """
+    if bgr is None or bgr.size == 0:
+        return None
+    if (os.environ.get("VECTOR_SKIP_ESRGAN") or "").strip().lower() in ("1", "on", "true", "yes"):
+        return None
+    token = ""
+    try:
+        from ai_enhancements import _call_replicate, _get_replicate_token, _to_data_uri
+
+        token = (_get_replicate_token() or "").strip()
+    except Exception:
+        return None
+    if not token:
+        return None
+    try:
+        from press_ready_engine import replicate_available
+
+        if not replicate_available():
+            return None
+    except Exception:
+        return None
+    height, width = bgr.shape[:2]
+    scale = 2 if max(height, width) * 2 <= 4000 else 1
+    if scale < 2:
+        return None
+    folder = tempfile.mkdtemp(prefix="press-esrgan-")
+    src = os.path.join(folder, "src.png")
+    try:
+        upload = bgr
+        if max(height, width) > 1600:
+            upload = _preview_bgr(bgr, 1600)
+        _write_png(src, upload, dpi=72)
+        from ai_enhancements import _call_replicate, _to_data_uri
+
+        out_path, error = _call_replicate(
+            "ai_upscale",
+            UPSCALE_MODEL_OWNER,
+            UPSCALE_MODEL_NAME,
+            {"image": _to_data_uri(src), "scale": scale, "face_enhance": False},
+            version=UPSCALE_MODEL_VERSION,
+            timeout_s=timeout_s,
+        )
+    except Exception:
+        return None
+    if error or not out_path or not os.path.exists(out_path):
+        return None
+    loaded = cv2.imread(out_path, cv2.IMREAD_COLOR)
+    return loaded if loaded is not None and loaded.size else None
 
 
 def _cap_long_edge(bgr: np.ndarray) -> np.ndarray:

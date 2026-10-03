@@ -2398,6 +2398,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         sys.stderr.write(f"[vector-retype] skipped ({str(exc)[:160]})\n")
         retyped = []
     retype_s = time.perf_counter() - retype_started
+    plate, sharpen_note = _upgrade_raster(plate, drawn, placed, bgr)
     qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyped)
     if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi") or (retyped and not qa.get("fonts")):
         from vector_text_v2 import _discard, _fail
@@ -2448,6 +2449,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         decisions.append(
             f"{len(retyped)} lines the trace left as a picture were set as vector type in a matching font."
         )
+    if sharpen_note:
+        decisions.append(sharpen_note)
     if reason:
         decisions.append(reason)
     colour_s = float(qa.get("colour_s") or 0)
@@ -4481,6 +4484,73 @@ def _apply_text_gate(
         for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_invadeFail", "_smallText", "_glyphOcr"):
             row.pop(key, None)
     return report, kept, qa, source_guard
+
+
+def _upgrade_raster(plate, drawn, placed, source_bgr):
+    """Sharpen the photo layer up to the plate size. Painted-out letters stay put.
+
+    Real-ESRGAN runs only when a token and credit are available, and it is
+    fitted to the same art box. Otherwise the Lanczos plate gets a mild unsharp.
+    Vector text is drawn later, on top of this picture.
+    """
+    try:
+        scale_mm = float((placed or {}).get("scale_mm") or 0)
+        if scale_mm <= 0:
+            return plate, ""
+        source_dpi = 25.4 / scale_mm
+        if source_dpi >= 299:
+            return plate, ""
+        art = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
+        paste_x, paste_y, art_w, art_h = [int(v) for v in art]
+        upgraded = None
+        note = ""
+        remote = _remote_art(source_bgr, art_w, art_h)
+        if remote is not None:
+            fitted = remote
+            if fitted.shape[1] != art_w or fitted.shape[0] != art_h:
+                fitted = cv2.resize(fitted, (max(1, art_w), max(1, art_h)), interpolation=cv2.INTER_LANCZOS4)
+            upgraded = plate.copy()
+            y1 = min(plate.shape[0], paste_y + fitted.shape[0])
+            x1 = min(plate.shape[1], paste_x + fitted.shape[1])
+            y0 = max(0, paste_y)
+            x0 = max(0, paste_x)
+            if y1 > y0 and x1 > x0:
+                upgraded[y0:y1, x0:x1] = fitted[y0 - paste_y:y0 - paste_y + (y1 - y0), x0 - paste_x:x0 - paste_x + (x1 - x0)]
+            note = "The press picture was enlarged with Real-ESRGAN. The vector lettering was left as it is."
+        if upgraded is None:
+            from ai_upscale import photo_unsharp
+
+            upgraded = photo_unsharp(plate)
+            note = "The press picture was sharpened with Lanczos to the print size. The vector lettering was left as it is."
+        protect = _paint_protect(plate, drawn)
+        if int(protect.max()) > 0:
+            keep = protect > 0
+            upgraded[keep] = plate[keep]
+        return upgraded, note
+    except Exception as exc:
+        sys.stderr.write(f"[vector-trace] raster sharpen skipped ({str(exc)[:140]})\n")
+        return plate, ""
+
+
+def _remote_art(source_bgr, art_w: int, art_h: int):
+    if source_bgr is None or art_w < 8 or art_h < 8:
+        return None
+    try:
+        from ai_upscale import full_frame_esrgan
+
+        return full_frame_esrgan(source_bgr, timeout_s=12.0)
+    except Exception:
+        return None
+
+
+def _paint_protect(plate, drawn) -> np.ndarray:
+    """Painted-out letters, plus a few pixels, so a sharpen cannot halo the hole."""
+    mask = np.zeros(plate.shape[:2], np.uint8)
+    for item in drawn or []:
+        _stamp_fringe(mask, item)
+    if int(mask.max()) == 0:
+        return mask
+    return cv2.dilate(mask, np.ones((9, 9), np.uint8))
 
 
 def _content_edge(drawn, raster_boxes, plate_shape, ppi: float, bleed_mm: float) -> dict:

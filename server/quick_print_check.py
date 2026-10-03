@@ -164,10 +164,8 @@ def test_existing(root: str) -> None:
     failed = [item for item in result.get("checklist") or [] if not item.get("passed")]
     check("existing-checklist", {"bleed", "boxes", "cmyk", "fonts", "safe"} <= set(items), str(list(items)))
     check("existing-boxes-pass", items["bleed"]["passed"] and items["boxes"]["passed"], str(items.get("bleed")) + str(items.get("boxes")))
-    if result["light"] == "green":
-        check("existing-green-clear", not failed, str(failed)[:300])
-    else:
-        check("existing-amber-explained", result["light"] == "amber" and bool(failed), f"{result['light']} {result.get('reasons')}")
+    check("existing-cmyk", items["cmyk"]["passed"] and items["ink"]["passed"], str(items.get("cmyk")) + str(items.get("ink")))
+    check("existing-green", result["light"] == "green" and not failed, f"{result['light']} {result.get('reasons')} {failed}")
     media = float(result.get("mediaWidthMm") or 0)
     check("existing-bleed-not-doubled", 156 <= media <= 161, str(result.get("mediaWidthMm")))
     check("existing-not-20mm", abs(media - 168) > 4, str(media))

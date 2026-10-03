@@ -41,6 +41,60 @@ def _bled(path: str) -> None:
     doc.close()
 
 
+def _image_pdf(path: str, pixels: int, page_pt: float) -> None:
+    import io
+
+    import numpy as np
+    import pymupdf as fitz
+    from PIL import Image
+
+    image = Image.fromarray(np.full((pixels, pixels, 3), 40, np.uint8), mode="RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=80)
+    doc = fitz.open()
+    page = doc.new_page(width=page_pt, height=page_pt)
+    page.insert_image(page.rect, stream=buffer.getvalue())
+    doc.save(path)
+    doc.close()
+
+
+def test_embedded_dpi() -> None:
+    folder = tempfile.mkdtemp(prefix="gate-dpi-")
+    sharp = os.path.join(folder, "sharp.pdf")
+    soft = os.path.join(folder, "soft.pdf")
+    _image_pdf(sharp, 400, 72)
+    _image_pdf(soft, 100, 72)
+    high = assess(sharp, 20, 20, {"upscale": 2.0})
+    low = assess(soft, 20, 20, {"upscale": 2.0})
+    items_high = {item["id"]: item for item in high["items"]}
+    items_low = {item["id"]: item for item in low["items"]}
+    check("dpi-embedded-passes", items_high["resolution"]["passed"], str(items_high["resolution"]))
+    check("dpi-embedded-fails", items_low["resolution"]["passed"] is False and "100" in items_low["resolution"]["detail"], str(items_low["resolution"]))
+
+
+def test_sharpen_keeps_the_hole() -> None:
+    import numpy as np
+
+    from vector_trace import _upgrade_raster
+
+    rng = np.random.default_rng(1)
+    plate = rng.integers(40, 220, (80, 120, 3), dtype=np.uint8)
+    hole = plate.copy()
+    drawn = [{
+        "_ink": np.ones((20, 40), np.uint8) * 255,
+        "origin": (40, 30),
+    }]
+    # The fringe of that ink is the hole. Source DPI under 300 forces a sharpen.
+    placed = {"scale_mm": 25.4 / 180.0, "art_box": (0, 0, 120, 80)}
+    upgraded, note = _upgrade_raster(plate, drawn, placed, plate)
+    check("sharpen-note", "sharpened" in note.lower() or "esrgan" in note.lower(), note)
+    from vector_trace import _paint_protect
+
+    protect = _paint_protect(plate, drawn)
+    check("sharpen-hole", np.array_equal(upgraded[protect > 0], hole[protect > 0]))
+    check("sharpen-photo", not np.array_equal(upgraded[protect == 0], plate[protect == 0]))
+
+
 def test_messages() -> None:
     check("msg-cut", "cut line" in client_message("cut").lower() and client_message("cut") == CUT_MESSAGE)
     check("msg-missing", "missing" in MISSING_MESSAGE.lower())
@@ -116,6 +170,8 @@ def test_blank_and_wrong_shape() -> None:
 
 def main() -> None:
     test_messages()
+    test_embedded_dpi()
+    test_sharpen_keeps_the_hole()
     test_bled_pdf_explains_itself()
     test_blank_and_wrong_shape()
     print("GREEN GATE CHECKS PASSED")

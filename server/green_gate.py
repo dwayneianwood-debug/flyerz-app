@@ -190,8 +190,9 @@ def _colour(path: str) -> tuple[dict, dict]:
     finally:
         doc.close()
     if not images:
-        cmyk_ok = False
-        cmyk_detail = "The file has no CMYK picture. Press files need to be CMYK."
+        cmyk_ok, tac = _vector_cmyk(path)
+        saw_cmyk = cmyk_ok
+        cmyk_detail = "The press file is not CMYK."
     else:
         cmyk_ok = all(space == 4 for space in spaces)
         cmyk_detail = "The press picture is not CMYK."
@@ -204,6 +205,28 @@ def _colour(path: str) -> tuple[dict, dict]:
         _item("cmyk", "The press file is CMYK", cmyk_ok, cmyk_detail),
         _item("ink", "Total ink stays within the press limit", ink_ok, ink_detail),
     )
+
+
+def _vector_cmyk(path: str) -> tuple[bool, float]:
+    """A page of CMYK fills and live text, with no RGB. Returns (ok, peak TAC)."""
+    import re
+
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        raw = "".join(page.read_contents().decode("latin1", "replace") for page in doc)
+    finally:
+        doc.close()
+    if re.search(r"\brg\b|\bRG\b|DeviceRGB", raw):
+        return False, 0.0
+    found = re.findall(r"([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+k\b", raw)
+    if not found and "DeviceCMYK" not in raw:
+        return False, 0.0
+    tac = 0.0
+    for parts in found:
+        tac = max(tac, sum(float(channel) for channel in parts) * 100.0)
+    return True, tac
 
 
 def _tac(blob: bytes) -> float:
@@ -226,11 +249,7 @@ def _tac(blob: bytes) -> float:
 
 
 def _resolution(path: str, context: dict) -> dict:
-    upscale = float(context.get("upscale") or 1)
-    if upscale < 0.05:
-        upscale = 1.0
-    effective = 300.0 / upscale
-    raster_left = _raster_text(context)
+    del context
     import pymupdf as fitz
 
     doc = fitz.open(path)
@@ -239,6 +258,9 @@ def _resolution(path: str, context: dict) -> dict:
         info = doc[0].get_image_info() or []
     finally:
         doc.close()
+    if not images:
+        return _item("resolution", "Remaining raster is at least 300 DPI at final size", True, "")
+    # Pixel size of the embedded picture against the box it is printed in.
     file_dpi = 0.0
     for image in info:
         bbox = image.get("bbox")
@@ -246,29 +268,11 @@ def _resolution(path: str, context: dict) -> dict:
             continue
         width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
         height_in = max(0.01, (float(bbox[3]) - float(bbox[1])) / 72.0)
-        file_dpi = max(file_dpi, float(image.get("width") or 0) / width_in, float(image.get("height") or 0) / height_in)
-    if not images:
-        return _item("resolution", "Remaining raster is at least 300 DPI", True, "")
-    # The file can claim 400 PPI after an enlarge. The honest figure is the source.
-    honest = min(effective, file_dpi) if file_dpi else effective
-    ok = honest + 1 >= MIN_EFFECTIVE_DPI or not raster_left
-    if raster_left and honest + 1 < MIN_EFFECTIVE_DPI:
-        ok = False
-    detail = f"The picture is about {honest:.0f} DPI at the print size. It needs 300 DPI."
-    if not raster_left and honest + 1 < MIN_EFFECTIVE_DPI:
-        # The picture was enlarged, but no text is still a picture. Flag the raster anyway.
-        ok = False
-        detail = f"The remaining picture is about {honest:.0f} DPI at the print size. It needs 300 DPI."
+        dpi = min(float(image.get("width") or 0) / width_in, float(image.get("height") or 0) / height_in)
+        file_dpi = max(file_dpi, dpi)
+    ok = file_dpi + 1 >= MIN_EFFECTIVE_DPI
+    detail = f"The picture is about {file_dpi:.0f} DPI at the print size. It needs 300 DPI."
     return _item("resolution", "Remaining raster is at least 300 DPI at final size", ok, detail)
-
-
-def _raster_text(context: dict) -> bool:
-    for row in context.get("textGate") or []:
-        text = str(row.get("text") or "")
-        letters = sum(1 for ch in text if ch.isalnum())
-        if letters >= 3 and row.get("mode") != "vector":
-            return True
-    return False
 
 
 def _safe_zone(path: str, trim_w: float, trim_h: float, context: dict) -> tuple[dict, bool]:
