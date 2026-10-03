@@ -94,42 +94,38 @@ def _crop_pair(name: str, result: dict, src: str, trim_w: float, trim_h: float, 
         return 0
     doc = fitz.open(result["pressPath"])
     page = doc[0]
-    ppi = int(placement.get("ppi") or 400)
-    pix = page.get_pixmap(matrix=fitz.Matrix(ppi / 72.0, ppi / 72.0), alpha=False, colorspace=fitz.csRGB)
-    press = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    ppi = float(placement.get("ppi") or 400)
+    # The crop is the press PDF rendered at 600 DPI, not a resized plate.
+    zoom = 600.0 / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+    press = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
     doc.close()
+    pad = int(round(3.0 / 25.4 * 600.0))
     written = 0
     for index, line in enumerate(lines):
         x, y, bw, bh = [int(v) for v in line["plateRect"]]
-        pad = 6
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(press.shape[1], x + bw + pad)
-        y1 = min(press.shape[0], y + bh + pad)
-        if x1 <= x0 or y1 <= y0:
+        x0 = max(0, int(round(x * 600.0 / ppi)) - pad)
+        y0 = max(0, int(round(y * 600.0 / ppi)) - pad)
+        x1 = min(press.shape[1], int(round((x + bw) * 600.0 / ppi)) + pad)
+        y1 = min(press.shape[0], int(round((y + bh) * 600.0 / ppi)) + pad)
+        if x1 - x0 < 8 or y1 - y0 < 8:
             continue
         after = press[y0:y1, x0:x1]
-        fx0 = int(round((x0 - paste_x) / max(1, art_w) * traced.shape[1]))
-        fy0 = int(round((y0 - paste_y) / max(1, art_h) * traced.shape[0]))
-        fx1 = int(round((x1 - paste_x) / max(1, art_w) * traced.shape[1]))
-        fy1 = int(round((y1 - paste_y) / max(1, art_h) * traced.shape[0]))
+        fx0 = int(round((x0 * ppi / 600.0 - paste_x) / max(1, art_w) * traced.shape[1]))
+        fy0 = int(round((y0 * ppi / 600.0 - paste_y) / max(1, art_h) * traced.shape[0]))
+        fx1 = int(round((x1 * ppi / 600.0 - paste_x) / max(1, art_w) * traced.shape[1]))
+        fy1 = int(round((y1 * ppi / 600.0 - paste_y) / max(1, art_h) * traced.shape[0]))
         fx0 = max(0, min(fx0, traced.shape[1] - 1))
         fy0 = max(0, min(fy0, traced.shape[0] - 1))
         fx1 = max(fx0 + 1, min(fx1, traced.shape[1]))
         fy1 = max(fy0 + 1, min(fy1, traced.shape[0]))
         before = cv2.cvtColor(traced[fy0:fy1, fx0:fx1], cv2.COLOR_BGR2RGB)
-        before = cv2.resize(before, (after.shape[1], after.shape[0]), interpolation=cv2.INTER_NEAREST)
+        before = cv2.resize(before, (after.shape[1], after.shape[0]), interpolation=cv2.INTER_LANCZOS4)
         gap = np.full((after.shape[0], 8, 3), 255, np.uint8)
         pair = np.concatenate([before, gap, after], axis=1)
-        scale = 600.0 / float(ppi)
-        shown = cv2.resize(
-            pair,
-            (max(1, int(round(pair.shape[1] * scale))), max(1, int(round(pair.shape[0] * scale)))),
-            interpolation=cv2.INTER_NEAREST,
-        )
         slug = "".join(ch if ch.isalnum() else "_" for ch in str(line.get("text") or ""))[:40]
         dest = os.path.join(folder, f"{name}_{index:02d}_{slug}.png")
-        Image.fromarray(shown).save(dest, dpi=(600, 600))
+        Image.fromarray(pair).save(dest, dpi=(600, 600))
         written += 1
     return written
 

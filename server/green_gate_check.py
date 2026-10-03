@@ -168,10 +168,60 @@ def test_blank_and_wrong_shape() -> None:
     check("shape-no-auto", shaped.get("clientMessage") and "http" not in shaped["clientMessage"].lower())
 
 
+def test_paint_and_ink_colour() -> None:
+    import pymupdf as fitz
+
+    folder = tempfile.mkdtemp(prefix="gate-type-")
+
+    def draw(path: str, behind: bool, color: tuple) -> None:
+        doc = fitz.open()
+        page = doc.new_page(width=220, height=90)
+        page.draw_rect(page.rect, color=None, fill=(1, 1, 1))
+        if behind:
+            page.draw_rect(fitz.Rect(26, 30, 122, 61), color=None, fill=(0.62, 0.62, 0.62))
+        page.insert_text((30, 52), "Hello there", fontsize=18, fontname="helv", color=color)
+        doc.save(path)
+        doc.close()
+
+    clean = os.path.join(folder, "clean.pdf")
+    dirty = os.path.join(folder, "dirty.pdf")
+    grey = os.path.join(folder, "grey.pdf")
+    draw(clean, False, (0.05, 0.08, 0.04))
+    draw(dirty, True, (0.05, 0.08, 0.04))
+    draw(grey, False, (0.55, 0.55, 0.55))
+    context = {"textGate": [{"text": "Hello there", "retyped": True, "sourceInk": [13, 20, 10], "mode": "vector"}]}
+    clean_items = {item["id"]: item for item in assess(clean, 50, 20, context)["items"]}
+    dirty_items = {item["id"]: item for item in assess(dirty, 50, 20, context)["items"]}
+    grey_items = {item["id"]: item for item in assess(grey, 50, 20, context)["items"]}
+    check("paint-clean", clean_items["paint"]["passed"], str(clean_items["paint"]))
+    check("paint-dirty", dirty_items["paint"]["passed"] is False, str(dirty_items["paint"]))
+    check("colour-core", clean_items["typecolour"]["passed"], str(clean_items["typecolour"]))
+    check("colour-grey", grey_items["typecolour"]["passed"] is False, str(grey_items["typecolour"]))
+
+
+def test_esrgan_only_with_token() -> None:
+    import numpy as np
+
+    from ai_upscale import full_frame_esrgan
+    from vector_trace import _upscale_choice
+
+    check("choice-esrgan", _upscale_choice("token", np.zeros((4, 4, 3), np.uint8)) == "esrgan")
+    check("choice-kept", _upscale_choice("token", None) == "kept")
+    check("choice-lanczos", _upscale_choice("", None) == "lanczos")
+    saved = os.environ.pop("REPLICATE_API_TOKEN", None)
+    try:
+        check("no-token-no-esrgan", full_frame_esrgan(np.zeros((16, 16, 3), np.uint8)) is None)
+    finally:
+        if saved is not None:
+            os.environ["REPLICATE_API_TOKEN"] = saved
+
+
 def main() -> None:
     test_messages()
     test_embedded_dpi()
     test_sharpen_keeps_the_hole()
+    test_paint_and_ink_colour()
+    test_esrgan_only_with_token()
     test_bled_pdf_explains_itself()
     test_blank_and_wrong_shape()
     print("GREEN GATE CHECKS PASSED")

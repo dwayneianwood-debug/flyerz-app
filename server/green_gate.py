@@ -64,6 +64,8 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
             message = client_message("cut")
         items.append(_lines(context))
         items.append(_letters(context))
+        items.append(_paint_clean(press_path, context))
+        items.append(_ink_colour(press_path, context))
         items.append(_fonts(press_path))
         if _page_empty(press_path):
             severity = "red"
@@ -367,6 +369,187 @@ def _letters(context: dict) -> dict:
             changed.append(source[:60])
     detail = f"A line changed ({changed[0]})." if changed else ""
     return _item("letters", "No letters changed from the source", not changed, detail)
+
+
+def _retyped_rows(context: dict) -> list:
+    return [row for row in list(context.get("textGate") or []) if row.get("retyped")]
+
+
+def _page_rgb(path: str, zoom: float):
+    import pymupdf as fitz
+    import numpy as np
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        words = page.get_text("words") or []
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+    finally:
+        doc.close()
+    return rgb, words
+
+
+def _pdf_line_groups(words: list) -> list:
+    rows = []
+    for word in words:
+        if len(word) < 5 or not str(word[4]).strip():
+            continue
+        y0 = float(word[1])
+        placed = False
+        for row in rows:
+            if abs(row["y"] - y0) <= 2.2:
+                row["words"].append(word)
+                placed = True
+                break
+        if not placed:
+            rows.append({"y": y0, "words": [word]})
+    split = []
+    for row in rows:
+        words_sorted = sorted(row["words"], key=lambda word: float(word[0]))
+        current = [words_sorted[0]]
+        for word in words_sorted[1:]:
+            previous = current[-1]
+            gap = float(word[0]) - float(previous[2])
+            height = max(4.0, float(previous[3]) - float(previous[1]))
+            # Another column on the same baseline is not the same line.
+            if gap > max(8.0, height * 1.6):
+                split.append({"y": row["y"], "words": current})
+                current = [word]
+            else:
+                current.append(word)
+        split.append({"y": row["y"], "words": current})
+    for row in split:
+        row["text"] = " ".join(str(word[4]) for word in row["words"])
+    return split
+
+
+def _paint_clean(path: str, context: dict) -> dict:
+    """A retyped line must not leave a grey band on the paper around it."""
+    rows = _retyped_rows(context)
+    label = "Retyped lettering sits on the same paper"
+    if not rows:
+        return _item("paint", label, True, "")
+    try:
+        import cv2
+        import numpy as np
+
+        zoom = 4.0
+        rgb, words = _page_rgb(path, zoom)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        wanted = {" ".join(str(row.get("text") or "").split()) for row in rows}
+        wanted.discard("")
+        bad = ""
+        for group in _pdf_line_groups(words):
+            if group["text"] not in wanted and not any(group["text"] in line or line in group["text"] for line in wanted):
+                continue
+            for word in group["words"]:
+                x0 = max(0, int(float(word[0]) * zoom) - 2)
+                y0 = max(0, int(float(word[1]) * zoom) - 2)
+                x1 = min(gray.shape[1], int(float(word[2]) * zoom) + 3)
+                y1 = min(gray.shape[0], int(float(word[3]) * zoom) + 3)
+                if x1 - x0 < 6 or y1 - y0 < 6:
+                    continue
+                pad = 28
+                cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+                cx1, cy1 = min(gray.shape[1], x1 + pad), min(gray.shape[0], y1 + pad)
+                patch = gray[cy0:cy1, cx0:cx1]
+                paper = float(np.median(patch))
+                ink = (patch < paper - 28).astype(np.uint8)
+                if int(ink.sum()) < 8:
+                    continue
+                near_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+                far_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (49, 49))
+                skip = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+                near = (cv2.dilate(ink, near_k) > 0) & (skip == 0)
+                far = (cv2.dilate(ink, far_k) > 0) & (cv2.dilate(ink, near_k) == 0)
+                if int(near.sum()) < 12 or int(far.sum()) < 12:
+                    continue
+                near_px = patch[near].astype(np.float32)
+                far_px = patch[far].astype(np.float32)
+                if abs(float(near_px.mean()) - float(far_px.mean())) > 8.0:
+                    bad = group["text"][:60]
+                    break
+                if abs(float(near_px.std()) - float(far_px.std())) > 6.0:
+                    bad = group["text"][:60]
+                    break
+            if bad:
+                break
+    except Exception as exc:
+        return _item("paint", label, False, f"The paper around the type could not be checked ({str(exc)[:80]}).")
+    detail = f"A grey patch shows around the type ({bad})." if bad else ""
+    return _item("paint", label, not bad, detail)
+
+
+def _ink_colour(path: str, context: dict) -> dict:
+    """Retyped ink is the dark stroke core, not the grey edge."""
+    rows = [row for row in _retyped_rows(context) if row.get("sourceInk")]
+    label = "Retyped lettering matches the source ink colour"
+    if not rows:
+        return _item("typecolour", label, True, "")
+    try:
+        import cv2
+        import numpy as np
+
+        zoom = 8.0
+        rgb, words = _page_rgb(path, zoom)
+        wanted = {}
+        for row in rows:
+            text = " ".join(str(row.get("text") or "").split())
+            if text:
+                wanted[text] = [int(v) for v in row["sourceInk"][:3]]
+        bad = ""
+        for group in _pdf_line_groups(words):
+            target = wanted.get(group["text"])
+            if target is None:
+                for text, ink in wanted.items():
+                    if group["text"] and (group["text"] in text or text in group["text"]):
+                        target = ink
+                        break
+            if target is None:
+                continue
+            samples = []
+            for word in group["words"]:
+                x0 = max(0, int(float(word[0]) * zoom))
+                y0 = max(0, int(float(word[1]) * zoom))
+                x1 = min(rgb.shape[1], int(float(word[2]) * zoom) + 1)
+                y1 = min(rgb.shape[0], int(float(word[3]) * zoom) + 1)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                patch = rgb[y0:y1, x0:x1]
+                gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+                paper = float(np.median(gray))
+                dark = gray < paper - 24
+                if int(dark.sum()) < 6:
+                    continue
+                pixels = patch[dark].astype(np.float32)
+                luma = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
+                core = pixels[luma <= np.percentile(luma, 15)]
+                if core.shape[0] < 4:
+                    core = pixels
+                samples.append(np.median(core, axis=0))
+            if not samples:
+                continue
+            found = np.median(np.stack(samples, axis=0), axis=0)
+            target_px = np.array(target, dtype=np.float32)
+
+            def _luma(px: np.ndarray) -> float:
+                return float(0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2])
+
+            # Solid K previews a little lighter than a sampled core of 0. Both are
+            # still the dark stroke, not the grey edge the check is there to catch.
+            both_dark = _luma(found) < 55.0 and _luma(target_px) < 55.0
+            both_neutral = (float(found.max()) - float(found.min())) < 45.0 and (
+                float(target_px.max()) - float(target_px.min())
+            ) < 45.0
+            distance = float(np.linalg.norm(found - target_px))
+            if distance > 48.0 and not (both_dark and both_neutral):
+                bad = group["text"][:60]
+                break
+    except Exception as exc:
+        return _item("typecolour", label, False, f"The ink colour could not be checked ({str(exc)[:80]}).")
+    detail = f"The type is a different colour from the source ({bad})." if bad else ""
+    return _item("typecolour", label, not bad, detail)
 
 
 def _fonts(path: str) -> dict:

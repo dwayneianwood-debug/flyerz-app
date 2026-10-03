@@ -14,7 +14,14 @@ from vector_retype import (
     FAMILIES,
     RETYPE_BUDGET_S,
     _align_words,
+    _apply_source_marks,
+    _ink_mask,
+    _retarget_marks,
+    _classify_mark,
     _exact,
+    _fill_text_hole,
+    _ink_cmyk,
+    _match_word_widths,
     choose_font,
     fonts_embedded,
     retype_rejected,
@@ -76,6 +83,9 @@ def test_exact() -> None:
     check("exact-punct", _exact("health,", "health,") and not _exact("health,", "health"))
     check("exact-space-punct", _exact("health ,", "health,"))
     check("exact-accent", _exact("café", "café") and not _exact("café", "cafe"))
+    check("exact-apostrophe", not _exact("body's", "body\u2019s"))
+    check("exact-quote", not _exact("\u201cHi\u201d", '"Hi"'))
+    check("exact-dash", not _exact("one - two", "one \u2014 two"))
 
 
 def test_retype_keeps_neighbour_and_embeds() -> None:
@@ -188,12 +198,107 @@ def test_families_differ() -> None:
 
 
 def _mask(bgr: np.ndarray) -> np.ndarray:
+    from vector_retype import _ink_mask
+
+    mask = _ink_mask(bgr)
+    if mask is not None:
+        return mask
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return ((gray < 180).astype(np.uint8)) * 255
+    return ((gray < 160).astype(np.uint8)) * 255
+
+
+def test_source_glyph_and_core_and_paper() -> None:
+    curly = (np.array([
+        [0, 1, 1, 1],
+        [0, 0, 1, 1],
+        [0, 0, 1, 0],
+        [0, 1, 0, 0],
+    ], np.uint8) * 255)
+    straight = (np.array([
+        [0, 1, 0],
+        [0, 1, 0],
+        [0, 1, 0],
+        [0, 1, 0],
+        [0, 1, 0],
+    ], np.uint8) * 255)
+    check("mark-curly", _classify_mark(curly) == "curly", _classify_mark(curly))
+    check("mark-straight", _classify_mark(straight) == "straight", _classify_mark(straight))
+    mask = np.zeros((36, 120), np.uint8)
+    mask[8:28, 8:18] = 255
+    mask[8:28, 24:36] = 255
+    mask[8:28, 42:54] = 255
+    mask[8:28, 70:82] = 255
+    mask[4:8, 58:62] = curly
+    item = {"text": "body's", "mask": mask, "words": ["body's"]}
+    _apply_source_marks(item)
+    check("source-apostrophe", item["text"] == "body\u2019s", item["text"])
+    card = cv2.imread(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_back.png"))
+    boosts = _ink_mask(card[312:345, 158:476])
+    rewritten = _retarget_marks(boosts, "Boosts your body's natural defences")
+    check("card-apostrophe", "body\u2019s" in rewritten and "'" not in rewritten, rewritten)
+    split = np.zeros((28, 80), np.uint8)
+    split[6:22, 8:16] = 255
+    split[6:22, 22:34] = 255
+    split[4:7, 40:42] = 255
+    split[8:11, 43:45] = 255
+    split[6:22, 52:64] = 255
+    joined = _retarget_marks(split, "bo's")
+    check("split-apostrophe", joined == "bo\u2019s", joined)
+
+    plate = np.full((40, 80, 3), (236, 232, 220), np.uint8)
+    plate[12:28, 16:64] = (150, 155, 145)
+    plate[16:24, 24:56] = (8, 18, 6)
+    ink = np.zeros((40, 80), np.uint8)
+    ink[12:28, 16:64] = 255
+    _cmyk, rgb = _ink_cmyk(plate, (0, 0), ink)
+    check("core-not-grey", rgb[0] < 40 and rgb[1] < 50 and rgb[2] < 40, str(rgb))
+
+    paper = np.random.default_rng(2).integers(228, 242, (70, 140, 3), dtype=np.uint8)
+    hole = np.zeros((70, 140), np.uint8)
+    hole[24:42, 18:110] = 255
+    dirty = paper.copy()
+    dirty[hole > 0] = (150, 150, 148)
+    filled, ok = _fill_text_hole(dirty, hole)
+    check("paper-kept", ok, "fill rejected")
+    if ok:
+        grey = cv2.cvtColor(filled, cv2.COLOR_BGR2GRAY)
+        ring = np.zeros(hole.shape, np.uint8)
+        ring[16:50, 8:124] = 255
+        ring[hole > 0] = 0
+        diff = abs(float(grey[hole > 0].mean()) - float(grey[ring > 0].mean()))
+        check("paper-mean", diff <= 3.0, f"{diff:.2f}")
+    blocked = np.full((12, 12, 3), 180, np.uint8)
+    _filled, closed = _fill_text_hole(blocked, np.full((12, 12), 255, np.uint8))
+    check("paper-no-ring", closed is False)
+
+    source = np.zeros((24, 80), np.uint8)
+    source[4:20, 8:40] = 255
+    rendered = np.zeros_like(source)
+    rendered[4:20, 9:40] = 255
+    wide = _match_word_widths(source, rendered, "Word", [("W", 10), ("o", 18), ("r", 26), ("d", 32)], 16.0, "crimson")
+    check("width-within", wide is not None and wide[2][0]["scale"] <= 1.05, str(None if wide is None else wide[2][0]["scale"]))
+    narrow = np.zeros_like(source)
+    narrow[4:20, 14:28] = 255
+    too_far = _match_word_widths(source, narrow, "Word", [("W", 14), ("o", 18), ("r", 22), ("d", 26)], 16.0, "crimson")
+    check("width-capped", too_far is None)
+    # One short word with a noisy span does not throw away a line that otherwise fits.
+    both = np.zeros((24, 180), np.uint8)
+    both[4:20, 8:78] = 255
+    both[4:20, 100:112] = 255
+    drawn = np.zeros_like(both)
+    drawn[4:20, 8:76] = 255
+    drawn[4:20, 96:124] = 255
+    kept = _match_word_widths(
+        both, drawn, "Longer it",
+        [("L", 10), ("o", 22), ("n", 34), ("g", 46), ("e", 58), ("r", 68), (" ", 80), ("i", 100), ("t", 108)],
+        16.0, "crimson",
+    )
+    check("width-short-word", kept is not None and kept[2][0]["scale"] <= 1.05, str(None if kept is None else [run["scale"] for run in kept[2]]))
 
 
 def main() -> None:
     test_exact()
+    test_source_glyph_and_core_and_paper()
     test_align_words()
     test_low_confidence_stays()
     test_disagreement_stays()

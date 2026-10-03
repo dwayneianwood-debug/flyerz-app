@@ -2435,6 +2435,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "pt": _points(int(core[3]), placed.get("ppi") or MIN_PPI),
             "retyped": True,
             "plateRect": [int(v) for v in core[:4]],
+            "sourceInk": list(item.get("source_ink") or []),
         })
     still_raster = [row for row in raster_lines if row.get("mode") != "vector"]
     amber = bool(still_raster)
@@ -4493,11 +4494,19 @@ def _apply_text_gate(
     return report, kept, qa, source_guard
 
 
+def _upscale_choice(token: str, remote) -> str:
+    """Real-ESRGAN when a token returned a picture. Lanczos only with no token."""
+    if remote is not None:
+        return "esrgan"
+    if str(token or "").strip():
+        return "kept"
+    return "lanczos"
+
+
 def _upgrade_raster(plate, drawn, placed, source_bgr):
     """Sharpen the photo layer up to the plate size. Painted-out letters stay put.
 
-    Real-ESRGAN runs only when a token and credit are available, and it is
-    fitted to the same art box. Otherwise the Lanczos plate gets a mild unsharp.
+    A Replicate token uses Real-ESRGAN. Lanczos is only the path with no token.
     Vector text is drawn later, on top of this picture.
     """
     try:
@@ -4509,10 +4518,16 @@ def _upgrade_raster(plate, drawn, placed, source_bgr):
             return plate, ""
         art = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
         paste_x, paste_y, art_w, art_h = [int(v) for v in art]
-        upgraded = None
-        note = ""
-        remote = _remote_art(source_bgr, art_w, art_h)
-        if remote is not None:
+        token = ""
+        try:
+            from ai_enhancements import _get_replicate_token
+
+            token = (_get_replicate_token() or "").strip()
+        except Exception:
+            token = ""
+        remote = _remote_art(source_bgr, art_w, art_h) if token else None
+        choice = _upscale_choice(token, remote)
+        if choice == "esrgan":
             fitted = remote
             if fitted.shape[1] != art_w or fitted.shape[0] != art_h:
                 fitted = cv2.resize(fitted, (max(1, art_w), max(1, art_h)), interpolation=cv2.INTER_LANCZOS4)
@@ -4524,11 +4539,13 @@ def _upgrade_raster(plate, drawn, placed, source_bgr):
             if y1 > y0 and x1 > x0:
                 upgraded[y0:y1, x0:x1] = fitted[y0 - paste_y:y0 - paste_y + (y1 - y0), x0 - paste_x:x0 - paste_x + (x1 - x0)]
             note = "The press picture was enlarged with Real-ESRGAN. The vector lettering was left as it is."
-        if upgraded is None:
+        elif choice == "lanczos":
             from ai_upscale import photo_unsharp
 
             upgraded = photo_unsharp(plate)
             note = "The press picture was sharpened with Lanczos to the print size. The vector lettering was left as it is."
+        else:
+            return plate, "A Replicate token is set, but Real-ESRGAN did not return a picture. Lanczos was not used."
         protect = _paint_protect(plate, drawn)
         if int(protect.max()) > 0:
             keep = protect > 0

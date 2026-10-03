@@ -130,8 +130,11 @@ def photo_unsharp(bgr: np.ndarray) -> np.ndarray:
 
 
 def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.ndarray]:
-    """Real-ESRGAN of the whole picture, or None when credit or the network is missing.
+    """Real-ESRGAN of the whole picture when a Replicate token is set.
 
+    No token returns None, and the caller may sharpen with Lanczos.
+    A token always attempts the model. A failed call also returns None;
+    the caller must not pretend that was a Lanczos upscale.
     The frame is not cover-cropped. The caller fits it onto the press plate.
     """
     if bgr is None or bgr.size == 0:
@@ -147,17 +150,7 @@ def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.n
         return None
     if not token:
         return None
-    try:
-        from press_ready_engine import replicate_available
-
-        if not replicate_available():
-            return None
-    except Exception:
-        return None
     height, width = bgr.shape[:2]
-    scale = 2 if max(height, width) * 2 <= 4000 else 1
-    if scale < 2:
-        return None
     folder = tempfile.mkdtemp(prefix="press-esrgan-")
     src = os.path.join(folder, "src.png")
     try:
@@ -171,7 +164,7 @@ def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.n
             "ai_upscale",
             UPSCALE_MODEL_OWNER,
             UPSCALE_MODEL_NAME,
-            {"image": _to_data_uri(src), "scale": scale, "face_enhance": False},
+            {"image": _to_data_uri(src), "scale": 2, "face_enhance": False},
             version=UPSCALE_MODEL_VERSION,
             timeout_s=timeout_s,
         )
