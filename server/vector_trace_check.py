@@ -171,12 +171,24 @@ def test_default_trace_and_font_flag() -> None:
         low = trace_fitted(canvas, 90, 50, missed, blocks=[_block("only", 40 / 640, 80 / 360, 520 / 640, 180 / 360)])
     finally:
         vector_trace.IOU_FLOOR = saved
-    check("iou-gate", low.get("ok") is True and int(low.get("vector_lines") or 0) == 0, str(low.get("lines")))
-    check("iou-raster", low["lines"] and low["lines"][0]["mode"] == "raster", str(low.get("lines")))
+    traced = [
+        row for row in (low.get("lines") or [])
+        if row.get("mode") == "vector" and not row.get("retyped")
+    ]
+    retyped = [row for row in (low.get("lines") or []) if row.get("retyped")]
+    check("iou-gate", low.get("ok") is True and not traced, str(low.get("lines")))
+    if retyped:
+        check("iou-retype", retyped[0].get("text") == "only" and bool(retyped[0].get("font")), str(retyped))
+    else:
+        check("iou-raster", low["lines"] and low["lines"][0]["mode"] == "raster", str(low.get("lines")))
     doc = fitz.open(missed)
     missed_drawings = doc[0].get_drawings()
+    missed_text = doc[0].get_text("text") or ""
     doc.close()
-    check("iou-no-path", missed_drawings == [], str(len(missed_drawings)))
+    if retyped:
+        check("iou-retype-live", "only" in missed_text, missed_text[:80])
+    else:
+        check("iou-no-path", missed_drawings == [], str(len(missed_drawings)))
 
     heart = canvas.copy()
     heart[20:70, 560:630] = (40, 40, 220)
@@ -1053,9 +1065,10 @@ def test_card_back_body_is_traced() -> None:
     gate = result.get("text_gate") or []
     for text in wanted:
         line = lines.get(text)
-        kept = line is not None and line.get("mode") == "vector" and float(line.get("match") or 0) >= 0.86
+        kept = line is not None and line.get("mode") == "vector" and not line.get("retyped") and float(line.get("match") or 0) >= 0.86
+        retyped_ok = line is not None and line.get("retyped") and line.get("mode") == "vector" and bool(line.get("font"))
         put_back = line is not None and line.get("mode") == "raster"
-        check("card-body-" + text[:24], kept or put_back, str(line))
+        check("card-body-" + text[:24], kept or put_back or retyped_ok, str(line))
         if kept:
             print(f"IOU {text} {line.get('match')}")
     bad = _vector_reads_match(gate)
@@ -1254,9 +1267,19 @@ def _check_card_back_raster(side: dict) -> None:
     gate = side.get("textGate") or []
     for word in ("DETECT", "BALANCE", "HEAL", "LIVE BETTER"):
         rows = [row for row in gate if str(row.get("text") or "").strip() == word]
+        # A faint footer stays in the picture unless a second read and the
+        # overlap check both accepted it as live type.
+        kept = len(rows) == 1 and (
+            rows[0].get("mode") == "raster"
+            or (
+                rows[0].get("retyped")
+                and rows[0].get("mode") == "vector"
+                and _reads_match(str(rows[0].get("text") or ""), str(rows[0].get("render") or ""))
+            )
+        )
         check(
-            "footer-" + word.lower().replace(" ", "-") + "-raster",
-            len(rows) == 1 and rows[0].get("mode") == "raster",
+            "footer-" + word.lower().replace(" ", "-") + "-kept",
+            kept,
             str(rows)[:300],
         )
     ident = [row for row in gate if "BY IDENTIFYING" in str(row.get("text") or "")]
@@ -1350,7 +1373,15 @@ def _check_allergies_column(gate: list) -> None:
     body = [row for row in rows if "Identifies triggers" in str(row.get("text") or "")]
     check("allergies-present", bool(heading) and bool(body), str(rows)[:240])
     modes = {row.get("mode") for row in heading + body}
-    check("allergies-one-weight", modes == {"vector"} or modes == {"raster"}, str(heading + body)[:400])
+    retyped = [row for row in heading + body if row.get("retyped")]
+    if retyped:
+        check(
+            "allergies-retype-reads",
+            all(_reads_match(str(row.get("text") or ""), str(row.get("render") or "")) for row in retyped),
+            str(retyped)[:400],
+        )
+    else:
+        check("allergies-one-weight", modes == {"vector"} or modes == {"raster"}, str(heading + body)[:400])
 
 
 def test_medella_coverage_and_gate_speed() -> None:
@@ -1390,11 +1421,15 @@ def test_medella_coverage_and_gate_speed() -> None:
     back = _trace_side("card_back", 90, 50)
     check("card-back-still", int(back.get("vector_lines") or 0) >= 6, str(back.get("vector_lines")))
     ident = [row for row in (back.get("textGate") or []) if "Identifies triggers" in str(row.get("text") or "")]
-    check(
-        "identifies-triggers-raster",
-        len(ident) == 1 and ident[0].get("mode") == "raster",
-        str(ident)[:240],
+    ident_ok = len(ident) == 1 and (
+        ident[0].get("mode") == "raster"
+        or (
+            ident[0].get("retyped")
+            and ident[0].get("mode") == "vector"
+            and _reads_match(str(ident[0].get("text") or ""), str(ident[0].get("render") or ""))
+        )
     )
+    check("identifies-triggers-kept", ident_ok, str(ident)[:240])
     back_pred = _predicted(back.get("timings") or {})
     print("PREDICTED card_back", back_pred)
     check("card-back-gate", float(back_pred.get("gate_s") or 99) <= 4.0, str(back_pred))

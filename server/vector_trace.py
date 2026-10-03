@@ -3,8 +3,9 @@
 
 The picture is enlarged and left as it is. Each text box is split into ink
 and paper, the ink mask is traced with potrace, and those paths are filled
-in the same place with the sampled ink colour. Nothing is retyped. A box
-whose trace does not match the ink (IoU under 0.9) stays as pixels.
+in the same place with the sampled ink colour. A box whose trace does not
+match the ink (IoU under 0.9) stays as pixels, then may be set as live type
+when a second word-by-word read agrees and a bundled face matches the ink.
 """
 
 from __future__ import annotations
@@ -2384,8 +2385,21 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         trim_w, trim_h, bleed_mm, placed, {}, bgr.shape, source_guard,
     )
     gate_s = time.perf_counter() - gate_started
-    qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed)
-    if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi"):
+    retype_started = time.perf_counter()
+    retyped = []
+    try:
+        from vector_retype import retype_rejected
+
+        retyped = retype_rejected(
+            plate, pristine, blocks, raster_lines, raster_boxes, drawn, placed,
+            bgr.shape, text_gate,
+        )
+    except Exception as exc:
+        sys.stderr.write(f"[vector-retype] skipped ({str(exc)[:160]})\n")
+        retyped = []
+    retype_s = time.perf_counter() - retype_started
+    qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyped)
+    if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi") or (retyped and not qa.get("fonts")):
         from vector_text_v2 import _discard, _fail
         _discard(output_pdf)
         reason = "The traced press file failed the check, so the original lettering was kept."
@@ -2395,6 +2409,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             reason = "The trim box was wrong, so the original lettering was kept."
         elif not qa.get("ppi"):
             reason = "The picture was under 400 PPI, so the original lettering was kept."
+        elif retyped and not qa.get("fonts"):
+            reason = "The retyped fonts were not embedded, so the original lettering was kept."
         return _fail(started, reason, provider=provider, qa=qa)
 
     vector_lines = []
@@ -2407,16 +2423,31 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "match": item["iou"],
             "pt": _points(item["rect"][3], placed.get("ppi") or MIN_PPI),
         })
-    amber = bool(raster_lines)
+    for item in retyped:
+        vector_lines.append({
+            "text": item["text"],
+            "mode": "vector",
+            "font": item.get("font") or "",
+            "reason": "",
+            "match": item.get("overlap"),
+            "pt": _points(int((item.get("core") or (0, 0, 0, 0))[3]), placed.get("ppi") or MIN_PPI),
+            "retyped": True,
+        })
+    still_raster = [row for row in raster_lines if row.get("mode") != "vector"]
+    amber = bool(still_raster)
     reason = ""
     if amber:
         reason = "Some lettering stayed in the picture because its trace did not match. Glance at it before printing."
     decisions = [
-        f"The lettering was traced as vector shapes ({len(vector_lines)} boxes).",
+        f"The lettering was traced as vector shapes ({len(drawn)} boxes).",
         "The original raster letter under each trace was painted out, so the vector edge is what prints.",
         f"The picture was enlarged with {provider}.",
         "The press file is CMYK at 400 PPI or more, with the trim 5 mm inside the bleed.",
     ]
+    if retyped:
+        decisions.append(
+            f"{len(retyped)} lines the trace left as a picture were set as vector type in a matching font."
+        )
     if reason:
         decisions.append(reason)
     colour_s = float(qa.get("colour_s") or 0)
@@ -2436,13 +2467,15 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "colour_s": round(colour_s, 3),
         "compose_s": round(compose_s, 3),
         "gate_s": round(gate_s, 3),
+        "retype_s": round(retype_s, 3),
         "total_s": round(time.perf_counter() - started, 3),
         "spawns": int(_spawn_count),
     }
     timing_line = (
         f"Timing: OCR {timings['ocr_s']:.2f}s, upscale {timings['enlarge_s']:.2f}s, "
         f"trace {timings['trace_s']:.2f}s, colour {timings['colour_s']:.2f}s, "
-        f"PDF {timings['compose_s']:.2f}s, gate {timings['gate_s']:.2f}s."
+        f"PDF {timings['compose_s']:.2f}s, gate {timings['gate_s']:.2f}s, "
+        f"retype {timings['retype_s']:.2f}s."
     )
     decisions.append(timing_line)
     sys.stderr.write("[vector-trace] " + timing_line + "\n")
@@ -2462,12 +2495,12 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "decisions": decisions,
         "elapsed_s": timings["total_s"],
         "timings": timings,
-        "lines": vector_lines + raster_lines,
+        "lines": vector_lines + still_raster,
         "qa": qa,
         "provider": provider,
         "pdf": output_pdf,
         "vector_lines": len(vector_lines),
-        "raster_lines": len(raster_lines),
+        "raster_lines": len(still_raster),
         "mode": "trace",
         "text_gate": text_gate,
         "source_guard": bool(source_guard),
@@ -4454,7 +4487,7 @@ def _points(height_px: int, ppi: int) -> float:
     return round(float(height_px) / float(ppi) * 72.0, 2)
 
 
-def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> dict:
+def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyped=None) -> dict:
     import io
 
     import pymupdf as fitz
@@ -4482,12 +4515,25 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed) -> di
         sx = page.rect.width / float(img_w)
         sy = page.rect.height / float(img_h)
         _paint_drawn(page, drawn, sx, sy)
+        if retyped:
+            from vector_retype import paint_retyped
+
+            paint_retyped(page, retyped, sx, sy)
+            try:
+                doc.subset_fonts()
+            except Exception:
+                pass
         _set_boxes(page, trim_w, trim_h, bleed_mm)
         doc.save(output_pdf, deflate=True, garbage=1)
         qa["wrote"] = True
     finally:
         doc.close()
     _inspect_plate(output_pdf, trim_w, trim_h, bleed_mm, qa)
+    if retyped:
+        from vector_retype import fonts_embedded
+
+        qa["fonts"] = bool(fonts_embedded(output_pdf))
+        qa["retyped"] = len(retyped)
     qa["compose_s"] = time.perf_counter() - compose_started
     qa["traced"] = len(drawn)
     return qa
