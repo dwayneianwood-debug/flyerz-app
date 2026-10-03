@@ -115,6 +115,7 @@ test("result cards show green download, amber reasons, and a red client message"
   assert.match(red, /RED/);
   assert.match(red, /Please send a PDF/);
   assert.match(red, /Copy message for the client/);
+  assert.match(red, /Nothing is sent until you copy this and send it yourself/);
   assert.equal(red.includes("Download press PDF"), false);
 });
 

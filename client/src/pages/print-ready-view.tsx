@@ -186,6 +186,9 @@ export function QuickResultCard(props: {
           >
             {props.copied ? "Copied" : "Copy message for the client"}
           </Button>
+          <p className="mt-2 text-sm" data-testid={`text-client-unsent-${card.id}`}>
+            Nothing is sent until you copy this and send it yourself.
+          </p>
         </div>
       )}
       {card.decisions.length > 0 && (
