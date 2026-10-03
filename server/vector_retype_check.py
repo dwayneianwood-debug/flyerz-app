@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retype checks. A line is set only when the second read matches."""
+"""Retype checks. A line is set only when the press glyphs match the source."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from vector_retype import (
     FAMILIES,
+    RETYPE_BUDGET_S,
     _align_words,
     _exact,
     choose_font,
@@ -143,6 +144,37 @@ def test_low_confidence_stays() -> None:
     check("low-score-kept", items == [], str(len(items)))
 
 
+def test_one_face_per_block_and_the_paint() -> None:
+    """A column keeps one serif. Caps stay a heavy serif. The old letters are gone."""
+    check("budget", RETYPE_BUDGET_S <= 3.0, str(RETYPE_BUDGET_S))
+    body = "Supports natural balance"
+    body2 = "Guides you through care"
+    caps = "SKIN CONDITIONS"
+    plate = np.full((240, 640, 3), (244, 236, 220), np.uint8)
+    plate[8:72] = _draw_line(body, "CrimsonText-Regular.ttf", 26, 640, 64)
+    plate[80:144] = _draw_line(body2, "CrimsonText-Regular.ttf", 26, 640, 64)
+    plate[160:224] = _draw_line(caps, "CrimsonText-Bold.ttf", 26, 640, 64)
+    blocks = []
+    boxes = []
+    records = []
+    gate = []
+    for text, y, height in ((body, 8, 64), (body2, 80, 64), (caps, 160, 64)):
+        block, box, record, _placed = _job(plate, text, y, height)
+        blocks.append(block)
+        boxes.append(box)
+        records.append(record)
+        gate.append({"text": text, "mode": "raster", "render": text, "ok": True})
+    _block, _box, _record, placed = _job(plate, body, 8, 64)
+    before = plate.copy()
+    items = retype_rejected(plate, before, blocks, records, boxes, [], placed, plate.shape, gate)
+    fonts = {item["text"]: item["font"] for item in items}
+    check("block-both-body", body in fonts and body2 in fonts, str(fonts))
+    check("block-one-face", fonts.get(body) == fonts.get(body2) and fonts.get(body) in FAMILIES["serif"], str(fonts))
+    check("caps-not-sans", fonts.get(caps) in ("crimson-bold", "crimson-semibold"), str(fonts))
+    gray = cv2.cvtColor(plate[16:68, 20:600], cv2.COLOR_BGR2GRAY)
+    check("no-ghost", float(np.percentile(gray, 5)) > 175, f"{float(np.percentile(gray, 5)):.1f}")
+
+
 def test_families_differ() -> None:
     serif = _draw_line("natural balance", "LibreBaskerville-Regular.ttf", 32, 420, 70)
     sans = _draw_line("NATURAL BALANCE", "Montserrat-700.ttf", 28, 460, 70)
@@ -166,6 +198,7 @@ def main() -> None:
     test_low_confidence_stays()
     test_disagreement_stays()
     test_families_differ()
+    test_one_face_per_block_and_the_paint()
     test_retype_keeps_neighbour_and_embeds()
     print("RETYPE CHECKS PASSED")
 

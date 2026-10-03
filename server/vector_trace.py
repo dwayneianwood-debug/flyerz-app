@@ -2425,14 +2425,16 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "pt": _points(item["rect"][3], placed.get("ppi") or MIN_PPI),
         })
     for item in retyped:
+        core = item.get("core") or (0, 0, 0, 0)
         vector_lines.append({
             "text": item["text"],
             "mode": "vector",
             "font": item.get("font") or "",
             "reason": "",
             "match": item.get("overlap"),
-            "pt": _points(int((item.get("core") or (0, 0, 0, 0))[3]), placed.get("ppi") or MIN_PPI),
+            "pt": _points(int(core[3]), placed.get("ppi") or MIN_PPI),
             "retyped": True,
+            "plateRect": [int(v) for v in core[:4]],
         })
     still_raster = [row for row in raster_lines if row.get("mode") != "vector"]
     amber = bool(still_raster)
@@ -2509,6 +2511,11 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "text_gate": text_gate,
         "source_guard": bool(source_guard),
         "edge": edge,
+        "placement": {
+            "artBox": [int(v) for v in (placed.get("art_box") or (0, 0, plate.shape[1], plate.shape[0]))],
+            "ppi": int(placed.get("ppi") or MIN_PPI),
+            "plate": [int(plate.shape[0]), int(plate.shape[1])],
+        },
     }
 
 

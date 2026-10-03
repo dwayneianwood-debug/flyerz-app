@@ -5,11 +5,11 @@ Only a line the trace rejected is considered. It becomes live type when all
 of these hold:
 
 - the page read is confident
-- a second read of each word on the upscaled picture matches that line
-  letter for letter, including case, accents and punctuation
-- a bundled open-licence face is close to the ink
-- the fitted render overlaps the source ink, and a read of that render
-  matches the same letters
+- one face is chosen for the whole style block by comparing rendered
+  candidates to the source ink (weight and serif or sans)
+- every word of that face overlaps the source ink
+- the same overlap still holds on the press page, drawn in this process
+  with the same font objects the PDF embeds
 
 Anything unsure stays in the picture. Icons and neighbouring lines are not
 painted. The face is embedded in the press PDF.
@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -33,8 +34,13 @@ CONFIDENCE_FLOOR = 0.90
 WORD_SCORE_FLOOR = 0.80
 FAMILY_FLOOR = 0.12
 OVERLAP_FLOOR = 0.34
+WORD_OVERLAP_FLOOR = 0.40
 CONTRAST_FLOOR = 40.0
 MIN_LETTERS = 3
+# A slow 4-core laptop has to finish retype inside this, including the press read-back.
+RETYPE_BUDGET_S = 3.0
+BODY_FACES = ("crimson", "crimson-semibold", "crimson-bold", "libre", "poppins-regular")
+CAPS_FACES = ("crimson-bold", "crimson-semibold", "cinzel-700", "montserrat", "cinzel-600")
 
 # One face is not used for every line. Each family is scored, then the
 # weights inside the winning family.
@@ -80,26 +86,39 @@ def retype_rejected(
     """Set rejected lines as type. Paints the plate. Returns PDF text items."""
     if not retype_enabled() or plate is None or pristine is None:
         return []
+    started = time.perf_counter()
+    deadline = started + RETYPE_BUDGET_S
     candidates = _candidates(blocks, raster_lines, raster_boxes, drawn, placed, source_shape, pristine.shape)
     _dbg(f"candidates {len(candidates)} of {len(raster_boxes or [])} raster boxes")
     if not candidates:
         return []
-    agreed = _agree_words(pristine, candidates)
-    _dbg(f"agreed {len(agreed)} of {len(candidates)}")
-    if not agreed:
+    prepared = _prepare(pristine, candidates)
+    _dbg(f"prepared {len(prepared)} of {len(candidates)}")
+    if not prepared:
         return []
     fitted = []
-    for item in agreed:
-        choice = _fit_line(pristine, item)
-        if choice is None:
-            _dbg(f"fit-reject {item['text'][:60]!r}")
-        else:
+    for group in _style_blocks(prepared):
+        if time.perf_counter() > deadline:
+            _dbg("budget")
+            break
+        key = _pick_face(pristine, group, deadline)
+        if not key:
+            continue
+        for item in group:
+            if time.perf_counter() > deadline:
+                _dbg("budget")
+                break
+            choice = _place_font(pristine, item, key, 0.0)
+            if choice is None or not _words_clear(choice):
+                _dbg(f"fit-reject {key} {item['text'][:50]!r}")
+                continue
+            choice["font"] = key
             fitted.append(choice)
     _dbg(f"fitted {len(fitted)}")
     if not fitted:
         return []
-    confirmed = _confirm_render(fitted)
-    _dbg(f"confirmed {len(confirmed)} of {len(fitted)}")
+    confirmed = _press_keep(fitted, pristine.shape)
+    _dbg(f"confirmed {len(confirmed)} of {len(fitted)} in {time.perf_counter() - started:.2f}s")
     if not confirmed:
         return []
     _paint(plate, confirmed)
@@ -672,53 +691,29 @@ def _read_crops(crops: list, words: bool = True) -> list[tuple[str, float]]:
     return results
 
 
-def rank_fonts(mask: np.ndarray, text: str) -> list[tuple[str, float]]:
-    """Closest bundled faces, best first. Empty when none of the families is close."""
-    from vector_text_v2 import _score_key
+def _is_caps(text: str) -> bool:
+    letters = _letters(text)
+    if len(letters) < 3:
+        return False
+    return sum(1 for ch in letters if ch.isupper()) / len(letters) >= 0.72
 
-    if mask is None or not text:
+
+def _face_keys(text: str) -> tuple[str, ...]:
+    return CAPS_FACES if _is_caps(text) else BODY_FACES
+
+
+def rank_fonts(mask: np.ndarray, text: str) -> list[tuple[str, float]]:
+    """Closest bundled faces, best first. Scored by the press renderer, not a preview."""
+    item = _item_from_mask(mask, text)
+    if item is None:
         return []
-    scores = {name: _score_key(mask, text, key) for name, key in REPS.items()}
-    order = sorted(scores, key=lambda name: scores[name], reverse=True)
-    winner = order[0]
-    best = float(scores[winner])
-    if best < FAMILY_FLOOR:
-        return []
-    second = float(scores[order[1]]) if len(order) > 1 else 0.0
-    if winner == "script" and best < second + 0.04:
-        winner = "serif" if scores["serif"] >= scores["sans"] else "sans"
-    if winner == "italic" and best < scores["serif"] + 0.02:
-        winner = "serif"
-    caps = len(_letters(text)) >= 3 and sum(1 for ch in _letters(text) if ch.isupper()) / max(1, len(_letters(text))) >= 0.72
-    if winner != "display" and caps and scores["display"] + 0.02 >= scores[winner]:
-        winner = "display"
-    # The closest family, then the runner-up. A script score can beat a serif
-    # on a short line; the overlap check keeps only a face that sits on the ink.
-    chosen = [winner]
-    for name in order[1:]:
-        if float(scores[name]) < FAMILY_FLOOR:
-            continue
-        if name not in chosen:
-            chosen.append(name)
-        if len(chosen) >= 2:
-            break
     ranked = []
-    for name in chosen:
-        family = FAMILIES[name]
-        ranked.extend((key, _score_key(mask, text, key)) for key in family)
-    ranked.sort(key=lambda item: item[1], reverse=True)
-    if not ranked or ranked[0][1] < FAMILY_FLOOR:
-        return []
-    ordered = []
-    seen = set()
-    for key, score in _weight_order(mask, text, ranked[:8]):
-        if key in seen or float(score) < FAMILY_FLOOR:
-            continue
-        seen.add(key)
-        ordered.append((key, float(score)))
-        if len(ordered) >= 4:
-            break
-    return ordered
+    for key in _face_keys(text):
+        score = _face_score(item, key)
+        if score >= FAMILY_FLOOR:
+            ranked.append((key, score))
+    ranked.sort(key=lambda pair: pair[1], reverse=True)
+    return ranked[:4]
 
 
 def choose_font(mask: np.ndarray, text: str) -> tuple[str, float]:
@@ -729,49 +724,86 @@ def choose_font(mask: np.ndarray, text: str) -> tuple[str, float]:
     return ranked[0]
 
 
-def _weight_order(mask: np.ndarray, text: str, ranked: list) -> list[tuple[str, float]]:
-    """Among close shape scores, keep the weight whose stroke matches the ink."""
-    from vector_text_v2 import _FONT_ROLE, _rel_stroke, _render_ink, font_path
-
-    best_score = float(ranked[0][1])
-    pool = [(key, float(score)) for key, score in ranked if float(score) >= best_score - 0.06]
-    if len(pool) == 1:
-        return pool
-    source = _rel_stroke(mask)
-    weighted = []
-    for key, score in pool:
-        rendered = _render_ink(
-            text, font_path(key), max(int(mask.shape[1]), 80), max(int(mask.shape[0]), 24),
-            _FONT_ROLE.get(key, "body"),
-        )
-        err = 1.0 if rendered is None else abs(_rel_stroke(rendered) - source)
-        weighted.append((err, -score, key, score))
-    weighted.sort()
-    rest = [key for key, _score in ranked if key not in {item[2] for item in weighted}]
-    ordered = [(key, score) for _err, _neg, key, score in weighted]
-    for key in rest:
-        ordered.append((key, dict(ranked)[key]))
-    return ordered
-
-
-def _fit_line(plate: np.ndarray, item: dict) -> dict | None:
-    mask = item["mask"]
-    ranked = rank_fonts(mask, item["text"])
-    if not ranked:
-        _dbg(f"no-font {item['text'][:50]!r}")
+def _item_from_mask(mask: np.ndarray, text: str) -> dict | None:
+    if mask is None or not str(text or "").strip():
         return None
-    best = None
-    for key, score in ranked:
-        placed = _place_font(plate, item, key, score)
-        if placed is None:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 12:
+        return None
+    words = str(text).split()
+    if not words:
+        return None
+    return {
+        "text": str(text),
+        "mask": mask,
+        "words": words,
+        "ink_box": (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
+        "mask_origin": (0, 0),
+        "core": (0, 0, int(mask.shape[1]), int(mask.shape[0])),
+        "rect": (0, 0, int(mask.shape[1]), int(mask.shape[0])),
+        "protect": [],
+    }
+
+
+def _face_score(item: dict, key: str) -> float:
+    """Overlap, minus a penalty when the weight or the serifs do not match."""
+    from vector_text_v2 import _rel_stroke
+
+    placed = _place_font(np.zeros((1, 1, 3), np.uint8), item, key, 0.0)
+    if placed is None:
+        return 0.0
+    source_stroke = _rel_stroke(item["mask"])
+    render_stroke = _rel_stroke(placed["render_mask"])
+    stroke_err = abs(source_stroke - render_stroke) / max(0.05, source_stroke)
+    terminals = abs(_terminal_ratio(item["mask"]) - _terminal_ratio(placed["render_mask"]))
+    score = float(placed["overlap"]) - 0.28 * min(1.0, stroke_err) - (0.22 if terminals > 0.45 else 0.0)
+    return max(0.0, score)
+
+
+def _terminal_ratio(mask: np.ndarray) -> float:
+    """How much wider the ends of a letter are than its middle. Serifs sit above 1."""
+    binary = (mask > 0).astype(np.uint8)
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(binary, 8)
+    ratios = []
+    for index in range(1, count):
+        x, y, width, height, area = [int(stats[index, k]) for k in range(5)]
+        if height < 8 or width < 2 or area < 10:
             continue
-        if best is None or placed["overlap"] > best["overlap"]:
-            best = placed
-        if placed["overlap"] >= OVERLAP_FLOOR + 0.08:
+        glyph = binary[y:y + height, x:x + width] > 0
+        band = max(2, height // 6)
+        mid = glyph[height // 3: max(height // 3 + 1, 2 * height // 3)]
+
+        def span(rows: np.ndarray) -> int:
+            return int(rows.any(axis=0).sum()) if rows.size else 0
+
+        middle = max(1, span(mid))
+        ratios.append(max(span(glyph[:band]), span(glyph[-band:])) / middle)
+    if not ratios:
+        return 1.0
+    return float(np.median(ratios))
+
+
+def _pick_face(plate: np.ndarray, group: list, deadline: float) -> str:
+    """One face for the block, from the line with the most letters."""
+    sample = max(group, key=lambda item: len(_letters(item["text"])))
+    best_key = ""
+    best_score = 0.0
+    second = 0.0
+    for key in _face_keys(sample["text"]):
+        if time.perf_counter() > deadline:
             break
-    if best is None:
-        _dbg(f"fit-reject {item['text'][:60]!r}")
-    return best
+        score = _face_score(sample, key)
+        _dbg(f"face {score:.2f} {key} {sample['text'][:40]!r}")
+        if score > best_score:
+            second = best_score
+            best_score = score
+            best_key = key
+        elif score > second:
+            second = score
+    if best_score < 0.42:
+        _dbg(f"no-face {best_score:.2f} {sample['text'][:40]!r}")
+        return ""
+    return best_key
 
 
 def _glyph_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -928,15 +960,13 @@ def _place_font(plate: np.ndarray, item: dict, key: str, score: float) -> dict |
     shift_y = int((y0 + y1) / 2) - int((rys.min() + rys.max()) / 2)
     overlap, shift_x, shift_y = _best_shift(mask, rendered, shift_x, shift_y)
     placed_mask = _stamp(mask.shape, rendered, shift_x, shift_y)
+    # One shift for the line, then each word may move a couple of pixels so
+    # it sits on the source word. Letters inside a word are not moved apart.
     used_chars = [(ch, shift_x + px) for ch, px in chars]
     used_shift_y = shift_y
-    snapped = _snap_glyphs(mask, rendered, item["text"], chars)
-    if snapped is not None and snapped["overlap"] > overlap + 0.02:
-        placed_mask = snapped["mask"]
-        overlap = float(snapped["overlap"])
-        used_chars = snapped["chars"]
-        used_shift_y = int(snapped["shift_y"])
-        _dbg(f"snap {overlap:.2f} {key} {item['text'][:40]!r}")
+    sat = _sit_words(mask, placed_mask, item["text"], used_chars)
+    if sat is not None:
+        placed_mask, used_chars, overlap = sat
     if overlap < OVERLAP_FLOOR:
         rys2, rxs2 = np.where(placed_mask > 0)
         rh = int(rys2.max() - rys2.min() + 1) if rxs2.size else 0
@@ -967,16 +997,17 @@ def _place_font(plate: np.ndarray, item: dict, key: str, score: float) -> dict |
         "rect": item["rect"],
         "protect": list(item.get("protect") or []),
         "render_mask": placed_mask,
+        "source_crop": item.get("source_crop"),
+        "words": list(item.get("words") or []),
     }
 
 
 def _fit_metrics(key: str, text: str, ink_h: int, ink_w: int, size_hint: float | None = None) -> tuple[float, float]:
-    import pymupdf as fitz
+    from vector_text_v2 import _fitz_font
 
-    from vector_text_v2 import _FONT_ROLE, font_path
-
-    font = fitz.Font(fontfile=font_path(key))
-
+    font = _fitz_font(key)
+    if font is None:
+        return 12.0, 0.0
     em = max(0.4, float(font.ascender) - float(font.descender))
     if size_hint is None:
         size = max(4.0, float(ink_h) / (em * 0.72))
@@ -985,12 +1016,10 @@ def _fit_metrics(key: str, text: str, ink_h: int, ink_w: int, size_hint: float |
     natural = _text_width(font, text, size, 0.0)
     track = 0.0
     gaps = max(1, len(text) - 1)
-    role = _FONT_ROLE.get(key, "body")
-    # Display headings are tracked much wider than body copy. The overlap
-    # check still rejects a face that only fills the width by stretching.
-    cap = {"spaced": 0.62, "display": 0.45, "script": 0.18, "tagline": 0.30}.get(role, 0.22)
+    # A face that only matches by stretching the gaps is the wrong face.
+    cap = 0.08 * size
     if natural < ink_w * 0.98:
-        track = min((ink_w - natural) / gaps, cap * size)
+        track = min((ink_w - natural) / gaps, cap)
     elif natural > ink_w * 1.04 and natural > 0:
         size *= (ink_w / natural)
         track = 0.0
@@ -1006,21 +1035,30 @@ def _text_width(font, text: str, size: float, track: float) -> float:
     return total
 
 
+def _scratch_doc():
+    import pymupdf as fitz
+
+    doc = getattr(_scratch_doc, "doc", None)
+    if doc is None or doc.is_closed:
+        doc = fitz.open()
+        _scratch_doc.doc = doc
+    return doc
+
+
 def _render_layout(key: str, text: str, size: float, track: float):
     import pymupdf as fitz
 
-    from vector_text_v2 import font_path
+    from vector_text_v2 import _fitz_font
 
-    path = font_path(key)
-    if not os.path.exists(path):
+    font = _fitz_font(key)
+    if font is None:
         return None, 0.0, []
-    font = fitz.Font(fontfile=path)
     width = _text_width(font, text, size, track)
     page_w = max(8, int(math_ceil(width)) + 6)
     page_h = max(8, int(math_ceil(size * 2.4)) + 4)
-    doc = fitz.open()
+    doc = _scratch_doc()
+    page = doc.new_page(width=page_w, height=page_h)
     try:
-        page = doc.new_page(width=page_w, height=page_h)
         writer = fitz.TextWriter(page.rect)
         baseline = size * (0.2 + max(0.0, float(font.ascender)))
         cursor = 2.0
@@ -1033,9 +1071,9 @@ def _render_layout(key: str, text: str, size: float, track: float):
                 cursor += track
         writer.write_text(page, color=(0, 0, 0))
         pix = page.get_pixmap(alpha=False, colorspace=fitz.csRGB)
-        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
     finally:
-        doc.close()
+        doc.delete_page(page.number)
     mask = (rgb[:, :, 0] < 200).astype(np.uint8) * 255
     return mask, float(baseline), chars
 
@@ -1091,32 +1129,144 @@ def _ink_cmyk(plate: np.ndarray, origin, mask: np.ndarray):
     return _cmyk((red, green, blue))
 
 
-def _confirm_render(fitted: list) -> list:
-    crops = []
-    for item in fitted:
-        mask = item["render_mask"]
-        ys, xs = np.where(mask > 0)
-        if xs.size < 8:
-            crops.append(None)
+def _sit_words(source: np.ndarray, rendered: np.ndarray, text: str, chars: list):
+    """Nudge each word onto the source word. None when a word cannot sit."""
+    words = str(text or "").split()
+    source_spans = _word_spans(source, words)
+    render_spans = _word_spans(rendered, words)
+    if source_spans is None or render_spans is None:
+        return None
+    groups = _char_groups(text, chars)
+    if len(groups) != len(words):
+        return None
+    placed = np.zeros_like(rendered)
+    moved = list(chars)
+    ious = []
+    for (sx0, sx1), (rx0, rx1), indexes in zip(source_spans, render_spans, groups):
+        dx = int(round(((sx0 + sx1) / 2.0) - ((rx0 + rx1) / 2.0)))
+        limit = min(4, max(2, int(0.15 * max(1, sx1 - sx0))))
+        if abs(dx) > limit:
+            return None
+        src_x = max(0, rx0 + dx)
+        copy = rendered[:, rx0:rx1]
+        dest_x = min(placed.shape[1], src_x)
+        width = min(copy.shape[1], placed.shape[1] - dest_x)
+        if width < 1:
+            return None
+        view = placed[:, dest_x:dest_x + width]
+        view[:] = np.maximum(view, copy[:, :width])
+        for index in indexes:
+            ch, px = moved[index]
+            moved[index] = (ch, px + dx)
+        ious.append(_iou(source[:, sx0:sx1], placed[:, sx0:sx1]))
+    if not ious or min(ious) < WORD_OVERLAP_FLOOR:
+        return None
+    overlap = _iou(source, placed)
+    return placed, moved, overlap
+
+
+def _char_groups(text: str, chars: list) -> list[list[int]]:
+    groups = []
+    current: list[int] = []
+    for index, ch in enumerate(text):
+        if index >= len(chars):
+            break
+        if ch.isspace():
+            if current:
+                groups.append(current)
+                current = []
             continue
-        pad = 3
-        y0 = max(0, int(ys.min()) - pad)
-        y1 = min(mask.shape[0], int(ys.max()) + 1 + pad)
-        x0 = max(0, int(xs.min()) - pad)
-        x1 = min(mask.shape[1], int(xs.max()) + 1 + pad)
-        crop = np.full((y1 - y0, x1 - x0, 3), 255, np.uint8)
-        ink = mask[y0:y1, x0:x1] > 0
-        crop[ink] = (0, 0, 0)
-        crops.append(crop)
-    reads = _read_crops(crops, words=False)
+        current.append(index)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _words_clear(item: dict) -> bool:
+    """Each word overlaps the source, and letters do not land on each other."""
+    ious = _word_ious(item["mask"], item["render_mask"], item.get("words") or [])
+    if not ious or min(ious) < WORD_OVERLAP_FLOOR:
+        _dbg(f"word-overlap {item.get('font')} {ious} {item['text'][:40]!r}")
+        return False
+    if _glyphs_collide(item["render_mask"]):
+        _dbg(f"collide {item.get('font')} {item['text'][:40]!r}")
+        return False
+    return True
+
+
+def _word_ious(source: np.ndarray, rendered: np.ndarray, words: list) -> list[float] | None:
+    spans = _word_spans(source, words)
+    if spans is None or rendered.shape[:2] != source.shape[:2]:
+        return None
+    ious = []
+    for x0, x1 in spans:
+        ious.append(_iou(source[:, x0:x1], rendered[:, x0:x1]))
+    return ious
+
+
+def _glyphs_collide(rendered: np.ndarray) -> bool:
+    boxes = _glyph_boxes(rendered)
+    if len(boxes) < 2:
+        return False
+    for left, right in zip(boxes, boxes[1:]):
+        overlap = min(left[2], right[2]) - max(left[0], right[0])
+        narrow = max(1, min(left[2] - left[0], right[2] - right[0]))
+        if overlap > 0.45 * narrow:
+            return True
+    return False
+
+
+def _press_keep(fitted: list, shape) -> list:
+    """Draw the lines the way the PDF will, then compare each word to the source."""
+    import pymupdf as fitz
+
+    height, width = int(shape[0]), int(shape[1])
+    if width < 8 or height < 8 or not fitted:
+        return []
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=width, height=height)
+        paint_retyped(page, fitted, 1.0, 1.0)
+        pix = page.get_pixmap(alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+    finally:
+        doc.close()
+    if rgb.shape[0] != height or rgb.shape[1] != width:
+        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     kept = []
-    for item, (text, score) in zip(fitted, reads):
-        if score < WORD_SCORE_FLOOR or not _exact(text, item["text"]):
-            _dbg(f"render-read {item['text'][:60]!r} -> {text[:60]!r} {score:.2f}")
-            continue
-        _dbg(f"accept {item['font']} overlap={item['overlap']} {item['text'][:70]!r}")
-        kept.append(item)
+    for item in fitted:
+        if _press_words(gray, item):
+            _dbg(f"accept {item['font']} overlap={item['overlap']} {item['text'][:70]!r}")
+            kept.append(item)
+        else:
+            _dbg(f"press-reject {item['font']} {item['text'][:60]!r}")
     return kept
+
+
+def _press_words(gray: np.ndarray, item: dict) -> bool:
+    mask = item["mask"]
+    spans = _word_spans(mask, item.get("words") or [])
+    if not spans:
+        return False
+    ox, oy = item["mask_origin"]
+    for x0, x1 in spans:
+        y_idx, x_idx = np.where(mask[:, x0:x1] > 0)
+        if x_idx.size < 4:
+            return False
+        top = max(0, oy + int(y_idx.min()))
+        bottom = min(gray.shape[0], oy + int(y_idx.max()) + 1)
+        left = max(0, ox + x0)
+        right = min(gray.shape[1], ox + x1)
+        if bottom <= top or right <= left:
+            return False
+        press = (gray[top:bottom, left:right] < 200).astype(np.uint8) * 255
+        source = mask[int(y_idx.min()):int(y_idx.max()) + 1, x0:x1]
+        if press.shape != source.shape:
+            press = cv2.resize(press, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_NEAREST)
+        if _iou(source, press) < WORD_OVERLAP_FLOOR:
+            return False
+    return True
 
 
 def _paint(plate: np.ndarray, items: list) -> None:
@@ -1124,7 +1274,8 @@ def _paint(plate: np.ndarray, items: list) -> None:
 
     erase = np.zeros(plate.shape[:2], np.uint8)
     for item in items:
-        mask = _letter_erase_mask(item["mask"])
+        mask = _cover_mask(item.get("source_crop"), item["mask"])
+        mask = _letter_erase_mask(mask)
         mask = _clip_protect(mask, item["mask_origin"], _protect_from(item, items))
         ox, oy = item["mask_origin"]
         height, width = mask.shape[:2]
@@ -1138,6 +1289,88 @@ def _paint(plate: np.ndarray, items: list) -> None:
         return
     filled = _fill_from_paper(plate, erase)
     plate[:] = filled
+
+
+def _cover_mask(crop: np.ndarray | None, core: np.ndarray) -> np.ndarray:
+    """The letter core plus the grey edge, so the original does not ghost through."""
+    if crop is None or crop.ndim != 3 or crop.shape[:2] != core.shape[:2]:
+        return core
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]]).astype(np.float32)
+    paper = float(np.median(border))
+    if paper - float(gray.min()) >= 28:
+        soft = gray <= (paper - 8.0)
+    elif float(gray.max()) - paper >= 28:
+        soft = gray >= (paper + 8.0)
+    else:
+        return core
+    near = cv2.dilate((core > 0).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    covered = np.zeros(core.shape, np.uint8)
+    covered[(core > 0) | (soft & near)] = 255
+    return covered
+
+
+def _prepare(plate: np.ndarray, candidates: list) -> list:
+    """Ink masks and word spans. A line that cannot be split stays a picture."""
+    prepared = []
+    for item in candidates:
+        x, y, bw, bh = item["rect"]
+        x = max(0, int(x))
+        y = max(0, int(y))
+        bw = max(2, int(bw))
+        bh = max(2, int(bh))
+        crop = plate[y:y + bh, x:x + bw]
+        mask = _ink_mask(crop)
+        if mask is None:
+            continue
+        mask = _clip_protect(mask, (x, y), item.get("protect"))
+        if int(np.count_nonzero(mask)) < 12:
+            continue
+        words = item["text"].split()
+        if not words:
+            continue
+        ys, xs = np.where(mask > 0)
+        made = dict(item)
+        made["mask_origin"] = (x, y)
+        made["mask"] = mask
+        made["source_crop"] = np.ascontiguousarray(crop)
+        made["ink_box"] = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        made["words"] = words
+        if _word_spans(mask, words) is None:
+            _dbg(f"no-split {item['text'][:50]!r}")
+            continue
+        _drop_side_marks(made)
+        if _word_spans(made["mask"], words) is None:
+            continue
+        prepared.append(made)
+    return prepared
+
+
+def _style_blocks(items: list) -> list:
+    """One group shares a column, a size, and capitals or sentence case."""
+    pending = sorted(items, key=lambda item: (item["core"][0], item["core"][1]))
+    used = [False] * len(pending)
+    groups = []
+    for index, item in enumerate(pending):
+        if used[index]:
+            continue
+        caps = _is_caps(item["text"])
+        height = max(4, item["ink_box"][3] - item["ink_box"][1])
+        left = item["core"][0]
+        group = [item]
+        used[index] = True
+        for other_index, other in enumerate(pending):
+            if used[other_index] or _is_caps(other["text"]) != caps:
+                continue
+            other_h = max(4, other["ink_box"][3] - other["ink_box"][1])
+            if abs(other_h - height) / float(height) > 0.22:
+                continue
+            if abs(other["core"][0] - left) > max(18, int(height * 0.85)):
+                continue
+            group.append(other)
+            used[other_index] = True
+        groups.append(group)
+    return groups
 
 
 def _protect_from(item: dict, items: list) -> list:

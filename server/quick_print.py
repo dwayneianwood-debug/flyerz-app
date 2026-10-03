@@ -1564,6 +1564,7 @@ def make_print_ready(
             "textGate": vector_built.get("text_gate") or [],
             "sourceGuard": bool(vector_built.get("source_guard")),
             "edge": vector_built.get("edge") or {},
+            "placement": vector_built.get("placement") or {},
         }
     return _finish(result, output_dir)
 
