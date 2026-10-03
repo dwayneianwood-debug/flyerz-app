@@ -339,6 +339,10 @@ def test_placement_matches_the_reference_fit() -> None:
         abs(off_y - 7.5) < 1e-6 and abs(off_x - (158 - 1024 * 205 / 1536) / 2) < 1e-4,
         f"{off_x},{off_y}",
     )
+    # The side pad makes the flyer a hair short of the trim. The tagline is still pulled in.
+    scale, off_x, off_y = fit_placement(1083, 1536, 148, 210, 5, [(80, 43, 1000, 1532)])
+    check("flyer-front-padded-scale", abs(scale - 205 / 1536) < 1e-6, f"{scale}")
+    check("flyer-front-padded-origin", abs(off_y - 7.5) < 1e-6, f"{off_y}")
     scale, off_x, off_y = fit_placement(1054, 1492, 148, 210, 5, [(63, 53, 1027, 1432)])
     check("flyer-back-scale", abs(scale - 148 / 1054) < 1e-9, f"{scale}")
     check("flyer-back-origin", abs(off_x - 5) < 1e-6, f"{off_x},{off_y}")

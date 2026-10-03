@@ -19,6 +19,9 @@ import numpy as np
 SAFE_TEXT_MM = 3.0
 EDGE_CLEARANCE_MM = 2.5
 MIN_PPI = 400
+# A side pad can leave the long edge a fraction of a millimetre short of the trim.
+# That edge is still flush, so lettering on it is pulled inside the safe zone.
+FLUSH_SLACK_MM = 0.2
 
 
 def is_short_numeral(text: str) -> bool:
@@ -38,9 +41,9 @@ def fit_placement(src_w: int, src_h: int, trim_w: float, trim_h: float, bleed_mm
     scale = min(float(trim_w) / src_w, float(trim_h) / src_h)
     fit_w = float(trim_w)
     fit_h = float(trim_h)
-    if src_h * scale >= float(trim_h) - 0.05 and _edge_mm(boxes, "y", scale, src_h) < SAFE_TEXT_MM:
+    if src_h * scale >= float(trim_h) - FLUSH_SLACK_MM and _edge_mm(boxes, "y", scale, src_h) < SAFE_TEXT_MM:
         fit_h = float(trim_h) - 2.0 * EDGE_CLEARANCE_MM
-    if src_w * scale >= float(trim_w) - 0.05 and _edge_mm(boxes, "x", scale, src_w) < SAFE_TEXT_MM:
+    if src_w * scale >= float(trim_w) - FLUSH_SLACK_MM and _edge_mm(boxes, "x", scale, src_w) < SAFE_TEXT_MM:
         fit_w = float(trim_w) - 2.0 * EDGE_CLEARANCE_MM
     scale = min(fit_w / src_w, fit_h / src_h)
     art_w = src_w * scale
