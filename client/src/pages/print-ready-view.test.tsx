@@ -46,6 +46,10 @@ test("result cards show green download, amber reasons, and a red client message"
         light: "green",
         reasons: [],
         decisions: ["Bleed is 5 mm on every side."],
+        checklist: [
+          { id: "bleed", label: "5 mm bleed is present and filled, with no slivers", passed: true, detail: "" },
+          { id: "fonts", label: "Fonts are embedded", passed: false, detail: "A font in the press file is not embedded." },
+        ],
         clientMessage: "",
         approved: false,
         hasPress: true,
@@ -57,6 +61,11 @@ test("result cards show green download, amber reasons, and a red client message"
     />,
   );
   assert.match(green, /GREEN/);
+  assert.match(green, /check-bleed-1/);
+  assert.match(green, />Pass</);
+  assert.match(green, /5 mm bleed is present and filled, with no slivers/);
+  assert.match(green, />Fail</);
+  assert.match(green, /Fonts are embedded/);
   assert.match(green, /Download press PDF/);
   assert.match(green, /\/api\/jobs\/1\/download\/press-ready/);
   assert.match(green, /img-proof-1/);

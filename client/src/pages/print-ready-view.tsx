@@ -148,6 +148,18 @@ export function QuickResultCard(props: {
       {light === "green" && (
         <p className="mt-3 text-sm">Print-ready. Download the press PDF.</p>
       )}
+      {card.checklist && card.checklist.length > 0 && (
+        <ul className="mt-3 space-y-1 text-sm" data-testid={`list-checklist-${card.id}`}>
+          {card.checklist.map((item) => (
+            <li key={item.id} data-testid={`check-${item.id}-${card.id}`}>
+              <span className="font-semibold">{item.passed ? "Pass" : "Fail"}</span>
+              {" — "}
+              {item.label}
+              {item.detail ? ` — ${item.detail}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
       {light === "amber" && (
         <div className="mt-3">
           <p className="text-sm font-semibold">A press file was made. Glance at this before it goes to print:</p>

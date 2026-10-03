@@ -2488,6 +2488,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             f"glyph={bool(row.get('glyphFail'))} iou={row.get('glyphIou')} mismatch={bool(row.get('mismatch'))} "
             f"{row.get('text')!r} -> {row.get('render')!r}\n"
         )
+    edge = _content_edge(drawn, raster_boxes, plate.shape, float((placed or {}).get("ppi") or MIN_PPI), bleed_mm)
     return {
         "ok": True,
         "amber": amber,
@@ -2504,6 +2505,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         "mode": "trace",
         "text_gate": text_gate,
         "source_guard": bool(source_guard),
+        "edge": edge,
     }
 
 
@@ -4479,6 +4481,31 @@ def _apply_text_gate(
         for key in ("_rect", "_core", "_vector", "_source", "_render", "_revert", "_pixelFail", "_paragraph", "_lineOnly", "_strokeFail", "_invadeFail", "_smallText", "_glyphOcr"):
             row.pop(key, None)
     return report, kept, qa, source_guard
+
+
+def _content_edge(drawn, raster_boxes, plate_shape, ppi: float, bleed_mm: float) -> dict:
+    """Text in the bleed crosses the cut. Text inside 3 mm of the trim is too close."""
+    height, width = int(plate_shape[0]), int(plate_shape[1])
+    if ppi <= 0 or width < 4 or height < 4:
+        return {"overCut": [], "nearTrim": []}
+    bleed_px = float(bleed_mm) / 25.4 * float(ppi)
+    safe_px = (float(bleed_mm) + 3.0) / 25.4 * float(ppi)
+    over, near = [], []
+    boxes = []
+    for item in list(drawn or []) + list(raster_boxes or []):
+        rect = item.get("core") or item.get("rect")
+        text = str(item.get("text") or "").strip()
+        if not rect or len(rect) < 4 or len(text) < 2:
+            continue
+        boxes.append((text, rect))
+    for text, rect in boxes:
+        x, y, bw, bh = [float(v) for v in rect[:4]]
+        margin = min(x, y, width - (x + bw), height - (y + bh))
+        if margin < bleed_px - (ppi / 25.4):
+            over.append(text[:80])
+        elif margin < safe_px - 1:
+            near.append(text[:80])
+    return {"overCut": over[:8], "nearTrim": near[:8]}
 
 
 def _points(height_px: int, ppi: int) -> float:

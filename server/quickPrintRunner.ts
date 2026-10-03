@@ -25,6 +25,7 @@ export interface QuickRunResult {
   light: "green" | "amber" | "red";
   reasons: string[];
   decisions: string[];
+  checklist: { id: string; label: string; passed: boolean; detail: string }[];
   clientMessage: string;
   pressPath: string;
   proofPng: string;
@@ -54,6 +55,17 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     light,
     reasons: list(raw.reasons),
     decisions: list(raw.decisions),
+    checklist: Array.isArray(raw.checklist)
+      ? raw.checklist.map((item) => {
+          const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          return {
+            id: String(row.id || ""),
+            label: String(row.label || ""),
+            passed: row.passed === true,
+            detail: String(row.detail || ""),
+          };
+        })
+      : [],
     clientMessage: String(raw.clientMessage || ""),
     pressPath: String(raw.pressPath || ""),
     proofPng: String(raw.proofPng || ""),

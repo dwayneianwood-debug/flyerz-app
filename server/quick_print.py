@@ -96,6 +96,22 @@ def decide_light(facts: dict) -> dict:
             "reasons": ["The picture is far too small to print at this size."],
             "clientMessage": facts.get("tooSmallMessage") or too_small_message("this size", 148, 210),
         }
+    if facts.get("unextendable"):
+        from green_gate import client_message
+
+        return {
+            "light": "red",
+            "reasons": ["The picture's shape cannot be extended to this print size."],
+            "clientMessage": client_message("proportions"),
+        }
+    if facts.get("missingContent"):
+        from green_gate import client_message
+
+        return {
+            "light": "red",
+            "reasons": ["The page looks empty, so some of the artwork is missing."],
+            "clientMessage": client_message("missing"),
+        }
     if not facts.get("compiled"):
         return {
             "light": "red",
@@ -118,7 +134,8 @@ def decide_light(facts: dict) -> dict:
         reasons.append(f"The picture was enlarged {upscale:.1f} times to reach print size. Glance at fine detail.")
     if facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
         reasons.append("The picture was a different shape, so the edges were extended. Glance at those edges.")
-    if facts.get("vectorAmber"):
+    # The checklist already says whether leftover pictures are sharp enough.
+    if facts.get("vectorAmber") and not facts.get("checklist"):
         note = str(facts.get("vectorAmberReason") or "").strip()
         if note and note not in reasons:
             reasons.append(note)
@@ -126,6 +143,22 @@ def decide_light(facts: dict) -> dict:
         note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
         if note not in reasons:
             reasons.append(note)
+    checklist = facts.get("checklist") if isinstance(facts.get("checklist"), dict) else None
+    if checklist:
+        for item in checklist.get("items") or []:
+            if item.get("passed"):
+                continue
+            detail = str(item.get("detail") or item.get("label") or "").strip()
+            if detail and detail not in reasons:
+                reasons.append(detail)
+        if checklist.get("severity") == "red":
+            from green_gate import client_message
+
+            return {
+                "light": "red",
+                "reasons": reasons or ["This file cannot go to press as it is."],
+                "clientMessage": str(checklist.get("clientMessage") or client_message("cut")),
+            }
     if reasons:
         return {"light": "amber", "reasons": reasons, "clientMessage": ""}
     return {"light": "green", "reasons": [], "clientMessage": ""}
@@ -1260,6 +1293,12 @@ def make_print_ready(
                 )
             if matches:
                 decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
+            elif live_type:
+                decisions.append(
+                    "This PDF has live type and the wrong proportions. The edges cannot be extended without losing that type."
+                )
+                info = decide_light({"unextendable": True})
+                return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
             else:
                 decisions.append(
                     "The PDF shape does not match the product. The page was placed whole and the edges were extended. It was not stretched."
@@ -1273,6 +1312,9 @@ def make_print_ready(
                 info = decide_light({"kind": "corrupt", "readable": False})
                 return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
             src_h, src_w = raster.shape[:2]
+            if float(raster.mean()) > 250 and float(raster.std()) < 4:
+                info = decide_light({"missingContent": True})
+                return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
             upscale = _cover_scale(src_w, src_h, trim_w, trim_h)
             if too_small(src_w, src_h, trim_w, trim_h):
                 info = decide_light({
@@ -1462,8 +1504,22 @@ def make_print_ready(
         "vectorAmber": bool(vector_built and vector_built.get("amber")),
         "vectorAmberReason": str((vector_built or {}).get("reason") or ""),
     }
+    checklist = None
+    if press_ok:
+        try:
+            from green_gate import assess
+
+            checklist = assess(press_path, trim_w, trim_h, {
+                "upscale": upscale,
+                "textGate": (vector_built or {}).get("text_gate") or [],
+                "edge": (vector_built or {}).get("edge") or {},
+            })
+            facts["checklist"] = checklist
+        except Exception:
+            checklist = None
     info = decide_light(facts)
     result = _blank(info, decisions, product, quantity, notes)
+    result["checklist"] = list((checklist or {}).get("items") or [])
     result["upscale"] = round(upscale, 3)
     result["existingBleedKept"] = existing_kept
     result["enginePassed"] = facts["enginePassed"]
@@ -1507,6 +1563,7 @@ def make_print_ready(
             "lines": vector_built.get("lines") or [],
             "textGate": vector_built.get("text_gate") or [],
             "sourceGuard": bool(vector_built.get("source_guard")),
+            "edge": vector_built.get("edge") or {},
         }
     return _finish(result, output_dir)
 
