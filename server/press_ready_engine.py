@@ -1070,83 +1070,146 @@ def _page_proxy(page, max_px: int = 500) -> np.ndarray:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def _pixmap_rgb(page, clip):
+# One device pixel at 300 DPI. Edge replication samples this radius only.
+_EDGE_PIXEL_PT = 72.0 / 300.0
+# Drawn on top of the live page so a renderer cannot leave a white hairline.
+_SEAM_COVER_PT = _EDGE_PIXEL_PT * 2
+
+
+def _pixmap_cmyk(page, clip):
+    """DeviceCMYK samples. An RGB round-trip turns a navy edge into a grey band."""
     import pymupdf as fitz
 
-    if clip is None or clip.width < 0.4 or clip.height < 0.4:
+    if clip is None or clip.width < 0.15 or clip.height < 0.15:
         return None
-    pix = page.get_pixmap(matrix=fitz.Matrix(300.0 / 72.0, 300.0 / 72.0), clip=clip, alpha=False, colorspace=fitz.csRGB)
-    if pix.width < 1 or pix.height < 1:
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(300.0 / 72.0, 300.0 / 72.0),
+        clip=clip,
+        alpha=False,
+        colorspace=fitz.csCMYK,
+    )
+    if pix.width < 1 or pix.height < 1 or pix.n < 4:
         return None
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-    return np.ascontiguousarray(arr[:, :, :3])
+    return np.ascontiguousarray(arr[:, :, :4])
 
 
-def _insert_rgb(page, rgb, rect) -> None:
-    if rgb is None or rect is None or rect.width < 0.3 or rect.height < 0.3:
+def _insert_cmyk(page, cmyk, rect) -> None:
+    if cmyk is None or rect is None or rect.width < 0.2 or rect.height < 0.2:
         return
     target_w = max(1, int(round(rect.width / 72.0 * 300.0)))
     target_h = max(1, int(round(rect.height / 72.0 * 300.0)))
-    if rgb.shape[1] != target_w or rgb.shape[0] != target_h:
-        rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    if cmyk.shape[1] != target_w or cmyk.shape[0] != target_h:
+        cmyk = cv2.resize(cmyk, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
     import io
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.fromarray(np.ascontiguousarray(rgb), "RGB").convert("CMYK").save(buf, format="TIFF", dpi=(300, 300))
+    Image.fromarray(np.ascontiguousarray(cmyk), mode="CMYK").save(
+        buf, format="TIFF", compression="raw", dpi=(300, 300),
+    )
     page.insert_image(rect, stream=buf.getvalue())
 
 
-def _paint_margin(dest_page, src_page, src_clip, placed) -> None:
-    """Mirror each edge of the placed art into the margin around it."""
+def _paint_cmyk_edge(page, placed) -> None:
+    """Replicate one CMYK pixel from the live edge into the margin around it.
+
+    The sample is taken from the press page after the artwork is already there,
+    so the extension is the same ink as the edge beside it. Two pixels of that
+    ink are drawn over the join, which closes a white hairline.
+    """
     import pymupdf as fitz
 
-    full = dest_page.rect
+    full = page.rect
+    pixel = _EDGE_PIXEL_PT
+    cover = _SEAM_COVER_PT
+    placed = fitz.Rect(placed)
+    if placed.width < 1 or placed.height < 1:
+        return
     gaps = {
         "left": max(0.0, placed.x0 - full.x0),
         "right": max(0.0, full.x1 - placed.x1),
         "top": max(0.0, placed.y0 - full.y0),
         "bottom": max(0.0, full.y1 - placed.y1),
     }
+    if max(gaps.values()) < 0.3:
+        return
 
-    def sample(clip, flip_x: bool, flip_y: bool):
-        rgb = _pixmap_rgb(src_page, clip)
-        if rgb is None:
+    def clip_of(box):
+        rect = fitz.Rect(*box) & page.rect
+        if rect.width < 0.12 or rect.height < 0.12:
             return None
-        if flip_x:
-            rgb = rgb[:, ::-1]
-        if flip_y:
-            rgb = rgb[::-1, :]
-        return np.ascontiguousarray(rgb)
+        return rect
 
-    take_l = min(gaps["left"], src_clip.width)
-    take_r = min(gaps["right"], src_clip.width)
-    take_t = min(gaps["top"], src_clip.height)
-    take_b = min(gaps["bottom"], src_clip.height)
-    if gaps["left"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x0 + take_l, src_clip.y1), True, False)
-        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, placed.y0, placed.x0, placed.y1))
-    if gaps["right"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y0, src_clip.x1, src_clip.y1), True, False)
-        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, placed.y0, full.x1, placed.y1))
-    if gaps["top"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x1, src_clip.y0 + take_t), False, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0))
-    if gaps["bottom"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y1 - take_b, src_clip.x1, src_clip.y1), False, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x0, placed.y1, placed.x1, full.y1))
-    if gaps["left"] > 0.4 and gaps["top"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x0 + take_l, src_clip.y0 + take_t), True, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, full.y0, placed.x0, placed.y0))
-    if gaps["right"] > 0.4 and gaps["top"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y0, src_clip.x1, src_clip.y0 + take_t), True, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, full.y0, full.x1, placed.y0))
-    if gaps["left"] > 0.4 and gaps["bottom"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y1 - take_b, src_clip.x0 + take_l, src_clip.y1), True, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, placed.y1, placed.x0, full.y1))
-    if gaps["right"] > 0.4 and gaps["bottom"] > 0.4:
-        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y1 - take_b, src_clip.x1, src_clip.y1), True, True)
-        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, placed.y1, full.x1, full.y1))
+    def ink(near_box, deep_box):
+        """One pixel in. If that pixel is bare paper, use the ink a millimetre inside."""
+        near = _pixmap_cmyk(page, clip_of(near_box))
+        deep = _pixmap_cmyk(page, clip_of(deep_box))
+        if near is None:
+            return deep
+        if deep is not None and float(near.mean()) + 25 < float(deep.mean()):
+            return deep
+        return near
+
+    mm = 72.0 / 25.4
+    samples = {}
+    if gaps["left"] > 0.3:
+        samples["left"] = ink(
+            (placed.x0 + pixel, placed.y0, placed.x0 + pixel * 2, placed.y1),
+            (placed.x0 + mm, placed.y0, placed.x0 + mm + pixel, placed.y1),
+        )
+    if gaps["right"] > 0.3:
+        samples["right"] = ink(
+            (placed.x1 - pixel * 2, placed.y0, placed.x1 - pixel, placed.y1),
+            (placed.x1 - mm - pixel, placed.y0, placed.x1 - mm, placed.y1),
+        )
+    if gaps["top"] > 0.3:
+        samples["top"] = ink(
+            (placed.x0, placed.y0 + pixel, placed.x1, placed.y0 + pixel * 2),
+            (placed.x0, placed.y0 + mm, placed.x1, placed.y0 + mm + pixel),
+        )
+    if gaps["bottom"] > 0.3:
+        samples["bottom"] = ink(
+            (placed.x0, placed.y1 - pixel * 2, placed.x1, placed.y1 - pixel),
+            (placed.x0, placed.y1 - mm - pixel, placed.x1, placed.y1 - mm),
+        )
+    if gaps["left"] > 0.3 and gaps["top"] > 0.3:
+        samples["tl"] = ink(
+            (placed.x0 + pixel, placed.y0 + pixel, placed.x0 + pixel * 2, placed.y0 + pixel * 2),
+            (placed.x0 + mm, placed.y0 + mm, placed.x0 + mm + pixel, placed.y0 + mm + pixel),
+        )
+    if gaps["right"] > 0.3 and gaps["top"] > 0.3:
+        samples["tr"] = ink(
+            (placed.x1 - pixel * 2, placed.y0 + pixel, placed.x1 - pixel, placed.y0 + pixel * 2),
+            (placed.x1 - mm - pixel, placed.y0 + mm, placed.x1 - mm, placed.y0 + mm + pixel),
+        )
+    if gaps["left"] > 0.3 and gaps["bottom"] > 0.3:
+        samples["bl"] = ink(
+            (placed.x0 + pixel, placed.y1 - pixel * 2, placed.x0 + pixel * 2, placed.y1 - pixel),
+            (placed.x0 + mm, placed.y1 - mm - pixel, placed.x0 + mm + pixel, placed.y1 - mm),
+        )
+    if gaps["right"] > 0.3 and gaps["bottom"] > 0.3:
+        samples["br"] = ink(
+            (placed.x1 - pixel * 2, placed.y1 - pixel * 2, placed.x1 - pixel, placed.y1 - pixel),
+            (placed.x1 - mm - pixel, placed.y1 - mm - pixel, placed.x1 - mm, placed.y1 - mm),
+        )
+
+    if gaps["left"] > 0.3:
+        _insert_cmyk(page, samples.get("left"), fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1))
+    if gaps["right"] > 0.3:
+        _insert_cmyk(page, samples.get("right"), fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1))
+    if gaps["top"] > 0.3:
+        _insert_cmyk(page, samples.get("top"), fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover))
+    if gaps["bottom"] > 0.3:
+        _insert_cmyk(page, samples.get("bottom"), fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1))
+    if gaps["left"] > 0.3 and gaps["top"] > 0.3:
+        _insert_cmyk(page, samples.get("tl"), fitz.Rect(full.x0, full.y0, placed.x0 + cover, placed.y0 + cover))
+    if gaps["right"] > 0.3 and gaps["top"] > 0.3:
+        _insert_cmyk(page, samples.get("tr"), fitz.Rect(placed.x1 - cover, full.y0, full.x1, placed.y0 + cover))
+    if gaps["left"] > 0.3 and gaps["bottom"] > 0.3:
+        _insert_cmyk(page, samples.get("bl"), fitz.Rect(full.x0, placed.y1 - cover, placed.x0 + cover, full.y1))
+    if gaps["right"] > 0.3 and gaps["bottom"] > 0.3:
+        _insert_cmyk(page, samples.get("br"), fitz.Rect(placed.x1 - cover, placed.y1 - cover, full.x1, full.y1))
 
 
 def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:
@@ -1241,6 +1304,7 @@ def compile_vector_press(
     kept = False
     extended = False
     shrunk = False
+    edge_placements = []
     for index in range(src.page_count):
         src_page = src[index]
         new_page = doc.new_page(width=out_w, height=out_h)
@@ -1271,11 +1335,17 @@ def compile_vector_press(
                 src_rect.y1 - extra_b,
             )
             short_l = max(0.0, bleed_pt - existing["left"] * MM_TO_PT)
+            short_r = max(0.0, bleed_pt - existing["right"] * MM_TO_PT)
             short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
+            short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
             placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
-            _paint_margin(new_page, src_page, clip, placed)
             new_page.show_pdf_page(placed, src, index, clip=clip)
-            extended = True
+            if max(short_l, short_r, short_t, short_b) >= 0.4:
+                extended = True
+                edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+            else:
+                kept = True
+                edge_placements.append(None)
         else:
             dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
             scale = 1.0
@@ -1299,8 +1369,10 @@ def compile_vector_press(
                 src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
                 src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
             )
-            _paint_margin(new_page, src_page, clip, placed)
             new_page.show_pdf_page(placed, src, index, clip=clip)
+            edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+        if len(edge_placements) < index + 1:
+            edge_placements.append(None)
         _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
     if kept and not extended:
         edges = _edge_lines(analysis, methods, kept=True)
@@ -1318,7 +1390,9 @@ def compile_vector_press(
             os.remove(raw_path)
     # Ghostscript can drop the boxes. Put them back.
     fixed = fitz.open(out_path)
-    for fixed_page in fixed:
+    for fixed_page, placement in zip(fixed, edge_placements):
+        if placement:
+            _paint_cmyk_edge(fixed_page, fitz.Rect(*placement))
         _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
     boxed = out_path + ".box.pdf"
     fixed.save(boxed, deflate=True, garbage=4)
@@ -1335,7 +1409,8 @@ def compile_vector_press(
     report = _base_report(analysis, edges, full_keep, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
     report["contentKind"] = kind
     report["analysis"]["contentKind"] = kind
-    report["existingBleed"] = full_keep
+    report["existingBleed"] = bool(kept or extended)
+    report["fullBleedKept"] = full_keep
     report["rescue"] = rescue
     report["pageCount"] = page_count
     report["effectiveDpi"] = 300
@@ -1354,3 +1429,87 @@ def summary_sentence(report: dict) -> str:
     rescue = (report.get("rescue") or {}).get("note", "")
     existing = " Existing bleed was kept." if report.get("existingBleed") else ""
     return ("Ready for press. " + " ".join(parts) + " " + rescue + existing).strip()
+
+
+def _srgb_lab(rgb) -> np.ndarray:
+    """CIE Lab from a mean sRGB triple. Used for seam delta E."""
+    channel = np.asarray(rgb, dtype=np.float64) / 255.0
+
+    def linear(value):
+        return np.where(value <= 0.04045, value / 12.92, ((value + 0.055) / 1.055) ** 2.4)
+
+    red, green, blue = linear(channel)
+    x = red * 0.4124564 + green * 0.3575761 + blue * 0.1804375
+    y = red * 0.2126729 + green * 0.7151522 + blue * 0.0721750
+    z = red * 0.0193339 + green * 0.1191920 + blue * 0.9503041
+    white = (0.95047, 1.0, 1.08883)
+
+    def pivot(value):
+        return np.where(value > 0.008856, np.cbrt(value), 7.787 * value + 16.0 / 116.0)
+
+    fx, fy, fz = (pivot(x / white[0]), pivot(y / white[1]), pivot(z / white[2]))
+    return np.array([116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)], dtype=np.float64)
+
+
+def _delta_e(left, right) -> float:
+    gap = _srgb_lab(left) - _srgb_lab(right)
+    return float(np.sqrt(np.sum(gap * gap)))
+
+
+def _band_mean(image: np.ndarray, box) -> np.ndarray | None:
+    y0, y1, x0, x1 = box
+    y0, x0 = max(0, int(y0)), max(0, int(x0))
+    y1, x1 = min(image.shape[0], int(y1)), min(image.shape[1], int(x1))
+    if y1 <= y0 or x1 <= x0:
+        return None
+    return image[y0:y1, x0:x1].reshape(-1, image.shape[2]).mean(axis=0)
+
+
+def edge_seam_delta_e(path: str, seam_x_pt: float, seam_y_pt: float, dpi: float = 300.0) -> list:
+    """CIE76 between the ink just inside the seam and the extension just outside it.
+
+    seam_x_pt / seam_y_pt are the distance from the media edge to the join.
+    One row per page: left, right, top, bottom, and the four corners.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    rows = []
+    try:
+        scale = float(dpi) / 72.0
+        band = 6
+        for index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+            height, width = rgb.shape[:2]
+            sx = int(round(float(seam_x_pt) * scale))
+            sy = int(round(float(seam_y_pt) * scale))
+            sx = min(max(sx, band + 1), width - band - 1)
+            sy = min(max(sy, band + 1), height - band - 1)
+            pairs = {
+                "left": ((sy, height - sy, sx - band, sx), (sy, height - sy, sx, sx + band)),
+                "right": ((sy, height - sy, width - sx, width - sx + band), (sy, height - sy, width - sx - band, width - sx)),
+                "top": ((sy - band, sy, sx, width - sx), (sy, sy + band, sx, width - sx)),
+                "bottom": ((height - sy, height - sy + band, sx, width - sx), (height - sy - band, height - sy, sx, width - sx)),
+            }
+            # outside, inside. A white hairline sits in the outside band and moves the mean.
+            edges = {}
+            for name, (outside, inside) in pairs.items():
+                out_mean = _band_mean(rgb, outside)
+                in_mean = _band_mean(rgb, inside)
+                edges[name] = None if out_mean is None or in_mean is None else round(_delta_e(out_mean, in_mean), 2)
+            corners = {
+                "tl": ((0, sy, 0, sx), (sy, sy + band, sx, sx + band)),
+                "tr": ((0, sy, width - sx, width), (sy, sy + band, width - sx - band, width - sx)),
+                "bl": ((height - sy, height, 0, sx), (height - sy - band, height - sy, sx, sx + band)),
+                "br": ((height - sy, height, width - sx, width), (height - sy - band, height - sy, width - sx - band, width - sx)),
+            }
+            corner_de = {}
+            for name, (outside, inside) in corners.items():
+                out_mean = _band_mean(rgb, outside)
+                in_mean = _band_mean(rgb, inside)
+                corner_de[name] = None if out_mean is None or in_mean is None else round(_delta_e(out_mean, in_mean), 2)
+            rows.append({"page": index + 1, **edges, "corners": corner_de})
+        return rows
+    finally:
+        doc.close()

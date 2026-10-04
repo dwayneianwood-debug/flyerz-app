@@ -266,7 +266,7 @@ function runPythonBleed(
   outputPath: string,
   fileType: string,
   bleedOptions?: BleedOptions
-): { checks: AuditCheck[]; correctedPath?: string; preBleedPath?: string; proofPath?: string; proofPaths?: string[]; proofPageCount?: number; proofIsBlank?: boolean; comparisonPath?: string; bleedVariants?: Record<string, string>; recommendedBleedMethod?: string; criticalSafeZone?: boolean; rightSafety?: string; error?: string; originalDpi?: number; finalDpi?: number; showLowDpiWarning?: boolean; aiEnhanced?: boolean; inkSavingsPercent?: number; safetyStatus?: string; bleedProofPath?: string; lensesDetected?: boolean; lensesFlattened?: boolean; supersampled?: boolean; originalTic?: number; finalTic?: number; autoHealEvent?: AuditResults["autoHealEvent"] } {
+): { checks: AuditCheck[]; correctedPath?: string; preBleedPath?: string; proofPath?: string; proofPaths?: string[]; proofPageCount?: number; proofIsBlank?: boolean; comparisonPath?: string; bleedVariants?: Record<string, string>; bleedVariantPages?: Record<string, string[]>; pageCount?: number; recommendedBleedMethod?: string; criticalSafeZone?: boolean; rightSafety?: string; error?: string; originalDpi?: number; finalDpi?: number; showLowDpiWarning?: boolean; aiEnhanced?: boolean; inkSavingsPercent?: number; safetyStatus?: string; bleedProofPath?: string; lensesDetected?: boolean; lensesFlattened?: boolean; supersampled?: boolean; originalTic?: number; finalTic?: number; autoHealEvent?: AuditResults["autoHealEvent"] } {
   const resultFile = makeResultFile("bleed");
   const args = [PYTHON_SCRIPT, inputPath, outputPath, fileType, resultFile];
   if (bleedOptions) {
@@ -554,6 +554,8 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
     let inkSavingsPercent: number | undefined;
     let safetyStatus: 'SAFE' | 'CRITICAL' | undefined;
     let bleedVariants: Record<string, string> | undefined;
+    let bleedVariantPages: Record<string, string[]> | undefined;
+    let stylePageCount: number | undefined;
     let recommendedBleedMethod: string | undefined;
     let criticalSafeZone: boolean | undefined;
     let rightSafety: string | undefined;
@@ -676,6 +678,8 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       comparisonPath = result.comparisonPath;
       bleedProofPath = result.bleedProofPath;
       bleedVariants = result.bleedVariants;
+      bleedVariantPages = result.bleedVariantPages;
+      stylePageCount = result.pageCount;
       recommendedBleedMethod = result.recommendedBleedMethod;
       criticalSafeZone = result.criticalSafeZone;
       rightSafety = result.rightSafety;
@@ -757,7 +761,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       complianceReport,
       proofPath,
       proofPaths,
-      proofPageCount,
+      proofPageCount: proofPageCount || stylePageCount,
       proofIsBlank,
       originalDpi,
       showLowDpiWarning,
@@ -767,6 +771,9 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       healthReportPath,
       savedBleedOptions: effectiveBleed,
       bleedVariants: bleedVariants as AuditResults["bleedVariants"],
+      bleedVariantPages,
+      pageCount: stylePageCount || (job.auditResults as { pageCount?: number } | null)?.pageCount,
+      autoFixApplied: applyFixes,
       recommendedBleedMethod: recommendedBleedMethod as AuditResults["recommendedBleedMethod"],
       selectedBleedMethod: "auto",
       preBleedPath,

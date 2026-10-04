@@ -164,20 +164,42 @@ def render_cover_preview(bgr: np.ndarray, trim_w_mm: float, trim_h_mm: float, de
     }
 
 
+def load_artwork_bgr(path: str):
+    """A PDF page is rendered. OpenCV cannot read a PDF, which reported 'Could not read artwork'."""
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext == ".pdf":
+        import pymupdf as fitz
+
+        doc = fitz.open(path)
+        try:
+            if doc.page_count < 1:
+                return None
+            page = doc[0]
+            scale = 150.0 / 72.0
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            if pix.width < 2 or pix.height < 2:
+                return None
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            return cv2.cvtColor(np.ascontiguousarray(rgb[:, :, :3]), cv2.COLOR_RGB2BGR)
+        finally:
+            doc.close()
+    return cv2.imread(path, cv2.IMREAD_COLOR)
+
+
 if __name__ == "__main__":
     import json
     import sys
 
     action = sys.argv[1] if len(sys.argv) > 1 else ""
     if action == "recommend" and len(sys.argv) >= 3:
-        image = cv2.imread(sys.argv[2], cv2.IMREAD_COLOR)
+        image = load_artwork_bgr(sys.argv[2])
         if image is None:
             print(json.dumps({"success": False, "error": "Could not read artwork"}))
             sys.exit(1)
         advice = recommend_whole_artwork(image)
         print(json.dumps({"success": True, **advice}))
     elif action == "preview" and len(sys.argv) >= 6:
-        image = cv2.imread(sys.argv[2], cv2.IMREAD_COLOR)
+        image = load_artwork_bgr(sys.argv[2])
         if image is None:
             print(json.dumps({"success": False, "error": "Could not read artwork"}))
             sys.exit(1)

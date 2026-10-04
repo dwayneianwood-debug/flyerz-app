@@ -112,6 +112,8 @@ export interface AuditResults {
   };
   /** Same styles, one path per page. Page 1 is also bleedVariants. */
   bleedVariantPages?: Record<string, string[]>;
+  /** Set when Fix Everything has finished, so a reload does not ask again. */
+  autoFixApplied?: boolean;
   recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "gradient_extrapolate" | "frequency_separated" | "upscale" | "ai_outpaint" | "colourBorder";
   selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "gradient_extrapolate" | "frequency_separated" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
   /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */

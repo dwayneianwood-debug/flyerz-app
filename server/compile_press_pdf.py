@@ -1651,6 +1651,7 @@ def main():
                         bleed_strategy=bleed_api_strategy,
                         dpi=float(dpi),
                         border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
+                        allow_cloud=bleed_api_strategy == "ai_outpaint",
                     )
                     sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
                     if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("automaticChoice"):
@@ -1992,6 +1993,7 @@ def main():
                                     bleed_strategy=bleed_api_pdf,
                                     dpi=float(render_dpi),
                                     border_cmyk=_border_cmyk_arg(args) if bleed_api_pdf == "colourBorder" else None,
+                                    allow_cloud=bleed_api_pdf == "ai_outpaint",
                                 )
                             if isinstance(_pdf_heal_meta, dict) and _pdf_heal_meta.get("automaticChoice"):
                                 compile_stats["automatic_bleed"] = _pdf_heal_meta["automaticChoice"]

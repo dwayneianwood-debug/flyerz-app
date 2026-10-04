@@ -100,6 +100,11 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
   };
 }
 
+/** Auto must stay "auto" so Python measures the file. The A5 fallback is only a size until then. */
+export function productIdForEngine(requestedId: string, resolvedId: string): string {
+  return requestedId === "auto" ? "auto" : resolvedId;
+}
+
 export function resolveQuickProduct(productId: string, customW?: number, customH?: number) {
   if (productId === "custom") {
     const width = Number(customW);

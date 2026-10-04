@@ -1565,9 +1565,11 @@ def make_print_ready(
         compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}
         press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
-        if isinstance(engine, dict) and engine.get("existingBleed"):
+        if isinstance(engine, dict) and engine.get("fullBleedKept"):
             existing_kept = True
             decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
+        elif isinstance(engine, dict) and engine.get("existingBleed"):
+            existing_kept = True
         elif press_ok:
             decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
     if isinstance(engine, dict) and engine.get("headline"):

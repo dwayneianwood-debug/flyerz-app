@@ -353,6 +353,12 @@ export default function JobDetails() {
   }, [id]);
 
   useEffect(() => {
+    if ((job?.auditResults as { autoFixApplied?: boolean } | null)?.autoFixApplied) {
+      setAutoFixApplied(true);
+    }
+  }, [id, job?.auditResults]);
+
+  useEffect(() => {
     if (job?.status === "complete" && job?.correctedPath && !bleedPreview && !bleedPreviewLoading) {
       loadBleedPreview();
     }

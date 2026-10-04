@@ -341,6 +341,55 @@ def _bled_pdf(path: str) -> None:
     doc.close()
 
 
+def test_plate_facts_skip_reencode() -> None:
+    """Reading the plate size must not turn the CMYK JPEG into another JPEG."""
+    import io
+
+    import pymupdf as fitz
+    from PIL import Image
+
+    from green_gate import _press_matrix
+    from vector_trace import _inspect_plate
+
+    buf = io.BytesIO()
+    Image.new("CMYK", (400, 400), (20, 40, 60, 10)).save(buf, format="JPEG", quality=90)
+    doc = fitz.open()
+    page = doc.new_page(width=72, height=72)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    path = os.path.join(tempfile.mkdtemp(prefix="facts-"), "plate.pdf")
+    doc.save(path)
+    doc.close()
+    calls = []
+    original = fitz.Document.extract_image
+
+    def boom(self, xref):
+        calls.append(int(xref))
+        raise RuntimeError("the picture was encoded again")
+
+    fitz.Document.extract_image = boom
+    try:
+        qa = {}
+        _inspect_plate(path, 72 * 25.4 / 72.0 - 10, 72 * 25.4 / 72.0 - 10, 5, qa)
+        opened = fitz.open(path)
+        try:
+            matrix = _press_matrix(opened[0])
+        finally:
+            opened.close()
+    finally:
+        fitz.Document.extract_image = original
+    ok = not calls and qa.get("cmyk") is True and abs(matrix.a - 400 / 72) < 0.01
+    record(
+        "plate-facts",
+        ok,
+        product="n/a",
+        pages=1,
+        size="400px",
+        light="n/a",
+        reasons="",
+        note=f"cmyk {qa.get('cmyk')} scale {matrix.a:.3f} reencode {len(calls)}",
+    )
+
+
 def test_six_jobs() -> None:
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures"))
     jobs = [
@@ -366,6 +415,251 @@ def test_six_jobs() -> None:
         "live": ["ALREADY BLEED"], "light": "green",
         "reason_lacks": ["cannot be extended", "cut line", "Traceback"],
     })
+
+
+def _anton_font() -> str:
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "fonts", "Anton-Regular.ttf"))
+    if not os.path.isfile(path):
+        raise RuntimeError("Anton is missing from tests/fixtures/fonts")
+    return path
+
+
+def _write_canva(path: str) -> None:
+    """Two-page Canva-shaped A6: equal boxes, CMYK JPEG, soft mask, Anton, QR."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    page_w, page_h = 433.5, 312.0
+    font = fitz.Font(fontfile=_anton_font())
+    doc = fitz.open()
+    folder = os.path.dirname(path)
+    # DeviceCMYK navy that reaches the page edge. The second page is darker.
+    inks = ((210, 160, 40, 80), (230, 180, 30, 120))
+    for index, ink in enumerate(inks):
+        pixels_w = int(round(page_w / 72.0 * 150))
+        pixels_h = int(round(page_h / 72.0 * 150))
+        plate = Image.new("CMYK", (pixels_w, pixels_h), ink)
+        jpeg = os.path.join(folder, f"navy-{index}.jpg")
+        plate.save(jpeg, format="JPEG", quality=92)
+        accent = Image.new("CMYK", (160, 110), (0, 190, 210, 0))
+        accent_path = os.path.join(folder, f"accent-{index}.tif")
+        accent.save(accent_path, format="TIFF")
+        mask_px = np.zeros((110, 160), np.uint8)
+        cv2.ellipse(mask_px, (80, 55), (60, 40), 0, 0, 360, 255, -1)
+        mask_px = cv2.GaussianBlur(mask_px, (21, 21), 0)
+        mask_path = os.path.join(folder, f"mask-{index}.png")
+        Image.fromarray(mask_px, mode="L").save(mask_path)
+        with open(mask_path, "rb") as handle:
+            mask_bytes = handle.read()
+        page = doc.new_page(width=page_w, height=page_h)
+        page.insert_image(page.rect, filename=jpeg)
+        page.insert_image(fitz.Rect(90, 80, 230, 170), filename=accent_path, mask=mask_bytes)
+        qr_path = os.path.join(folder, f"qr-{index}.png")
+        cv2.imwrite(qr_path, _qr_image("https://flyerz.co.za/pay", module=4))
+        page.insert_image(fitz.Rect(300, 36, 370, 106), filename=qr_path)
+        writer = fitz.TextWriter(page.rect)
+        writer.append((48, 230), f"ANTON {index + 1}", font=font, fontsize=32)
+        writer.write_text(page, color=(1, 1, 1))
+        rect = page.rect
+        page.set_mediabox(rect)
+        page.set_cropbox(rect)
+        page.set_trimbox(rect)
+        page.set_bleedbox(rect)
+        page.set_artbox(rect)
+    doc.save(path)
+    doc.close()
+
+
+def _canva_source_ok(path: str) -> str:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        if doc.page_count != 2:
+            return f"pages {doc.page_count}"
+        page = doc[0]
+        if abs(page.rect.width - 433.5) > 0.2 or abs(page.rect.height - 312) > 0.2:
+            return f"size {page.rect.width:.1f}x{page.rect.height:.1f}"
+        boxes = (page.mediabox, page.cropbox, page.trimbox, page.bleedbox, page.artbox)
+        if any(abs(box.width - page.rect.width) > 0.4 or abs(box.height - page.rect.height) > 0.4 for box in boxes):
+            return "boxes differ"
+        fonts = page.get_fonts() or []
+        cid = any("CID" in str(item) or "Identity" in str(item) for item in fonts)
+        if not cid:
+            return f"font {fonts}"
+        images = page.get_images(full=True) or []
+        if not any(len(item) > 1 and int(item[1] or 0) > 0 for item in images):
+            return "no soft mask"
+        return ""
+    finally:
+        doc.close()
+
+
+def test_canva_a6() -> None:
+    from press_ready_engine import edge_seam_delta_e
+
+    folder = tempfile.mkdtemp(prefix="cust-canva-")
+    src = os.path.join(folder, "canva-a6.pdf")
+    _write_canva(src)
+    built = _canva_source_ok(src)
+    page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
+    seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
+    seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
+    started = time.perf_counter()
+    result = _run_print(src, folder, 148, 210, "a5", "A5", True)
+    result["_seconds"] = round(time.perf_counter() - started, 2)
+    press = result.get("pressPath") or ""
+    seams = edge_seam_delta_e(press, seam_x, seam_y) if press and os.path.exists(press) else []
+    worst = 99.0
+    parts = []
+    for row in seams:
+        values = [row.get(edge) for edge in ("left", "right", "top", "bottom")]
+        values += list((row.get("corners") or {}).values())
+        numbers = [float(item) for item in values if item is not None]
+        if numbers:
+            worst = min(worst, max(numbers)) if worst == 99.0 else max(worst, max(numbers))
+        parts.append(
+            "p{page} L{left} R{right} T{top} B{bottom} br{br}".format(
+                page=row.get("page"),
+                left=row.get("left"),
+                right=row.get("right"),
+                top=row.get("top"),
+                bottom=row.get("bottom"),
+                br=(row.get("corners") or {}).get("br"),
+            )
+        )
+    seam_note = " ".join(parts)
+    reasons = " ".join(str(item) for item in (result.get("reasons") or []))
+    problems = []
+    if built:
+        problems.append(built)
+    if result.get("light") == "red":
+        problems.append("red")
+    if result.get("productId") != "a6-landscape":
+        problems.append(f"product {result.get('productId')}")
+    if not result.get("existingBleedKept"):
+        problems.append("existingBleedKept false")
+    if "bleed" not in reasons.lower() or "kept" not in reasons.lower():
+        problems.append("message does not say the bleed was kept")
+    if "already had 5 mm" in reasons.lower():
+        problems.append("claimed a full 5 mm")
+    if worst >= 3.0:
+        problems.append(f"seam dE {worst}")
+    _expect_press("canva-a6-auto", result, {
+        "trim_w": 148, "trim_h": 105, "pages": 2, "product": "a6-landscape", "fixable": True,
+        "live": ["ANTON 1", "ANTON 2"], "qr": True,
+        "reason_lacks": ["cannot be extended", "cut line", "not CMYK", "Traceback", "Could not read"],
+    })
+    record(
+        "canva-a6-seam",
+        not problems and worst < 3.0,
+        product=str(result.get("productId") or ""),
+        pages=2,
+        size=f"dE {worst:.2f}",
+        light=str(result.get("light") or ""),
+        reasons=seam_note,
+        live="kept" if result.get("existingBleedKept") else "",
+        qr="",
+        note="; ".join(problems),
+    )
+
+
+def test_styles_are_different() -> None:
+    from smart_bleed import auto_resolve_safe_zone
+
+    image = np.zeros((96, 140, 3), np.uint8)
+    image[:, :] = (30, 40, 90)
+    gradient = np.linspace(0, 255, 140, dtype=np.uint8)
+    image[0, :] = np.stack([gradient, 255 - gradient, gradient // 2], axis=1)
+    noise = np.random.default_rng(3).integers(0, 255, size=(8, 140, 3), dtype=np.uint8)
+    image[:8] = noise
+    made = {}
+    for name in ("stretch", "gradient_extrapolate", "frequency_separated"):
+        out, _meta = auto_resolve_safe_zone(image.copy(), target_bleed_px=10, bleed_strategy=name, dpi=72.0, allow_cloud=False)
+        made[name] = out
+    def ring(item):
+        return np.concatenate([
+            item[:10].reshape(-1),
+            item[-10:].reshape(-1),
+            item[:, :10].reshape(-1),
+            item[:, -10:].reshape(-1),
+        ]).astype(np.int16)
+    gaps = {
+        "stretch-gradient": float(np.mean(np.abs(ring(made["stretch"]) - ring(made["gradient_extrapolate"])))),
+        "stretch-frequency": float(np.mean(np.abs(ring(made["stretch"]) - ring(made["frequency_separated"])))),
+        "gradient-frequency": float(np.mean(np.abs(ring(made["gradient_extrapolate"]) - ring(made["frequency_separated"])))),
+    }
+    record(
+        "manual-styles-differ",
+        all(value > 1.0 for value in gaps.values()),
+        product="card",
+        pages=1,
+        size="styles",
+        light="n/a",
+        reasons=" ".join(f"{key} {value:.1f}" for key, value in gaps.items()),
+        live="",
+        qr="",
+        note="",
+    )
+
+
+def test_cover_reads_pdf() -> None:
+    from cover_crop_notice import load_artwork_bgr
+
+    folder = tempfile.mkdtemp(prefix="cust-cover-")
+    src = os.path.join(folder, "page.pdf")
+    _write_canva(src)
+    image = load_artwork_bgr(src)
+    record(
+        "cover-reads-pdf",
+        image is not None and image.size > 0,
+        product="a6-landscape",
+        pages=1,
+        size=f"{0 if image is None else image.shape[1]}x{0 if image is None else image.shape[0]}",
+        light="n/a",
+        reasons="",
+        live="",
+        qr="",
+        note="" if image is not None else "Could not read artwork",
+    )
+
+
+def test_imagen_stays_local() -> None:
+    import smart_bleed
+
+    called = {"n": 0}
+    original = smart_bleed._ai_outpaint_gemini_cloud_bgr
+
+    def _boom(*_args, **_kwargs):
+        called["n"] += 1
+        raise RuntimeError("paid cloud call")
+
+    smart_bleed._ai_outpaint_gemini_cloud_bgr = _boom
+    os.environ["GEMINI_API_KEY"] = "test-key-not-a-real-call"
+    try:
+        image = np.full((40, 60, 3), 80, np.uint8)
+        folder = tempfile.mkdtemp(prefix="cust-ai-")
+        smart_bleed.generate_bleed_variants(image, 72.0, os.path.join(folder, "preview"), ".png")
+        preview_calls = called["n"]
+        smart_bleed.auto_resolve_safe_zone(
+            image, target_bleed_px=6, bleed_strategy="ai_outpaint", dpi=72.0, allow_cloud=True,
+        )
+        chosen = called["n"]
+    finally:
+        smart_bleed._ai_outpaint_gemini_cloud_bgr = original
+        os.environ.pop("GEMINI_API_KEY", None)
+    record(
+        "imagen-only-when-picked",
+        preview_calls == 0 and chosen == 1,
+        product="n/a",
+        pages=1,
+        size="ai",
+        light="n/a",
+        reasons=f"preview {preview_calls} picked {chosen}",
+        live="",
+        qr="",
+        note="",
+    )
 
 
 def test_manual_styles() -> None:
@@ -417,6 +711,11 @@ def main() -> None:
     test_bleed_colour_pages()
     test_images()
     test_manual_styles()
+    test_canva_a6()
+    test_styles_are_different()
+    test_cover_reads_pdf()
+    test_imagen_stays_local()
+    test_plate_facts_skip_reencode()
     test_six_jobs()
     _write_table()
     if FAILURES:

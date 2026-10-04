@@ -4486,13 +4486,12 @@ def _apply_text_gate(
     for row in quiet:
         row["render"] = _norm_text(row["text"])
         row["mismatch"] = False
-    readings = _read_render_strip(
-        [row["_render"] for row in rejected],
-        [row["text"] for row in rejected],
-    ) if rejected else []
-    for row, reading in zip(rejected, readings):
-        row["render"] = reading
-        row["mismatch"] = not _reads_match(row["text"], reading)
+    # These rows already failed the pixel check, so a second read of the render
+    # cannot put them back. Reusing the source text avoids that OCR. The small
+    # lines that were kept are still read below, because that read can reject them.
+    for row in rejected:
+        row["render"] = _norm_text(row["text"])
+        row["mismatch"] = False
     # Short lines the stroke check kept are read one letter at a time. The
     # trace letter has to be the picture's letter. One batch covers the page.
     small_rows = [row for row in accepted if row.get("_glyphOcr")]
@@ -4973,6 +4972,31 @@ def _pt(point, sx, sy, origin_x, origin_y):
     return fitz.Point((origin_x + point[0]) * sx, (origin_y + point[1]) * sy)
 
 
+def _image_facts(page, xref: int) -> dict:
+    """Width, height and colour space. The picture is not decoded or saved again."""
+    wanted = int(xref)
+    for info in page.get_image_info(xrefs=True) or []:
+        if int(info.get("xref") or 0) != wanted:
+            continue
+        name = str(info.get("cs-name") or "")
+        space = info.get("colorspace")
+        if space in (None, "") and "CMYK" in name.upper():
+            space = 4
+        return {
+            "width": int(info.get("width") or 0),
+            "height": int(info.get("height") or 0),
+            "colorspace": int(space or 0),
+            "cs-name": name,
+        }
+    info = page.parent.extract_image(wanted)
+    return {
+        "width": int(info.get("width") or 0),
+        "height": int(info.get("height") or 0),
+        "colorspace": int(info.get("colorspace") or 0),
+        "cs-name": str(info.get("cs-name") or ""),
+    }
+
+
 def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
     import pymupdf as fitz
 
@@ -4997,7 +5021,7 @@ def _inspect_plate(path, trim_w, trim_h, bleed_mm, qa) -> None:
         images = page.get_images()
         qa["image_count"] = len(images)
         if images:
-            info = doc.extract_image(images[0][0])
+            info = _image_facts(page, images[0][0])
             qa["cmyk"] = info.get("colorspace") == 4 or "CMYK" in str(info.get("cs-name", ""))
             width_in = media.width / 72.0
             height_in = media.height / 72.0

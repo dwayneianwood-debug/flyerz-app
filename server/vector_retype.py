@@ -65,6 +65,7 @@ SKIP_REASON = (
     "logo lettering",
     "circle stayed",
     "short mark",
+    "too small to trace",
 )
 
 

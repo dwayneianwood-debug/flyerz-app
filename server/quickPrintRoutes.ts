@@ -8,6 +8,7 @@ import { readQuickPrintSettings, writeQuickPrintSettings } from "./quickPrintSet
 import {
   fileTypeForName,
   jobOutputDir,
+  productIdForEngine,
   redFallback,
   resolveQuickProduct,
   runQuickPrintFile,
@@ -100,13 +101,13 @@ function progressFields(jobId: number): { stage?: string; percent?: number; elap
 }
 
 async function runJob(jobId: number, inputPath: string, filename: string, body: Record<string, unknown>) {
-  const productId = String(body.productId || "a5");
-  const product = resolveQuickProduct(productId, Number(body.customWidth), Number(body.customHeight));
+  const requestedId = String(body.productId || "a5");
+  const product = resolveQuickProduct(requestedId, Number(body.customWidth), Number(body.customHeight));
   const quantity = Number(body.quantity);
   const notes = String(body.notes || "").slice(0, 400);
   try {
     const result = await runQuickPrintFile(inputPath, jobOutputDir(jobId), {
-      productId: product.id,
+      productId: productIdForEngine(requestedId, product.id),
       trimW: product.widthMm,
       trimH: product.heightMm,
       quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,

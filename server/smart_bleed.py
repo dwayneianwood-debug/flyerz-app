@@ -4016,7 +4016,7 @@ def _ai_outpaint_inpaint_bgr(padded_bgr: np.ndarray, mask_u8: np.ndarray, bleed_
     return _ai_outpaint_inpaint_bgr_strips(padded_bgr, mask_u8, bleed_px)
 
 
-def _apply_ai_outpaint_bleed(img: np.ndarray, bleed_px: int) -> np.ndarray:
+def _apply_ai_outpaint_bleed(img: np.ndarray, bleed_px: int, allow_cloud: bool = False) -> np.ndarray:
     """
     AI Outpaint (isolated): optional Google Imagen masked edit when GEMINI_API_KEY is set;
     otherwise or on any failure, Navier-Stokes inpainting (INPAINT_NS).
@@ -4065,7 +4065,9 @@ def _apply_ai_outpaint_bleed(img: np.ndarray, bleed_px: int) -> np.ndarray:
 
     filled_bgr = None
     api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if api_key:
+    # Preview generation builds every style, including this one. That must stay
+    # on the local inpainter. The paid call runs only when the user picks AI.
+    if allow_cloud and api_key:
         try:
             filled_bgr = _ai_outpaint_gemini_cloud_bgr(padded_bgr, mask, api_key)
             sys.stderr.write(
@@ -4080,7 +4082,9 @@ def _apply_ai_outpaint_bleed(img: np.ndarray, bleed_px: int) -> np.ndarray:
             filled_bgr = None
     else:
         sys.stderr.write(
-            "[BLEED][AI-OUTPAINT] GEMINI_API_KEY unset — local cv2.inpaint INPAINT_NS\n"
+            "[BLEED][AI-OUTPAINT] local cv2.inpaint INPAINT_NS"
+            + ("" if allow_cloud else " (cloud skipped until an AI style is chosen)")
+            + "\n"
         )
 
     if filled_bgr is None:
@@ -7256,7 +7260,7 @@ def apply_existing_bleed(
 
 def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
                            bleed_strategy: str = "auto", dpi: float = 300.0,
-                           border_cmyk: tuple | None = None):
+                           border_cmyk: tuple | None = None, allow_cloud: bool = False):
     """
     Unified bleed entry: strict geometric safe-zone clamp (SAFE_ZONE_MM vs trim), INTER_CUBIC resize,
     centered full-trim canvas with BORDER_REPLICATE margins; then validate_safe_zone; Elastic Anchor
@@ -7343,6 +7347,7 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
             f"Elastic Anchor ghostFrameApplied={meta['ghostFrameApplied']} ({gf_meta.get('reason','')}).\n"
         )
 
+    cloud = bool(allow_cloud and api_key == "ai_outpaint")
     if api_key == "auto" or api_key not in strategy_map_lc:
         chosen = choose_automatic_bleed_api(val_plane, dpi_f)
         meta["automaticChoice"] = chosen
@@ -7355,7 +7360,9 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
             api_key = "stretch"
 
     internal = strategy_map_lc[api_key]
-    out = _apply_forced_strategy_bleed(work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk)
+    out = _apply_forced_strategy_bleed(
+        work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk, allow_cloud=cloud,
+    )
     if internal == BLEED_STRATEGY_COLOUR_BORDER:
         meta["colourBorder"] = True
         return out, meta
@@ -7363,7 +7370,15 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
     return out, meta
 
 
-def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0, border_cmyk: tuple | None = None) -> np.ndarray:
+def _expand_each_edge(img: np.ndarray, strategy: str, bleed_px: int, dpi: float) -> np.ndarray:
+    """One side at a time, so gradient and frequency are not the stretch fallback."""
+    out = img
+    for side in ("top", "bottom", "left", "right"):
+        out = _fill_bleed_edge(out, side, bleed_px, dpi=dpi, strategy_override=strategy)
+    return out
+
+
+def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, dpi: float = 300.0, border_cmyk: tuple | None = None, allow_cloud: bool = False) -> np.ndarray:
     orig_h, orig_w = img.shape[:2]
 
     def _bleed_tic_if_match(out_img: np.ndarray) -> np.ndarray:
@@ -7383,7 +7398,7 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             "[BLEED][ROUTING] ai_outpaint → Google Imagen inpaint if GEMINI_API_KEY else "
             "cv2.inpaint INPAINT_NS (border mask; strip/tile when large)\n"
         )
-        return _bleed_tic_if_match(_apply_ai_outpaint_bleed(img, bleed_px))
+        return _bleed_tic_if_match(_apply_ai_outpaint_bleed(img, bleed_px, allow_cloud=allow_cloud))
 
     if strategy == BLEED_STRATEGY_REPLICATE:
         sys.stderr.write(
@@ -7420,6 +7435,14 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
         return _bleed_tic_if_match(
             mirror_blend_bleed_expand(img, bleed_px, bleed_px, bleed_px, bleed_px, dpi)
         )
+
+    if strategy == BLEED_STRATEGY_GRADIENT_EXTRAPOLATE:
+        sys.stderr.write("[BLEED][ROUTING] gradient_extrapolate → per-edge linear continuation\n")
+        return _bleed_tic_if_match(_expand_each_edge(img, strategy, bleed_px, dpi))
+
+    if strategy == BLEED_STRATEGY_FREQUENCY_SEPARATED:
+        sys.stderr.write("[BLEED][ROUTING] frequency_separated → per-edge frequency split\n")
+        return _bleed_tic_if_match(_expand_each_edge(img, strategy, bleed_px, dpi))
 
     if strategy == BLEED_STRATEGY_COLOUR_BORDER:
         from colour_border import apply_colour_border_bgr
@@ -8056,6 +8079,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
         result["bleedVariants"] = variant_result["paths"]
         result["bleedVariantPages"] = _variant_pages_by_method(variant_result)
         result["recommendedBleedMethod"] = variant_result.get("recommended", "stretch")
+    result["pageCount"] = int(variant_result.get("pageCount") or 1)
     if safety_status_val:
         result["rightSafety"] = safety_status_val
     if comparison_result.get("success"):
@@ -9183,6 +9207,7 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
         result["bleedVariants"] = variant_result["paths"]
         result["bleedVariantPages"] = _variant_pages_by_method(variant_result)
         result["recommendedBleedMethod"] = variant_result.get("recommended", "stretch")
+    result["pageCount"] = int(variant_result.get("pageCount") or (proof_result.get("pageCount") if isinstance(proof_result, dict) else 0) or 1)
     if safety_status_val:
         result["rightSafety"] = safety_status_val
 

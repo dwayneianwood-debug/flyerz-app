@@ -632,6 +632,17 @@ def _retyped_rows(context: dict) -> list:
     return [row for row in list(context.get("textGate") or []) if row.get("retyped")]
 
 
+def _image_pixels(page, xref: int) -> tuple[int, int]:
+    """Pixel size of one embedded picture, without decoding or re-saving it."""
+    wanted = int(xref)
+    for info in page.get_image_info(xrefs=True) or []:
+        if int(info.get("xref") or 0) != wanted:
+            continue
+        return int(info.get("width") or 0), int(info.get("height") or 0)
+    info = page.parent.extract_image(wanted)
+    return int(info.get("width") or 0), int(info.get("height") or 0)
+
+
 def _press_matrix(page):
     """Scale that lands on the embedded picture's pixels.
 
@@ -641,9 +652,7 @@ def _press_matrix(page):
 
     images = page.get_images() or []
     if images:
-        info = page.parent.extract_image(images[0][0])
-        width = int(info.get("width") or 0)
-        height = int(info.get("height") or 0)
+        width, height = _image_pixels(page, int(images[0][0]))
         if width >= 8 and height >= 8 and page.rect.width > 1 and page.rect.height > 1:
             return fitz.Matrix(width / page.rect.width, height / page.rect.height)
     return fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
