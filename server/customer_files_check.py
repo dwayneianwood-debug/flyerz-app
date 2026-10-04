@@ -757,6 +757,68 @@ def test_bleed_diagonal_and_column() -> None:
     )
 
 
+def test_real_a6_file() -> None:
+    """Ian's real A6, kept in /tmp and never committed. Every 2 mm window must be under 5."""
+    from press_ready_engine import edge_seam_delta_e
+
+    src = "/tmp/real_a6.pdf"
+    if not os.path.isfile(src) or os.path.getsize(src) < 1000:
+        record(
+            "real-a6-seam",
+            True,
+            product="a6-landscape",
+            pages=0,
+            size="skip",
+            light="n/a",
+            reasons="file not in /tmp",
+            live="",
+            qr="",
+            note="skipped",
+        )
+        return
+    folder = tempfile.mkdtemp(prefix="cust-real-a6-")
+    page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
+    seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
+    seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
+    result = _run_print(src, folder, 148, 210, "a5", "A5", True)
+    press = result.get("pressPath") or ""
+    seams = edge_seam_delta_e(press, seam_x, seam_y) if press and os.path.exists(press) else []
+    local_keys = ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")
+    worst = 0.0
+    parts = []
+    problems = []
+    if not seams:
+        worst = 99.0
+        problems.append("no seam report")
+    for row in seams:
+        local = row.get("local") or {}
+        numbers = [None if local.get(key) is None else float(local.get(key)) for key in local_keys]
+        if any(item is None for item in numbers):
+            worst = 99.0
+            problems.append(f"p{row.get('page')} missing window")
+        else:
+            worst = max(worst, max(numbers))
+        parts.append(
+            "p{page} L{left} R{right} T{top} B{bottom} tl{tl} tr{tr} bl{bl} br{br}".format(
+                page=row.get("page"), **{key: local.get(key) for key in local_keys},
+            )
+        )
+    if worst >= 5.0:
+        problems.append(f"local seam dE {worst}")
+    record(
+        "real-a6-seam",
+        not problems and worst < 5.0,
+        product=str(result.get("productId") or ""),
+        pages=len(seams),
+        size=f"dE {worst:.2f}",
+        light=str(result.get("light") or ""),
+        reasons=" ".join(parts),
+        live="",
+        qr="",
+        note="; ".join(problems),
+    )
+
+
 def test_canva_a6() -> None:
     from press_ready_engine import edge_seam_delta_e
 
@@ -1069,6 +1131,7 @@ def main() -> None:
     test_manual_styles()
     test_bleed_matches_edge()
     test_bleed_diagonal_and_column()
+    test_real_a6_file()
     test_canva_a6()
     test_gs_and_colour_border()
     test_styles_are_different()
