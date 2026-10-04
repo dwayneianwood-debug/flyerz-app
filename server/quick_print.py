@@ -159,6 +159,19 @@ def decide_light(facts: dict) -> dict:
                 "reasons": reasons or ["This file cannot go to press as it is."],
                 "clientMessage": str(checklist.get("clientMessage") or client_message("cut")),
             }
+    twenty = facts.get("twentyFive") if isinstance(facts.get("twentyFive"), dict) else None
+    if twenty and twenty.get("light") == "red":
+        extra = [line for line in (twenty.get("reasons") or []) if line not in reasons]
+        return {
+            "light": "red",
+            "reasons": extra + reasons,
+            "clientMessage": str(twenty.get("clientMessage") or ""),
+            "checklistRed": True,
+        }
+    if twenty and twenty.get("light") == "amber":
+        for line in twenty.get("reasons") or []:
+            if line and line not in reasons:
+                reasons.append(line)
     if reasons:
         return {"light": "amber", "reasons": reasons, "clientMessage": ""}
     return {"light": "green", "reasons": [], "clientMessage": ""}
@@ -1314,6 +1327,8 @@ def make_print_ready(
     aspect_extended = False
     aspect_delta = 0.0
     upscale = 1.0
+    dpi_mode = ""
+    dpi_detail = ""
     existing_kept = False
     ocr_low = False
     ocr_doubtful = False
@@ -1508,15 +1523,31 @@ def make_print_ready(
             if not (vector_built and vector_built.get("ok")):
                 _mark("enlarging", lettering_note)
                 upscaled_path = os.path.join(output_dir, "upscaled.png")
+                source_ppi = 300.0 / max(float(upscale), 1e-6)
                 try:
                     from ai_upscale import apply_ai_upscale
 
-                    enlarged = apply_ai_upscale(fitted_path, {
-                        "trim_w_mm": trim_w,
-                        "trim_h_mm": trim_h,
-                        "bleed_mm": 0,
-                        "output_path": upscaled_path,
-                    })
+                    if source_ppi < 75:
+                        dpi_mode = "under"
+                        dpi_detail = f"About {source_ppi:.0f} ppi. Under 75 ppi, so the picture was not enhanced."
+                        enlarged = {"used_original": True, "message": dpi_detail}
+                    else:
+                        enlarged = apply_ai_upscale(fitted_path, {
+                            "trim_w_mm": trim_w,
+                            "trim_h_mm": trim_h,
+                            "bleed_mm": 0,
+                            "output_path": upscaled_path,
+                            "max_scale": 4,
+                            "skip_below_ppi": 75,
+                        })
+                        if enlarged.get("used_original"):
+                            dpi_mode = "under" if source_ppi < 75 else ""
+                        elif float(upscale) > 4:
+                            dpi_mode = "capped"
+                            dpi_detail = f"About {source_ppi:.0f} ppi was enlarged by 4× and is still under 300 ppi."
+                        elif float(upscale) > 1.05:
+                            dpi_mode = "upscaled"
+                            dpi_detail = f"About {source_ppi:.0f} ppi was enlarged toward 300 ppi, and not by more than 4×."
                 except Exception as exc:
                     enlarged = {"used_original": True, "message": str(exc)[:160]}
                 if enlarged.get("enhanced_path") and os.path.exists(str(enlarged.get("enhanced_path"))) and not enlarged.get("used_original"):
@@ -1619,14 +1650,36 @@ def make_print_ready(
             facts["checklist"] = checklist
         except Exception:
             checklist = None
+    if os.path.isfile(src_path):
+        try:
+            from twenty_five import assess as assess_points
+            from twenty_five import light_from_checks, settle_checks
+
+            raw_points = assess_points(src_path, trim_w, trim_h)
+            point_audit = (engine.get("clientAudit") if isinstance(engine, dict) else None) or {}
+            settled = settle_checks(raw_points.get("checks") or [], {
+                "bleed": bool(press_ok),
+                "cmyk": bool(press_ok),
+                "flattened": bool(press_ok),
+                "black": bool(point_audit.get("black")),
+                "hair": int(point_audit.get("hairlines") or 0) > 0,
+                "spots": bool(point_audit.get("spots")),
+                "dpi": dpi_mode,
+                "dpiDetail": dpi_detail,
+            })
+            derived = light_from_checks(settled)
+            facts["twentyFive"] = {**derived, "checks": settled}
+        except Exception:
+            pass
     info = decide_light(facts)
     result = _blank(info, decisions, product, quantity, notes)
     result["checklist"] = list((checklist or {}).get("items") or [])
+    result["prepressChecks"] = list((facts.get("twentyFive") or {}).get("checks") or [])
     result["upscale"] = round(upscale, 3)
     result["existingBleedKept"] = existing_kept
     result["enginePassed"] = facts["enginePassed"]
     result["pressEngine"] = engine if isinstance(engine, dict) else None
-    if press_ok and info["light"] != "red":
+    if press_ok and (info["light"] != "red" or info.get("checklistRed")):
         result["pressPath"] = press_path
         try:
             boxes = _boxes_mm(press_path)

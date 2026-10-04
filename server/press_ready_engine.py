@@ -2047,7 +2047,7 @@ def compile_vector_press(
             }
         open_path = prepared.get("pdfPath") or src_path
 
-    from client_file_audit import apply_vector_fixes, audit_pdf, repair_cmyk_images
+    from client_file_audit import apply_vector_fixes, audit_pdf, repair_cmyk_images, upscale_soft_images
 
     client_audit = audit_pdf(open_path, trim_w_mm, trim_h_mm)
     font_problems = (client_audit.get("fonts") or {}).get("problems") or []
@@ -2056,10 +2056,20 @@ def compile_vector_press(
         or (client_audit.get("black") or {}).get("needsFix")
         or (client_audit.get("spots") or {}).get("names")
     )
-    if client_audit.get("isPdf") and needs_fix:
+    soft_images = [
+        row for row in ((client_audit.get("resolution") or {}).get("images") or [])
+        if 75 <= float(row.get("ppi") or 0) < 300 and float(row.get("area") or 1) < 0.85
+    ]
+    image_upscale = {"changed": 0, "skippedLow": 0, "skippedFull": 0}
+    if client_audit.get("isPdf") and (needs_fix or soft_images):
         fixed_path = open_path + ".clientfix.pdf"
-        apply_vector_fixes(open_path, fixed_path)
-        repair_cmyk_images(fixed_path)
+        if needs_fix:
+            apply_vector_fixes(open_path, fixed_path)
+            repair_cmyk_images(fixed_path)
+        else:
+            shutil.copyfile(open_path, fixed_path)
+        if soft_images:
+            image_upscale = upscale_soft_images(fixed_path)
         open_path = fixed_path
     src = fitz.open(open_path)
     if src.page_count < 1:
@@ -2191,12 +2201,6 @@ def compile_vector_press(
     fixed.close()
     _paint_bleed_matching(boxed, edge_placements)
     os.replace(boxed, out_path)
-    if needs_fix:
-        try:
-            apply_vector_fixes(out_path, out_path)
-            repair_cmyk_images(out_path)
-        except Exception:
-            pass
 
     full_keep = kept and not extended
     rescue = {
@@ -2213,6 +2217,7 @@ def compile_vector_press(
     report["rescue"] = rescue
     report["pageCount"] = page_count
     report["clientFileAudit"] = client_audit
+    report["imageUpscale"] = image_upscale
     report["clientAudit"] = {
         "fonts": [row.get("name") for row in font_problems],
         "hairlines": int((client_audit.get("hairlines") or {}).get("count") or 0),

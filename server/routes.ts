@@ -4296,9 +4296,10 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const file = job.originalPath || job.correctedPath;
       if (!file) return res.json({ checks: [] });
       const script = path.join(process.cwd(), "server", "twenty_five.py");
-      const args = [script, "--input", file];
+      const args = [script, "--input", file, "--apply"];
+      if (job.correctedPath && fsSync.existsSync(job.correctedPath)) args.push("--press-done");
       if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
-      const result = execPythonCapture(args, "TwentyFive", 25_000);
+      const result = execPythonCapture(args, "TwentyFive", 60_000);
       const checks = Array.isArray(result?.checks) ? result.checks : [];
       const body = { checks };
       glitchyChecklistCache.set(cacheKey, body);
@@ -4336,6 +4337,7 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const replyJson = (result: any, extras: Record<string, unknown> = {}) => res.json({
         reply: result?.reply || "I couldn't read a result from the check.",
         actions: Array.isArray(result?.actions) ? result.actions : [],
+        checks: Array.isArray(result?.checks) ? result.checks : [],
         provider: result?.provider || "rules",
         ok: result?.ok !== false,
         previewBefore: "",

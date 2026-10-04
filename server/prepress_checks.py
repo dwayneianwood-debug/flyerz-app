@@ -21,7 +21,7 @@ def _px_to_mm(px_val, dpi):
     return round(px_val * 25.4 / dpi, 2)
 
 
-def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=False):
+def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=False, safe_mm=None):
     """
     Section 2 — Enhanced Safe Zone Validation with severity levels.
     For all foreground content, calculate distance to trim on all sides.
@@ -43,7 +43,8 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
             "auto_fixed": False
         }
 
-    safe_px = _mm_to_px(SAFE_ZONE_MM, dpi)
+    zone_mm = SAFE_ZONE_MM if safe_mm is None else float(safe_mm)
+    safe_px = _mm_to_px(zone_mm, dpi)
 
     trim_region = img_bgr[trim_top:trim_bottom, trim_left:trim_right]
     gray = cv2.cvtColor(trim_region, cv2.COLOR_BGR2GRAY)
@@ -70,7 +71,7 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
                 "page": page_num,
                 "side": side_name,
                 "severity": "PASS",
-                "distance_mm": SAFE_ZONE_MM,
+                "distance_mm": zone_mm,
                 "content_percentage": 0.0
             })
             continue
@@ -105,7 +106,7 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
         if distance_mm <= 0:
             severity = "CRITICAL"
             overall_severity = "CRITICAL"
-        elif distance_mm < SAFE_ZONE_MM:
+        elif distance_mm < zone_mm:
             severity = "WARNING"
             if overall_severity != "CRITICAL":
                 overall_severity = "WARNING"

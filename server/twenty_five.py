@@ -237,7 +237,8 @@ def assess(path: str, trim_w: float | None = None, trim_h: float | None = None) 
         for num in ("7", "8", "9", "10", "11", "12", "16"):
             put(num, "skipped", "The page could not be rendered, so this point did not run.")
     else:
-        _layout_points(rows, put, image, dpi, trim_w, trim_h, pages)
+        picture = bool((fonts.get("picture") or black.get("picture")))
+        _layout_points(rows, put, image, dpi, trim_w, trim_h, pages, picture)
 
     if pages < 4:
         put("13", "passed", f"{pages or 1} page(s). Spine shift applies from 4 pages.")
@@ -279,7 +280,7 @@ def assess(path: str, trim_w: float | None = None, trim_h: float | None = None) 
     return {"success": True, "checks": ordered, "pages": pages}
 
 
-def _layout_points(rows, put, image, dpi, trim_w, trim_h, pages) -> None:
+def _layout_points(rows, put, image, dpi, trim_w, trim_h, pages, picture: bool = False) -> None:
     from prepress_checks import (
         build_prepress_checks,
         check_margin_normalization,
@@ -292,11 +293,18 @@ def _layout_points(rows, put, image, dpi, trim_w, trim_h, pages) -> None:
     )
 
     trim = _trim_pixels(image, trim_w, trim_h, dpi)
-    safe = enhanced_safe_zone_analysis(image, trim, dpi, 1)
-    severity = str(safe.get("severity") or "PASS")
-    if severity == "CRITICAL":
-        put("7", "failed", "Something sits on the cut.")
-    elif severity == "WARNING":
+    # Ian's master prompt: critical at 0 mm or less, warning from 0 to 5 mm.
+    safe = enhanced_safe_zone_analysis(image, trim, dpi, 1, safe_mm=5.0)
+    sparse = [
+        row for row in (safe.get("details") or [])
+        if row.get("severity") != "PASS" and float(row.get("content_percentage") or 0) < 80
+    ]
+    if any(float(row.get("distance_mm") or 0) <= 0 for row in sparse):
+        if picture:
+            put("7", "warning", "The picture reaches the cut. Check that nothing important sits there.")
+        else:
+            put("7", "failed", "Something sits on the cut.")
+    elif sparse:
         put("7", "warning", "Something is inside the 5 mm safe zone.")
     else:
         put("7", "passed", "The safe zone is clear.")
@@ -305,12 +313,22 @@ def _layout_points(rows, put, image, dpi, trim_w, trim_h, pages) -> None:
     put("8", "passed" if layout.get("balanced") else "warning", "Layout is centred." if layout.get("balanced") else "Layout weight is off centre.")
     centre = compute_visual_centroid(image, trim, dpi)
     put("9", "passed" if centre.get("centered") else "warning", f"Visual centre is {centre.get('deviation_mm', 0)} mm from the middle.")
-    radar = evaluate_smart_downscale(safe, layout)
+    # A solid colour that fills the trim is the bleed field, not a cut object.
+    radar_safe = dict(safe)
+    radar_safe["warnings"] = sparse
+    radar_safe["severity"] = "CRITICAL" if any(float(row.get("distance_mm") or 0) <= 0 for row in sparse) else ("WARNING" if sparse else "PASS")
+    radar = evaluate_smart_downscale(radar_safe, layout)
     put("10", "passed" if not radar.get("recommended") else "warning", "No downscale is recommended." if not radar.get("recommended") else str(radar.get("reason") or "A downscale was recommended. Nothing was resized."))
     margins = check_margin_normalization(safe.get("details") or [], dpi)
     put("11", "passed" if margins.get("normalized") else "warning", "Margins match." if margins.get("normalized") else "Opposing margins differ by more than 3 mm.")
     drift = simulate_trim_tolerance(image, trim, dpi)
-    put("12", "passed" if drift.get("risk_level") == "LOW" else "warning", f"Trim drift risk is {drift.get('risk_level', 'unknown')}.")
+    exposures = [float(row.get("content_exposure") or 0) for row in (drift.get("simulations") or [])]
+    if drift.get("risk_level") == "LOW":
+        put("12", "passed", "Trim drift risk is LOW.")
+    elif exposures and min(exposures) >= 80:
+        put("12", "passed", "Colour runs to the trim on every side. The 5 mm bleed covers that drift.")
+    else:
+        put("12", "warning", f"Trim drift risk is {drift.get('risk_level', 'unknown')}.")
     edge = detect_white_edge_risk(image, trim, {"bleed_mm": 5}, dpi)
     if edge.get("risk"):
         put("16", "warning", "A dark edge may show white paper after the cut.")
@@ -368,6 +386,150 @@ def _transparency(path: str) -> bool | None:
     return any(marker in raw for marker in markers)
 
 
+def light_from_checks(checks: list) -> dict:
+    """Failed is red and names those items. A warning with no failure is amber. Passed and auto-fixed is green."""
+    failed = [row for row in checks if row.get("status") == "failed"]
+    warned = [row for row in checks if row.get("status") == "warning"]
+    if failed:
+        lines = [f"{row['num']}. {row['name']}: {row['detail']}" for row in failed]
+        return {
+            "light": "red",
+            "reasons": lines,
+            "clientMessage": "These items failed the 25-point check:\n" + "\n".join(lines),
+        }
+    if warned:
+        lines = [f"{row['num']}. {row['name']}: {row['detail']}" for row in warned]
+        return {"light": "amber", "reasons": lines, "clientMessage": ""}
+    return {"light": "green", "reasons": [], "clientMessage": ""}
+
+
+def _retitle(row: dict, status: str, detail: str) -> dict:
+    row = dict(row)
+    row["status"] = status
+    row["pass"] = status in ("passed", "auto")
+    row["detail"] = detail
+    row["label"] = f"{row['num']}. {row['name']}: {detail}"
+    return row
+
+
+def settle_checks(checks: list, done: dict | None = None) -> list:
+    """Mark a point auto-fixed only when this job actually performed that fix."""
+    done = done or {}
+    rows = [dict(row) for row in checks]
+    by_num = {row["num"]: row for row in rows}
+
+    def auto(num: str, detail: str) -> None:
+        row = by_num.get(num)
+        if row and row.get("status") in ("warning", "failed"):
+            by_num[num] = _retitle(row, "auto", detail)
+
+    if done.get("bleed"):
+        auto("1", "Bleed was set to 5 mm on the press file.")
+        auto("6e", "The bleed perimeter was filled on the press file.")
+    if done.get("cmyk"):
+        auto("2", "The press file was converted to CMYK.")
+    if done.get("flattened"):
+        auto("6", "Transparency was flattened for press.")
+    if done.get("scaled"):
+        auto("6d", "The artwork was scaled and centred to the print size.")
+    if done.get("black"):
+        auto("2b", "Black was rewritten before rasterising. Text under 18 pt and items under 56 pt are K-only. Above 70% is rich black C40 M30 Y30 K100 with knockout. 30–69% overprints. 5–29% knocks out. Ink over 300% is capped at that rich black.")
+        auto("6f", "Text under 18 pt was set to K-only before rasterising.")
+    if done.get("hair"):
+        auto("2h", "Strokes under 0.25 pt were raised to 0.3 pt before rasterising.")
+    if done.get("spots"):
+        row = by_num.get("16")
+        if row and row.get("status") == "warning" and "Spot" in str(row.get("detail") or ""):
+            by_num["16"] = _retitle(row, "auto", "Spot colours were converted to CMYK before rasterising.")
+    dpi = str(done.get("dpi") or "")
+    if dpi == "upscaled":
+        auto("3", str(done.get("dpiDetail") or "The picture was enlarged toward 300 ppi, and not by more than 4×."))
+        auto("3b", "Upscale ran at no more than 4×.")
+    elif dpi == "capped":
+        for num, detail in (
+            ("3", str(done.get("dpiDetail") or "Upscale stopped at 4× and the picture is still under 300 ppi.")),
+            ("3b", "Upscale stopped at 4× and is still under 300 ppi."),
+        ):
+            row = by_num.get(num)
+            if row and row.get("status") in ("warning", "failed"):
+                by_num[num] = _retitle(row, "warning", detail)
+    elif dpi == "under":
+        for num, detail in (
+            ("3", str(done.get("dpiDetail") or "Under 75 ppi, so the picture was not enhanced.")),
+            ("3b", "Under 75 ppi, so enhancement was not run."),
+        ):
+            row = by_num.get(num)
+            if row and row.get("status") in ("warning", "failed", "passed"):
+                by_num[num] = _retitle(row, "warning", detail)
+    ordered = []
+    for num, _name in POINTS:
+        ordered.append(by_num.get(num) or _row(num, _name, "skipped", "This point did not run."))
+    return ordered
+
+
+def _promote_fixed(before: list, after: list) -> list:
+    """A point becomes auto-fixed only when the measured problem is gone."""
+    previous = {row["num"]: row for row in before}
+    promoted = []
+    notes = {
+        "2b": "Black was rewritten before rasterising. Text under 18 pt and items under 56 pt are K-only. Above 70% is rich black C40 M30 Y30 K100 with knockout. 30–69% overprints. 5–29% knocks out. Ink over 300% is capped at that rich black.",
+        "6f": "Text under 18 pt was set to K-only before rasterising.",
+        "2h": "Strokes under 0.25 pt were raised to 0.3 pt before rasterising.",
+        "3": "Pictures between 75 and 299 ppi were enlarged, and not by more than 4×.",
+        "3b": "Upscale ran at no more than 4×.",
+    }
+    for row in after:
+        prev = previous.get(row["num"]) or row
+        if row["num"] == "4" and prev.get("status") == "failed":
+            promoted.append(dict(prev))
+            continue
+        if prev.get("status") in ("warning", "failed") and row.get("status") == "passed" and row["num"] in notes:
+            promoted.append(_retitle(row, "auto", notes[row["num"]]))
+            continue
+        if row["num"] == "16" and prev.get("status") == "warning" and "Spot" in str(prev.get("detail") or "") and "Spot" not in str(row.get("detail") or ""):
+            promoted.append(_retitle(row, "auto", "Spot colours were converted to CMYK before rasterising. " + str(row.get("detail") or "")))
+            continue
+        promoted.append(row)
+    return promoted
+
+
+def run_checklist(path: str, trim_w: float | None = None, trim_h: float | None = None, apply: bool = True, press_done: bool = False) -> dict:
+    """Run the 25 points. Fixes that rewrite vectors run on a copy, before any raster."""
+    import shutil
+    import tempfile
+
+    before = assess(path, trim_w, trim_h)
+    checks = before["checks"]
+    fixed_path = ""
+    if apply and os.path.isfile(path) and str(path).lower().endswith(".pdf"):
+        folder = tempfile.mkdtemp(prefix="points-")
+        fixed_path = os.path.join(folder, "fixed.pdf")
+        shutil.copyfile(path, fixed_path)
+        try:
+            from client_file_audit import apply_vector_fixes, repair_cmyk_images, upscale_soft_images
+
+            apply_vector_fixes(fixed_path, fixed_path)
+            repair_cmyk_images(fixed_path)
+            upscale_soft_images(fixed_path)
+            after = assess(fixed_path, trim_w, trim_h)
+            checks = _promote_fixed(before["checks"], after["checks"])
+        except Exception:
+            checks = before["checks"]
+            fixed_path = ""
+    if press_done:
+        checks = settle_checks(checks, {"bleed": True, "cmyk": True, "flattened": True})
+    derived = light_from_checks(checks)
+    return {
+        "success": True,
+        "checks": checks,
+        "pages": before.get("pages") or 0,
+        "light": derived["light"],
+        "reasons": derived["reasons"],
+        "clientMessage": derived["clientMessage"],
+        "fixedPath": fixed_path,
+    }
+
+
 def main() -> None:
     import argparse
 
@@ -375,8 +537,13 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--trim-w", type=float, default=0)
     parser.add_argument("--trim-h", type=float, default=0)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--press-done", action="store_true")
     args = parser.parse_args()
-    report = assess(args.input, args.trim_w or None, args.trim_h or None)
+    if args.apply or args.press_done:
+        report = run_checklist(args.input, args.trim_w or None, args.trim_h or None, apply=bool(args.apply), press_done=bool(args.press_done))
+    else:
+        report = assess(args.input, args.trim_w or None, args.trim_h or None)
     print(json.dumps(report))
 
 

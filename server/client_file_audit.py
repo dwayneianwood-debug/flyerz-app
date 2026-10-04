@@ -19,6 +19,7 @@ import shutil
 import subprocess
 
 HAIRLINE_PT = 0.25
+HAIRLINE_TARGET_PT = 0.30
 SMALL_TEXT_PT = 18.0
 LARGE_PT = 56.0
 TAC_LIMIT = 3.0
@@ -259,7 +260,7 @@ def _process_tokens(
                     found["minStroke"] = width
                 if rewrite and width < HAIRLINE_PT - 1e-4:
                     scale = _scale(ctm) or 1.0
-                    stack = stack[:-1] + [f"{(HAIRLINE_PT / scale):.4f}"]
+                    stack = stack[:-1] + [f"{(HAIRLINE_TARGET_PT / scale):.4f}"]
                     changed = True
         elif op == "BT":
             in_text = True
@@ -1009,7 +1010,7 @@ def combined_client_message(audit: dict, extra: list[str] | None = None) -> str:
     if hair.get("checked") and int(hair.get("count") or 0) > 0:
         parts.append(
             f"Thin lines under {HAIRLINE_PT:.2f} pt were found ({int(hair['count'])}). "
-            f"They are raised to {HAIRLINE_PT:.2f} pt in the press file."
+            f"They are raised to {HAIRLINE_TARGET_PT:.2f} pt in the press file."
         )
     black = audit.get("black") or {}
     if black.get("checked") and (black.get("registration") or black.get("tacOver") or black.get("richSmallText") or black.get("largeKOnly")):
@@ -1186,6 +1187,86 @@ def _repair_array(arr, dpi: float) -> bool:
             arr[mask] = rich
         changed = True
     return changed
+
+
+def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.85) -> dict:
+    """Enlarge embedded pictures of 75–299 ppi by at most 4×. Under 75 ppi is left alone. A full-page plate is left alone so a kept bleed is not resampled."""
+    import pymupdf as fitz
+    from PIL import Image
+    import io
+    import numpy as np
+
+    result = {"changed": 0, "skippedLow": 0, "skippedFull": 0}
+    if not str(path).lower().endswith(".pdf"):
+        return result
+    doc = fitz.open(path)
+    try:
+        seen = set()
+        replaced = False
+        for page in doc:
+            page_area = abs(float(page.rect.width) * float(page.rect.height)) or 1.0
+            for info in page.get_image_info(xrefs=True) or []:
+                xref = int(info.get("xref") or 0)
+                if xref <= 0 or xref in seen:
+                    continue
+                seen.add(xref)
+                bbox = info.get("bbox") or (0, 0, 0, 0)
+                if len(bbox) < 4:
+                    continue
+                area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
+                if area / page_area >= full_page:
+                    result["skippedFull"] += 1
+                    continue
+                width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
+                height_in = max(0.01, (float(bbox[3]) - float(bbox[1])) / 72.0)
+                px_w = float(info.get("width") or 0)
+                px_h = float(info.get("height") or 0)
+                if px_w < 2 or px_h < 2:
+                    continue
+                ppi = min(px_w / width_in, px_h / height_in)
+                if ppi >= 299:
+                    continue
+                if ppi < DPI_FLOOR:
+                    result["skippedLow"] += 1
+                    continue
+                factor = min(float(max_scale), 300.0 / max(ppi, 1.0))
+                if factor < 1.05:
+                    continue
+                if px_w * px_h * factor * factor > 20_000_000:
+                    factor = min(factor, (20_000_000 / max(px_w * px_h, 1.0)) ** 0.5)
+                    if factor < 1.05:
+                        continue
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    samples = np.frombuffer(pix.samples, dtype=np.uint8)
+                    if pix.n == 4 and pix.alpha == 0:
+                        mode = "CMYK"
+                        arr = samples.reshape(pix.h, pix.w, 4)
+                    elif pix.n >= 3:
+                        mode = "RGB"
+                        arr = samples.reshape(pix.h, pix.w, pix.n)[:, :, :3]
+                    else:
+                        continue
+                    new_w = max(1, int(round(pix.w * factor)))
+                    new_h = max(1, int(round(pix.h * factor)))
+                    if max(new_w / pix.w, new_h / pix.h) > float(max_scale) + 0.01:
+                        continue
+                    image = Image.fromarray(arr, mode=mode)
+                    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    payload = io.BytesIO()
+                    image.save(payload, format="PNG")
+                    page.replace_image(xref, stream=payload.getvalue())
+                    result["changed"] += 1
+                    replaced = True
+                except Exception:
+                    continue
+        if replaced:
+            tmp = path + ".upscale.pdf"
+            doc.save(tmp, garbage=4, deflate=True)
+            os.replace(tmp, path)
+    finally:
+        doc.close()
+    return result
 
 
 def prepare_original(src: str, dest: str | None = None) -> dict:

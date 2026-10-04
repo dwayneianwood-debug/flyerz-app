@@ -26,7 +26,7 @@ ACTION_LABELS = {
     "extend-bleed": "Extend the bleed to 5 mm",
     "convert-cmyk": "Convert to CMYK",
     "fix-black": "Fix the black",
-    "thicken-hairlines": "Thicken hairlines to 0.25 pt",
+    "thicken-hairlines": "Thicken hairlines to 0.3 pt",
     "change-size": "Change the size or orientation",
     "print-ready": "Run Print-ready",
     "client-message": "Write the client message",
@@ -78,7 +78,7 @@ def _sentence(check_id: str, audit: dict, extra: dict) -> str | None:
         count = int(hair.get("count") or 0)
         if count <= 0:
             return "Strokes were checked. None are under 0.25 pt."
-        return f"There are {count} hairlines under 0.25 pt. I can thicken them to 0.25 pt."
+        return f"There are {count} hairlines under 0.25 pt. I can thicken them to 0.3 pt."
     if check_id == "black":
         black = audit.get("black") or {}
         if not black.get("checked"):
@@ -197,9 +197,11 @@ def _polish(reply: str) -> str:
     key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     url = gemini_generate_content_url(key)
     prompt = (
-        "Rephrase this prepress note in plain English. Keep every fact. "
+        "You are Glitchy. Your only rulebook is Ian's 25-point prepress check, and the note below is the result for this job. "
+        "Rephrase it in plain English. Keep every point and every fact. "
         "Do not add a check, a measurement, or a result that is not already in the note. "
-        "Do not say a check passed if the note does not say it ran.\n\n"
+        "Do not say a point passed if the note does not say it passed or was auto-fixed. "
+        "If the key cannot answer, the note itself is the reply.\n\n"
         + reply
     )
     body = json.dumps({
@@ -336,6 +338,54 @@ def _qr(path: str) -> dict:
     return {"ran": True, "ok": True, "detail": "The QR code reads: " + found[0]}
 
 
+def actions_for_checks(checks: list) -> list[dict]:
+    by_num = {row.get("num"): row for row in checks}
+
+    def status(num: str) -> str:
+        return str((by_num.get(num) or {}).get("status") or "")
+
+    actions = []
+
+    def add(action_id: str) -> None:
+        if any(item["id"] == action_id for item in actions):
+            return
+        if action_id not in ACTION_LABELS:
+            return
+        actions.append({"id": action_id, "label": ACTION_LABELS[action_id]})
+
+    if status("1") in ("warning", "failed") or status("6e") in ("warning", "failed"):
+        add("add-bleed")
+    if status("2") in ("warning", "failed") or "Spot" in str((by_num.get("16") or {}).get("detail") or ""):
+        add("convert-cmyk")
+    if status("2b") in ("warning", "failed") or status("6f") in ("warning", "failed"):
+        add("fix-black")
+    if status("2h") in ("warning", "failed"):
+        add("thicken-hairlines")
+    if status("6d") in ("warning", "failed"):
+        add("change-size")
+    add("print-ready")
+    add("client-message")
+    add("download")
+    return actions
+
+
+def reply_from_checks(checks: list) -> tuple[str, list[dict]]:
+    lines = ["I ran Ian's 25-point prepress check on this file."]
+    for row in checks:
+        lines.append(f"{row.get('num')}. {row.get('name')}: {row.get('status')}. {row.get('detail')}")
+    actions = actions_for_checks(checks)
+    if actions:
+        labels = ", ".join(item["label"] for item in actions)
+        lines.append("I can do these: " + labels + ". Tell me which, or press a button.")
+    failed = [row for row in checks if row.get("status") == "failed"]
+    if failed:
+        named = "; ".join(f"{row.get('num')} {row.get('name')}" for row in failed)
+        lines.append("Failed items for the client: " + named + ".")
+    reply = " ".join(lines)
+    polished = _polish(reply)
+    return polished or reply, actions
+
+
 def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None = None, client: str = "") -> dict:
     from house_rules import menu_rule, rich_black_for, size_for
 
@@ -343,14 +393,17 @@ def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None
     sized = size_for(client) if client else None
     if sized and not trim_w:
         trim_w, trim_h = sized[0], sized[1]
+    from twenty_five import assess as assess_points
+
     audit = audit_pdf(path, trim_w, trim_h)
+    points = assess_points(path, trim_w, trim_h)
     extra = {
         "size": _size_check(path, trim_w, trim_h),
         "bleed": _bleed_check(path, client),
         "textCut": _text_cut(path, trim_w, trim_h),
         "qr": _qr(path),
     }
-    reply, actions = reply_from_audit(audit, extra)
+    reply, actions = reply_from_checks(points.get("checks") or [])
     notes = []
     if sized:
         notes.append(f"Applied rule: {sized[2]}")
@@ -364,24 +417,23 @@ def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None
             actions = [item for item in actions if item["id"] != "print-ready"]
     if notes:
         reply = reply + " " + " ".join(notes)
-    return {"audit": audit, "extra": extra, "reply": reply, "actions": actions, "provider": "gemini" if gemini_key_usable() else "rules", "client": client}
+    return {
+        "audit": audit,
+        "extra": extra,
+        "checks": points.get("checks") or [],
+        "reply": reply,
+        "actions": actions,
+        "provider": "gemini" if gemini_key_usable() else "rules",
+        "client": client,
+    }
 
 
 def client_message_text(path: str, trim_w: float | None, trim_h: float | None) -> str:
-    from client_file_audit import combined_client_message
+    from twenty_five import assess as assess_points
+    from twenty_five import light_from_checks
 
-    audit = audit_pdf(path, trim_w, trim_h)
-    extra_lines = []
-    cut = _text_cut(path, trim_w, trim_h)
-    if cut.get("ran") and not cut.get("ok"):
-        extra_lines.append(cut["detail"])
-    size = _size_check(path, trim_w, trim_h)
-    if size.get("ran") and not size.get("ok"):
-        extra_lines.append(size["detail"])
-    bleed = _bleed_check(path, guess_client(path))
-    if bleed.get("ran") and not bleed.get("ok"):
-        extra_lines.append(bleed["detail"])
-    note = combined_client_message(audit, extra_lines)
+    report = assess_points(path, trim_w, trim_h)
+    note = light_from_checks(report.get("checks") or []).get("clientMessage") or ""
     return note or "I checked the file. There is nothing I need the client to change."
 
 
@@ -563,6 +615,7 @@ def main() -> None:
         "reply": inspected["reply"],
         "actions": inspected["actions"],
         "provider": inspected["provider"],
+        "checks": inspected.get("checks") or [],
     })
 
 

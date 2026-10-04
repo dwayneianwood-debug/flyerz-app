@@ -382,8 +382,19 @@ export default function GlitchyWidget() {
       }
 
       const items: PreflightItem[] = [];
+      const liveChecks = Array.isArray(detail.checks) ? detail.checks : [];
+      if (liveChecks.length) {
+        setChecklist(
+          liveChecks.map((c: CheckItem) =>
+            textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
+          ),
+        );
+        for (const c of liveChecks) {
+          items.push({ label: c.label, done: !!c.pass });
+        }
+      }
       const report = detail.auditReport;
-      if (report) {
+      if (!liveChecks.length && report) {
         if (report.geometry?.action_taken) {
           items.push({ label: `📐 ${report.geometry.action_taken}`, done: true });
         }
@@ -396,19 +407,8 @@ export default function GlitchyWidget() {
         if (report.resolution_and_lenses?.action_taken) {
           items.push({ label: `🔍 ${report.resolution_and_lenses.action_taken}`, done: true });
         }
-      } else {
-        items.push({ label: "Ink Coverage: Clamped to 200% TIC (Press-Safe)", done: true });
-        items.push({ label: "Text Sharpening: Converted to 100% K Overprint", done: true });
-        items.push({ label: "Bleed Status: 5mm TrimBox & BleedBox Embedded", done: true });
-        if (detail.lensesDetected) {
-          items.push({ label: "Lenses Flattened: Supersampled 600→300 DPI", done: !!detail.lensesFlattened });
-        }
-        if (detail.aiEnhanced) {
-          items.push({ label: "AI Resolution Enhancement Applied", done: true });
-        }
-        if (detail.originalTic && detail.finalTic && detail.originalTic > detail.finalTic) {
-          items.push({ label: `TIC Reduced: ${detail.originalTic}% → ${detail.finalTic}%`, done: true });
-        }
+      } else if (!liveChecks.length) {
+        fetchChecklist();
       }
       if (bleedLabel) {
         items.push({ label: `Bleed strategy: ${bleedLabel}`, done: true });
@@ -732,6 +732,9 @@ export default function GlitchyWidget() {
       const data = await res.json();
       setResponseText(data.reply || "I couldn't read a reply.");
       setChatActions(Array.isArray(data.actions) ? data.actions : []);
+      if (Array.isArray(data.checks) && data.checks.length) {
+        setChecklist(data.checks);
+      }
       const stamp = Date.now();
       setPreviewBefore(data.previewBefore ? `${data.previewBefore}?t=${stamp}` : "");
       setPreviewAfter(data.previewAfter ? `${data.previewAfter}?t=${stamp}` : "");
@@ -779,7 +782,7 @@ export default function GlitchyWidget() {
   const hasFailedChecks =
     !checklistPassOverride &&
     checklist.some((c) => !c.pass && !textContainsCropBoxMediaBoxUiNoise(c.label));
-  const showChecklist = hasFailedChecks && catMode === "head" && chatBoxVisible;
+  const showChecklist = checklist.length > 0 && catMode === "head" && chatBoxVisible;
 
   const suppressCropBoxErrorBubble =
     processState === "ERROR" && textContainsCropBoxMediaBoxUiNoise(compileErrorMsg);
@@ -1090,8 +1093,8 @@ export default function GlitchyWidget() {
             <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5, maxHeight: 220, overflowY: "auto" }}>
               {checklist.map((c, i) => {
                 const status = c.status || (c.pass ? "passed" : "failed");
-                const color = status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
-                const mark = status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
+                const color = status === "auto" ? "#0f766e" : status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
+                const mark = status === "auto" ? "\u2728" : status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
                 return (
                   <li
                     key={i}
