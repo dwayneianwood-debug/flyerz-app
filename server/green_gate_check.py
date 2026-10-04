@@ -95,10 +95,17 @@ def test_sharpen_keeps_the_hole() -> None:
     # The fringe of that ink is the hole. Source DPI under 300 forces a sharpen.
     placed = {"scale_mm": 25.4 / 180.0, "art_box": (0, 0, 120, 80)}
     upgraded, note = _upgrade_raster(plate, drawn, placed, plate)
-    check("sharpen-note", "lanczos" in note.lower() or "esrgan" in note.lower(), note)
+    check("sharpen-note", note == "The picture was enlarged with Lanczos.", note)
+    check("sharpen-plate", np.array_equal(upgraded, hole))
+    from ai_upscale import PlateUpscale
     from vector_trace import _paint_protect
 
+    ready = PlateUpscale(plate, 148, 210)
+    ready._done.set()
+    ready.image = np.full(plate.shape, (0, 180, 40), np.uint8)
+    upgraded, note = _upgrade_raster(plate, drawn, placed, plate, ready)
     protect = _paint_protect(plate, drawn)
+    check("sharpen-esrgan-note", "Real-ESRGAN" in note, note)
     check("sharpen-hole", np.array_equal(upgraded[protect > 0], hole[protect > 0]))
     check("sharpen-photo", not np.array_equal(upgraded[protect == 0], plate[protect == 0]))
 
@@ -350,13 +357,17 @@ def test_picture_upscale_message() -> None:
     missed._done.set()
     _upgraded, note = _upgrade_raster(plate, [], placed, plate, missed)
     line = _enlarge_line("Lanczos", note)
+    from vector_trace import _named_provider
+
     check("picture-one-lanczos", line == LANCZOS_MESSAGE and "was not used" not in line, line)
+    check("provider-lanczos", _named_provider(note) == "Lanczos" and "Lanczos" in line, line)
     ready = PlateUpscale(plate, 148, 210)
     ready._done.set()
     ready.image = np.full((30, 40, 3), (0, 180, 0), np.uint8)
     _upgraded, note = _upgrade_raster(plate, [], placed, plate, ready)
-    line = _enlarge_line("Lanczos", note)
+    line = _enlarge_line("Real-ESRGAN", note)
     check("picture-one-esrgan", line == ESRGAN_MESSAGE and "Lanczos" not in line, line)
+    check("provider-esrgan", _named_provider(note) == "Real-ESRGAN" and "Real-ESRGAN" in line, line)
 
 
 def test_esrgan_only_with_token() -> None:

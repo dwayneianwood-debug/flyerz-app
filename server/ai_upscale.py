@@ -385,7 +385,14 @@ class PlateUpscale:
 
 
 def start_plate_upscale(bgr: np.ndarray, trim_w: float, trim_h: float, runner=None):
-    """Begin Real-ESRGAN when this picture still needs print resolution. Otherwise None."""
+    """Begin Real-ESRGAN only when VECTOR_ESRGAN is on and the picture is still soft.
+
+    The setting stays off. A token on its own does not call Replicate.
+    """
+    from host_paths import esrgan_enabled
+
+    if not esrgan_enabled():
+        return None
     if bgr is None or getattr(bgr, "size", 0) == 0:
         return None
     if (os.environ.get("VECTOR_SKIP_ESRGAN") or "").strip().lower() in ("1", "on", "true", "yes"):
@@ -405,13 +412,16 @@ def start_plate_upscale(bgr: np.ndarray, trim_w: float, trim_h: float, runner=No
 
 
 def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.ndarray]:
-    """Real-ESRGAN of the whole picture when a Replicate token is set.
+    """Real-ESRGAN of the whole picture when VECTOR_ESRGAN is on and a token is set.
 
-    No token returns None, and the caller may sharpen with Lanczos.
-    A token always attempts the model. A failed call also returns None;
-    the caller must not pretend that was a Lanczos upscale.
+    The setting stays off, so this does not call Replicate during a normal job.
+    No token returns None. A failed call also returns None.
     The frame is not cover-cropped. The caller fits it onto the press plate.
     """
+    from host_paths import esrgan_enabled
+
+    if not esrgan_enabled():
+        return None
     if bgr is None or bgr.size == 0:
         return None
     if (os.environ.get("VECTOR_SKIP_ESRGAN") or "").strip().lower() in ("1", "on", "true", "yes"):

@@ -9,6 +9,17 @@ import { storage } from "./storage";
 import { jobProgressPath, writeJobProgress } from "./jobProgress";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
+const PRESS_LOG_TAG = /^\[[A-Za-z][A-Za-z0-9_-]*\]/;
+
+/** Python lines such as [AI-UPSCALE] and [vector-trace], without the text-gate body. */
+export function pressLogLines(stderr: string): string[] {
+  const lines: string[] = [];
+  for (const row of String(stderr || "").split(/\r?\n/)) {
+    const line = row.trim();
+    if (PRESS_LOG_TAG.test(line)) lines.push(line);
+  }
+  return lines;
+}
 const SCRIPT = path.join(process.cwd(), "server", "quick_print.py");
 
 export interface QuickRunOptions {
@@ -186,6 +197,9 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
         }));
         if (stderr.trim()) console.error(`[QUICK-PRINT] ${stderr.trim().slice(0, 500)}`);
         return;
+      }
+      for (const line of pressLogLines(stderr)) {
+        console.error(`[QUICK-PRINT] ${line.slice(0, 500)}`);
       }
       resolve(asResult(parsed));
     });

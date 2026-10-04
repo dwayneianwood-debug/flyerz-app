@@ -332,6 +332,28 @@ def test_press_upscale_stays_inside_the_job() -> None:
 
     sharp = np.full((1200, 2000, 3), 10, np.uint8)
     check("sharp-skips", start_plate_upscale(sharp, 90, 50, runner=slow) is None)
+    called = {}
+
+    def marker(upload_bgr, scale, _deadline):
+        called["hit"] = True
+        return None, "failed", "should-not-run"
+
+    soft = np.zeros((400, 300, 3), np.uint8)
+    saved_flag = os.environ.pop("VECTOR_ESRGAN", None)
+    try:
+        idle = start_plate_upscale(soft, 148, 210, runner=marker)
+        check("esrgan-off-no-start", idle is None and "hit" not in called)
+        os.environ["VECTOR_ESRGAN"] = "1"
+        started = start_plate_upscale(soft, 148, 210, runner=marker)
+        check("esrgan-on-starts", started is not None)
+        if started is not None:
+            started.cancel()
+            started._done.wait(2)
+    finally:
+        if saved_flag is None:
+            os.environ.pop("VECTOR_ESRGAN", None)
+        else:
+            os.environ["VECTOR_ESRGAN"] = saved_flag
 
     seen_headers = {}
 

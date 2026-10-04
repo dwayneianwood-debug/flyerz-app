@@ -1679,6 +1679,42 @@ def test_column_style_follows_the_majority() -> None:
     check("distant-row-stays", far_kept == ["Other column"], str(far_kept))
 
 
+def test_even_odd_fill_cache_and_parallel_score() -> None:
+    """A counter stays open, a repeat hits the cache, and the process pool agrees."""
+    import vector_trace as vt
+
+    ring = [[
+        [("M", [(10.0, 10.0)]), ("L", [(80.0, 10.0)]), ("L", [(80.0, 80.0)]), ("L", [(10.0, 80.0)]), ("Z", [])],
+        [("M", [(30.0, 30.0)]), ("L", [(60.0, 30.0)]), ("L", [(60.0, 60.0)]), ("L", [(30.0, 60.0)]), ("Z", [])],
+    ]]
+    vt._raster_cache.clear()
+    vt._raster_order.clear()
+    painted = vt.rasterise_paths(ring, 400, 220)
+    again = vt.rasterise_paths(ring, 400, 220)
+    check("raster-cache", np.array_equal(painted, again) and vt._raster_cache)
+    check("raster-ring", int(painted[20, 20]) == 255, str(int(painted[20, 20])))
+    check("raster-hole", int(painted[45, 45]) == 0, str(int(painted[45, 45])))
+    check("raster-paper", int(painted[2, 2]) == 0)
+    item = {
+        "mask": np.zeros((8, 8), np.uint8),
+        "text": "Hi",
+        "crop": np.zeros((8, 8, 3), np.uint8),
+        "inner": (0, 0, 8, 8),
+        "colour": (0, 0, 0),
+    }
+    pairs = [(item, []) for _ in range(4)]
+    serial = [row.get("reason") for row in (vt._judge_pending(left, right, 600.0) for left, right in pairs)]
+    parallel = [row.get("reason") for row in vt._judge_many(pairs, 600.0)]
+    check("parallel-score", serial == parallel, str(parallel))
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    payloads = [(item, [], 600.0) for item, _paths in pairs]
+    with ctx.Pool(processes=2) as pool:
+        spawned = [row.get("reason") for row in pool.map(vt._judge_payload, payloads)]
+    check("spawn-score", serial == spawned, str(spawned))
+
+
 def main() -> None:
     test_segment_dark_light_and_fills()
     test_trace_matches_the_ink()
@@ -1703,6 +1739,7 @@ def main() -> None:
     test_comma_decimal_matches_the_dot_trace()
     test_env_report_names_the_stack()
     test_one_potrace_covers_the_page()
+    test_even_odd_fill_cache_and_parallel_score()
     test_gate_image_keeps_a_word_whole()
     test_column_style_follows_the_majority()
     test_paths_and_local_plate()

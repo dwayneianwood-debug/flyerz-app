@@ -10,10 +10,12 @@ when a second word-by-word read agrees and a bundled face matches the ink.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -33,6 +35,12 @@ PAD_FRAC = 0.14
 # above it, so the trace crop has to be taller than the box OCR returned.
 ABOVE_FRAC = 0.25
 BELOW_FRAC = 0.35
+
+_spawn_lock = threading.Lock()
+_JUDGE_PAIRS = []
+_JUDGE_PPI = 0.0
+_raster_cache: dict = {}
+_raster_order: list = []
 
 _NUM = r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"
 _TOKEN = re.compile(rf"[MmLlHhVvCcZz]|{_NUM}")
@@ -1395,25 +1403,73 @@ def _topology_fails(crop: np.ndarray, painted: np.ndarray, ppi: float = 400.0) -
     return False
 
 
+def _raster_key(paths, width: int, height: int) -> bytes:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(int(width).to_bytes(4, "little", signed=True))
+    digest.update(int(height).to_bytes(4, "little", signed=True))
+    for group in paths:
+        for sub in group:
+            for cmd, pts in sub:
+                digest.update(cmd.encode("ascii"))
+                for x, y in pts:
+                    digest.update(f"{x:.3f},{y:.3f};".encode("ascii"))
+    return digest.digest()
+
+
+def _remember_raster(key: bytes, canvas: np.ndarray) -> None:
+    if key in _raster_cache:
+        return
+    _raster_cache[key] = canvas
+    _raster_order.append(key)
+    while len(_raster_order) > 24:
+        _raster_cache.pop(_raster_order.pop(0), None)
+
+
 def rasterise_paths(paths: list, width: int, height: int) -> np.ndarray:
-    """Fill the traced paths onto a binary mask the size of the crop."""
+    """Fill the traced paths onto a binary mask the size of the crop.
+
+    A repeated crop reuses the mask. The painter is the same even-odd fill as before.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if not paths:
+        return np.zeros((height, width), np.uint8)
+    key = None
+    if width * height >= 80000:
+        key = _raster_key(paths, width, height)
+        cached = _raster_cache.get(key)
+        if cached is not None and cached.shape == (height, width):
+            return cached.copy()
+    canvas = _rasterise_with_page(paths, width, height)
+    if key is not None:
+        _remember_raster(key, canvas.copy())
+    return canvas
+
+
+def _rasterise_with_page(paths, width: int, height: int) -> np.ndarray:
+    """Even-odd fill of the curves. One content stream, not a Python call per curve."""
     import pymupdf as fitz
 
-    canvas = np.zeros((max(1, height), max(1, width)), np.uint8)
-    if not paths:
-        return canvas
+    canvas = np.zeros((height, width), np.uint8)
     doc = fitz.open()
     try:
-        page = doc.new_page(width=max(1, width), height=max(1, height))
-        _paint_paths(page, paths, (0.0, 0.0, 0.0, 1.0), 1.0, 1.0, 0.0, 0.0)
+        page = doc.new_page(width=width, height=height)
+        page.clean_contents()
+        chunks = ["q\n0 g\n"]
+        used = _append_pdf_paths(chunks, paths, 1.0, 1.0, 0.0, 0.0, float(page.rect.height))
+        chunks.append("f*\nQ\n" if used else "Q\n")
+        xrefs = page.get_contents()
+        if len(xrefs) == 1 and used:
+            page.parent.update_stream(xrefs[0], page.read_contents() + b"\n" + "".join(chunks).encode("ascii"))
+        elif used:
+            _paint_paths(page, paths, (0.0, 0.0, 0.0, 1.0), 1.0, 1.0, 0.0, 0.0)
         pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
     finally:
         doc.close()
-    fitted = gray
-    if fitted.shape[0] != height or fitted.shape[1] != width:
-        fitted = cv2.resize(fitted, (width, height), interpolation=cv2.INTER_AREA)
-    canvas[fitted < 200] = 255
+    if gray.shape[0] != height or gray.shape[1] != width:
+        gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
+    canvas[gray < 200] = 255
     return canvas
 
 
@@ -1933,6 +1989,33 @@ def _repair_source(plate, pristine, drawn, raster_lines, raster_boxes, art_box) 
     return kept, not bool(_source_leaks(plate, pristine, kept, art_box).any())
 
 
+def _already_picture(pending: list, raster_boxes: list) -> set:
+    """Lines a uniform column would put back even if every trace matched.
+
+    They are not traced. The column still sees the picture lines that caused it.
+    """
+    if not pending or not raster_boxes:
+        return set()
+    synthetic = []
+    for item in pending:
+        core = item.get("core")
+        rect = core or (
+            int(item["left"]),
+            int(item["top"]),
+            int(item["right"]) - int(item["left"]),
+            int(item["bottom"]) - int(item["top"]),
+        )
+        synthetic.append({
+            "text": item.get("text") or "",
+            "rect": rect,
+            "core": core or rect,
+            "style": item.get("style"),
+        })
+    kept = _keep_uniform(synthetic, [], list(raster_boxes))
+    alive = {id(item) for item in kept}
+    return {index for index, item in enumerate(synthetic) if id(item) not in alive}
+
+
 def _keep_uniform(drawn: list, raster_lines: list, raster_boxes: list) -> list:
     """A line is all vector or all raster.
 
@@ -2192,6 +2275,77 @@ def _separate_line(job: dict) -> dict:
     }}
 
 
+def _judge_pending(item: dict, paths: list, plate_ppi: float) -> dict:
+    """Accept or reject one traced line. The picture decision is unchanged."""
+    mask = item["mask"]
+    if not paths:
+        return {
+            "raster": True,
+            "reason": "The trace was empty, so this box stayed in the picture.",
+        }
+    score, accepted, painted = _accept_trace(mask, paths)
+    if not accepted:
+        return {
+            "raster": True,
+            "reason": f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture.",
+        }
+    check_crop = _hide_foreign_ink(item["crop"], mask)
+    reason = shape_gate(check_crop, mask, painted, item["inner"])
+    if reason:
+        return {"raster": True, "reason": reason}
+    if _topology_fails(check_crop, painted, plate_ppi):
+        return {
+            "raster": True,
+            "reason": "A letter lost its tail or its counter, so this line stayed in the picture.",
+        }
+    return {
+        "raster": False,
+        "score": score,
+        "painted": painted,
+        "fill": _trace_fill(item["colour"]),
+    }
+
+
+def _judge_index(index: int) -> dict:
+    item, paths = _JUDGE_PAIRS[index]
+    return _judge_pending(item, paths, _JUDGE_PPI)
+
+
+def _judge_payload(payload: tuple) -> dict:
+    """One region, with its crops passed in. Spawn cannot see the parent's memory."""
+    item, paths, plate_ppi = payload
+    return _judge_pending(item, paths, float(plate_ppi))
+
+
+def _judge_many(pairs: list, plate_ppi: float) -> list:
+    """Score every region at once. One process per core, because painting holds the lock.
+
+    Fork shares the crops. Windows has no fork, so a fresh process pool is
+    started instead. Threads do not overlap this paint. A pool that cannot
+    start scores in order.
+    """
+    if len(pairs) < 4 or _workers() <= 1:
+        return [_judge_pending(item, paths, plate_ppi) for item, paths in pairs]
+    workers = min(_workers(), len(pairs))
+    try:
+        import multiprocessing as mp
+
+        if sys.platform != "win32" and threading.active_count() <= 1:
+            global _JUDGE_PAIRS, _JUDGE_PPI
+            _JUDGE_PAIRS = pairs
+            _JUDGE_PPI = float(plate_ppi)
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=workers) as pool:
+                return pool.map(_judge_index, range(len(pairs)), chunksize=1)
+        ctx = mp.get_context("spawn")
+        payloads = [(item, paths, float(plate_ppi)) for item, paths in pairs]
+        with ctx.Pool(processes=workers) as pool:
+            return pool.map(_judge_payload, payloads, chunksize=max(1, len(payloads) // (workers * 2)))
+    except Exception as exc:
+        sys.stderr.write(f"[vector-trace] region pool fell back ({str(exc)[:160]})\n")
+        return [_judge_pending(item, paths, plate_ppi) for item, paths in pairs]
+
+
 def trace_fitted(
     bgr: np.ndarray,
     trim_w_mm: float,
@@ -2325,49 +2479,44 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         if separated.get("box") is not None:
             raster_boxes.append(separated["box"])
     harmonise_pending(pending)
+    # A paragraph already condemned by two picture lines stays a picture even
+    # when every remaining trace would pass. Those regions are not traced.
+    staying = _already_picture(pending, raster_boxes)
+    if staying:
+        kept_pending = []
+        for index, item in enumerate(pending):
+            if index not in staying:
+                kept_pending.append(item)
+                continue
+            raster_lines.append(_line(
+                item["text"], "raster",
+                "This line stayed in the picture so it would not be half traced.",
+            ))
+        pending = kept_pending
     traced = _trace_many([item["mask"] for item in pending])
-    for item, paths in zip(pending, traced):
+    judged = _judge_many(list(zip(pending, traced)), plate_ppi)
+    for item, paths, verdict in zip(pending, traced, judged):
         text = item["text"]
-        mask = item["mask"]
         left, top, right, bottom = item["left"], item["top"], item["right"], item["bottom"]
         core = item.get("core")
-        if not paths:
-            raster_lines.append(_line(text, "raster", "The trace was empty, so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
-            continue
-        score, accepted, painted = _accept_trace(mask, paths)
-        if not accepted:
-            raster_lines.append(_line(text, "raster", f"The trace did not match the ink ({score:.2f}), so this box stayed in the picture."))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
-            continue
-        check_crop = _hide_foreign_ink(item["crop"], mask)
-        reason = shape_gate(check_crop, mask, painted, item["inner"])
-        if reason:
-            raster_lines.append(_line(text, "raster", reason))
-            raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
-            continue
-        if _topology_fails(check_crop, painted, plate_ppi):
-            if os.environ.get("TOPO_DEBUG"):
+        if verdict.get("raster"):
+            if os.environ.get("TOPO_DEBUG") and "tail" in str(verdict.get("reason") or ""):
                 sys.stderr.write(f"[topo] line {text!r}\n")
-            raster_lines.append(_line(
-                text, "raster",
-                "A letter lost its tail or its counter, so this line stayed in the picture.",
-            ))
+            raster_lines.append(_line(text, "raster", verdict.get("reason") or "This box stayed in the picture."))
             raster_boxes.append(_raster_box(text, left, top, right, bottom, core, "paragraph", item.get("style")))
             continue
-        fill = _trace_fill(item["colour"])
         drawn.append({
             "text": text,
             "paths": paths,
-            "fill": fill,
+            "fill": verdict["fill"],
             "origin": (left, top),
-            "iou": round(score, 3),
+            "iou": round(float(verdict["score"]), 3),
             "rect": (left, top, right - left, bottom - top),
             "core": core,
-            "painted": painted,
+            "painted": verdict["painted"],
             "colour": item["colour"],
             "changed": bool(item.get("changed")),
-            "_mask": mask,
+            "_mask": item["mask"],
             "_clear": item.get("clear"),
             "style": item.get("style"),
         })
@@ -2412,6 +2561,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         retyped = []
     retype_s = time.perf_counter() - retype_started
     plate, sharpen_note = _upgrade_raster(plate, drawn, placed, bgr, upscale)
+    provider = _named_provider(sharpen_note, provider)
     qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyped)
     if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi") or (retyped and not qa.get("fonts")):
         from vector_text_v2 import _discard, _fail
@@ -4515,12 +4665,25 @@ def _stop_upscale(upscale) -> None:
         pass
 
 
+def _named_provider(note: str, fallback: str = "") -> str:
+    """The enlargement name inside the decision sentence."""
+    text = str(note or "")
+    if "Real-ESRGAN" in text:
+        return "Real-ESRGAN"
+    if "Lanczos" in text:
+        return "Lanczos"
+    name = str(fallback or "").strip()
+    if name in ("Real-ESRGAN", "Lanczos"):
+        return name
+    return "Lanczos"
+
+
 def _enlarge_line(provider: str, note: str) -> str:
     """One sentence for how the press picture was enlarged."""
     text = str(note or "").strip()
     if text:
         return text
-    name = str(provider or "").strip() or "Lanczos"
+    name = _named_provider("", provider)
     return f"The picture was enlarged with {name}."
 
 
@@ -4549,27 +4712,27 @@ def _upgrade_raster(plate, drawn, placed, source_bgr, upscale=None):
             return plate, ""
         art = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
         paste_x, paste_y, art_w, art_h = [int(v) for v in art]
-        remote = upscale.take() if upscale is not None else None
         from ai_upscale import ESRGAN_MESSAGE, LANCZOS_MESSAGE
 
+        # The plate is already one Lanczos resize. Real-ESRGAN is opt-in and,
+        # when it misses, the same plate is what prints. No second unsharp.
+        if upscale is None:
+            return plate, LANCZOS_MESSAGE
+        remote = upscale.take()
         choice = _upscale_choice("", remote)
-        if choice == "esrgan":
-            fitted = remote
-            if fitted.shape[1] != art_w or fitted.shape[0] != art_h:
-                fitted = cv2.resize(fitted, (max(1, art_w), max(1, art_h)), interpolation=cv2.INTER_LANCZOS4)
-            upgraded = plate.copy()
-            y1 = min(plate.shape[0], paste_y + fitted.shape[0])
-            x1 = min(plate.shape[1], paste_x + fitted.shape[1])
-            y0 = max(0, paste_y)
-            x0 = max(0, paste_x)
-            if y1 > y0 and x1 > x0:
-                upgraded[y0:y1, x0:x1] = fitted[y0 - paste_y:y0 - paste_y + (y1 - y0), x0 - paste_x:x0 - paste_x + (x1 - x0)]
-            note = ESRGAN_MESSAGE
-        else:
-            from ai_upscale import photo_unsharp
-
-            upgraded = photo_unsharp(plate)
-            note = LANCZOS_MESSAGE
+        if choice != "esrgan":
+            return plate, LANCZOS_MESSAGE
+        fitted = remote
+        if fitted.shape[1] != art_w or fitted.shape[0] != art_h:
+            fitted = cv2.resize(fitted, (max(1, art_w), max(1, art_h)), interpolation=cv2.INTER_LANCZOS4)
+        upgraded = plate.copy()
+        y1 = min(plate.shape[0], paste_y + fitted.shape[0])
+        x1 = min(plate.shape[1], paste_x + fitted.shape[1])
+        y0 = max(0, paste_y)
+        x0 = max(0, paste_x)
+        if y1 > y0 and x1 > x0:
+            upgraded[y0:y1, x0:x1] = fitted[y0 - paste_y:y0 - paste_y + (y1 - y0), x0 - paste_x:x0 - paste_x + (x1 - x0)]
+        note = ESRGAN_MESSAGE
         protect = _paint_protect(plate, drawn)
         if int(protect.max()) > 0:
             keep = protect > 0
@@ -4981,8 +5144,15 @@ def _potrace_placed(bitmaps: list) -> list:
         pixels += area
     if current:
         chunks.append(current)
-    for chunk in chunks:
-        _potrace_chunk(bitmaps, chunk, results)
+    if len(chunks) <= 1 or _workers() <= 1:
+        for chunk in chunks:
+            _potrace_chunk(bitmaps, chunk, results)
+        return results
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Potrace is a subprocess, so the chunks overlap. Each writes its own slots.
+    with ThreadPoolExecutor(max_workers=min(_workers(), len(chunks))) as pool:
+        list(pool.map(lambda chunk: _potrace_chunk(bitmaps, chunk, results), chunks))
     return results
 
 
@@ -5069,7 +5239,8 @@ def _potrace_svg(binary: np.ndarray) -> str:
 
 def _run_potrace(program: str, payload: bytes, alpha: str, opt: str, env: dict):
     global _spawn_count
-    _spawn_count += 1
+    with _spawn_lock:
+        _spawn_count += 1
     return subprocess.run(
         [
             program, "-s", "--flat",
