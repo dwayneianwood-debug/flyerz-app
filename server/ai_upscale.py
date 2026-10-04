@@ -15,6 +15,9 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
+import urllib.error
 from typing import Callable, Optional
 
 import cv2
@@ -129,6 +132,278 @@ def photo_unsharp(bgr: np.ndarray) -> np.ndarray:
     return np.clip(sharp, 0, 255).astype(np.uint8)
 
 
+# A 1600px upload does not come back inside a press job. Send the original
+# when its long side is already at or under this, otherwise this long side.
+# The model then scales 2 or 4, and the plate resizes that picture to the art.
+PRESS_UPLOAD_EDGE = 1024
+# After the rest of the job is done, wait this long for the prediction.
+PRESS_GRACE_S = 8.0
+# The wait also stops at this, measured from the moment the job loaded the picture.
+JOB_BUDGET_S = 35.0
+LANCZOS_MESSAGE = "The picture was enlarged with Lanczos."
+ESRGAN_MESSAGE = "The picture was enlarged with Real-ESRGAN."
+
+
+def log_replicate(status, error, token: str = "") -> None:
+    """Status and error only. The token is never written."""
+    detail = str(error or "").replace("\n", " ").strip()
+    secret = str(token or "").strip()
+    if secret and secret in detail:
+        detail = detail.replace(secret, "")
+    sys.stderr.write(
+        f"[AI-UPSCALE] replicate status={status or 'unknown'} error={detail[:240]}\n"
+    )
+
+
+def _press_upload(bgr: np.ndarray) -> np.ndarray:
+    """The original picture, or that picture brought down to a size the model can finish."""
+    height, width = bgr.shape[:2]
+    if max(height, width) <= PRESS_UPLOAD_EDGE:
+        return bgr
+    return _preview_bgr(bgr, PRESS_UPLOAD_EDGE)
+
+
+def _press_scale(upload: np.ndarray, target_long: float) -> int:
+    """2 or 4. A large upload stays at 2 so the model can return inside the job."""
+    long_edge = max(int(upload.shape[0]), int(upload.shape[1]), 1)
+    need = float(target_long) / float(long_edge)
+    if long_edge <= 512 and need > 2.0:
+        return 4
+    return 2
+
+
+def _plate_target_long(trim_w: float, trim_h: float) -> float:
+    from vector_plate import PRESS_PPI
+
+    long_mm = max(float(trim_w), float(trim_h)) + 2.0 * DEFAULT_BLEED_MM
+    return long_mm / 25.4 * float(PRESS_PPI)
+
+
+class PlateUpscale:
+    """Real-ESRGAN started with the file, polled until compose needs the plate."""
+
+    def __init__(self, bgr: np.ndarray, trim_w: float, trim_h: float, runner=None):
+        self.bgr = bgr
+        self.trim_w = float(trim_w)
+        self.trim_h = float(trim_h)
+        self.target_long = _plate_target_long(self.trim_w, self.trim_h)
+        self._runner = runner
+        self.image = None
+        self.status = ""
+        self.error = ""
+        self.scale = 2
+        self._token = ""
+        self._cancel_url = ""
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self.started = time.perf_counter()
+        self._wall_deadline = time.time() + JOB_BUDGET_S
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="press-esrgan", daemon=True)
+        self._thread.start()
+        return self
+
+    def take(self):
+        """The model picture, or None once the grace and the job budget are both spent."""
+        wait = self._grace()
+        if not self._done.wait(wait):
+            self.cancel()
+            if not self.status:
+                self.status = "deadline"
+                self.error = "not back before compose"
+            log_replicate(self.status, self.error, self._token)
+            return None
+        return self.image
+
+    def cancel(self) -> None:
+        self._stop.set()
+        url = self._cancel_url
+        token = self._token
+        if not url or not token:
+            return
+        try:
+            from ai_enhancements import _replicate_cancel
+
+            _replicate_cancel(url, token)
+        except Exception:
+            pass
+
+    def _grace(self) -> float:
+        now = time.perf_counter()
+        budget_left = JOB_BUDGET_S - (now - self.started)
+        return max(0.0, min(PRESS_GRACE_S, budget_left))
+
+    def _run(self) -> None:
+        try:
+            if self._runner is not None:
+                upload = _press_upload(self.bgr)
+                self.scale = _press_scale(upload, self.target_long)
+                image, status, error = self._runner(upload, self.scale, self._wall_deadline)
+                self.image = image if image is not None and getattr(image, "size", 0) else None
+                self.status = str(status or "")
+                self.error = str(error or "")
+                if self.image is None:
+                    log_replicate(self.status, self.error, self._token)
+                return
+            self._replicate()
+        except Exception as exc:
+            self.status = "error"
+            self.error = str(exc)[:240]
+            log_replicate(self.status, self.error, self._token)
+        finally:
+            self._done.set()
+
+    def _replicate(self) -> None:
+        from ai_enhancements import (
+            _download_to_ramdisk,
+            _get_replicate_token,
+            _replicate_create_prediction,
+            _replicate_poll_prediction,
+            _to_data_uri,
+        )
+
+        token = (_get_replicate_token() or "").strip()
+        self._token = token
+        if not token or self._stop.is_set():
+            self.status = "no-token"
+            return
+        upload = _press_upload(self.bgr)
+        self.scale = _press_scale(upload, self.target_long)
+        sys.stderr.write(
+            f"[AI-UPSCALE] replicate start model={UPSCALE_MODEL_ID} "
+            f"version={UPSCALE_MODEL_VERSION} scale={self.scale} "
+            f"upload={upload.shape[1]}x{upload.shape[0]}\n"
+        )
+        folder = tempfile.mkdtemp(prefix="press-esrgan-")
+        src = os.path.join(folder, "src.png")
+        _write_png(src, upload, dpi=72)
+        model_input = {
+            "image": _to_data_uri(src),
+            "scale": int(self.scale),
+            "face_enhance": False,
+        }
+        try:
+            prediction = _replicate_create_prediction(
+                UPSCALE_MODEL_OWNER,
+                UPSCALE_MODEL_NAME,
+                model_input,
+                token,
+                version=UPSCALE_MODEL_VERSION,
+                deadline=self._wall_deadline,
+                prefer_wait=False,
+            )
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:240]
+            except Exception:
+                body = ""
+            self.status = f"http-{exc.code}"
+            self.error = body or str(exc)[:240]
+            log_replicate(self.status, self.error, token)
+            return
+        except TimeoutError as exc:
+            self.status = "timeout"
+            self.error = str(exc)[:240]
+            log_replicate(self.status, self.error, token)
+            return
+        except Exception as exc:
+            self.status = "error"
+            self.error = str(exc)[:240]
+            log_replicate(self.status, self.error, token)
+            return
+        self._cancel_url = str((prediction.get("urls") or {}).get("cancel") or "")
+        status = str(prediction.get("status") or "")
+        if status == "succeeded":
+            self._accept(prediction, token)
+            return
+        if status in ("failed", "canceled"):
+            self.status = status
+            self.error = str(prediction.get("error") or "")
+            log_replicate(self.status, self.error, token)
+            return
+        poll_url = str((prediction.get("urls") or {}).get("get") or "")
+        if not poll_url:
+            self.status = status or "no-poll"
+            self.error = "The prediction had no poll URL."
+            log_replicate(self.status, self.error, token)
+            return
+        while time.time() < self._wall_deadline and not self._stop.is_set():
+            result = _replicate_poll_prediction(
+                poll_url, token, min(self._wall_deadline, time.time() + 2.5),
+            )
+            if self._stop.is_set():
+                break
+            if not result:
+                continue
+            status = str(result.get("status") or "")
+            if status == "succeeded":
+                self._accept(result, token)
+                return
+            if status in ("failed", "canceled"):
+                self.status = status
+                self.error = str(result.get("error") or "")
+                log_replicate(self.status, self.error, token)
+                return
+        if not self.status:
+            self.status = "deadline" if not self._stop.is_set() else "canceled"
+            self.error = self.error or "not back before compose"
+            log_replicate(self.status, self.error, token)
+
+    def _accept(self, prediction: dict, token: str) -> None:
+        from ai_enhancements import _download_to_ramdisk
+
+        output = prediction.get("output")
+        if isinstance(output, str):
+            output_url = output
+        elif isinstance(output, list) and output:
+            output_url = str(output[-1]) if isinstance(output[-1], str) else str(output[0])
+        else:
+            self.status = "bad-output"
+            self.error = f"Unexpected API output format: {type(output).__name__}"
+            log_replicate(self.status, self.error, token)
+            return
+        try:
+            out_path = _download_to_ramdisk(output_url, "_upscaled.png")
+        except Exception as exc:
+            self.status = "download"
+            self.error = str(exc)[:240]
+            log_replicate(self.status, self.error, token)
+            return
+        loaded = cv2.imread(out_path, cv2.IMREAD_COLOR)
+        if loaded is None or not loaded.size:
+            self.status = "empty"
+            self.error = "The model returned a file that could not be read."
+            log_replicate(self.status, self.error, token)
+            return
+        self.image = loaded
+        self.status = "succeeded"
+        self.error = ""
+        log_replicate(self.status, "", token)
+
+
+def start_plate_upscale(bgr: np.ndarray, trim_w: float, trim_h: float, runner=None):
+    """Begin Real-ESRGAN when this picture still needs print resolution. Otherwise None."""
+    if bgr is None or getattr(bgr, "size", 0) == 0:
+        return None
+    if (os.environ.get("VECTOR_SKIP_ESRGAN") or "").strip().lower() in ("1", "on", "true", "yes"):
+        return None
+    if runner is None:
+        try:
+            from ai_enhancements import _get_replicate_token
+
+            if not (_get_replicate_token() or "").strip():
+                return None
+        except Exception:
+            return None
+    height, width = bgr.shape[:2]
+    if effective_print_dpi(width, height, trim_w, trim_h, DEFAULT_BLEED_MM) >= 299:
+        return None
+    return PlateUpscale(bgr, trim_w, trim_h, runner=runner).start()
+
+
 def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.ndarray]:
     """Real-ESRGAN of the whole picture when a Replicate token is set.
 
@@ -168,9 +443,11 @@ def full_frame_esrgan(bgr: np.ndarray, timeout_s: float = 12.0) -> Optional[np.n
             version=UPSCALE_MODEL_VERSION,
             timeout_s=timeout_s,
         )
-    except Exception:
+    except Exception as exc:
+        log_replicate("error", str(exc)[:240], token)
         return None
     if error or not out_path or not os.path.exists(out_path):
+        log_replicate("failed", error or "no picture", token)
         return None
     loaded = cv2.imread(out_path, cv2.IMREAD_COLOR)
     return loaded if loaded is not None and loaded.size else None

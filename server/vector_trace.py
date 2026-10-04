@@ -2201,6 +2201,7 @@ def trace_fitted(
     progress=None,
     blocks: list | None = None,
     ocr_s: float | None = None,
+    upscale=None,
 ) -> dict:
     """Enlarge the picture and trace its lettering. Never raises."""
     from vector_text_v2 import _fail, _note
@@ -2209,18 +2210,26 @@ def trace_fitted(
     try:
         return _trace(
             bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
-            float(bleed_mm), progress, blocks, started, ocr_s,
+            float(bleed_mm), progress, blocks, started, ocr_s, upscale,
         )
     except Exception as exc:
         return _fail(started, f"Vector trace failed ({str(exc)[:160]}). The original lettering was kept.")
 
 
-def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started, ocr_already=None) -> dict:
+def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started, ocr_already=None, upscale=None) -> dict:
     from vector_plate import PRESS_PPI, place_plate
     from vector_text_v2 import MIN_PPI, _note, _rect, read_blocks
 
     global _spawn_count
     _spawn_count = 0
+    if upscale is None:
+        try:
+            from ai_upscale import start_plate_upscale
+
+            upscale = start_plate_upscale(bgr, trim_w, trim_h)
+        except Exception as exc:
+            sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
+            upscale = None
     _note(progress, "reading", "Reading the lettering.")
     ocr_started = time.perf_counter()
     if blocks is None:
@@ -2238,6 +2247,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         guide.append((rx, ry, rx + rw, ry + rh))
     if not guide:
         from vector_text_v2 import _fail
+
+        _stop_upscale(upscale)
         return _fail(started, "No lettering was found to trace, so the original picture was kept.")
 
     _note(progress, "enlarging", "Enlarging the picture.")
@@ -2377,6 +2388,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     trace_s = time.perf_counter() - trace_started
     if not drawn and not raster_lines:
         from vector_text_v2 import _fail
+
+        _stop_upscale(upscale)
         return _fail(started, "No lettering was traced, so the original picture was kept.", provider=provider)
 
     gate_started = time.perf_counter()
@@ -2398,7 +2411,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
         sys.stderr.write(f"[vector-retype] skipped ({str(exc)[:160]})\n")
         retyped = []
     retype_s = time.perf_counter() - retype_started
-    plate, sharpen_note = _upgrade_raster(plate, drawn, placed, bgr)
+    plate, sharpen_note = _upgrade_raster(plate, drawn, placed, bgr, upscale)
     qa = _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyped)
     if not qa.get("wrote") or not qa.get("cmyk") or not qa.get("boxes") or not qa.get("ppi") or (retyped and not qa.get("fonts")):
         from vector_text_v2 import _discard, _fail
@@ -2412,6 +2425,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             reason = "The picture was under 400 PPI, so the original lettering was kept."
         elif retyped and not qa.get("fonts"):
             reason = "The retyped fonts were not embedded, so the original lettering was kept."
+        _stop_upscale(upscale)
         return _fail(started, reason, provider=provider, qa=qa)
 
     vector_lines = []
@@ -2445,15 +2459,13 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
     decisions = [
         f"The lettering was traced as vector shapes ({len(drawn)} boxes).",
         "The original raster letter under each trace was painted out, so the vector edge is what prints.",
-        f"The picture was enlarged with {provider}.",
+        _enlarge_line(provider, sharpen_note),
         "The press file is CMYK at 400 PPI or more, with the trim 5 mm inside the bleed.",
     ]
     if retyped:
         decisions.append(
             f"{len(retyped)} lines the trace left as a picture were set as vector type in a matching font."
         )
-    if sharpen_note:
-        decisions.append(sharpen_note)
     if reason:
         decisions.append(reason)
     colour_s = float(qa.get("colour_s") or 0)
@@ -4494,39 +4506,53 @@ def _apply_text_gate(
     return report, kept, qa, source_guard
 
 
+def _stop_upscale(upscale) -> None:
+    if upscale is None:
+        return
+    try:
+        upscale.cancel()
+    except Exception:
+        pass
+
+
+def _enlarge_line(provider: str, note: str) -> str:
+    """One sentence for how the press picture was enlarged."""
+    text = str(note or "").strip()
+    if text:
+        return text
+    name = str(provider or "").strip() or "Lanczos"
+    return f"The picture was enlarged with {name}."
+
+
 def _upscale_choice(token: str, remote) -> str:
-    """Real-ESRGAN when a token returned a picture. Lanczos only with no token."""
+    """Real-ESRGAN when a picture came back. Otherwise Lanczos, token or not."""
     if remote is not None:
         return "esrgan"
-    if str(token or "").strip():
-        return "kept"
     return "lanczos"
 
 
-def _upgrade_raster(plate, drawn, placed, source_bgr):
+def _upgrade_raster(plate, drawn, placed, source_bgr, upscale=None):
     """Sharpen the photo layer up to the plate size. Painted-out letters stay put.
 
-    A Replicate token uses Real-ESRGAN. Lanczos is only the path with no token.
+    A picture that Real-ESRGAN already returned is fitted onto the art.
+    If it is not back, Lanczos is the press picture, and the note says so once.
     Vector text is drawn later, on top of this picture.
     """
     try:
         scale_mm = float((placed or {}).get("scale_mm") or 0)
         if scale_mm <= 0:
+            _stop_upscale(upscale)
             return plate, ""
         source_dpi = 25.4 / scale_mm
         if source_dpi >= 299:
+            _stop_upscale(upscale)
             return plate, ""
         art = (placed or {}).get("art_box") or (0, 0, plate.shape[1], plate.shape[0])
         paste_x, paste_y, art_w, art_h = [int(v) for v in art]
-        token = ""
-        try:
-            from ai_enhancements import _get_replicate_token
+        remote = upscale.take() if upscale is not None else None
+        from ai_upscale import ESRGAN_MESSAGE, LANCZOS_MESSAGE
 
-            token = (_get_replicate_token() or "").strip()
-        except Exception:
-            token = ""
-        remote = _remote_art(source_bgr, art_w, art_h) if token else None
-        choice = _upscale_choice(token, remote)
+        choice = _upscale_choice("", remote)
         if choice == "esrgan":
             fitted = remote
             if fitted.shape[1] != art_w or fitted.shape[0] != art_h:
@@ -4538,14 +4564,12 @@ def _upgrade_raster(plate, drawn, placed, source_bgr):
             x0 = max(0, paste_x)
             if y1 > y0 and x1 > x0:
                 upgraded[y0:y1, x0:x1] = fitted[y0 - paste_y:y0 - paste_y + (y1 - y0), x0 - paste_x:x0 - paste_x + (x1 - x0)]
-            note = "The press picture was enlarged with Real-ESRGAN. The vector lettering was left as it is."
-        elif choice == "lanczos":
+            note = ESRGAN_MESSAGE
+        else:
             from ai_upscale import photo_unsharp
 
             upgraded = photo_unsharp(plate)
-            note = "The press picture was sharpened with Lanczos to the print size. The vector lettering was left as it is."
-        else:
-            return plate, "A Replicate token is set, but Real-ESRGAN did not return a picture. Lanczos was not used."
+            note = LANCZOS_MESSAGE
         protect = _paint_protect(plate, drawn)
         if int(protect.max()) > 0:
             keep = protect > 0
@@ -4553,18 +4577,8 @@ def _upgrade_raster(plate, drawn, placed, source_bgr):
         return upgraded, note
     except Exception as exc:
         sys.stderr.write(f"[vector-trace] raster sharpen skipped ({str(exc)[:140]})\n")
+        _stop_upscale(upscale)
         return plate, ""
-
-
-def _remote_art(source_bgr, art_w: int, art_h: int):
-    if source_bgr is None or art_w < 8 or art_h < 8:
-        return None
-    try:
-        from ai_upscale import full_frame_esrgan
-
-        return full_frame_esrgan(source_bgr, timeout_s=12.0)
-    except Exception:
-        return None
 
 
 def _paint_protect(plate, drawn) -> np.ndarray:

@@ -121,6 +121,7 @@ def rebuild_fitted(
     reocr: Optional[Callable[[str], str]] = None,
     recall_floor: float = RECALL_FLOOR,
     ocr_s: Optional[float] = None,
+    upscale=None,
 ) -> dict:
     """Build a vector press PDF. Never raises. ok False means fall back.
 
@@ -135,8 +136,10 @@ def rebuild_fitted(
 
             return trace_fitted(
                 bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
-                float(bleed_mm), progress, blocks, ocr_s,
+                float(bleed_mm), progress, blocks, ocr_s, upscale,
             )
+        if upscale is not None:
+            upscale.cancel()
         return _rebuild(
             bgr, float(trim_w_mm), float(trim_h_mm), output_pdf,
             float(bleed_mm), progress, blocks, reocr, float(recall_floor), started,

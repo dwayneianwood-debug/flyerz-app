@@ -1265,6 +1265,7 @@ def make_print_ready(
     ocr_doubtful_reason = ""
     vector_built = None
     vector_source = None
+    upscale_job = None
     lettering_note = "The original lettering is kept."
 
     try:
@@ -1339,6 +1340,13 @@ def make_print_ready(
                 vector_source = raster
             else:
                 vector_source = picture
+            try:
+                from ai_upscale import start_plate_upscale
+
+                upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
+            except Exception as exc:
+                sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
+                upscale_job = None
             fitted_path = os.path.join(output_dir, "fitted.png")
             _write_png(raster, fitted_path)
             work_path = fitted_path
@@ -1388,6 +1396,7 @@ def make_print_ready(
                         progress=_mark,
                         blocks=None if fonts_on else lettering_blocks,
                         ocr_s=outer_ocr_s if lettering_blocks is not None else None,
+                        upscale=upscale_job,
                     )
                 except Exception as exc:
                     vector_built = {
@@ -1458,6 +1467,12 @@ def make_print_ready(
         info = decide_light({"kind": "corrupt", "readable": False})
         decisions.append(f"The file could not be prepared ({str(exc)[:140]}).")
         return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+    finally:
+        if upscale_job is not None:
+            try:
+                upscale_job.cancel()
+            except Exception:
+                pass
 
     press_path = os.path.join(output_dir, "press.pdf")
     _mark("press", lettering_note)

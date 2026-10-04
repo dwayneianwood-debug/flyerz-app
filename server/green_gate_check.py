@@ -95,7 +95,7 @@ def test_sharpen_keeps_the_hole() -> None:
     # The fringe of that ink is the hole. Source DPI under 300 forces a sharpen.
     placed = {"scale_mm": 25.4 / 180.0, "art_box": (0, 0, 120, 80)}
     upgraded, note = _upgrade_raster(plate, drawn, placed, plate)
-    check("sharpen-note", "sharpened" in note.lower() or "esrgan" in note.lower(), note)
+    check("sharpen-note", "lanczos" in note.lower() or "esrgan" in note.lower(), note)
     from vector_trace import _paint_protect
 
     protect = _paint_protect(plate, drawn)
@@ -338,6 +338,27 @@ def test_picture_text_is_not_green() -> None:
     )
 
 
+def test_picture_upscale_message() -> None:
+    import numpy as np
+
+    from ai_upscale import ESRGAN_MESSAGE, LANCZOS_MESSAGE, PlateUpscale
+    from vector_trace import _enlarge_line, _upgrade_raster
+
+    plate = np.full((80, 120, 3), 25, np.uint8)
+    placed = {"scale_mm": 25.4 / 180.0, "art_box": (0, 0, 120, 80)}
+    missed = PlateUpscale(plate, 148, 210)
+    missed._done.set()
+    _upgraded, note = _upgrade_raster(plate, [], placed, plate, missed)
+    line = _enlarge_line("Lanczos", note)
+    check("picture-one-lanczos", line == LANCZOS_MESSAGE and "was not used" not in line, line)
+    ready = PlateUpscale(plate, 148, 210)
+    ready._done.set()
+    ready.image = np.full((30, 40, 3), (0, 180, 0), np.uint8)
+    _upgraded, note = _upgrade_raster(plate, [], placed, plate, ready)
+    line = _enlarge_line("Lanczos", note)
+    check("picture-one-esrgan", line == ESRGAN_MESSAGE and "Lanczos" not in line, line)
+
+
 def test_esrgan_only_with_token() -> None:
     import numpy as np
 
@@ -345,7 +366,7 @@ def test_esrgan_only_with_token() -> None:
     from vector_trace import _upscale_choice
 
     check("choice-esrgan", _upscale_choice("token", np.zeros((4, 4, 3), np.uint8)) == "esrgan")
-    check("choice-kept", _upscale_choice("token", None) == "kept")
+    check("choice-fallback", _upscale_choice("token", None) == "lanczos")
     check("choice-lanczos", _upscale_choice("", None) == "lanczos")
     saved = os.environ.pop("REPLICATE_API_TOKEN", None)
     try:
@@ -362,6 +383,7 @@ def main() -> None:
     test_paint_and_ink_colour()
     test_sharpness_and_one_resample()
     test_picture_text_is_not_green()
+    test_picture_upscale_message()
     test_esrgan_only_with_token()
     test_bled_pdf_explains_itself()
     test_blank_and_wrong_shape()
