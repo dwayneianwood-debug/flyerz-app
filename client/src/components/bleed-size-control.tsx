@@ -1,3 +1,4 @@
+import React from "react";
 import { BLEED_PRESETS_MM, normalizeBleedMm } from "@shared/bleed-size";
 
 export function BleedSizeControl({

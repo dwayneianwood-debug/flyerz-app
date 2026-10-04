@@ -163,7 +163,7 @@ def _to_data_uri(image_path: str) -> str:
 
 def _replicate_create_prediction(model_owner: str, model_name: str,
                                   model_input: dict, token: str, version: str = "",
-                                  deadline: float = None) -> dict:
+                                  deadline: float = None, prefer_wait: bool = True) -> dict:
     if version:
         url = f"{REPLICATE_API_URL}/predictions"
         body = {"version": version, "input": model_input}
@@ -180,12 +180,17 @@ def _replicate_create_prediction(model_owner: str, model_name: str,
             if last_error is not None:
                 raise last_error
             raise TimeoutError("AI service is busy, please try again")
-        req = urllib.request.Request(url, data=payload, headers=external_headers({
+        headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "Prefer": "wait",
-        }))
-        timeout = min(REPLICATE_CREATE_TIMEOUT_S, remaining)
+        }
+        # Prefer: wait holds the create call until the model finishes. The press
+        # job creates, then polls, so a slow model does not sit on this socket.
+        if prefer_wait:
+            headers["Prefer"] = "wait"
+        req = urllib.request.Request(url, data=payload, headers=external_headers(headers))
+        create_cap = REPLICATE_CREATE_TIMEOUT_S if prefer_wait else 20.0
+        timeout = min(create_cap, remaining)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -267,12 +272,13 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
 
 
 def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
-                     model_input: dict, version: str = "") -> tuple:
+                     model_input: dict, version: str = "", timeout_s: float | None = None) -> tuple:
     token = _get_replicate_token()
     if not token:
         return None, "REPLICATE_API_TOKEN not configured — enhancement requires API access"
 
-    deadline = time.time() + REPLICATE_TIMEOUT_S
+    budget = REPLICATE_TIMEOUT_S if timeout_s is None else max(1.0, float(timeout_s))
+    deadline = time.time() + budget
 
     try:
         prediction = _replicate_create_prediction(

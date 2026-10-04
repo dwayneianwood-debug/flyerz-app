@@ -17,7 +17,7 @@
     "test:ai-upscale": "tsx --test server/aiUpscale.test.ts client/src/components/ai-upscale-panel.test.tsx",
     "test:ai-artwork": "tsx --test server/aiArtwork.test.ts client/src/components/ai-artwork-panel.test.tsx",
     "test:external-http": "python3 server/external_http_check.py",
-    "test:ai-rebuild": "tsx --test server/aiRebuildPolicy.test.ts client/src/components/ai-rebuild-panel.test.tsx && python3 server/ai_rebuild_check.py && python3 server/rebuild_policy_check.py && python3 server/external_http_check.py",
+    "test:ai-rebuild": "tsx --test server/aiRebuildPolicy.test.ts client/src/components/ai-rebuild-panel.test.tsx && python3 server/ai_rebuild_check.py && python3 server/rebuild_policy_check.py && python3 server/vector_text_v2_check.py && python3 server/vector_trace_check.py && python3 server/external_http_check.py",
     "test:quick-check": "tsx --test server/quickCheckRules.test.ts",
     "test:illustrator-intake": "tsx --test server/illustratorIntake.test.ts",
     "test:load-env": "tsx --test server/loadEnv.test.ts",

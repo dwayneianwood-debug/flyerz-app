@@ -28,12 +28,14 @@ test("quick print form lists the product sizes and one button", () => {
   );
   assert.match(html, /Make it print-ready/);
   assert.match(html, /data-testid="button-make-print-ready"/);
+  assert.match(html, /A6 landscape \(148 × 105 mm\)/);
   assert.match(html, /A5 \(148 × 210 mm\)/);
   assert.match(html, /DL \(99 × 210 mm\)/);
   assert.match(html, /Business card 90 × 50/);
   assert.match(html, /Business card 90 × 55/);
   assert.match(html, /Custom size/);
   assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a5" && product.widthMm === 148), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a6-landscape" && product.widthMm === 148 && product.heightMm === 105), true);
 });
 
 test("result cards show green download, amber reasons, and a red client message", () => {
@@ -46,6 +48,10 @@ test("result cards show green download, amber reasons, and a red client message"
         light: "green",
         reasons: [],
         decisions: ["Bleed is 5 mm on every side."],
+        checklist: [
+          { id: "bleed", label: "5 mm bleed is present and filled, with no slivers", passed: true, detail: "" },
+          { id: "fonts", label: "Fonts are embedded", passed: false, detail: "A font in the press file is not embedded." },
+        ],
         clientMessage: "",
         approved: false,
         hasPress: true,
@@ -57,6 +63,11 @@ test("result cards show green download, amber reasons, and a red client message"
     />,
   );
   assert.match(green, /GREEN/);
+  assert.match(green, /check-bleed-1/);
+  assert.match(green, />Pass</);
+  assert.match(green, /5 mm bleed is present and filled, with no slivers/);
+  assert.match(green, />Fail</);
+  assert.match(green, /Fonts are embedded/);
   assert.match(green, /Download press PDF/);
   assert.match(green, /\/api\/jobs\/1\/download\/press-ready/);
   assert.match(green, /img-proof-1/);
@@ -106,6 +117,7 @@ test("result cards show green download, amber reasons, and a red client message"
   assert.match(red, /RED/);
   assert.match(red, /Please send a PDF/);
   assert.match(red, /Copy message for the client/);
+  assert.match(red, /Nothing is sent until you copy this and send it yourself/);
   assert.equal(red.includes("Download press PDF"), false);
 });
 

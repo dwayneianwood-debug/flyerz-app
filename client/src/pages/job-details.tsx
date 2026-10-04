@@ -28,13 +28,12 @@ import {
   isSafeZoneLayoutError,
   handleSafeZoneLayoutProcessingError,
 } from "@/lib/safe-zone-error";
-import { BLEED_STRATEGY_IDS } from "@shared/schema";
-import { ColourBorderPicker } from "@/components/colour-border-picker";
 import { AiUpscalePanel } from "@/components/ai-upscale-panel";
 import { AiArtworkPanel, type AiArtworkPlan } from "@/components/ai-artwork-panel";
 import { AiRebuildPanel } from "@/components/ai-rebuild-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
-import { AUTOMATIC_BLEED_LABEL, pressReadyHeadline, shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
+import { BLEED_METHOD_LABELS, BleedMethodSelector } from "@/components/bleed-method-selector";
+import { shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
 import { proceedButtonState } from "@/lib/job-page-actions";
 import { displayPercent, formatElapsed } from "@shared/jobProgress";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
@@ -111,42 +110,6 @@ const PHASE_LABELS = [
   { num: 3, label: "Download", icon: Download },
 ];
 
-const BLEED_METHOD_LABELS = {
-  auto: {
-    label: AUTOMATIC_BLEED_LABEL,
-    description: "The press-ready engine checks each edge and fills only the bleed. You can still pick a style yourself below.",
-  },
-  bgExtract: {
-    label: "Background Extract",
-    description: "Extends only the background colour, ideal for artwork with text near the edge.",
-  },
-  stretch: {
-    label: "Pixel-Drift Stretch",
-    description: "Projects edge pixels outward with gentle drift, best for complex images.",
-  },
-  mirror: {
-    label: "Mirror + Blend",
-    description: "Mirrors the edge and cross-fades the seam, great for busy textures.",
-  },
-  replicate: {
-    label: "Edge Replication",
-    description: "Repeats the outermost pixel row, cleanest for solid colours.",
-  },
-  upscale: {
-    label: "Upscale",
-    description: "Smoothly scales entire artwork to include bleed — perfectly smooth boundaries.",
-  },
-  ai_outpaint: {
-    label: "AI Outpaint",
-    description:
-      "Fast proxy inpainting extends bleed colors softly; your 300 DPI artwork stays pixel-perfect in the center.",
-  },
-  colourBorder: {
-    label: "Colour Border",
-    description: "Keeps the artwork at trim size and fills the bleed with a solid colour you choose.",
-  },
-} as const;
-
 export default function JobDetails() {
   const [, params] = useRoute("/job/:id");
   const id = params?.id ? parseInt(params.id, 10) : 0;
@@ -171,7 +134,6 @@ export default function JobDetails() {
   const [bleedPreview, setBleedPreview] = useState<BleedPreviewData | null>(null);
   const [bleedPreviewLoading, setBleedPreviewLoading] = useState(false);
   const [bleedPreviewError, setBleedPreviewError] = useState<string | null>(null);
-  const [bleedPreviewPage, setBleedPreviewPage] = useState(0);
   const [bleedChecked, setBleedChecked] = useState(false);
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
@@ -350,7 +312,7 @@ export default function JobDetails() {
     setBleedPreview(null);
     setBleedPreviewLoading(false);
     setBleedPreviewError(null);
-    setBleedPreviewPage(0);
+    setProofPage(0);
     setBleedChecked(false);
     setComparisonChecked(false);
     setPhaseOverride(null);
@@ -389,6 +351,12 @@ export default function JobDetails() {
     layoutGlitchyDispatchedForJobRef.current = null;
     window.dispatchEvent(new CustomEvent("glitchy:job-reset"));
   }, [id]);
+
+  useEffect(() => {
+    if ((job?.auditResults as { autoFixApplied?: boolean } | null)?.autoFixApplied) {
+      setAutoFixApplied(true);
+    }
+  }, [id, job?.auditResults]);
 
   useEffect(() => {
     if (job?.status === "complete" && job?.correctedPath && !bleedPreview && !bleedPreviewLoading) {
@@ -809,7 +777,7 @@ export default function JobDetails() {
     let choice = next;
     if (next.source === "edge" && job) {
       try {
-        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0`);
+        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0&page=${proofPage + 1}`);
         const data = await res.json();
         if (res.ok && data.success) {
           choice = {
@@ -857,8 +825,8 @@ export default function JobDetails() {
 
   const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
     ? {
-        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}`,
-        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}`,
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}&page=${proofPage + 1}`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}&page=${proofPage + 1}`,
         trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
         trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
         bleedMm,
@@ -950,7 +918,7 @@ export default function JobDetails() {
       }
       const data = await res.json();
       setBleedPreview(data);
-      setBleedPreviewPage(0);
+      setProofPage(0);
     } catch (err: any) {
       setBleedPreviewError(err.message);
     } finally {
@@ -1004,7 +972,7 @@ export default function JobDetails() {
     : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
   const pressDownloadName = quickPressReady ? "Print Ready Artwork.pdf" : "Print Ready Artwork.zip";
 
-  const currentBleedPage = bleedPreview?.previewUrls?.[bleedPreviewPage];
+  const currentBleedPage = bleedPreview?.previewUrls?.[proofPage] || bleedPreview?.previewUrls?.[0];
 
   const isFailed = job.status === "failed";
   const hasUserSelectedBleed = selectedBleedMethod !== "auto";
@@ -1149,7 +1117,7 @@ export default function JobDetails() {
                 <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto" data-testid="text-processing-description">
                   {isQueued
                     ? "The press room is busy. Your file is in line and will be processed as soon as a slot opens."
-                    : (job.progress?.note || "We're fitting the picture and building the press file. The original lettering is kept.")}
+                    : (job.progress?.note || "We're fitting the picture and building the press file.")}
                 </p>
                 {!isQueued && (
                   <div className="max-w-xs mx-auto" data-testid="job-progress">
@@ -1580,10 +1548,8 @@ export default function JobDetails() {
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
                       />
-                      <details className="text-sm" data-testid="advanced-bleed-size">
-                        <summary className="cursor-pointer text-xs text-muted-foreground">
-                          Advanced bleed size. A normal Flyerz job stays at 5 mm.
-                        </summary>
+                      <div className="text-sm space-y-2" data-testid="advanced-bleed-size">
+                        <p className="text-xs text-muted-foreground">Bleed size. A normal Flyerz job stays at 5 mm.</p>
                         <BleedSizeControl
                           value={bleedMm}
                           disabled={bleedMethodLoading || bleedPreviewLoading}
@@ -1602,7 +1568,7 @@ export default function JobDetails() {
                             });
                           }}
                         />
-                      </details>
+                      </div>
                       <BleedMethodSelector
                         jobId={job.id}
                         variants={job.auditResults.bleedVariants ?? {}}
@@ -1613,8 +1579,12 @@ export default function JobDetails() {
                         colourBorder={colourBorder}
                         onColourBorderChange={handleColourBorderChange}
                         pressEngine={job.auditResults.pressEngine}
-                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof` : null}
-                        afterUrl={bleedPreview?.previewUrls?.[0]?.url || null}
+                        beforeUrl={(job.auditResults?.proofPath || (job.auditResults as { quickPrint?: { proofPng?: string } } | null)?.quickPrint?.proofPng || job.correctedPath || job.originalPath) ? `/api/jobs/${job.id}/proof?page=${proofPage}` : null}
+                        pageCount={artworkPageCount(job.auditResults)}
+                        afterUrl={bleedPreview?.previewUrls?.[proofPage]?.url || bleedPreview?.previewUrls?.[0]?.url || null}
+                        proofPage={proofPage}
+                        onProofPage={setProofPage}
+                        variantPages={(job.auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages}
                         pressDownloadHref={quickPressReady ? pressDownloadHref : null}
                       />
                     </div>
@@ -1671,8 +1641,8 @@ export default function JobDetails() {
                       bleedPreview={bleedPreview}
                       bleedPreviewLoading={bleedPreviewLoading}
                       bleedPreviewError={bleedPreviewError}
-                      bleedPreviewPage={bleedPreviewPage}
-                      setBleedPreviewPage={setBleedPreviewPage}
+                      bleedPreviewPage={proofPage}
+                      setBleedPreviewPage={setProofPage}
                       currentBleedPage={currentBleedPage}
                       loadBleedPreview={loadBleedPreview}
                       enhancementLoading={aiEnhanceLoading}
@@ -2344,6 +2314,21 @@ export default function JobDetails() {
 
 
 
+function artworkPageCount(audit: { pageCount?: number; proofPageCount?: number; proofPaths?: string[]; bleedVariantPages?: Record<string, string[]>; pressEngine?: { pageCount?: number; report?: { pageCount?: number } }; quickPrint?: { pageCount?: number } } | null | undefined): number {
+  const variants = audit?.bleedVariantPages || {};
+  const variantCount = Math.max(0, ...Object.values(variants).map((pages) => (Array.isArray(pages) ? pages.length : 0)));
+  const proofCount = Array.isArray(audit?.proofPaths) ? audit.proofPaths.length : 0;
+  return Math.max(
+    Number(audit?.pageCount) || 0,
+    Number(audit?.proofPageCount) || 0,
+    Number(audit?.pressEngine?.pageCount) || 0,
+    Number(audit?.pressEngine?.report?.pageCount) || 0,
+    Number(audit?.quickPrint?.pageCount) || 0,
+    variantCount,
+    proofCount,
+  );
+}
+
 function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading, colourBorderPreview }: {
   bleedPreview: BleedPreviewData | null;
   bleedPreviewLoading: boolean;
@@ -2752,144 +2737,6 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
           })}
         </motion.div>
       )}
-    </div>
-  );
-}
-
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref }: {
-  jobId: number;
-  variants: Record<string, string>;
-  recommended: string | null;
-  selected: string;
-  onSelect: (method: string) => void;
-  loading: boolean;
-  colourBorder: ColourBorderChoice;
-  onColourBorderChange: (next: ColourBorderChoice) => void;
-  pressEngine?: {
-    passed?: boolean;
-    status?: string;
-    headline?: string;
-    reason?: string;
-    fix?: string;
-    rescue?: { note?: string };
-    edges?: Array<{ side: string; note: string }>;
-  } | null;
-  beforeUrl?: string | null;
-  afterUrl?: string | null;
-  pressDownloadHref?: string | null;
-}) {
-  /** Automatic is the default. The older styles stay as manual overrides. */
-  const methods = ["auto", ...BLEED_STRATEGY_IDS];
-  const activeMethod = selected || "auto";
-  const activeInfo = activeMethod ? BLEED_METHOD_LABELS[activeMethod as keyof typeof BLEED_METHOD_LABELS] : null;
-  const engineAttention = pressEngine?.status === "needs-attention";
-
-  if (methods.length === 0) return null;
-
-  return (
-    <div data-testid="section-bleed-method-selector">
-      <div className="flex items-center gap-2 mb-3">
-        <Sparkles className="w-4 h-4 text-primary" />
-        <h4 className="text-sm font-bold text-foreground">Choose Your Bleed Style</h4>
-        {loading && (
-          <div className="flex items-center gap-2 ml-auto">
-            <Loader2 className="w-4 h-4 animate-spin text-primary" />
-            <span className="text-xs font-medium text-primary animate-pulse" data-testid="text-bleed-processing">Processing...</span>
-          </div>
-        )}
-      </div>
-      <div className="flex flex-col gap-3">
-        <select
-          value={activeMethod || ""}
-          onChange={(e) => onSelect(e.target.value)}
-          disabled={loading}
-          className="w-full px-3 py-2.5 rounded-lg border-2 border-border/60 bg-white dark:bg-background text-sm font-medium text-foreground focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition-all disabled:opacity-50 disabled:cursor-not-allowed appearance-none cursor-pointer"
-          style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' viewBox='0 0 24 24' stroke='%236b7280' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 12px center" }}
-          data-testid="select-bleed-method"
-        >
-          {methods.map((method) => {
-            const info = BLEED_METHOD_LABELS[method as keyof typeof BLEED_METHOD_LABELS];
-            const isRecommended = method === "auto" || method === recommended;
-            return (
-              <option key={method} value={method} data-testid={`option-bleed-method-${method}`}>
-                {info?.label ?? method}{method === "auto" ? "" : isRecommended && method === recommended ? " (manual)" : ""}
-              </option>
-            );
-          })}
-        </select>
-        {activeInfo && (
-          <p className="text-xs text-muted-foreground" data-testid="text-bleed-description">
-            {activeInfo.description}
-          </p>
-        )}
-        {activeMethod === "auto" && (
-          <div className="rounded-lg border border-border/60 bg-white dark:bg-background p-3 space-y-2" data-testid="panel-press-ready">
-            <p className={`text-sm font-semibold ${engineAttention ? "text-amber-700" : "text-green-700"}`} data-testid="text-press-ready-headline">
-              {pressReadyHeadline(pressEngine)}
-            </p>
-            {pressDownloadHref && (
-              <a href={pressDownloadHref} className="inline-flex text-sm font-semibold underline" data-testid="link-job-press-download">Download press PDF</a>
-            )}
-            {pressEngine?.reason && (
-              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-reason">{pressEngine.reason} {pressEngine.fix}</p>
-            )}
-            {pressEngine?.rescue?.note && (
-              <p className="text-xs text-muted-foreground" data-testid="text-press-ready-rescue">{pressEngine.rescue.note}</p>
-            )}
-            <ul className="space-y-1" data-testid="list-press-ready-edges">
-              {(pressEngine?.edges || []).map((edge) => (
-                <li key={edge.side} className="text-xs text-foreground">{edge.note}</li>
-              ))}
-            </ul>
-            {(beforeUrl || afterUrl) && (
-              <div className="grid grid-cols-2 gap-2">
-                {beforeUrl && <img src={beforeUrl} alt="Artwork before bleed" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-before" />}
-                {afterUrl && <img src={afterUrl} alt="Artwork with bleed and cut line" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-after" />}
-              </div>
-            )}
-          </div>
-        )}
-        {activeMethod === "colourBorder" && (
-          <ColourBorderPicker value={colourBorder} onChange={onColourBorderChange} disabled={loading} />
-        )}
-        {activeMethod && activeMethod !== "auto" && (
-          <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
-            <div className="aspect-[16/9]">
-              {activeMethod === "colourBorder" ? (
-              <img
-                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`}
-                alt="Colour border preview"
-                className="w-full h-full object-contain"
-                data-testid="img-bleed-variant-colourBorder"
-              />
-              ) : variants[activeMethod] ? (
-              <img
-                src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
-                alt={activeInfo?.label || activeMethod}
-                className="w-full h-full object-contain"
-                data-testid={`img-bleed-variant-${activeMethod}`}
-              />
-              ) : (
-                <div
-                  className="w-full h-full flex items-center justify-center px-4 text-center text-xs text-muted-foreground"
-                  data-testid={`placeholder-bleed-variant-${activeMethod}`}
-                >
-                  No cached preview for this strategy — select &quot;Apply&quot; or re-run processing to generate it.
-                </div>
-              )}
-              {loading && (
-                <div className="absolute inset-0 bg-black/30 flex items-center justify-center" data-testid="overlay-loading-bleed">
-                  <Loader2 className="w-6 h-6 animate-spin text-white" />
-                </div>
-              )}
-            </div>
-            <div className="absolute top-2 left-2 flex items-center gap-1 px-2 py-1 rounded-full bg-primary/90 text-primary-foreground text-[10px] font-bold">
-              <CheckCircle2 className="w-3 h-3" />
-              {activeInfo?.label || activeMethod}
-            </div>
-          </div>
-        )}
-      </div>
     </div>
   );
 }

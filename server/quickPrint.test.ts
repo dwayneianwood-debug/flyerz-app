@@ -4,6 +4,30 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+test("auto is passed through so Python detects the page size", async () => {
+  const { productIdForEngine, resolveQuickProduct } = await import("./quickPrintRunner.ts");
+  const fallback = resolveQuickProduct("auto");
+  assert.equal(fallback.id, "a5");
+  assert.equal(productIdForEngine("auto", fallback.id), "auto");
+  assert.equal(productIdForEngine("a6-landscape", "a6-landscape"), "a6-landscape");
+});
+
+test("tagged python lines reach the press log", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "flyerz-log-"));
+  process.env.FLYERZ_DB_PATH = path.join(dir, "jobs.sqlite");
+  const { pressLogLines } = await import("./quickPrintRunner.ts");
+  const lines = pressLogLines(
+    "[AI-UPSCALE] replicate status=failed error=denied\n" +
+      "  FAIL raster ssim=1.000 'body'\n" +
+      "[vector-trace] Timing: trace 1.20s.\n" +
+      "plain note\n",
+  );
+  assert.deepEqual(lines, [
+    "[AI-UPSCALE] replicate status=failed error=denied",
+    "[vector-trace] Timing: trace 1.20s.",
+  ]);
+});
+
 test("quick print settings, attention queue, and drop folder", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "flyerz-quick-"));
   process.env.FLYERZ_DB_PATH = path.join(dir, "jobs.sqlite");

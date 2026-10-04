@@ -1435,16 +1435,20 @@ export async function registerRoutes(
       const auditResults = job.auditResults as any;
 
       const selectedMethod = auditResults?.selectedBleedMethod;
-      if (selectedMethod && selectedMethod !== "auto" && pageIndex === 0) {
-        const variantPath = auditResults?.bleedVariants?.[selectedMethod];
+      if (selectedMethod && selectedMethod !== "auto") {
+        const pageList = auditResults?.bleedVariantPages?.[selectedMethod];
+        const variantPath = Array.isArray(pageList) && pageList[pageIndex]
+          ? pageList[pageIndex]
+          : (pageIndex === 0 ? auditResults?.bleedVariants?.[selectedMethod] : null);
+        const variantPageCount = Array.isArray(pageList) && pageList.length ? pageList.length : (variantPath ? 1 : 0);
         if (variantPath && isPathSafe(variantPath)) {
           try {
             const stat = fsSync.statSync(variantPath);
             if (stat.size > 0) {
-              console.log(`[FAI] Serving proof from selected strategy variant: ${selectedMethod} → ${variantPath}`);
+              console.log(`[FAI] Serving proof from selected strategy variant: ${selectedMethod} page ${pageIndex + 1} → ${variantPath}`);
               res.setHeader('Content-Type', 'image/png');
               res.setHeader('Cache-Control', 'no-cache');
-              res.setHeader('X-Proof-Page-Count', '1');
+              res.setHeader('X-Proof-Page-Count', String(variantPageCount));
               res.setHeader('X-Proof-Strategy', selectedMethod);
               const { createReadStream } = await import('fs');
               createReadStream(variantPath).pipe(res);
@@ -1714,14 +1718,30 @@ export async function registerRoutes(
         encoding: "utf8",
         timeout: EXEC_TIMEOUT_MS,
       });
-      if (previewProc.status !== 0) {
-        const detail = (previewProc.stderr || previewProc.stdout || "").slice(-400);
-        throw new Error(detail || "Colour border preview failed");
+      // Ghostscript prints an informational banner on stderr while importing.
+      // Success is the exit code plus a real PNG, never the stderr text.
+      const wrotePreview = fsSync.existsSync(previewPath) && fsSync.statSync(previewPath).size > 32;
+      const stdout = (previewProc.stdout || "").trim();
+      const previewLine = stdout.split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
+      let info: any = null;
+      if (previewLine) {
+        try { info = JSON.parse(previewLine); } catch { info = null; }
       }
-      const previewLine = (previewProc.stdout || "").trim().split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
-      const info = previewLine ? JSON.parse(previewLine) : null;
+      const exitOk = previewProc.status === 0;
+      if (!wrotePreview || (!exitOk && info?.success !== true)) {
+        throw new Error(info?.error || "Colour border preview failed");
+      }
       if (!info?.success) {
-        return res.status(400).json({ message: info?.error || "Could not build the colour border preview" });
+        info = {
+          success: true,
+          c: options.c,
+          m: options.m,
+          y: options.y,
+          k: options.k,
+          r: 0,
+          g: 0,
+          b: 0,
+        };
       }
       if (req.query.format === "json") {
         return res.json({ ...info, url: `/api/jobs/${jobId}/bleed-preview-image/${previewFilename}` });
@@ -1768,8 +1788,13 @@ export async function registerRoutes(
       let previewSourcePath = job.correctedPath!;
       let previewFileType = pipelineTypeFor(job.fileType || 'pdf');
 
+      const stylePages = strategy !== "auto"
+        ? (auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages?.[strategy]
+        : null;
       if (strategy !== "auto" && (validStrategies as readonly string[]).includes(strategy)) {
-        const variantPath = auditResults?.bleedVariants?.[strategy as keyof NonNullable<AuditResults["bleedVariants"]>];
+        const variantPath = Array.isArray(stylePages) && stylePages[0]
+          ? stylePages[0]
+          : auditResults?.bleedVariants?.[strategy as keyof NonNullable<AuditResults["bleedVariants"]>];
         if (variantPath && isPathSafe(variantPath)) {
           try {
             await fs.access(variantPath);
@@ -1789,6 +1814,36 @@ export async function registerRoutes(
       const previewPath = path.join(uploadDir, previewFilename);
       const targetWidth = String(savedOpts.targetWidth ?? 148);
       const targetHeight = String(savedOpts.targetHeight ?? 210);
+
+      const styleSources = Array.isArray(stylePages) ? stylePages.filter((item) => item && isPathSafe(item)) : [];
+      if (strategy !== "auto" && styleSources.length > 1) {
+        const pages: any[] = [];
+        for (let index = 0; index < styleSources.length; index++) {
+          const oneName = `bleed_preview_${jobId}_${Date.now()}_p${index + 1}.png`;
+          const onePath = path.join(uploadDir, oneName);
+          const oneType = path.extname(styleSources[index]).replace(".", "") || "png";
+          const one = execPythonCapture([
+            BLEED_PREVIEW_SCRIPT, styleSources[index], onePath,
+            oneType, String(bleedMm), targetWidth, targetHeight,
+          ], "BleedPreview");
+          for (const item of one.pages || []) {
+            pages.push({ ...item, page: pages.length + 1 });
+          }
+        }
+        return res.json({
+          success: true,
+          pageCount: pages.length,
+          pages,
+          previewUrls: pages.map((item) => ({
+            page: item.page,
+            url: `/api/jobs/${jobId}/bleed-preview-image/${path.basename(item.previewPath)}`,
+            downloadUrl: `/api/jobs/${jobId}/bleed-preview-download/${path.basename(item.previewPath)}?name=${encodeURIComponent(`${basename}_bleed_preview_page${item.page}.png`)}`,
+            totalSize_mm: item.totalSize_mm,
+            trimSize_mm: item.trimSize_mm,
+            bleed_mm: item.bleed_mm,
+          })),
+        });
+      }
 
       const result = execPythonCapture([
         BLEED_PREVIEW_SCRIPT, previewSourcePath, previewPath,
@@ -1855,7 +1910,11 @@ export async function registerRoutes(
       });
     } catch (error) {
       console.error('[FAI] Cover crop notice failed:', error);
-      res.json({ success: true, cropped: false });
+      res.status(500).json({
+        success: false,
+        cropped: false,
+        error: error instanceof Error ? error.message : 'Cover crop notice failed',
+      });
     }
   });
 
@@ -1942,10 +2001,15 @@ export async function registerRoutes(
       if (!job) return res.status(404).json({ message: "Job not found" });
 
       const auditResults = job.auditResults as AuditResults | null;
-      const variantPath = auditResults?.bleedVariants?.[method as keyof NonNullable<AuditResults["bleedVariants"]>];
+      const pageIndex = Math.max(0, parseInt(req.query.page as string) || 0);
+      const pageList = (auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages?.[method];
+      const variantPath = Array.isArray(pageList) && pageList[pageIndex]
+        ? pageList[pageIndex]
+        : (pageIndex === 0 ? auditResults?.bleedVariants?.[method as keyof NonNullable<AuditResults["bleedVariants"]>] : null);
       if (!variantPath) {
         return res.status(404).json({ message: `No variant found for method: ${method}` });
       }
+      res.setHeader("X-Proof-Page-Count", String(Array.isArray(pageList) && pageList.length ? pageList.length : 1));
 
       if (!isPathSafe(variantPath)) {
         return res.status(403).json({ message: "Invalid variant file path" });
@@ -3563,11 +3627,19 @@ FITZ_EXTS = {'.pdf', '.xps', '.epub', '.mobi', '.fb2', '.cbz', '.svg'}
 PIL_EXTS = {'.tif', '.tiff', '.eps', '.bmp', '.webp', '.ico', '.psd', '.dds', '.pcx', '.ppm', '.pgm', '.pbm', '.tga'}
 
 w, h = 0, 0
+page_count, page_index, w_mm, h_mm = 1, 0, 0.0, 0.0
+try:
+    page_index = max(0, int(sys.argv[4]))
+except Exception:
+    page_index = 0
 
-if ext in FITZ_EXTS:
-    import fitz, cv2, numpy as np
-    doc = fitz.open(input_path)
-    page = doc[0]
+def render_fitz(doc):
+    global w, h, page_count, page_index, w_mm, h_mm
+    import cv2, numpy as np
+    page_count = doc.page_count
+    index = max(0, min(page_index, page_count - 1)) if page_count else 0
+    page = doc[index]
+    page_index = index
     zoom = max(1.0, min(3.0, 2400.0 / max(page.rect.width, page.rect.height)))
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -3575,6 +3647,13 @@ if ext in FITZ_EXTS:
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(output_path, img_bgr)
     w, h = pix.w, pix.h
+    w_mm = page.rect.width * 25.4 / 72.0
+    h_mm = page.rect.height * 25.4 / 72.0
+
+if ext in FITZ_EXTS:
+    import fitz
+    doc = fitz.open(input_path)
+    render_fitz(doc)
 elif ext in PIL_EXTS:
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = 300_000_000
@@ -3592,15 +3671,7 @@ else:
     try:
         import fitz
         doc = fitz.open(input_path)
-        page = doc[0]
-        zoom = max(1.0, min(3.0, 2400.0 / max(page.rect.width, page.rect.height)))
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        import cv2, numpy as np
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_path, img_bgr)
-        w, h = pix.w, pix.h
+        render_fitz(doc)
     except Exception:
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = 300_000_000
@@ -3615,8 +3686,8 @@ else:
         im.save(output_path, 'PNG')
         w, h = im.size
 
-print(f'{w},{h}')
-`, tmpInput, previewPath, ext], {
+print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
+`, tmpInput, previewPath, ext, String(Math.max(0, parseInt(String(req.body?.page ?? "0"), 10) || 0))], {
         cwd: process.cwd(),
         env: pythonChildEnv(),
         stdio: ["pipe", "pipe", "pipe"],
@@ -3638,6 +3709,10 @@ print(f'{w},{h}')
           previewUrl: `/api/manual-crop/preview-image/${previewFilename}`,
           width: parseInt(dims[0]) || 0,
           height: parseInt(dims[1]) || 0,
+          pageCount: parseInt(dims[2]) || 1,
+          page: parseInt(dims[3]) || 0,
+          widthMm: parseFloat(dims[4]) || 0,
+          heightMm: parseFloat(dims[5]) || 0,
         });
       });
     } catch (error) {

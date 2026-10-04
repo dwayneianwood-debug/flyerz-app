@@ -107,9 +107,15 @@ export interface AuditResults {
     upscale?: string;
     ai_outpaint?: string;
     colourBorder?: string;
+    gradient_extrapolate?: string;
+    frequency_separated?: string;
   };
-  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder";
-  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
+  /** Same styles, one path per page. Page 1 is also bleedVariants. */
+  bleedVariantPages?: Record<string, string[]>;
+  /** Set when Fix Everything has finished, so a reload does not ask again. */
+  autoFixApplied?: boolean;
+  recommendedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "gradient_extrapolate" | "frequency_separated" | "upscale" | "ai_outpaint" | "colourBorder";
+  selectedBleedMethod?: "bgExtract" | "stretch" | "mirror" | "replicate" | "gradient_extrapolate" | "frequency_separated" | "upscale" | "ai_outpaint" | "colourBorder" | "auto";
   /** Solid bleed colour chosen with the Colour Border strategy. CMYK is 0–100. */
   colourBorder?: { c: number; m: number; y: number; k: number; label?: string; source?: string };
   /** Optional AI upscale accepted after the bleed choice. Applied to the artwork before bleed. */
@@ -262,6 +268,8 @@ export const BLEED_STRATEGY_IDS = [
   "stretch",
   "mirror",
   "replicate",
+  "gradient_extrapolate",
+  "frequency_separated",
   "upscale",
   "ai_outpaint",
   "colourBorder",

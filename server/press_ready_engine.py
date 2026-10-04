@@ -34,6 +34,44 @@ MIN_HONEST_EFFECTIVE_DPI = 240.0
 TAC_LIMIT = 300.0
 MM_TO_PT = 72.0 / 25.4
 
+
+def inferred_side_bleed(
+    page_w_mm: float,
+    page_h_mm: float,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    lo: float = 2.0,
+    hi: float = 15.0,
+    trim_tol: float = 2.5,
+):
+    """Per-side bleed when the page is the trim, or the trim plus bleed already there.
+
+    A Canva page often has no TrimBox. Two to 15 mm on each side is bleed that is
+    already in the file, including a full 5 mm and a more generous bleed. None
+    means the page is a different shape.
+    """
+    extra_w = float(page_w_mm) - float(trim_w_mm)
+    extra_h = float(page_h_mm) - float(trim_h_mm)
+    side_w = extra_w / 2.0
+    side_h = extra_h / 2.0
+    if (lo - 0.05) <= side_w <= (hi + 0.05) and (lo - 0.05) <= side_h <= (hi + 0.05):
+        return {
+            "left": side_w,
+            "right": side_w,
+            "top": side_h,
+            "bottom": side_h,
+            "kind": "existing",
+        }
+    if abs(extra_w) <= trim_tol and abs(extra_h) <= trim_tol:
+        return {
+            "left": max(0.0, side_w),
+            "right": max(0.0, side_w),
+            "top": max(0.0, side_h),
+            "bottom": max(0.0, side_h),
+            "kind": "trim",
+        }
+    return None
+
 SIDES = ("top", "bottom", "left", "right")
 CHAIN = {
     "flat": ("colour", "replicate", "stretch"),
@@ -118,6 +156,11 @@ def replicate_available() -> bool:
 
 
 def replicate_note() -> str:
+    """Local fill unless Real-ESRGAN is explicitly on. Do not contact Replicate otherwise."""
+    from host_paths import esrgan_enabled
+
+    if not esrgan_enabled():
+        return "Real-ESRGAN is off, so nothing was sent to Replicate."
     if not (os.environ.get("REPLICATE_API_TOKEN") or "").strip():
         return "No Replicate token, so the fill was done on this computer."
     if replicate_available():
@@ -876,6 +919,22 @@ def fitz_rect(x0, y0, x1, y1):
     return fitz.Rect(x0, y0, x1, y1)
 
 
+def _content_image_xrefs(doc, page) -> list:
+    """Image xrefs that are the artwork. A soft-mask grey is not one of them."""
+    full = page.get_images(full=True) or []
+    masks = set()
+    for item in full:
+        if len(item) > 1 and int(item[1] or 0) > 0:
+            masks.add(int(item[1]))
+    xrefs = []
+    for item in full:
+        xref = int(item[0])
+        if xref in masks:
+            continue
+        xrefs.append(xref)
+    return xrefs
+
+
 def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float, report: dict, require_text: str = "") -> dict:
     import pymupdf as fitz
 
@@ -907,11 +966,11 @@ def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float
     text = page.get_text("text") or ""
     if require_text and require_text not in text:
         failures.append("The original text is no longer in the file.")
-    images = page.get_images()
+    images = _content_image_xrefs(doc, page)
     if images:
-        info = doc.extract_image(images[0][0])
+        info = doc.extract_image(images[0])
         if info.get("colorspace") not in (4, "CMYK", None) and info.get("cs-name") not in ("DeviceCMYK", None):
-            # PyMuPDF uses numeric colorspace 4 for CMYK.
+            # PyMuPDF uses numeric colorspace 4 for CMYK. Soft-mask greys are not the picture.
             if info.get("colorspace") != 4 and "CMYK" not in str(info.get("cs-name", "")):
                 failures.append("The press file is not CMYK.")
     elif report.get("contentKind") != "vector":
@@ -991,10 +1050,20 @@ def convert_cmyk_keep_text(src: str, dest: str) -> None:
     ]
     if os.path.isfile(icc):
         cmd.insert(cmd.index("-f"), f"-sDefaultCMYKProfile={icc}")
-    srgb = "/usr/share/color/icc/ghostscript/srgb.icc"
-    if os.path.isfile(srgb):
+    from host_paths import c_numeric_env, icc_file
+
+    try:
+        srgb = icc_file("srgb.icc")
+    except FileNotFoundError:
+        srgb = ""
+    if srgb and os.path.isfile(srgb):
         cmd.insert(cmd.index("-f"), f"-sDefaultRGBProfile={srgb}")
-    subprocess.run(cmd, check=True, timeout=90, capture_output=True)
+    completed = subprocess.run(cmd, check=False, timeout=90, capture_output=True, env=c_numeric_env())
+    from gs_binary import ghostscript_succeeded
+
+    # Informational Ghostscript stderr is not a failure. The exit and the file are.
+    if not ghostscript_succeeded(completed.returncode, dest, min_bytes=64):
+        raise RuntimeError(f"Ghostscript did not write the CMYK file (exit {completed.returncode}).")
 
 
 def _page_proxy(page, max_px: int = 500) -> np.ndarray:
@@ -1004,6 +1073,298 @@ def _page_proxy(page, max_px: int = 500) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+# One device pixel at 300 DPI. Edge replication samples this radius only.
+_EDGE_PIXEL_PT = 72.0 / 300.0
+# Drawn on top of the live page so a renderer cannot leave a white hairline.
+_SEAM_COVER_PT = _EDGE_PIXEL_PT * 2
+
+
+def _pixmap_cmyk(page, clip):
+    """DeviceCMYK samples. An RGB round-trip turns a navy edge into a grey band."""
+    import pymupdf as fitz
+
+    if clip is None or clip.width < 0.15 or clip.height < 0.15:
+        return None
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(300.0 / 72.0, 300.0 / 72.0),
+        clip=clip,
+        alpha=False,
+        colorspace=fitz.csCMYK,
+    )
+    if pix.width < 1 or pix.height < 1 or pix.n < 4:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    return np.ascontiguousarray(arr[:, :, :4])
+
+
+def _insert_cmyk(page, cmyk, rect) -> None:
+    if cmyk is None or rect is None or rect.width < 0.2 or rect.height < 0.2:
+        return
+    target_w = max(1, int(round(rect.width / 72.0 * 300.0)))
+    target_h = max(1, int(round(rect.height / 72.0 * 300.0)))
+    if cmyk.shape[1] != target_w or cmyk.shape[0] != target_h:
+        cmyk = cv2.resize(cmyk, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(cmyk), mode="CMYK").save(
+        buf, format="TIFF", compression="raw", dpi=(300, 300),
+    )
+    page.insert_image(rect, stream=buf.getvalue())
+
+
+# A 1–2 px light line sits on the page edge. Read a few pixels past it.
+_INSET_PX = 3
+# Median only across depth, so one JPEG spike is dropped and a thin column stays sharp.
+_INSET_MEDIAN_PX = 3
+
+
+def _fit_nearest(sample: np.ndarray, length: int, along_rows: bool) -> np.ndarray:
+    if sample is None:
+        return None
+    if along_rows:
+        if sample.shape[0] == length:
+            return sample
+        return cv2.resize(sample, (sample.shape[1], length), interpolation=cv2.INTER_NEAREST)
+    if sample.shape[1] == length:
+        return sample
+    return cv2.resize(sample, (length, sample.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+
+def _median_cols(band: np.ndarray, from_end: bool = False) -> np.ndarray | None:
+    """One colour per row. Column 0 is closest to the page edge unless from_end."""
+    if band is None or band.size == 0 or getattr(band, "ndim", 0) != 3 or band.shape[1] < 1:
+        return None
+    depth = min(_INSET_MEDIAN_PX, band.shape[1])
+    sample = band[:, -depth:, :] if from_end else band[:, :depth, :]
+    return np.median(sample, axis=1).astype(np.uint8)
+
+
+def _median_rows(band: np.ndarray, from_end: bool = False) -> np.ndarray | None:
+    """One colour per column. Row 0 is closest to the page edge unless from_end."""
+    if band is None or band.size == 0 or getattr(band, "ndim", 0) != 3 or band.shape[0] < 1:
+        return None
+    depth = min(_INSET_MEDIAN_PX, band.shape[0])
+    sample = band[-depth:, :, :] if from_end else band[:depth, :, :]
+    return np.median(sample, axis=0).astype(np.uint8)
+
+
+def _replicate_cols(colors: np.ndarray, out_px: int) -> np.ndarray | None:
+    """Repeat each row colour straight across the margin. No mirror and no blur."""
+    if colors is None or out_px < 1:
+        return None
+    return np.ascontiguousarray(np.repeat(colors[:, None, :], out_px, axis=1))
+
+
+def _replicate_rows(colors: np.ndarray, out_px: int) -> np.ndarray | None:
+    """Repeat each column colour straight out from the seam."""
+    if colors is None or out_px < 1:
+        return None
+    return np.ascontiguousarray(np.repeat(colors[None, :, :], out_px, axis=0))
+
+
+def _clear_crossed_fringe(colors: np.ndarray | None) -> np.ndarray | None:
+    """The other edge's light line crosses the first rows. Extend the ink behind it."""
+    if colors is None or len(colors) <= _INSET_PX * 2:
+        return colors
+    cleaned = np.array(colors, copy=True)
+    cleaned[:_INSET_PX] = cleaned[_INSET_PX]
+    cleaned[-_INSET_PX:] = cleaned[-1 - _INSET_PX]
+    return cleaned
+
+
+def _color_at(colors: np.ndarray | None, at_end: bool) -> np.ndarray | None:
+    """The corner colour is inset from the other edge, past that edge's light line."""
+    if colors is None or len(colors) < 1:
+        return None
+    inset = min(_INSET_PX, len(colors) - 1)
+    return colors[-1 - inset] if at_end else colors[inset]
+
+
+def _blend_corner(vertical: np.ndarray, horizontal: np.ndarray, out_h: int, out_w: int, pin_row_end: bool, pin_col_end: bool) -> np.ndarray:
+    """Blend the two adjacent edge colours. The shared edges stay pinned to that edge."""
+    rows = np.arange(out_h, dtype=np.float32)
+    cols = np.arange(out_w, dtype=np.float32)
+    dist_vertical = ((out_h - 1) - rows) if pin_row_end else rows
+    dist_horizontal = ((out_w - 1) - cols) if pin_col_end else cols
+    together = dist_vertical[:, None] + dist_horizontal[None, :]
+    weight = np.where(together > 0, dist_horizontal[None, :] / np.maximum(together, 1e-6), 0.5).astype(np.float32)
+    blended = vertical.astype(np.float32) * weight[..., None] + horizontal.astype(np.float32) * (1.0 - weight)[..., None]
+    return np.ascontiguousarray(np.clip(np.round(blended), 0, 255).astype(np.uint8))
+
+
+def _paint_cmyk_edge(page, placed) -> None:
+    """Continue each edge from one inset colour per row or column.
+
+    The sample sits 3 px inside the page, past a 1–2 px light line. A thin
+    column or a curve is carried straight out, with no mirror, tiling, blur,
+    or sharpening. Each corner is a blend of the two edge colours that meet
+    there, and those shared edges keep that colour so the seam has no hairline.
+    """
+    import pymupdf as fitz
+
+    full = page.rect
+    pixel = _EDGE_PIXEL_PT
+    cover = _SEAM_COVER_PT
+    inset = pixel * _INSET_PX
+    sample_span = pixel * _INSET_MEDIAN_PX
+    placed = fitz.Rect(placed)
+    if placed.width < 1 or placed.height < 1:
+        return
+    gaps = {
+        "left": max(0.0, placed.x0 - full.x0),
+        "right": max(0.0, full.x1 - placed.x1),
+        "top": max(0.0, placed.y0 - full.y0),
+        "bottom": max(0.0, full.y1 - placed.y1),
+    }
+    if max(gaps.values()) < 0.3:
+        return
+
+    scale = 300.0 / 72.0
+
+    def grab(box):
+        rect = fitz.Rect(*box) & page.rect
+        if rect.width < 0.12 or rect.height < 0.12:
+            return None
+        return _pixmap_cmyk(page, rect)
+
+    def snap(rect):
+        snapped = fitz.Rect(rect)
+        if snapped.x0 - full.x0 < 1.0:
+            snapped.x0 = full.x0
+        if full.x1 - snapped.x1 < 1.0:
+            snapped.x1 = full.x1
+        if snapped.y0 - full.y0 < 1.0:
+            snapped.y0 = full.y0
+        if full.y1 - snapped.y1 < 1.0:
+            snapped.y1 = full.y1
+        return snapped
+
+    left_colors = right_colors = top_colors = bottom_colors = None
+    if gaps["left"] > 0.3:
+        rect = snap(fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0 + inset, placed.y0, placed.x0 + inset + sample_span, placed.y1)),
+            out_h,
+            True,
+        )
+        left_colors = _clear_crossed_fringe(_median_cols(band, False))
+        _insert_cmyk(page, _replicate_cols(left_colors, out_w), rect)
+    if gaps["right"] > 0.3:
+        rect = snap(fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x1 - inset - sample_span, placed.y0, placed.x1 - inset, placed.y1)),
+            out_h,
+            True,
+        )
+        right_colors = _clear_crossed_fringe(_median_cols(band, True))
+        _insert_cmyk(page, _replicate_cols(right_colors, out_w), rect)
+    if gaps["top"] > 0.3:
+        rect = snap(fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0, placed.y0 + inset, placed.x1, placed.y0 + inset + sample_span)),
+            out_w,
+            False,
+        )
+        top_colors = _clear_crossed_fringe(_median_rows(band, False))
+        _insert_cmyk(page, _replicate_rows(top_colors, out_h), rect)
+    if gaps["bottom"] > 0.3:
+        rect = snap(fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0, placed.y1 - inset - sample_span, placed.x1, placed.y1 - inset)),
+            out_w,
+            False,
+        )
+        bottom_colors = _clear_crossed_fringe(_median_rows(band, True))
+        _insert_cmyk(page, _replicate_rows(bottom_colors, out_h), rect)
+
+    def paint_corner(rect, vertical, horizontal, pin_row_end, pin_col_end):
+        if vertical is None and horizontal is None:
+            return
+        if vertical is None:
+            vertical = horizontal
+        if horizontal is None:
+            horizontal = vertical
+        rect = snap(rect)
+        _insert_cmyk(page, _blend_corner(
+            vertical,
+            horizontal,
+            max(1, int(round(rect.height * scale))),
+            max(1, int(round(rect.width * scale))),
+            pin_row_end,
+            pin_col_end,
+        ), rect)
+
+    if gaps["left"] > 0.3 and gaps["top"] > 0.3:
+        paint_corner(
+            fitz.Rect(full.x0, full.y0, placed.x0 + cover, placed.y0 + cover),
+            _color_at(left_colors, False),
+            _color_at(top_colors, False),
+            True,
+            True,
+        )
+    if gaps["right"] > 0.3 and gaps["top"] > 0.3:
+        paint_corner(
+            fitz.Rect(placed.x1 - cover, full.y0, full.x1, placed.y0 + cover),
+            _color_at(right_colors, False),
+            _color_at(top_colors, True),
+            True,
+            False,
+        )
+    if gaps["left"] > 0.3 and gaps["bottom"] > 0.3:
+        paint_corner(
+            fitz.Rect(full.x0, placed.y1 - cover, placed.x0 + cover, full.y1),
+            _color_at(left_colors, True),
+            _color_at(bottom_colors, False),
+            False,
+            True,
+        )
+    if gaps["right"] > 0.3 and gaps["bottom"] > 0.3:
+        paint_corner(
+            fitz.Rect(placed.x1 - cover, placed.y1 - cover, full.x1, full.y1),
+            _color_at(right_colors, True),
+            _color_at(bottom_colors, True),
+            False,
+            False,
+        )
+
+
+def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:
+    """Box inset when a TrimBox exists, otherwise the size match when every box is equal."""
+    media = page.mediabox
+    trim = page.trimbox if page.trimbox.width > 2 and page.trimbox.height > 2 else media
+    boxes_differ = abs(trim.width - media.width) >= 1.5 or abs(trim.height - media.height) >= 1.5
+    if boxes_differ:
+        existing = {
+            "left": max(0.0, (trim.x0 - media.x0) * 25.4 / 72.0),
+            "bottom": max(0.0, (trim.y0 - media.y0) * 25.4 / 72.0),
+            "right": max(0.0, (media.x1 - trim.x1) * 25.4 / 72.0),
+            "top": max(0.0, (media.y1 - trim.y1) * 25.4 / 72.0),
+        }
+        trim_w = trim.width * 25.4 / 72.0
+        trim_h = trim.height * 25.4 / 72.0
+        if min(existing.values()) >= 1.5 and abs(trim_w - trim_w_mm) <= 2.0 and abs(trim_h - trim_h_mm) <= 2.0:
+            return existing, "boxes"
+        return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
+    page_w = media.width * 25.4 / 72.0
+    page_h = media.height * 25.4 / 72.0
+    bleed = inferred_side_bleed(page_w, page_h, trim_w_mm, trim_h_mm)
+    if bleed and bleed.get("kind") == "existing":
+        return {side: float(bleed[side]) for side in ("left", "right", "top", "bottom")}, "partial"
+    if bleed and bleed.get("kind") == "trim":
+        return {side: float(bleed[side]) for side in ("left", "right", "top", "bottom")}, "trim"
+    return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
 
 
 def compile_vector_press(
@@ -1036,17 +1397,20 @@ def compile_vector_press(
         open_path = prepared.get("pdfPath") or src_path
 
     src = fitz.open(open_path)
+    if src.page_count < 1:
+        src.close()
+        return {
+            "used": False,
+            "report": {
+                "passed": False,
+                "status": "needs-attention",
+                "headline": "Needs attention",
+                "reason": "The PDF has no pages.",
+                "fix": "Upload the file again.",
+                "edges": [],
+            },
+        }
     page = src[0]
-    media = page.mediabox
-    trim = page.trimbox
-    trim_w_pt = trim.width
-    trim_h_pt = trim.height
-    existing = {
-        "left": max(0.0, (trim.x0 - media.x0) * 25.4 / 72.0),
-        "bottom": max(0.0, (trim.y0 - media.y0) * 25.4 / 72.0),
-        "right": max(0.0, (media.x1 - trim.x1) * 25.4 / 72.0),
-        "top": max(0.0, (media.y1 - trim.y1) * 25.4 / 72.0),
-    }
     text = page.get_text("text") or ""
     images = page.get_images()
     if text.strip() and images:
@@ -1065,67 +1429,82 @@ def compile_vector_press(
     out_h = (trim_h_mm + 2 * bleed_mm) * MM_TO_PT
     bleed_pt = bleed_mm * MM_TO_PT
     doc = fitz.open()
-    new_page = doc.new_page(width=out_w, height=out_h)
-    # Background from the sampled edge colours, in CMYK, only as the page fill.
-    # The original page is placed on top, still as vectors.
-    colour = _median_bgr(proxy)
-    # RGB here is only the under-colour. Ghostscript turns the page into CMYK and leaves the text in place.
-    r = int(colour[2]) / 255.0
-    g = int(colour[1]) / 255.0
-    b = int(colour[0]) / 255.0
-    new_page.draw_rect(new_page.rect, color=None, fill=(r, g, b), fill_opacity=1)
-    have = min(existing.values()) if existing else 0
-    trim_matches = abs(trim_w_pt * 25.4 / 72.0 - trim_w_mm) <= 2 and abs(trim_h_pt * 25.4 / 72.0 - trim_h_mm) <= 2
-    dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
-    if trim_matches and have + 0.4 >= bleed_mm:
-        # Place the existing trim-plus-bleed, clipped to the requested bleed. Do not add another ring.
-        clip = fitz.Rect(
-            trim.x0 - bleed_mm * MM_TO_PT,
-            trim.y0 - bleed_mm * MM_TO_PT,
-            trim.x1 + bleed_mm * MM_TO_PT,
-            trim.y1 + bleed_mm * MM_TO_PT,
-        )
-        new_page.show_pdf_page(new_page.rect, src, 0, clip=clip)
+    kept = False
+    extended = False
+    shrunk = False
+    edge_placements = []
+    for index in range(src.page_count):
+        src_page = src[index]
+        new_page = doc.new_page(width=out_w, height=out_h)
+        existing, mode = _vector_page_bleed(src_page, trim_w_mm, trim_h_mm)
+        have = min(existing.values()) if existing else 0.0
+        trim_box = src_page.trimbox if src_page.trimbox.width > 2 else src_page.mediabox
+        if mode == "boxes" and have + 0.4 >= bleed_mm:
+            # Already 5 mm. Clip to that bleed. Do not add another ring and do not shrink.
+            clip = fitz.Rect(
+                trim_box.x0 - bleed_mm * MM_TO_PT,
+                trim_box.y0 - bleed_mm * MM_TO_PT,
+                trim_box.x1 + bleed_mm * MM_TO_PT,
+                trim_box.y1 + bleed_mm * MM_TO_PT,
+            )
+            new_page.show_pdf_page(new_page.rect, src, index, clip=clip)
+            kept = True
+        elif mode in ("partial", "boxes") and have >= 2.0:
+            # Keep the bleed that is already there. Mirror only the shortfall out to 5 mm.
+            extra_l = max(0.0, existing["left"] * MM_TO_PT - bleed_pt)
+            extra_r = max(0.0, existing["right"] * MM_TO_PT - bleed_pt)
+            extra_t = max(0.0, existing["top"] * MM_TO_PT - bleed_pt)
+            extra_b = max(0.0, existing["bottom"] * MM_TO_PT - bleed_pt)
+            src_rect = src_page.rect
+            clip = fitz.Rect(
+                src_rect.x0 + extra_l,
+                src_rect.y0 + extra_t,
+                src_rect.x1 - extra_r,
+                src_rect.y1 - extra_b,
+            )
+            short_l = max(0.0, bleed_pt - existing["left"] * MM_TO_PT)
+            short_r = max(0.0, bleed_pt - existing["right"] * MM_TO_PT)
+            short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
+            short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
+            placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
+            new_page.show_pdf_page(placed, src, index, clip=clip)
+            if max(short_l, short_r, short_t, short_b) >= 0.4:
+                extended = True
+                edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+            else:
+                kept = True
+                edge_placements.append(None)
+        else:
+            dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
+            scale = 1.0
+            if analysis.get("safeHits", 0) > 0:
+                scale = 1.0 - min(SAFE_ZONE_SHRINK_CAP, 0.02)
+                shrunk = scale < 0.999
+            placed = dest
+            if scale < 0.999:
+                margin_x = dest.width * (1 - scale) / 2
+                margin_y = dest.height * (1 - scale) / 2
+                placed = fitz.Rect(dest.x0 + margin_x, dest.y0 + margin_y, dest.x1 - margin_x, dest.y1 - margin_y)
+            src_trim = src_page.rect
+            if abs(trim_box.width - src_page.mediabox.width) >= 1.5 or abs(trim_box.height - src_page.mediabox.height) >= 1.5:
+                src_trim = trim_box
+            cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
+            clip_w = placed.width / cover
+            clip_h = placed.height / cover
+            clip = fitz.Rect(
+                src_trim.x0 + (src_trim.width - clip_w) / 2,
+                src_trim.y0 + (src_trim.height - clip_h) / 2,
+                src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
+                src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
+            )
+            new_page.show_pdf_page(placed, src, index, clip=clip)
+            edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+        if len(edge_placements) < index + 1:
+            edge_placements.append(None)
+        _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
+    if kept and not extended:
         edges = _edge_lines(analysis, methods, kept=True)
-        kept = True
-    else:
-        scale = 1.0
-        if analysis.get("safeHits", 0) > 0:
-            scale = 1.0 - min(SAFE_ZONE_SHRINK_CAP, 0.02)
-        placed = dest
-        if scale < 0.999:
-            margin_x = dest.width * (1 - scale) / 2
-            margin_y = dest.height * (1 - scale) / 2
-            placed = fitz.Rect(dest.x0 + margin_x, dest.y0 + margin_y, dest.x1 - margin_x, dest.y1 - margin_y)
-        # Cover: clip the source trim so the placed art fills the trim.
-        src_trim = trim if trim.width > 2 and trim.height > 2 else page.rect
-        cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
-        clip_w = placed.width / cover
-        clip_h = placed.height / cover
-        clip = fitz.Rect(
-            src_trim.x0 + (src_trim.width - clip_w) / 2,
-            src_trim.y0 + (src_trim.height - clip_h) / 2,
-            src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
-            src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
-        )
-        new_page.show_pdf_page(placed, src, 0, clip=clip)
-        kept = False
-        # Photo edges get a raster ring in the bleed only, under the vectors.
-        if any(edge["kind"] in ("photo", "pattern") for edge in analysis["edges"].values()):
-            ring = extend_trim(cover_scale(proxy, max(32, int(trim_w_mm * 4)), max(32, int(trim_h_mm * 4))), max(4, int(bleed_mm * 4)), analysis)[0]
-            # The ring image is only a guide sitting full-page behind; vectors were already placed.
-            # Rebuild order: background image first, then vectors. Recreate the page.
-            doc.close()
-            doc = fitz.open()
-            new_page = doc.new_page(width=out_w, height=out_h)
-            import io
-            from PIL import Image
-            rgb = cv2.cvtColor(ring, cv2.COLOR_BGR2RGB)
-            buf = io.BytesIO()
-            Image.fromarray(rgb).convert("CMYK").save(buf, format="TIFF")
-            new_page.insert_image(new_page.rect, stream=buf.getvalue())
-            new_page.show_pdf_page(placed, src, 0, clip=clip)
-    _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
+    page_count = src.page_count
     raw_path = out_path + ".raw.pdf"
     doc.save(raw_path, deflate=True, garbage=4)
     doc.close()
@@ -1139,29 +1518,34 @@ def compile_vector_press(
             os.remove(raw_path)
     # Ghostscript can drop the boxes. Put them back.
     fixed = fitz.open(out_path)
-    for fixed_page in fixed:
+    for fixed_page, placement in zip(fixed, edge_placements):
+        if placement:
+            _paint_cmyk_edge(fixed_page, fitz.Rect(*placement))
         _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
     boxed = out_path + ".box.pdf"
     fixed.save(boxed, deflate=True, garbage=4)
     fixed.close()
     os.replace(boxed, out_path)
 
+    full_keep = kept and not extended
     rescue = {
-        "applied": (not kept) and analysis.get("safeHits", 0) > 0,
-        "scale": 0.98 if analysis.get("safeHits", 0) > 0 and not kept else 1.0,
+        "applied": shrunk,
+        "scale": 0.98 if shrunk else 1.0,
         "safeZoneMm": safe_zone_mm,
         "note": "Text and vectors were kept live." if kind != "raster" else "The picture stays as placed. Only the bleed ring was added.",
     }
-    report = _base_report(analysis, edges, kept, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
+    report = _base_report(analysis, edges, full_keep, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
     report["contentKind"] = kind
     report["analysis"]["contentKind"] = kind
-    report["existingBleed"] = kept
+    report["existingBleed"] = bool(kept or extended)
+    report["fullBleedKept"] = full_keep
     report["rescue"] = rescue
+    report["pageCount"] = page_count
     report["effectiveDpi"] = 300
     report["resolutionNote"] = "Vector artwork stays sharp at any size." if kind == "vector" else "The placed artwork was kept. The bleed ring is 300 DPI."
     report["allowWhite"] = False
     report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="")
-    return {"used": True, "report": report, "path": out_path}
+    return {"used": True, "report": report, "path": out_path, "pageCount": page_count}
 
 
 def summary_sentence(report: dict) -> str:
@@ -1173,3 +1557,226 @@ def summary_sentence(report: dict) -> str:
     rescue = (report.get("rescue") or {}).get("note", "")
     existing = " Existing bleed was kept." if report.get("existingBleed") else ""
     return ("Ready for press. " + " ".join(parts) + " " + rescue + existing).strip()
+
+
+def _srgb_lab(rgb) -> np.ndarray:
+    """CIE Lab from a mean sRGB triple. Used for seam delta E."""
+    channel = np.asarray(rgb, dtype=np.float64) / 255.0
+
+    def linear(value):
+        return np.where(value <= 0.04045, value / 12.92, ((value + 0.055) / 1.055) ** 2.4)
+
+    red, green, blue = linear(channel)
+    x = red * 0.4124564 + green * 0.3575761 + blue * 0.1804375
+    y = red * 0.2126729 + green * 0.7151522 + blue * 0.0721750
+    z = red * 0.0193339 + green * 0.1191920 + blue * 0.9503041
+    white = (0.95047, 1.0, 1.08883)
+
+    def pivot(value):
+        return np.where(value > 0.008856, np.cbrt(value), 7.787 * value + 16.0 / 116.0)
+
+    fx, fy, fz = (pivot(x / white[0]), pivot(y / white[1]), pivot(z / white[2]))
+    return np.array([116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)], dtype=np.float64)
+
+
+def _delta_e(left, right) -> float:
+    gap = _srgb_lab(left) - _srgb_lab(right)
+    return float(np.sqrt(np.sum(gap * gap)))
+
+
+def _delta_e00(left, right) -> float:
+    """CIEDE2000 between two mean sRGB colours. Local seam windows use this."""
+    import math
+
+    lab1 = _srgb_lab(left)
+    lab2 = _srgb_lab(right)
+    L1, a1, b1 = (float(lab1[0]), float(lab1[1]), float(lab1[2]))
+    L2, a2, b2 = (float(lab2[0]), float(lab2[1]), float(lab2[2]))
+    C1 = math.hypot(a1, b1)
+    C2 = math.hypot(a2, b2)
+    Cbar = (C1 + C2) / 2.0
+    c7 = Cbar ** 7
+    G = 0.5 * (1.0 - math.sqrt(c7 / (c7 + 25.0 ** 7)))
+    a1p = (1.0 + G) * a1
+    a2p = (1.0 + G) * a2
+    C1p = math.hypot(a1p, b1)
+    C2p = math.hypot(a2p, b2)
+
+    def hue(b_value, a_value):
+        return math.degrees(math.atan2(b_value, a_value)) % 360.0
+
+    h1p = hue(b1, a1p)
+    h2p = hue(b2, a2p)
+    dL = L2 - L1
+    dC = C2p - C1p
+    if C1p * C2p == 0.0:
+        dh = 0.0
+        hbar = h1p + h2p
+    else:
+        dh = h2p - h1p
+        if dh > 180.0:
+            dh -= 360.0
+        elif dh < -180.0:
+            dh += 360.0
+        hsum = h1p + h2p
+        if abs(h1p - h2p) > 180.0:
+            hbar = (hsum + 360.0) / 2.0 if hsum < 360.0 else (hsum - 360.0) / 2.0
+        else:
+            hbar = hsum / 2.0
+    dH = 2.0 * math.sqrt(max(C1p * C2p, 0.0)) * math.sin(math.radians(dh / 2.0))
+    Lbar = (L1 + L2) / 2.0
+    Cbarp = (C1p + C2p) / 2.0
+    T = (
+        1.0
+        - 0.17 * math.cos(math.radians(hbar - 30.0))
+        + 0.24 * math.cos(math.radians(2.0 * hbar))
+        + 0.32 * math.cos(math.radians(3.0 * hbar + 6.0))
+        - 0.20 * math.cos(math.radians(4.0 * hbar - 63.0))
+    )
+    dtheta = 30.0 * math.exp(-((hbar - 275.0) / 25.0) ** 2)
+    cp7 = Cbarp ** 7
+    Rc = 2.0 * math.sqrt(cp7 / (cp7 + 25.0 ** 7))
+    Sl = 1.0 + (0.015 * (Lbar - 50.0) ** 2) / math.sqrt(20.0 + (Lbar - 50.0) ** 2)
+    Sc = 1.0 + 0.045 * Cbarp
+    Sh = 1.0 + 0.015 * Cbarp * T
+    Rt = -math.sin(math.radians(2.0 * dtheta)) * Rc
+    return math.sqrt((dL / Sl) ** 2 + (dC / Sc) ** 2 + (dH / Sh) ** 2 + Rt * (dC / Sc) * (dH / Sh))
+
+
+def _window_max_delta_e(rgb: np.ndarray, outside, inside, axis: str) -> float | None:
+    """Max CIEDE2000 of sliding 2 mm windows. outside/inside are y0,y1,x0,x1."""
+    oy0, oy1, ox0, ox1 = outside
+    iy0, iy1, ix0, ix1 = inside
+    height, width = rgb.shape[:2]
+    oy0, ox0 = max(0, int(oy0)), max(0, int(ox0))
+    iy0, ix0 = max(0, int(iy0)), max(0, int(ix0))
+    oy1, ox1 = min(height, int(oy1)), min(width, int(ox1))
+    iy1, ix1 = min(height, int(iy1)), min(width, int(ix1))
+    if oy1 <= oy0 or ox1 <= ox0 or iy1 <= iy0 or ix1 <= ix0:
+        return None
+    window = max(4, int(round(2.0 / 25.4 * 300.0)))
+    step = max(1, window // 4)
+    worst = 0.0
+    found = False
+    if axis == "y":
+        limit = min(oy1 - oy0, iy1 - iy0)
+        if limit < 2:
+            return None
+        span = min(window, limit)
+        for start in range(0, max(1, limit - span + 1), step):
+            out_mean = rgb[oy0 + start:oy0 + start + span, ox0:ox1].reshape(-1, 3).mean(axis=0)
+            in_mean = rgb[iy0 + start:iy0 + start + span, ix0:ix1].reshape(-1, 3).mean(axis=0)
+            worst = max(worst, _delta_e00(out_mean, in_mean))
+            found = True
+    else:
+        limit = min(ox1 - ox0, ix1 - ix0)
+        if limit < 2:
+            return None
+        span = min(window, limit)
+        for start in range(0, max(1, limit - span + 1), step):
+            out_mean = rgb[oy0:oy1, ox0 + start:ox0 + start + span].reshape(-1, 3).mean(axis=0)
+            in_mean = rgb[iy0:iy1, ix0 + start:ix0 + start + span].reshape(-1, 3).mean(axis=0)
+            worst = max(worst, _delta_e00(out_mean, in_mean))
+            found = True
+    return round(worst, 2) if found else None
+
+
+def _band_mean(image: np.ndarray, box) -> np.ndarray | None:
+    y0, y1, x0, x1 = box
+    y0, x0 = max(0, int(y0)), max(0, int(x0))
+    y1, x1 = min(image.shape[0], int(y1)), min(image.shape[1], int(x1))
+    if y1 <= y0 or x1 <= x0:
+        return None
+    return image[y0:y1, x0:x1].reshape(-1, image.shape[2]).mean(axis=0)
+
+
+def edge_seam_delta_e(path: str, seam_x_pt: float, seam_y_pt: float, dpi: float = 300.0) -> list:
+    """CIE76 between the ink just inside the seam and the extension just outside it.
+
+    seam_x_pt / seam_y_pt are the distance from the media edge to the join.
+    One row per page: left, right, top, bottom, and the four corners.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    rows = []
+    try:
+        scale = float(dpi) / 72.0
+        band = 6
+        for index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+            height, width = rgb.shape[:2]
+            sx = int(round(float(seam_x_pt) * scale))
+            sy = int(round(float(seam_y_pt) * scale))
+            sx = min(max(sx, band + 1), width - band - 1)
+            sy = min(max(sy, band + 1), height - band - 1)
+            pairs = {
+                "left": ((sy, height - sy, sx - band, sx), (sy, height - sy, sx, sx + band)),
+                "right": ((sy, height - sy, width - sx, width - sx + band), (sy, height - sy, width - sx - band, width - sx)),
+                "top": ((sy - band, sy, sx, width - sx), (sy, sy + band, sx, width - sx)),
+                "bottom": ((height - sy, height - sy + band, sx, width - sx), (height - sy - band, height - sy, sx, width - sx)),
+            }
+            # outside, inside. A white hairline sits in the outside band and moves the mean.
+            edges = {}
+            for name, (outside, inside) in pairs.items():
+                out_mean = _band_mean(rgb, outside)
+                in_mean = _band_mean(rgb, inside)
+                edges[name] = None if out_mean is None or in_mean is None else round(_delta_e(out_mean, in_mean), 2)
+            corners = {
+                "tl": ((0, sy, 0, sx), (sy, sy + band, sx, sx + band)),
+                "tr": ((0, sy, width - sx, width), (sy, sy + band, width - sx - band, width - sx)),
+                "bl": ((height - sy, height, 0, sx), (height - sy - band, height - sy, sx, sx + band)),
+                "br": ((height - sy, height, width - sx, width), (height - sy - band, height - sy, width - sx - band, width - sx)),
+            }
+            corner_de = {}
+            for name, (outside, inside) in corners.items():
+                out_mean = _band_mean(rgb, outside)
+                in_mean = _band_mean(rgb, inside)
+                corner_de[name] = None if out_mean is None or in_mean is None else round(_delta_e(out_mean, in_mean), 2)
+            skip = 2
+            local_edges = {
+                "left": _window_max_delta_e(
+                    rgb, (sy, height - sy, max(0, sx - band), sx), (sy, height - sy, sx + skip, sx + skip + band), "y",
+                ),
+                "right": _window_max_delta_e(
+                    rgb,
+                    (sy, height - sy, width - sx, min(width, width - sx + band)),
+                    (sy, height - sy, width - sx - skip - band, width - sx - skip),
+                    "y",
+                ),
+                "top": _window_max_delta_e(
+                    rgb, (max(0, sy - band), sy, sx, width - sx), (sy + skip, sy + skip + band, sx, width - sx), "x",
+                ),
+                "bottom": _window_max_delta_e(
+                    rgb,
+                    (height - sy, min(height, height - sy + band), sx, width - sx),
+                    (height - sy - skip - band, height - sy - skip, sx, width - sx),
+                    "x",
+                ),
+            }
+            win = max(4, int(round(2.0 / 25.4 * float(dpi))))
+            local_corners = {
+                "tl": _window_max_delta_e(rgb, (0, sy, 0, sx), (sy + skip, sy + skip + win, sx + skip, sx + skip + win), "y"),
+                "tr": _window_max_delta_e(
+                    rgb, (0, sy, width - sx, width), (sy + skip, sy + skip + win, width - sx - skip - win, width - sx - skip), "y",
+                ),
+                "bl": _window_max_delta_e(
+                    rgb, (height - sy, height, 0, sx), (height - sy - skip - win, height - sy - skip, sx + skip, sx + skip + win), "y",
+                ),
+                "br": _window_max_delta_e(
+                    rgb,
+                    (height - sy, height, width - sx, width),
+                    (height - sy - skip - win, height - sy - skip, width - sx - skip - win, width - sx - skip),
+                    "y",
+                ),
+            }
+            rows.append({
+                "page": index + 1,
+                **edges,
+                "corners": corner_de,
+                "local": {**local_edges, **local_corners},
+            })
+        return rows
+    finally:
+        doc.close()

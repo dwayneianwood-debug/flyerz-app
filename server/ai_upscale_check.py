@@ -231,12 +231,213 @@ def test_lanczos_cap() -> None:
     check("lanczos-cap", max(out.shape[:2]) <= MAX_LONG_EDGE, str(out.shape))
 
 
+def test_press_upscale_stays_inside_the_job() -> None:
+    """A slow Replicate call must not sit on the end of the job, and its token stays out of the log."""
+    import io
+    import json
+    import threading
+    import time
+    import urllib.request
+    from contextlib import redirect_stderr
+
+    from ai_enhancements import _replicate_create_prediction
+    from ai_upscale import (
+        ESRGAN_MESSAGE,
+        JOB_BUDGET_S,
+        LANCZOS_MESSAGE,
+        PRESS_GRACE_S,
+        PRESS_UPLOAD_EDGE,
+        PlateUpscale,
+        _press_scale,
+        _press_upload,
+        log_replicate,
+        start_plate_upscale,
+    )
+    from vector_trace import _enlarge_line, _upgrade_raster
+
+    wide = np.zeros((1536, 1024, 3), np.uint8)
+    upload = _press_upload(wide)
+    check("upload-under-1600", max(upload.shape[:2]) == PRESS_UPLOAD_EDGE and PRESS_UPLOAD_EDGE < 1600, str(upload.shape))
+    original = np.zeros((400, 300, 3), np.uint8)
+    check("upload-original", _press_upload(original).shape == original.shape)
+    check("scale-quick", _press_scale(upload, 5000) == 2)
+    check("scale-small", _press_scale(np.zeros((200, 120, 3), np.uint8), 4000) == 4)
+
+    saved_grace = PRESS_GRACE_S
+    saved_budget = JOB_BUDGET_S
+    import ai_upscale as upscale_mod
+
+    seen = {}
+    gate = threading.Event()
+
+    def slow(upload_bgr, scale, _deadline):
+        seen["shape"] = tuple(upload_bgr.shape)
+        seen["scale"] = scale
+        gate.wait(5)
+        return None, "failed", "denied super-secret-token"
+
+    picture = np.full((80, 100, 3), 40, np.uint8)
+    upscale_mod.PRESS_GRACE_S = 0.35
+    upscale_mod.JOB_BUDGET_S = 35.0
+    job = PlateUpscale(picture, 148, 210, runner=slow)
+    job._token = "super-secret-token"
+    try:
+        job.start()
+        began = time.perf_counter()
+        while "scale" not in seen and time.perf_counter() - began < 2:
+            time.sleep(0.01)
+        check("started-early", seen.get("scale") in (2, 4) and max(seen.get("shape", (0,))) <= PRESS_UPLOAD_EDGE, str(seen))
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            tick = time.perf_counter()
+            missed = job.take()
+            waited = time.perf_counter() - tick
+            gate.set()
+            job._done.wait(2)
+        text = buf.getvalue()
+        check("miss-is-none", missed is None)
+        check("miss-does-not-block", waited < 1.5, f"{waited:.2f}s")
+        check("log-status", "status=" in text and ("deadline" in text or "failed" in text), text)
+        check("log-hides-token", "super-secret-token" not in text, text)
+    finally:
+        gate.set()
+        upscale_mod.PRESS_GRACE_S = saved_grace
+        upscale_mod.JOB_BUDGET_S = saved_budget
+        job.cancel()
+
+    buf = io.StringIO()
+    with redirect_stderr(buf):
+        log_replicate("failed", "model said super-secret-token exploded", "super-secret-token")
+    logged = buf.getvalue()
+    check("log-error-text", "status=failed" in logged and "exploded" in logged, logged)
+    check("log-strips-token", "super-secret-token" not in logged, logged)
+
+    plate = np.full((80, 120, 3), 30, np.uint8)
+    placed = {"scale_mm": 25.4 / 180.0, "art_box": (0, 0, 120, 80)}
+    missed_job = PlateUpscale(plate, 148, 210)
+    missed_job._done.set()
+    missed_job.status = "failed"
+    missed_job.error = "OOM"
+    _upgraded, note = _upgrade_raster(plate, [], placed, plate, missed_job)
+    line = _enlarge_line("Lanczos", note)
+    check("one-lanczos-message", line == LANCZOS_MESSAGE and "was not used" not in line and "Real-ESRGAN" not in line, line)
+
+    ready = PlateUpscale(plate, 148, 210)
+    ready._done.set()
+    ready.image = np.full((40, 60, 3), (0, 255, 0), np.uint8)
+    upgraded, note = _upgrade_raster(plate, [], placed, plate, ready)
+    esrgan_line = _enlarge_line("Lanczos", note)
+    check("one-esrgan-message", esrgan_line == ESRGAN_MESSAGE and "Lanczos" not in esrgan_line, esrgan_line)
+    check("esrgan-pixels", int(upgraded[20, 30, 1]) > 200, str(tuple(int(v) for v in upgraded[20, 30])))
+
+    sharp = np.full((1200, 2000, 3), 10, np.uint8)
+    check("sharp-skips", start_plate_upscale(sharp, 90, 50, runner=slow) is None)
+    called = {}
+
+    def marker(upload_bgr, scale, _deadline):
+        called["hit"] = True
+        return None, "failed", "should-not-run"
+
+    soft = np.zeros((400, 300, 3), np.uint8)
+    saved_flag = os.environ.pop("VECTOR_ESRGAN", None)
+    try:
+        idle = start_plate_upscale(soft, 148, 210, runner=marker)
+        check("esrgan-off-no-start", idle is None and "hit" not in called)
+        os.environ["VECTOR_ESRGAN"] = "1"
+        started = start_plate_upscale(soft, 148, 210, runner=marker)
+        check("esrgan-on-starts", started is not None)
+        if started is not None:
+            started.cancel()
+            started._done.wait(2)
+    finally:
+        if saved_flag is None:
+            os.environ.pop("VECTOR_ESRGAN", None)
+        else:
+            os.environ["VECTOR_ESRGAN"] = saved_flag
+
+    seen_headers = {}
+
+    class _Body:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "id": "p",
+                "status": "starting",
+                "urls": {"get": "https://example.test/p", "cancel": "https://example.test/c"},
+            }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        seen_headers["prefer"] = req.get_header("Prefer")
+        seen_headers["timeout"] = timeout
+        seen_headers["auth"] = req.get_header("Authorization")
+        return _Body()
+
+    old_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        created = _replicate_create_prediction(
+            "nightmareai", "real-esrgan", {"image": "x"}, "super-secret-token",
+            version="abc", prefer_wait=False,
+        )
+    finally:
+        urllib.request.urlopen = old_urlopen
+    check("async-status", created.get("status") == "starting", str(created))
+    check("async-no-prefer", not seen_headers.get("prefer"), str(seen_headers.get("prefer")))
+    check("async-short-socket", float(seen_headers.get("timeout") or 99) <= 20, str(seen_headers.get("timeout")))
+    check("async-token-not-in-result", "super-secret-token" not in json.dumps(created))
+
+
+def test_token_does_not_call_replicate() -> None:
+    import urllib.error
+    import urllib.request
+
+    folder = tempfile.mkdtemp()
+    path = os.path.join(folder, "soft.png")
+    cv2.imwrite(path, np.full((80, 60, 3), 40, np.uint8))
+    saved_token = os.environ.get("REPLICATE_API_TOKEN")
+    saved_flag = os.environ.pop("VECTOR_ESRGAN", None)
+    os.environ["REPLICATE_API_TOKEN"] = "test-token"
+    calls = []
+    old = urllib.request.urlopen
+
+    def boom(req, timeout=None):
+        calls.append(getattr(req, "full_url", "url"))
+        raise urllib.error.URLError("blocked")
+
+    urllib.request.urlopen = boom
+    set_upscale_provider(None)
+    try:
+        result = apply_ai_upscale(path, {
+            "trim_w_mm": 90,
+            "trim_h_mm": 50,
+            "assume_token": True,
+            "output_path": os.path.join(folder, "out.png"),
+        })
+        check("token-stays-local", result.get("provider") == "basic" and not calls, str(result.get("provider")) + str(calls))
+    finally:
+        urllib.request.urlopen = old
+        set_upscale_provider(None)
+        if saved_token is None:
+            os.environ.pop("REPLICATE_API_TOKEN", None)
+        else:
+            os.environ["REPLICATE_API_TOKEN"] = saved_token
+        if saved_flag is not None:
+            os.environ["VECTOR_ESRGAN"] = saved_flag
+
+
 def main() -> None:
     test_scale_plan()
     test_basic_fallback()
+    test_token_does_not_call_replicate()
     test_stub_and_failure()
     test_vector_pdf_skipped()
     test_lanczos_cap()
+    test_press_upscale_stays_inside_the_job()
     test_compile_uses_enhanced_before_border()
     print("all ai upscale checks passed")
 

@@ -29,7 +29,7 @@ def font(path):
         pdfmetrics.registerFont(TTFont(n,path)); _reg[n]=path
     return n
 _srgb=ImageCms.createProfile('sRGB')
-_cmyk=ImageCms.getOpenProfile('/usr/share/color/icc/ghostscript/default_cmyk.icc')
+_cmyk=ImageCms.getOpenProfile(os.path.join(os.path.dirname(__file__), '..', '..', 'server', 'assets', 'icc', 'default_cmyk.icc'))
 _tr=ImageCms.buildTransform(_srgb,_cmyk,'RGB','CMYK',renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,flags=ImageCms.Flags.BLACKPOINTCOMPENSATION)
 def cmyk(rgb,cls=''):
     r,g,b=[int(round(x)) for x in rgb]

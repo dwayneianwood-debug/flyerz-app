@@ -9,6 +9,17 @@ import { storage } from "./storage";
 import { jobProgressPath, writeJobProgress } from "./jobProgress";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
+const PRESS_LOG_TAG = /^\[[A-Za-z][A-Za-z0-9_-]*\]/;
+
+/** Python lines such as [AI-UPSCALE] and [vector-trace], without the text-gate body. */
+export function pressLogLines(stderr: string): string[] {
+  const lines: string[] = [];
+  for (const row of String(stderr || "").split(/\r?\n/)) {
+    const line = row.trim();
+    if (PRESS_LOG_TAG.test(line)) lines.push(line);
+  }
+  return lines;
+}
 const SCRIPT = path.join(process.cwd(), "server", "quick_print.py");
 
 export interface QuickRunOptions {
@@ -25,10 +36,13 @@ export interface QuickRunResult {
   light: "green" | "amber" | "red";
   reasons: string[];
   decisions: string[];
+  checklist: { id: string; label: string; passed: boolean; detail: string }[];
   clientMessage: string;
   pressPath: string;
   proofPng: string;
   proofPdf: string;
+  proofPaths: string[];
+  pageCount: number;
   bleedMm: number;
   existingBleedKept: boolean;
   productId: string;
@@ -54,10 +68,23 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     light,
     reasons: list(raw.reasons),
     decisions: list(raw.decisions),
+    checklist: Array.isArray(raw.checklist)
+      ? raw.checklist.map((item) => {
+          const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          return {
+            id: String(row.id || ""),
+            label: String(row.label || ""),
+            passed: row.passed === true,
+            detail: String(row.detail || ""),
+          };
+        })
+      : [],
     clientMessage: String(raw.clientMessage || ""),
     pressPath: String(raw.pressPath || ""),
     proofPng: String(raw.proofPng || ""),
     proofPdf: String(raw.proofPdf || ""),
+    proofPaths: Array.isArray(raw.proofPaths) ? raw.proofPaths.map((item) => String(item)).filter(Boolean) : [],
+    pageCount: Number(raw.pageCount) || 0,
     bleedMm: Number(raw.bleedMm) || 5,
     existingBleedKept: raw.existingBleedKept === true,
     productId: String(raw.productId || ""),
@@ -75,6 +102,11 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     rebuildBefore: raw.rebuildBefore ? String(raw.rebuildBefore) : "",
     rebuildAfter: raw.rebuildAfter ? String(raw.rebuildAfter) : "",
   };
+}
+
+/** Auto must stay "auto" so Python measures the file. The A5 fallback is only a size until then. */
+export function productIdForEngine(requestedId: string, resolvedId: string): string {
+  return requestedId === "auto" ? "auto" : resolvedId;
 }
 
 export function resolveQuickProduct(productId: string, customW?: number, customH?: number) {
@@ -175,6 +207,9 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
         if (stderr.trim()) console.error(`[QUICK-PRINT] ${stderr.trim().slice(0, 500)}`);
         return;
       }
+      for (const line of pressLogLines(stderr)) {
+        console.error(`[QUICK-PRINT] ${line.slice(0, 500)}`);
+      }
       resolve(asResult(parsed));
     });
   });
@@ -202,6 +237,10 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     fixesApplied: result.light === "red" ? 0 : checks.length,
     complianceReport: result.decisions.join(" "),
     compiledPdfPath: result.pressPath || undefined,
+    proofPath: result.proofPng || undefined,
+    proofPaths: result.proofPaths.length ? result.proofPaths : undefined,
+    pageCount: result.pageCount || undefined,
+    proofPageCount: result.pageCount || undefined,
     quickPrint: { ...quickPrint, approved: false },
     pressEngine,
     ...reused,

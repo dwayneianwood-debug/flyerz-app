@@ -349,11 +349,10 @@ def convert_cmyk_ghostscript(input_path: str, output_path: str) -> dict:
         except Exception:
             pass
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Ghostscript CMYK conversion failed (exit {result.returncode}): {stderr_content}")
+    from gs_binary import ghostscript_succeeded
 
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("Ghostscript produced no output file")
+    if not ghostscript_succeeded(result.returncode, output_path, min_bytes=1):
+        raise RuntimeError(f"Ghostscript CMYK conversion failed (exit {result.returncode}).")
 
     return {
         "cmykApplied": True,

@@ -8,6 +8,7 @@ import { readQuickPrintSettings, writeQuickPrintSettings } from "./quickPrintSet
 import {
   fileTypeForName,
   jobOutputDir,
+  productIdForEngine,
   redFallback,
   resolveQuickProduct,
   runQuickPrintFile,
@@ -49,6 +50,7 @@ export function slimQuickCard(job: {
       light?: string;
       reasons?: string[];
       decisions?: string[];
+      checklist?: { id?: string; label?: string; passed?: boolean; detail?: string }[];
       clientMessage?: string;
       approved?: boolean;
       pressPath?: string;
@@ -68,6 +70,14 @@ export function slimQuickCard(job: {
     light,
     reasons: Array.isArray(quick?.reasons) ? quick.reasons.map(String) : [],
     decisions: Array.isArray(quick?.decisions) ? quick.decisions.map(String) : [],
+    checklist: Array.isArray(quick?.checklist)
+      ? quick.checklist.map((item) => ({
+          id: String(item?.id || ""),
+          label: String(item?.label || ""),
+          passed: item?.passed === true,
+          detail: String(item?.detail || ""),
+        }))
+      : [],
     clientMessage: String(quick?.clientMessage || ""),
     approved: quick?.approved === true,
     hasPress: !!(quick?.pressPath && fs.existsSync(quick.pressPath)),
@@ -91,13 +101,13 @@ function progressFields(jobId: number): { stage?: string; percent?: number; elap
 }
 
 async function runJob(jobId: number, inputPath: string, filename: string, body: Record<string, unknown>) {
-  const productId = String(body.productId || "a5");
-  const product = resolveQuickProduct(productId, Number(body.customWidth), Number(body.customHeight));
+  const requestedId = String(body.productId || "a5");
+  const product = resolveQuickProduct(requestedId, Number(body.customWidth), Number(body.customHeight));
   const quantity = Number(body.quantity);
   const notes = String(body.notes || "").slice(0, 400);
   try {
     const result = await runQuickPrintFile(inputPath, jobOutputDir(jobId), {
-      productId: product.id,
+      productId: productIdForEngine(requestedId, product.id),
       trimW: product.widthMm,
       trimH: product.heightMm,
       quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,
@@ -207,7 +217,7 @@ export function registerQuickPrintRoutes(app: Express) {
         created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: true });
         continue;
       }
-      writeJobProgress(job.id, "fitting", "Original lettering is kept. Text is not retyped.");
+      writeJobProgress(job.id, "fitting", "Fitting the picture to the product.");
       created.push({ id: job.id, filename: job.filename, status: "processing" as const, inputPath: named, skip: false });
     }
     res.status(202).json({

@@ -243,8 +243,12 @@ def _embedded_image_dpi(path: str) -> float | None:
         return None
 
 
-def page_existing_bleed(page) -> dict | None:
-    """Visual bleed from a TrimBox that sits inside the MediaBox. None when there is no inset."""
+def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float | None = None) -> dict | None:
+    """Visual bleed from a TrimBox, or from the page size when every box equals the MediaBox.
+
+    A Canva export often has no TrimBox. If the page is the ordered trim plus 2–15 mm
+    on each side, that extra is bleed that is already in the file.
+    """
     try:
         media = page.mediabox
         trim = page.trimbox
@@ -253,6 +257,21 @@ def page_existing_bleed(page) -> dict | None:
     if trim is None:
         return None
     if abs(trim.width - media.width) < 1.5 and abs(trim.height - media.height) < 1.5:
+        if trim_w_mm and trim_h_mm:
+            from press_ready_engine import inferred_side_bleed
+
+            page_w = media.width * 25.4 / 72.0
+            page_h = media.height * 25.4 / 72.0
+            bleed = inferred_side_bleed(page_w, page_h, float(trim_w_mm), float(trim_h_mm))
+            if bleed and bleed.get("kind") == "existing":
+                return {
+                    "top": float(bleed["top"]),
+                    "bottom": float(bleed["bottom"]),
+                    "left": float(bleed["left"]),
+                    "right": float(bleed["right"]),
+                    "trim_w_mm": float(trim_w_mm),
+                    "trim_h_mm": float(trim_h_mm),
+                }
         return None
     top = (media.y1 - trim.y1) * 25.4 / 72.0
     bottom = (trim.y0 - media.y0) * 25.4 / 72.0
@@ -1470,7 +1489,7 @@ def main():
                     compile_stats["cmyk_converted"] = True
                     compile_stats["cmyk_verified"] = True
                     compile_stats["fonts_outlined"] = False
-                    page_count = 1
+                    page_count = int(live.get("pageCount") or 1)
                     sys.stderr.write(
                         f"[COMPILE] Press-Ready Engine kept vectors live: "
                         f"{(live.get('report') or {}).get('status')}\n"
@@ -1632,6 +1651,7 @@ def main():
                         bleed_strategy=bleed_api_strategy,
                         dpi=float(dpi),
                         border_cmyk=_border_cmyk_arg(args) if bleed_api_strategy == "colourBorder" else None,
+                        allow_cloud=bleed_api_strategy == "ai_outpaint",
                     )
                     sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
                     if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("automaticChoice"):
@@ -1915,7 +1935,7 @@ def main():
 
                             pdf_kept = None
                             if not _pdf_manual_crop_active and args.trim_w > 0 and args.trim_h > 0:
-                                existing_pdf = page_existing_bleed(page)
+                                existing_pdf = page_existing_bleed(page, args.trim_w, args.trim_h)
                                 if existing_pdf:
                                     from smart_bleed import apply_existing_bleed
                                     pdf_kept, pdf_report = apply_existing_bleed(
@@ -1973,6 +1993,7 @@ def main():
                                     bleed_strategy=bleed_api_pdf,
                                     dpi=float(render_dpi),
                                     border_cmyk=_border_cmyk_arg(args) if bleed_api_pdf == "colourBorder" else None,
+                                    allow_cloud=bleed_api_pdf == "ai_outpaint",
                                 )
                             if isinstance(_pdf_heal_meta, dict) and _pdf_heal_meta.get("automaticChoice"):
                                 compile_stats["automatic_bleed"] = _pdf_heal_meta["automaticChoice"]

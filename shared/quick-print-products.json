@@ -1,9 +1,14 @@
 [
   { "id": "a6", "label": "A6", "widthMm": 105, "heightMm": 148 },
+  { "id": "a6-landscape", "label": "A6 landscape", "widthMm": 148, "heightMm": 105 },
   { "id": "a5", "label": "A5", "widthMm": 148, "heightMm": 210 },
+  { "id": "a5-landscape", "label": "A5 landscape", "widthMm": 210, "heightMm": 148 },
   { "id": "a4", "label": "A4", "widthMm": 210, "heightMm": 297 },
+  { "id": "a4-landscape", "label": "A4 landscape", "widthMm": 297, "heightMm": 210 },
   { "id": "a3", "label": "A3", "widthMm": 297, "heightMm": 420 },
+  { "id": "a3-landscape", "label": "A3 landscape", "widthMm": 420, "heightMm": 297 },
   { "id": "dl", "label": "DL", "widthMm": 99, "heightMm": 210 },
+  { "id": "dl-landscape", "label": "DL landscape", "widthMm": 210, "heightMm": 99 },
   { "id": "card-90x50", "label": "Business card 90 × 50", "widthMm": 90, "heightMm": 50 },
   { "id": "card-90x55", "label": "Business card 90 × 55", "widthMm": 90, "heightMm": 55 }
 ]
