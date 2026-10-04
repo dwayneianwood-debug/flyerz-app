@@ -168,7 +168,7 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
             <div className="aspect-[16/9]">
               {activeMethod === "colourBorder" ? (
               <img
-                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0`}
+                src={`/api/jobs/${jobId}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&page=${(proofPage || 0) + 1}`}
                 alt="Colour border preview"
                 className="w-full h-full object-contain"
                 data-testid="img-bleed-variant-colourBorder"

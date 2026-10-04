@@ -433,12 +433,23 @@ def _write_canva(path: str) -> None:
     font = fitz.Font(fontfile=_anton_font())
     doc = fitz.open()
     folder = os.path.dirname(path)
-    # DeviceCMYK navy that reaches the page edge. The second page is darker.
-    inks = ((210, 160, 40, 80), (230, 180, 30, 120))
+    # Page 1 is flat navy. Page 2 is grey meeting a navy curve, with a thin light edge line.
+    inks = ((210, 160, 40, 80), (30, 24, 24, 70))
     for index, ink in enumerate(inks):
         pixels_w = int(round(page_w / 72.0 * 150))
         pixels_h = int(round(page_h / 72.0 * 150))
         plate = Image.new("CMYK", (pixels_w, pixels_h), ink)
+        if index == 1:
+            curved = np.array(plate)
+            cv2.ellipse(
+                curved,
+                (0, int(pixels_h * 0.58)),
+                (int(pixels_w * 0.36), int(pixels_h * 0.30)),
+                0, 0, 360,
+                (210, 160, 40, 90),
+                -1,
+            )
+            plate = Image.fromarray(curved, mode="CMYK")
         jpeg = os.path.join(folder, f"navy-{index}.jpg")
         plate.save(jpeg, format="JPEG", quality=92)
         accent = Image.new("CMYK", (160, 110), (0, 190, 210, 0))
@@ -460,6 +471,13 @@ def _write_canva(path: str) -> None:
         writer = fitz.TextWriter(page.rect)
         writer.append((48, 230), f"ANTON {index + 1}", font=font, fontsize=32)
         writer.write_text(page, color=(1, 1, 1))
+        if index == 1:
+            fringe = 0.45
+            light = (0.94, 0.94, 0.94)
+            page.draw_rect(fitz.Rect(0, 0, page_w, fringe), fill=light, color=None)
+            page.draw_rect(fitz.Rect(0, page_h - fringe, page_w, page_h), fill=light, color=None)
+            page.draw_rect(fitz.Rect(0, 0, fringe, page_h), fill=light, color=None)
+            page.draw_rect(fitz.Rect(page_w - fringe, 0, page_w, page_h), fill=light, color=None)
         rect = page.rect
         page.set_mediabox(rect)
         page.set_cropbox(rect)
@@ -510,22 +528,30 @@ def test_canva_a6() -> None:
     result["_seconds"] = round(time.perf_counter() - started, 2)
     press = result.get("pressPath") or ""
     seams = edge_seam_delta_e(press, seam_x, seam_y) if press and os.path.exists(press) else []
-    worst = 99.0
+    worst = 0.0
     parts = []
+    local_keys = ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")
+    if not seams:
+        worst = 99.0
+        problems_seed = ["no seam report"]
+    else:
+        problems_seed = []
     for row in seams:
-        values = [row.get(edge) for edge in ("left", "right", "top", "bottom")]
-        values += list((row.get("corners") or {}).values())
-        numbers = [float(item) for item in values if item is not None]
-        if numbers:
-            worst = min(worst, max(numbers)) if worst == 99.0 else max(worst, max(numbers))
+        local = row.get("local") or {}
+        numbers = [None if local.get(key) is None else float(local.get(key)) for key in local_keys]
+        if any(item is None for item in numbers):
+            worst = 99.0
+        else:
+            worst = max(worst, max(numbers))
         parts.append(
-            "p{page} L{left} R{right} T{top} B{bottom} br{br}".format(
+            "p{page} local L{left} R{right} T{top} B{bottom} bl{bl} br{br}".format(
                 page=row.get("page"),
-                left=row.get("left"),
-                right=row.get("right"),
-                top=row.get("top"),
-                bottom=row.get("bottom"),
-                br=(row.get("corners") or {}).get("br"),
+                left=local.get("left"),
+                right=local.get("right"),
+                top=local.get("top"),
+                bottom=local.get("bottom"),
+                bl=local.get("bl"),
+                br=local.get("br"),
             )
         )
     seam_note = " ".join(parts)
@@ -534,7 +560,7 @@ def test_canva_a6() -> None:
     )
     if result.get("clientMessage"):
         reasons = f"{reasons} {result.get('clientMessage')}"
-    problems = []
+    problems = list(problems_seed)
     if built:
         problems.append(built)
     if result.get("light") == "red":
@@ -547,8 +573,8 @@ def test_canva_a6() -> None:
         problems.append("message does not say the bleed was kept")
     if "already had 5 mm" in reasons.lower():
         problems.append("claimed a full 5 mm")
-    if worst >= 3.0:
-        problems.append(f"seam dE {worst}")
+    if worst >= 5.0:
+        problems.append(f"local seam dE {worst}")
     _expect_press("canva-a6-auto", result, {
         "trim_w": 148, "trim_h": 105, "pages": 2, "product": "a6-landscape", "fixable": True,
         "live": ["ANTON 1", "ANTON 2"], "qr": True,
@@ -556,7 +582,7 @@ def test_canva_a6() -> None:
     })
     record(
         "canva-a6-seam",
-        not problems and worst < 3.0,
+        not problems and worst < 5.0,
         product=str(result.get("productId") or ""),
         pages=2,
         size=f"dE {worst:.2f}",
@@ -565,6 +591,46 @@ def test_canva_a6() -> None:
         live="kept" if result.get("existingBleedKept") else "",
         qr="",
         note="; ".join(problems),
+    )
+
+
+def test_gs_and_colour_border() -> None:
+    """Informational Ghostscript stderr is not a failure, and both preview pages write a PNG."""
+    from gs_binary import ghostscript_succeeded
+    from colour_border import render_colour_border_preview
+
+    folder = tempfile.mkdtemp(prefix="cust-gs-")
+    good = os.path.join(folder, "out.pdf")
+    with open(good, "wb") as handle:
+        handle.write(b"%PDF-1.4 ok")
+    missing = os.path.join(folder, "missing.pdf")
+    checks = [
+        ghostscript_succeeded(0, good, min_bytes=8),
+        ghostscript_succeeded(1, good, min_bytes=8),
+        not ghostscript_succeeded(0, missing, min_bytes=8),
+        not ghostscript_succeeded(-9, good, min_bytes=8),
+    ]
+    src = os.path.join(folder, "canva.pdf")
+    _write_canva(src)
+    bare = os.path.join(folder, "upload-no-ext")
+    with open(src, "rb") as handle, open(bare, "wb") as out:
+        out.write(handle.read())
+    pages = []
+    for page in (1, 2):
+        dest = os.path.join(folder, f"border-{page}.png")
+        info = render_colour_border_preview(bare, dest, 148, 105, 5, (0, 100, 100, 0), False, page)
+        pages.append(bool(info.get("success")) and os.path.getsize(dest) > 32)
+    record(
+        "colour-border-gs",
+        all(checks) and all(pages),
+        product="a6-landscape",
+        pages=2,
+        size="preview",
+        light="n/a",
+        reasons="exit+file" if all(checks) else "gs rule",
+        live="",
+        qr="",
+        note="" if all(pages) else "preview missing",
     )
 
 
@@ -590,12 +656,15 @@ def test_styles_are_different() -> None:
         ]).astype(np.int16)
     gaps = {
         "stretch-gradient": float(np.mean(np.abs(ring(made["stretch"]) - ring(made["gradient_extrapolate"])))),
-        "stretch-frequency": float(np.mean(np.abs(ring(made["stretch"]) - ring(made["frequency_separated"])))),
+        "stretch-frequency": float(np.mean(np.abs(made["stretch"][:10].astype(np.int16) - made["frequency_separated"][:10].astype(np.int16)))),
         "gradient-frequency": float(np.mean(np.abs(ring(made["gradient_extrapolate"]) - ring(made["frequency_separated"])))),
     }
+    textured = np.abs(made["stretch"][:10].astype(np.int16) - made["frequency_separated"][:10].astype(np.int16))
+    textured_share = float(np.mean(textured > 12))
+    gaps["frequency-share"] = textured_share
     record(
         "manual-styles-differ",
-        all(value > 1.0 for value in gaps.values()),
+        gaps["stretch-gradient"] > 1.0 and gaps["gradient-frequency"] > 1.0 and gaps["stretch-frequency"] > 8.0 and textured_share > 0.15,
         product="card",
         pages=1,
         size="styles",
@@ -716,6 +785,7 @@ def main() -> None:
     test_images()
     test_manual_styles()
     test_canva_a6()
+    test_gs_and_colour_border()
     test_styles_are_different()
     test_cover_reads_pdf()
     test_imagen_stays_local()

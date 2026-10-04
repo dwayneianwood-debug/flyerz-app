@@ -777,7 +777,7 @@ export default function JobDetails() {
     let choice = next;
     if (next.source === "edge" && job) {
       try {
-        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0`);
+        const res = await fetch(`/api/jobs/${job.id}/colour-border-preview?format=json&edge=1&lines=0&page=${proofPage + 1}`);
         const data = await res.json();
         if (res.ok && data.success) {
           choice = {
@@ -825,8 +825,8 @@ export default function JobDetails() {
 
   const colourBorderPreview = selectedBleedMethod === "colourBorder" && job
     ? {
-        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}`,
-        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}`,
+        url: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=1&bleed=${bleedMm}&page=${proofPage + 1}`,
+        thumbUrl: `/api/jobs/${job.id}/colour-border-preview?c=${colourBorder.c}&m=${colourBorder.m}&y=${colourBorder.y}&k=${colourBorder.k}&lines=0&bleed=${bleedMm}&page=${proofPage + 1}`,
         trimW: Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } } | null)?.savedBleedOptions?.targetWidth) || 148,
         trimH: Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } } | null)?.savedBleedOptions?.targetHeight) || 210,
         bleedMm,

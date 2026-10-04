@@ -1718,14 +1718,30 @@ export async function registerRoutes(
         encoding: "utf8",
         timeout: EXEC_TIMEOUT_MS,
       });
-      if (previewProc.status !== 0) {
-        const detail = (previewProc.stderr || previewProc.stdout || "").slice(-400);
-        throw new Error(detail || "Colour border preview failed");
+      // Ghostscript prints an informational banner on stderr while importing.
+      // Success is the exit code plus a real PNG, never the stderr text.
+      const wrotePreview = fsSync.existsSync(previewPath) && fsSync.statSync(previewPath).size > 32;
+      const stdout = (previewProc.stdout || "").trim();
+      const previewLine = stdout.split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
+      let info: any = null;
+      if (previewLine) {
+        try { info = JSON.parse(previewLine); } catch { info = null; }
       }
-      const previewLine = (previewProc.stdout || "").trim().split(/\n/).reverse().find((line) => line.trim().startsWith("{"));
-      const info = previewLine ? JSON.parse(previewLine) : null;
+      const exitOk = previewProc.status === 0;
+      if (!wrotePreview || (!exitOk && info?.success !== true)) {
+        throw new Error(info?.error || "Colour border preview failed");
+      }
       if (!info?.success) {
-        return res.status(400).json({ message: info?.error || "Could not build the colour border preview" });
+        info = {
+          success: true,
+          c: options.c,
+          m: options.m,
+          y: options.y,
+          k: options.k,
+          r: 0,
+          g: 0,
+          b: 0,
+        };
       }
       if (req.query.format === "json") {
         return res.json({ ...info, url: `/api/jobs/${jobId}/bleed-preview-image/${previewFilename}` });

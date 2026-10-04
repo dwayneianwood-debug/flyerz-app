@@ -1439,7 +1439,8 @@ def generate_visual_proof(pdf_path: str, output_png_path: str) -> dict:
         gs_success = False
         try:
             returncode, stderr_tail = _run_gs_to_file(gs_cmd, timeout=45, label=f"Proof page {page_num}")
-            if returncode == 0 and os.path.exists(page_output) and not _is_proof_blank(page_output):
+            from gs_binary import ghostscript_succeeded
+            if ghostscript_succeeded(returncode, page_output, min_bytes=32) and not _is_proof_blank(page_output):
                 sys.stderr.write(f"[CORE] Rendered proof page {page_num}/{total_pages} via Ghostscript at 144 DPI.\n")
                 gs_success = True
         except (RuntimeError, subprocess.TimeoutExpired):
@@ -1944,21 +1945,14 @@ def force_cmyk_conversion(input_path: str, output_path: str, dpi: int = DEFAULT_
     _gc_pre.collect()
 
     returncode, stderr_msg = _run_gs_to_file(gs_cmd, timeout=120, label="CMYK Conversion")
+    from gs_binary import ghostscript_succeeded
 
-    if returncode != 0:
+    if not ghostscript_succeeded(returncode, output_path, min_bytes=1):
         oom_hint = " (killed by OS — likely out of memory)" if returncode == -9 else ""
-        sys.stderr.write(f"[FAI] Ghostscript CMYK exit={returncode}{oom_hint}, stderr: {stderr_msg}\n")
-        raise RuntimeError(f"Ghostscript Error: CMYK conversion failed (exit {returncode}){oom_hint}. {stderr_msg}")
+        sys.stderr.write(f"[FAI] Ghostscript CMYK exit={returncode}{oom_hint}\n")
+        raise RuntimeError(f"Ghostscript Error: CMYK conversion failed (exit {returncode}){oom_hint}.")
 
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"Ghostscript Error: No output file was created. GS stderr: {stderr_msg}")
-
-    file_size = os.path.getsize(output_path)
-    if file_size == 0:
-        os.unlink(output_path)
-        raise RuntimeError(f"Ghostscript Error: Output file is empty (0 bytes). GS stderr: {stderr_msg}")
-
-    return {"success": True, "outputSize": file_size}
+    return {"success": True, "outputSize": os.path.getsize(output_path)}
 
 
 def process_for_litho(input_path: str, output_path: str) -> dict:
@@ -2013,20 +2007,13 @@ def process_for_litho(input_path: str, output_path: str) -> dict:
     _gc_litho.collect()
 
     returncode, stderr_msg = _run_gs_to_file(gs_cmd, timeout=120, label="Litho Processing")
+    from gs_binary import ghostscript_succeeded
 
-    if returncode != 0:
-        sys.stderr.write(f"[FAI] Ghostscript litho stderr: {stderr_msg}\n")
-        raise RuntimeError(f"Ghostscript Error: Litho processing failed (exit {returncode}). {stderr_msg}")
+    if not ghostscript_succeeded(returncode, output_path, min_bytes=1):
+        sys.stderr.write(f"[FAI] Ghostscript litho exit={returncode}\n")
+        raise RuntimeError(f"Ghostscript Error: Litho processing failed (exit {returncode}).")
 
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"Ghostscript Error: No litho output file was created. GS stderr: {stderr_msg}")
-
-    file_size = os.path.getsize(output_path)
-    if file_size == 0:
-        os.unlink(output_path)
-        raise RuntimeError(f"Ghostscript Error: Litho output file is empty (0 bytes). GS stderr: {stderr_msg}")
-
-    return {"success": True, "outputSize": file_size}
+    return {"success": True, "outputSize": os.path.getsize(output_path)}
 
 
 def apply_k_only_neutralization(pdf_path: str, output_path: str) -> dict:
@@ -3561,10 +3548,10 @@ BLEED_STRATEGY_COLOUR_BORDER = "colourBorder"
 BLEED_STRATEGY_GRADIENT_EXTRAPOLATE = "gradient_extrapolate"
 BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
 
-# Frequency-separated edge replication: thick strip for grain vs low-frequency color split
-FREQ_SEP_STRIP_DEPTH = 4
-FREQ_SEP_GAUSSIAN_KSIZE = (3, 3)
-FREQ_SEP_GAUSSIAN_SIGMA = 1.0
+# Frequency-separated edge replication: a deep strip so grain is real, not one blurred pixel.
+FREQ_SEP_STRIP_DEPTH = 28
+FREQ_SEP_GAUSSIAN_KSIZE = (15, 15)
+FREQ_SEP_GAUSSIAN_SIGMA = 4.0
 
 
 def _median_edge_bgr_u8(bgr: np.ndarray) -> np.ndarray:
@@ -5671,12 +5658,27 @@ def _tile_depth_texture_pingpong(vol: np.ndarray, target: int) -> np.ndarray:
     return np.tile(unit, (n, 1, 1))[:target]
 
 
+def _mirror_depth(vol: np.ndarray, target: int) -> np.ndarray:
+    """Mirror along axis 0. Index 0 stays the seam and the texture folds back on itself."""
+    if target <= 0 or vol.size == 0:
+        return np.zeros((max(0, target),) + tuple(vol.shape[1:]), dtype=np.float32)
+    depth = vol.shape[0]
+    if depth <= 1:
+        return np.repeat(vol.astype(np.float32), target, axis=0)
+    forward = vol.astype(np.float32)
+    backward = vol[-2:0:-1].astype(np.float32)
+    unit = np.concatenate([forward, backward], axis=0)
+    reps = int(np.ceil(target / unit.shape[0]))
+    return np.concatenate([unit] * reps, axis=0)[:target]
+
+
 def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> np.ndarray:
     """
-    Split edge_strip (depth axis 0 = outer toward inner) into low-frequency base and residual grain,
-    replicate base from outer row, tile grain depth-wise, recombine. Pure NumPy + cv2.
+    Low-frequency colour is blurred and mirrored outward. High-frequency grain
+    is mirrored on top of it, so a textured edge keeps its texture instead of
+    becoming a stretched flat band.
 
-    edge_strip: (D, W, C) or (D, W) with D in [3,5] typical; returns (target_bleed_px, W, C) uint8.
+    edge_strip: (D, W, C) or (D, W), depth 0 = the seam. Returns (target_bleed_px, W, C) uint8.
     """
     if target_bleed_px <= 0 or edge_strip.size == 0:
         return np.zeros((target_bleed_px, 1, 1), dtype=np.uint8)
@@ -5688,12 +5690,13 @@ def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> 
     if d < 1 or w < 1:
         return np.zeros((target_bleed_px, max(w, 1), max(c, 1)), dtype=np.uint8)
 
-    low = cv2.GaussianBlur(src, FREQ_SEP_GAUSSIAN_KSIZE, FREQ_SEP_GAUSSIAN_SIGMA)
+    if min(d, w) < 3:
+        low = src
+    else:
+        low = cv2.GaussianBlur(src, FREQ_SEP_GAUSSIAN_KSIZE, FREQ_SEP_GAUSSIAN_SIGMA)
     high = src - low
-    low_row = low[0:1, :, :]
-    low_bleed = np.broadcast_to(low_row, (target_bleed_px, w, c))
-    high_tiled = _tile_depth_texture_pingpong(high, target_bleed_px)
-    out = np.clip(np.round(low_bleed + high_tiled), 0, 255).astype(np.uint8)
+    out = np.clip(np.round(_mirror_depth(low, target_bleed_px) + _mirror_depth(high, target_bleed_px)), 0, 255)
+    out = out.astype(np.uint8)
     if c == 1:
         return out[:, :, 0]
     return out

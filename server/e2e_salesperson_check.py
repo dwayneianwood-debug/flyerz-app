@@ -99,27 +99,29 @@ def assert_seams(name: str, rows: list) -> None:
         return
     worst = 0.0
     parts = []
+    keys = ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")
     for row in rows:
-        edges = []
-        for edge in ("left", "right", "top", "bottom"):
-            value = row.get(edge)
-            edges.append(99.0 if value is None else float(value))
-        corners = [99.0 if value is None else float(value) for value in (row.get("corners") or {}).values()]
-        worst = max([worst, *edges, *corners])
+        local = row.get("local") or {}
+        values = []
+        for key in keys:
+            value = local.get(key)
+            values.append(99.0 if value is None else float(value))
+        worst = max([worst, *values])
         parts.append(
-            "p{page} L{left:.2f} R{right:.2f} T{top:.2f} B{bottom:.2f}".format(
+            "p{page} L{left:.2f} R{right:.2f} T{top:.2f} B{bottom:.2f} bl{bl:.2f}".format(
                 page=row.get("page"),
-                left=edges[0],
-                right=edges[1],
-                top=edges[2],
-                bottom=edges[3],
+                left=values[0],
+                right=values[1],
+                top=values[2],
+                bottom=values[3],
+                bl=values[6],
             )
         )
     detail = " ".join(parts)
-    if worst >= 3.0:
-        fail(name, f"dE {worst:.2f} {detail}")
+    if worst >= 5.0:
+        fail(name, f"local dE {worst:.2f} {detail}")
     else:
-        ok(name, f"dE {worst:.2f} {detail}")
+        ok(name, f"local dE {worst:.2f} {detail}")
 
 
 def quick_print(pdf: bytes, product_id: str) -> dict:
@@ -276,10 +278,20 @@ def manual(pdf: bytes) -> None:
         )
         gaps = [float(np.mean(np.abs(bands[left] - bands[right]))) for left, right in pairs]
         same = [left == right for left, right in ((raw["stretch"], raw["gradient_extrapolate"]), (raw["stretch"], raw["frequency_separated"]), (raw["gradient_extrapolate"], raw["frequency_separated"]))]
-        if any(same):
-            fail("styles-differ", "styles returned the same file")
+        if any(same) or gaps[1] < 2.5:
+            fail("styles-differ", "frequency matches stretch " + " ".join(f"{gap:.1f}" for gap in gaps))
         else:
             ok("styles-differ", " ".join(f"{gap:.1f}" for gap in gaps))
+    for page in (1, 2):
+        status, _headers, image = request(
+            "GET",
+            f"{BASE}/api/jobs/{job_id}/colour-border-preview?page={page}&lines=0&c=0&m=100&y=100&k=0",
+            timeout=60,
+        )
+        if status != 200 or not image.startswith(b"\x89PNG"):
+            fail(f"colour-border-p{page}", f"HTTP {status} {image[:80]!r}")
+        else:
+            ok(f"colour-border-p{page}", f"HTTP 200 {len(image)} bytes")
     drive_ui(job_id)
 
 

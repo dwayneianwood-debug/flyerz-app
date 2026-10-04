@@ -267,8 +267,10 @@ def convert_postscript_to_pdf(input_path: str, output_path: str, *, eps_crop: bo
         except Exception:
             pass
 
-    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 64:
-        sys.stderr.write(f"[FAI] Illustrator GS convert failed: {stderr_tail}\n")
+    from gs_binary import ghostscript_succeeded
+
+    if not ghostscript_succeeded(result.returncode, output_path, min_bytes=64):
+        sys.stderr.write(f"[FAI] Illustrator GS convert failed (exit {result.returncode})\n")
         raise RuntimeError("Ghostscript could not convert this file to PDF.")
     if not _pdf_has_marks(output_path):
         sys.stderr.write(f"[FAI] Illustrator GS convert produced an empty PDF: {stderr_tail}\n")

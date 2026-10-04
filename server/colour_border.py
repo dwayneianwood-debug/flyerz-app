@@ -148,11 +148,22 @@ def _apply_crop(img: np.ndarray, crop_x: float, crop_y: float, crop_w: float, cr
     return img
 
 
+def _looks_like_pdf(path: str) -> bool:
+    if os.path.splitext(path)[1].lower() == ".pdf":
+        return True
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _load_artwork_bgr(path: str, page: int) -> np.ndarray:
     import cv2
 
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
+    # Uploads are stored without an extension. OpenCV then fails and the
+    # process exits, which used to surface as the Ghostscript stderr banner.
+    if _looks_like_pdf(path):
         import fitz
 
         doc = fitz.open(path)

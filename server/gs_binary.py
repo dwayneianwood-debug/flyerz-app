@@ -16,6 +16,24 @@ COMMAND_NAMES = ("gs", "gswin64c", "gswin32c", "gswin64")
 WINDOWS_EXES = ("gswin64c.exe", "gswin32c.exe", "gswin64.exe")
 
 
+def ghostscript_succeeded(returncode, output_path, min_bytes: int = 1) -> bool:
+    """A Ghostscript run worked when it finished and the output file is real.
+
+    The copyright banner and "errors were repaired" notes are informational.
+    They are not a failure. A killed process (negative exit) is a failure
+    even when a partial file was left behind. A non-zero exit with a
+    non-empty file still counts: some builds exit 1 after that repair note.
+    """
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return False
+    if returncode < 0:
+        return False
+    try:
+        return os.path.isfile(output_path) and os.path.getsize(output_path) >= min_bytes
+    except OSError:
+        return False
+
+
 def find_gs_binary() -> str:
     for key in ENV_KEYS:
         raw = (os.environ.get(key) or "").strip().strip('"')
