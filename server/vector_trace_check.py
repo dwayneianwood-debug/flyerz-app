@@ -1267,20 +1267,24 @@ def _y_arms(binary: np.ndarray):
 
 
 def _check_card_back_raster(side: dict) -> None:
-    """A faint footer goes back to the picture. A traced Y keeps both arms."""
+    """A faint footer stays the picture unless the gate accepted it. A traced Y keeps both arms."""
     gate = side.get("textGate") or []
     for word in ("DETECT", "BALANCE", "HEAL", "LIVE BETTER"):
         rows = [row for row in gate if str(row.get("text") or "").strip() == word]
-        # A faint footer stays in the picture unless a second read and the
-        # overlap check both accepted it as live type.
-        kept = len(rows) == 1 and (
-            rows[0].get("mode") == "raster"
-            or (
-                rows[0].get("retyped")
-                and rows[0].get("mode") == "vector"
-                and _reads_match(str(rows[0].get("text") or ""), str(rows[0].get("render") or ""))
+        # A faint footer stays in the picture unless the gate accepted the
+        # trace, or a retype read back as the same word. At 600 PPI these
+        # words clear that gate (the stroke matches). A rejected trace does not.
+        row = rows[0] if len(rows) == 1 else {}
+        reads = _reads_match(str(row.get("text") or ""), str(row.get("render") or ""))
+        accepted = (
+            row.get("mode") == "vector"
+            and reads
+            and (
+                row.get("retyped")
+                or (row.get("ok") is True and not row.get("glyphFail"))
             )
         )
+        kept = len(rows) == 1 and (row.get("mode") == "raster" or accepted)
         check(
             "footer-" + word.lower().replace(" ", "-") + "-kept",
             kept,
