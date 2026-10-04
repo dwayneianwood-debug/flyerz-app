@@ -278,7 +278,7 @@ def manual(pdf: bytes) -> None:
         )
         gaps = [float(np.mean(np.abs(bands[left] - bands[right]))) for left, right in pairs]
         same = [left == right for left, right in ((raw["stretch"], raw["gradient_extrapolate"]), (raw["stretch"], raw["frequency_separated"]), (raw["gradient_extrapolate"], raw["frequency_separated"]))]
-        if any(same) or gaps[1] < 2.5:
+        if any(same) or gaps[1] < 8.0:
             fail("styles-differ", "frequency matches stretch " + " ".join(f"{gap:.1f}" for gap in gaps))
         else:
             ok("styles-differ", " ".join(f"{gap:.1f}" for gap in gaps))
@@ -340,10 +340,11 @@ def drive_ui(job_id: int) -> None:
             return
         state = json.loads(report.get("state") or "{}")
         style = json.loads(report.get("style") or "{}")
-        if not state.get("ready") or state.get("fix") or state.get("coverError") or not style.get("page2"):
-            fail("ui", json.dumps({"state": state, "style": style}))
+        proof = json.loads(report.get("proof") or "{}")
+        if not state.get("ready") or state.get("fix") or state.get("coverError") or not style.get("page2") or not proof.get("page2") or not proof.get("before"):
+            fail("ui", json.dumps({"state": state, "style": style, "proof": proof}))
         else:
-            ok("ui", "page 2 style stays after reload and Fix Everything does not ask again")
+            ok("ui", "page 2 proof and the before image stay on the job page")
     finally:
         proc.terminate()
 

@@ -1579,7 +1579,8 @@ export default function JobDetails() {
                         colourBorder={colourBorder}
                         onColourBorderChange={handleColourBorderChange}
                         pressEngine={job.auditResults.pressEngine}
-                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof?page=${proofPage}` : null}
+                        beforeUrl={(job.auditResults?.proofPath || (job.auditResults as { quickPrint?: { proofPng?: string } } | null)?.quickPrint?.proofPng || job.correctedPath || job.originalPath) ? `/api/jobs/${job.id}/proof?page=${proofPage}` : null}
+                        pageCount={artworkPageCount(job.auditResults)}
                         afterUrl={bleedPreview?.previewUrls?.[proofPage]?.url || bleedPreview?.previewUrls?.[0]?.url || null}
                         proofPage={proofPage}
                         onProofPage={setProofPage}
@@ -2312,6 +2313,21 @@ export default function JobDetails() {
 }
 
 
+
+function artworkPageCount(audit: { pageCount?: number; proofPageCount?: number; proofPaths?: string[]; bleedVariantPages?: Record<string, string[]>; pressEngine?: { pageCount?: number; report?: { pageCount?: number } }; quickPrint?: { pageCount?: number } } | null | undefined): number {
+  const variants = audit?.bleedVariantPages || {};
+  const variantCount = Math.max(0, ...Object.values(variants).map((pages) => (Array.isArray(pages) ? pages.length : 0)));
+  const proofCount = Array.isArray(audit?.proofPaths) ? audit.proofPaths.length : 0;
+  return Math.max(
+    Number(audit?.pageCount) || 0,
+    Number(audit?.proofPageCount) || 0,
+    Number(audit?.pressEngine?.pageCount) || 0,
+    Number(audit?.pressEngine?.report?.pageCount) || 0,
+    Number(audit?.quickPrint?.pageCount) || 0,
+    variantCount,
+    proofCount,
+  );
+}
 
 function BleedPreviewPanel({ bleedPreview, bleedPreviewLoading, bleedPreviewError, bleedPreviewPage, setBleedPreviewPage, currentBleedPage, loadBleedPreview, enhancementLoading, colourBorderPreview }: {
   bleedPreview: BleedPreviewData | null;

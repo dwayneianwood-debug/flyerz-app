@@ -164,10 +164,18 @@ def render_cover_preview(bgr: np.ndarray, trim_w_mm: float, trim_h_mm: float, de
     }
 
 
+def _looks_like_pdf(path: str) -> bool:
+    """Manual uploads are stored without an extension, so the header decides."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def load_artwork_bgr(path: str):
     """A PDF page is rendered. OpenCV cannot read a PDF, which reported 'Could not read artwork'."""
-    ext = os.path.splitext(path or "")[1].lower()
-    if ext == ".pdf":
+    if _looks_like_pdf(path):
         import pymupdf as fitz
 
         doc = fitz.open(path)

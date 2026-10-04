@@ -49,7 +49,7 @@ export const BLEED_METHOD_LABELS = {
   },
 } as const;
 
-export function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref, proofPage = 0, onProofPage, variantPages }: {
+export function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref, proofPage = 0, onProofPage, variantPages, pageCount = 0 }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
@@ -73,6 +73,7 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
   proofPage?: number;
   onProofPage?: (page: number) => void;
   variantPages?: Record<string, string[]> | null;
+  pageCount?: number;
 }) {
   /** Automatic is the default. The older styles stay as manual overrides. */
   const methods = ["auto", ...BLEED_STRATEGY_IDS];
@@ -118,6 +119,28 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
             {activeInfo.description}
           </p>
         )}
+        {(pageCount > 1 || beforeUrl) && (
+          <div className="space-y-2" data-testid="job-proof-pages">
+            {pageCount > 1 && (
+              <div className="flex items-center gap-2 flex-wrap" data-testid="bleed-proof-page-selector">
+                {Array.from({ length: pageCount }, (_, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    className={`text-xs px-2 py-1 rounded border ${proofPage === index ? "bg-primary text-primary-foreground" : "bg-background"}`}
+                    onClick={() => onProofPage?.(index)}
+                    data-testid={`button-bleed-page-${index + 1}`}
+                  >
+                    Page {index + 1}
+                  </button>
+                ))}
+              </div>
+            )}
+            {beforeUrl && (
+              <img src={beforeUrl} alt="Artwork before bleed" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-before" />
+            )}
+          </div>
+        )}
         {activeMethod === "auto" && (
           <div className="rounded-lg border border-border/60 bg-white dark:bg-background p-3 space-y-2" data-testid="panel-press-ready">
             <p className={`text-sm font-semibold ${engineAttention ? "text-amber-700" : "text-green-700"}`} data-testid="text-press-ready-headline">
@@ -137,11 +160,8 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
                 <li key={edge.side} className="text-xs text-foreground">{edge.note}</li>
               ))}
             </ul>
-            {(beforeUrl || afterUrl) && (
-              <div className="grid grid-cols-2 gap-2">
-                {beforeUrl && <img src={beforeUrl} alt="Artwork before bleed" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-before" />}
-                {afterUrl && <img src={afterUrl} alt="Artwork with bleed and cut line" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-after" />}
-              </div>
+            {afterUrl && (
+              <img src={afterUrl} alt="Artwork with bleed and cut line" className="w-full h-24 object-contain bg-muted rounded" data-testid="img-press-after" />
             )}
           </div>
         )}

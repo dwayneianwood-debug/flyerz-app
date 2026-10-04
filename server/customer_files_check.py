@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -441,17 +442,37 @@ def _write_canva(path: str) -> None:
         plate = Image.new("CMYK", (pixels_w, pixels_h), ink)
         if index == 1:
             curved = np.array(plate)
+            # 4 mm and 5 mm grey columns cross the top and bottom edges.
+            column_px = max(1, int(round(150.0 / 25.4)))
+            for origin, width_mm, tone in ((0.28, 4.0, (18, 14, 14, 40)), (0.62, 5.5, (55, 42, 40, 20))):
+                x0 = int(pixels_w * origin)
+                width = max(3, int(round(width_mm * column_px)))
+                curved[:, x0:x0 + width] = tone
+            # Navy curve meets the grey at the left edge, just above the corner.
             cv2.ellipse(
                 curved,
-                (0, int(pixels_h * 0.58)),
-                (int(pixels_w * 0.36), int(pixels_h * 0.30)),
-                0, 0, 360,
+                (0, int(pixels_h * 0.78)),
+                (int(pixels_w * 0.22), int(pixels_h * 0.16)),
+                0, 270, 450,
                 (210, 160, 40, 90),
                 -1,
             )
+            # 8x8 halftone, then JPEG quality 80, so the source has real block noise.
+            dots = (curved.shape[0] // 8) * 8
+            dot_rows = np.arange(4, dots, 8)
+            dot_cols = np.arange(4, (curved.shape[1] // 8) * 8, 8)
+            curved[np.ix_(dot_rows, dot_cols)] = (200, 150, 30, 80)
+            # Dense block grain just inside the trim. The outer rim stays even so the seam can match.
+            rim = 16
+            block = np.random.default_rng(11).integers(-36, 37, size=(8, 8, 4), dtype=np.int16)
+            grain = np.tile(block, (curved.shape[0] // 8 + 1, curved.shape[1] // 8 + 1, 1))
+            grain = grain[: curved.shape[0], : curved.shape[1]]
+            lifted = curved.astype(np.int16)
+            lifted[rim:-rim, rim:-rim] += grain[rim:-rim, rim:-rim]
+            curved = np.clip(lifted, 0, 255).astype(np.uint8)
             plate = Image.fromarray(curved, mode="CMYK")
         jpeg = os.path.join(folder, f"navy-{index}.jpg")
-        plate.save(jpeg, format="JPEG", quality=92)
+        plate.save(jpeg, format="JPEG", quality=80 if index == 1 else 92)
         accent = Image.new("CMYK", (160, 110), (0, 190, 210, 0))
         accent_path = os.path.join(folder, f"accent-{index}.tif")
         accent.save(accent_path, format="TIFF")
@@ -513,6 +534,34 @@ def _canva_source_ok(path: str) -> str:
         doc.close()
 
 
+def _corner_near_white(path: str, seam_x_pt: float, seam_y_pt: float) -> list:
+    """Near-white pixels left in a corner square are a gap or an uncovered light line."""
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    counts = []
+    try:
+        scale = 300.0 / 72.0
+        for index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+            height, width = rgb.shape[:2]
+            sx = min(max(int(round(seam_x_pt * scale)), 2), width // 2)
+            sy = min(max(int(round(seam_y_pt * scale)), 2), height // 2)
+            boxes = {
+                "tl": rgb[:sy, :sx],
+                "tr": rgb[:sy, width - sx:],
+                "bl": rgb[height - sy:, :sx],
+                "br": rgb[height - sy:, width - sx:],
+            }
+            for name, crop in boxes.items():
+                white = int(np.count_nonzero(np.all(crop >= 245, axis=2)))
+                counts.append(f"p{index + 1}{name}:{white}")
+        return counts
+    finally:
+        doc.close()
+
+
 def test_canva_a6() -> None:
     from press_ready_engine import edge_seam_delta_e
 
@@ -544,12 +593,14 @@ def test_canva_a6() -> None:
         else:
             worst = max(worst, max(numbers))
         parts.append(
-            "p{page} local L{left} R{right} T{top} B{bottom} bl{bl} br{br}".format(
+            "p{page} local L{left} R{right} T{top} B{bottom} tl{tl} tr{tr} bl{bl} br{br}".format(
                 page=row.get("page"),
                 left=local.get("left"),
                 right=local.get("right"),
                 top=local.get("top"),
                 bottom=local.get("bottom"),
+                tl=local.get("tl"),
+                tr=local.get("tr"),
                 bl=local.get("bl"),
                 br=local.get("br"),
             )
@@ -575,6 +626,9 @@ def test_canva_a6() -> None:
         problems.append("claimed a full 5 mm")
     if worst >= 5.0:
         problems.append(f"local seam dE {worst}")
+    white = _corner_near_white(press, seam_x, seam_y) if press and os.path.exists(press) else ["unread"]
+    if any(int(item.rsplit(":", 1)[-1] or 99) > 4 for item in white):
+        problems.append("near-white " + " ".join(white))
     _expect_press("canva-a6-auto", result, {
         "trim_w": 148, "trim_h": 105, "pages": 2, "product": "a6-landscape", "fixable": True,
         "live": ["ANTON 1", "ANTON 2"], "qr": True,
@@ -637,12 +691,15 @@ def test_gs_and_colour_border() -> None:
 def test_styles_are_different() -> None:
     from smart_bleed import auto_resolve_safe_zone
 
-    image = np.zeros((96, 140, 3), np.uint8)
+    image = np.zeros((120, 160, 3), np.uint8)
     image[:, :] = (30, 40, 90)
-    gradient = np.linspace(0, 255, 140, dtype=np.uint8)
-    image[0, :] = np.stack([gradient, 255 - gradient, gradient // 2], axis=1)
-    noise = np.random.default_rng(3).integers(0, 255, size=(8, 140, 3), dtype=np.uint8)
-    image[:8] = noise
+    # The outer pixels are a smooth ramp. The texture sits just inside the trim.
+    gradient = np.linspace(0, 255, 160, dtype=np.uint8)
+    ramp = np.stack([gradient, 255 - gradient, gradient // 2], axis=1)
+    image[:6] = ramp
+    texture = np.random.default_rng(3).integers(0, 255, size=(28, 160, 3), dtype=np.uint8)
+    image[8:36] = texture
+    image[8:36:8, ::8] = (15, 15, 15)
     made = {}
     for name in ("stretch", "gradient_extrapolate", "frequency_separated"):
         out, _meta = auto_resolve_safe_zone(image.copy(), target_bleed_px=10, bleed_strategy=name, dpi=72.0, allow_cloud=False)
@@ -677,23 +734,43 @@ def test_styles_are_different() -> None:
 
 
 def test_cover_reads_pdf() -> None:
+    import subprocess
+    import sys
+
     from cover_crop_notice import load_artwork_bgr
 
     folder = tempfile.mkdtemp(prefix="cust-cover-")
     src = os.path.join(folder, "page.pdf")
     _write_canva(src)
-    image = load_artwork_bgr(src)
+    bare = os.path.join(folder, "upload-no-ext")
+    with open(src, "rb") as handle, open(bare, "wb") as out:
+        out.write(handle.read())
+    image = load_artwork_bgr(bare)
+    script = os.path.join(os.path.dirname(__file__), "cover_crop_notice.py")
+    failed = subprocess.run(
+        [sys.executable, script, "preview", os.path.join(folder, "missing"), os.path.join(folder, "out.png"), "148", "105"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(failed.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    route = open(os.path.join(os.path.dirname(__file__), "routes.ts"), encoding="utf-8").read()
+    catch = route.split("Cover crop notice failed", 1)[-1][:500]
+    reported_failure = failed.returncode != 0 and payload.get("success") is False and "success: false" in catch
     record(
         "cover-reads-pdf",
-        image is not None and image.size > 0,
+        image is not None and image.size > 0 and reported_failure,
         product="a6-landscape",
         pages=1,
         size=f"{0 if image is None else image.shape[1]}x{0 if image is None else image.shape[0]}",
         light="n/a",
-        reasons="",
+        reasons="header" if image is not None else "Could not read artwork",
         live="",
         qr="",
-        note="" if image is not None else "Could not read artwork",
+        note="" if reported_failure else f"exit {failed.returncode} {payload}",
     )
 
 

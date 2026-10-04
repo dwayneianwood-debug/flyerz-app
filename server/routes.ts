@@ -1910,7 +1910,11 @@ export async function registerRoutes(
       });
     } catch (error) {
       console.error('[FAI] Cover crop notice failed:', error);
-      res.json({ success: true, cropped: false });
+      res.status(500).json({
+        success: false,
+        cropped: false,
+        error: error instanceof Error ? error.message : 'Cover crop notice failed',
+      });
     }
   });
 

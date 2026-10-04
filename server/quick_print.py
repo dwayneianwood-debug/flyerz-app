@@ -1181,29 +1181,35 @@ def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
                 pass
 
 
-def _write_proof(press_path: str, png_path: str, pdf_path: str, caption: str) -> None:
+def _write_proof(press_path: str, png_path: str, pdf_path: str, caption: str) -> list:
+    """One proof picture per press page. Page 1 keeps the original png name."""
     import pymupdf as fitz
 
     src = fitz.open(press_path)
+    paths = []
     try:
-        page = src[0]
         proof = fitz.open()
         footer = 32
-        out = proof.new_page(width=page.rect.width, height=page.rect.height + footer)
-        out.show_pdf_page(page.rect, src, 0)
-        trim = page.trimbox
-        out.draw_rect(trim, color=(0.86, 0.05, 0.45), width=1.4)
-        out.insert_text(
-            (14, page.rect.height + 20),
-            caption[:180],
-            fontsize=8,
-            fontname="helv",
-            color=(0.15, 0.15, 0.15),
-        )
+        stem, ext = os.path.splitext(png_path)
+        for index, page in enumerate(src):
+            out = proof.new_page(width=page.rect.width, height=page.rect.height + footer)
+            out.show_pdf_page(page.rect, src, index)
+            trim = page.trimbox
+            out.draw_rect(trim, color=(0.86, 0.05, 0.45), width=1.4)
+            out.insert_text(
+                (14, page.rect.height + 20),
+                caption[:180],
+                fontsize=8,
+                fontname="helv",
+                color=(0.15, 0.15, 0.15),
+            )
+            page_png = png_path if index == 0 else f"{stem}-{index + 1}{ext}"
+            pix = out.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+            pix.save(page_png)
+            paths.append(page_png)
         proof.save(pdf_path, deflate=True, garbage=4)
-        pix = out.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
-        pix.save(png_path)
         proof.close()
+        return paths
     finally:
         src.close()
 
@@ -1626,13 +1632,15 @@ def make_print_ready(
         proof_png = os.path.join(output_dir, "proof.png")
         proof_pdf = os.path.join(output_dir, "proof.pdf")
         try:
-            _write_proof(
+            proof_pages = _write_proof(
                 press_path,
                 proof_png,
                 proof_pdf,
                 "Proof. The pink line is the trim. This is not the press file.",
             )
-            result["proofPng"] = proof_png
+            result["proofPng"] = proof_pages[0] if proof_pages else proof_png
+            result["proofPaths"] = proof_pages
+            result["pageCount"] = len(proof_pages) or 1
             result["proofPdf"] = proof_pdf
             decisions.append("A client proof with the trim line was made. No approval step is required.")
         except Exception as exc:

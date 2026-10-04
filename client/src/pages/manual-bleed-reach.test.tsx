@@ -48,6 +48,7 @@ test("bleed sizes and every style are on the page, including later pages", () =>
       proofPage={2}
       onProofPage={() => undefined}
       variantPages={{ mirror: pages }}
+      pageCount={3}
     />,
   );
   for (const id of BLEED_STRATEGY_IDS) {
@@ -59,6 +60,7 @@ test("bleed sizes and every style are on the page, including later pages", () =>
   assert.match(styles, /data-testid="button-style-page-1"/);
   assert.match(styles, /data-testid="button-style-page-2"/);
   assert.match(styles, /data-testid="button-style-page-3"/);
+  assert.match(styles, /data-testid="button-bleed-page-2"/);
   assert.match(styles, /bleed-variant\/mirror\?page=2/);
   assert.doesNotMatch(styles, /\(manual\)/);
 
@@ -77,6 +79,7 @@ test("bleed sizes and every style are on the page, including later pages", () =>
       proofPage={2}
       onProofPage={() => undefined}
       variantPages={{ mirror: pages }}
+      pageCount={3}
     />,
   );
   assert.match(proof, /img-press-before/);

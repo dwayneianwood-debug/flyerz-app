@@ -73,6 +73,17 @@ for (let attempt = 0; attempt < 40; attempt += 1) {
   if (state && state.includes('"ready":true')) break;
 }
 
+let proof = "";
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  proof = await evalPage(`(() => {
+    const page2 = document.querySelector('[data-testid="button-bleed-page-2"]');
+    const before = document.querySelector('[data-testid="img-press-before"]');
+    return JSON.stringify({ page2: !!page2, before: !!before });
+  })()`);
+  if (proof && proof.includes('"page2":true') && proof.includes('"before":true')) break;
+}
+
 let style = "";
 if (mode === "expect-done") {
   await evalPage(`(() => {
@@ -100,5 +111,5 @@ if (mode === "expect-done") {
   }
 }
 
-console.log(JSON.stringify({ mode, state, style }));
+console.log(JSON.stringify({ mode, state, style, proof }));
 socket.close();

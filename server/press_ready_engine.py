@@ -1116,115 +1116,101 @@ def _insert_cmyk(page, cmyk, rect) -> None:
     page.insert_image(rect, stream=buf.getvalue())
 
 
-# Skip a 1–2 px light or anti-aliased line, then read a few pixels further in.
-_FRINGE_PX = 2
-_INSET_SAMPLE_PX = 6
+# A 1–2 px light line sits on the page edge. Read a few pixels past it.
+_INSET_PX = 3
+# Median only across depth, so one JPEG spike is dropped and a thin column stays sharp.
+_INSET_MEDIAN_PX = 3
 
 
-def _drop_light_fringe(sample: np.ndarray) -> np.ndarray:
-    """Column 0 is the page edge. A near-white 1–2 px line is replaced by the ink behind it."""
-    if sample is None or sample.ndim != 3 or sample.shape[1] < 2:
-        return sample
-    cleaned = np.array(sample, copy=True)
-    ink = cleaned.astype(np.int16).sum(axis=2)
-    depth = cleaned.shape[1]
-    for col in range(min(2, depth - 1)):
-        deeper = min(col + 2, depth - 1)
-        pale = (ink[:, col] < 55) & (ink[:, col] + 25 < ink[:, deeper])
-        cleaned[pale, col] = cleaned[pale, deeper]
-    return cleaned
-
-
-def _pingpong(length: int, depth: int) -> np.ndarray:
-    if depth <= 1:
-        return np.zeros(max(0, length), np.int32)
-    cycle = depth * 2 - 2
-    pos = np.mod(np.arange(length), cycle)
-    return np.where(pos < depth, pos, cycle - pos).astype(np.int32)
-
-
-def _extend_from_seam(sample: np.ndarray, out_px: int, seam_at_end: bool) -> np.ndarray:
-    """Mirror a strip whose column 0 faces the seam. Blur only the added columns."""
-    if sample is None or sample.size == 0 or out_px < 1:
-        return None
-    cleaned = _drop_light_fringe(sample)
-    mirrored = cleaned[:, _pingpong(out_px, cleaned.shape[1]), :]
-    if seam_at_end:
-        mirrored = mirrored[:, ::-1, :]
-    blurred = cv2.GaussianBlur(np.ascontiguousarray(mirrored), (3, 3), 0.8)
-    cover = min(2, out_px)
-    if seam_at_end:
-        blurred[:, -cover:, :] = mirrored[:, -cover:, :]
-    else:
-        blurred[:, :cover, :] = mirrored[:, :cover, :]
-    return np.ascontiguousarray(blurred)
-
-
-def _extend_rows_from_seam(sample: np.ndarray, out_px: int, seam_at_end: bool) -> np.ndarray:
-    """sample row 0 faces the seam. Result rows run across the margin."""
-    if sample is None or sample.size == 0:
-        return None
-    swapped = np.ascontiguousarray(np.swapaxes(sample, 0, 1))
-    extended = _extend_from_seam(swapped, out_px, seam_at_end)
-    if extended is None:
-        return None
-    return np.ascontiguousarray(np.swapaxes(extended, 0, 1))
-
-
-def _extend_corner(patch: np.ndarray, out_h: int, out_w: int, source_row_end: bool, source_col_end: bool, output_row_end: bool, output_col_end: bool) -> np.ndarray:
-    """Mirror a patch out from the artwork corner. The seam sides are not blurred."""
-    if patch is None or patch.size == 0 or out_h < 1 or out_w < 1:
-        return None
-    src = patch[::-1, :, :] if source_row_end else patch
-    src = src[:, ::-1, :] if source_col_end else src
-    src = _drop_light_fringe(src)
-    src = np.swapaxes(_drop_light_fringe(np.swapaxes(src, 0, 1)), 0, 1)
-    filled = src[_pingpong(out_h, src.shape[0])[:, None], _pingpong(out_w, src.shape[1])[None, :], :]
-    if output_row_end:
-        filled = filled[::-1, :, :]
-    if output_col_end:
-        filled = filled[:, ::-1, :]
-    filled = np.ascontiguousarray(filled)
-    blurred = cv2.GaussianBlur(filled, (3, 3), 0.8)
-    cover = min(2, out_h, out_w)
-    if output_row_end:
-        blurred[-cover:, :, :] = filled[-cover:, :, :]
-    else:
-        blurred[:cover, :, :] = filled[:cover, :, :]
-    if output_col_end:
-        blurred[:, -cover:, :] = filled[:, -cover:, :]
-    else:
-        blurred[:, :cover, :] = filled[:, :cover, :]
-    return np.ascontiguousarray(blurred)
-
-
-def _fit_length(sample: np.ndarray, length: int, along_rows: bool) -> np.ndarray:
+def _fit_nearest(sample: np.ndarray, length: int, along_rows: bool) -> np.ndarray:
     if sample is None:
         return None
     if along_rows:
         if sample.shape[0] == length:
             return sample
-        return cv2.resize(sample, (sample.shape[1], length), interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(sample, (sample.shape[1], length), interpolation=cv2.INTER_NEAREST)
     if sample.shape[1] == length:
         return sample
-    return cv2.resize(sample, (length, sample.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(sample, (length, sample.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+
+def _median_cols(band: np.ndarray, from_end: bool = False) -> np.ndarray | None:
+    """One colour per row. Column 0 is closest to the page edge unless from_end."""
+    if band is None or band.size == 0 or getattr(band, "ndim", 0) != 3 or band.shape[1] < 1:
+        return None
+    depth = min(_INSET_MEDIAN_PX, band.shape[1])
+    sample = band[:, -depth:, :] if from_end else band[:, :depth, :]
+    return np.median(sample, axis=1).astype(np.uint8)
+
+
+def _median_rows(band: np.ndarray, from_end: bool = False) -> np.ndarray | None:
+    """One colour per column. Row 0 is closest to the page edge unless from_end."""
+    if band is None or band.size == 0 or getattr(band, "ndim", 0) != 3 or band.shape[0] < 1:
+        return None
+    depth = min(_INSET_MEDIAN_PX, band.shape[0])
+    sample = band[-depth:, :, :] if from_end else band[:depth, :, :]
+    return np.median(sample, axis=0).astype(np.uint8)
+
+
+def _replicate_cols(colors: np.ndarray, out_px: int) -> np.ndarray | None:
+    """Repeat each row colour straight across the margin. No mirror and no blur."""
+    if colors is None or out_px < 1:
+        return None
+    return np.ascontiguousarray(np.repeat(colors[:, None, :], out_px, axis=1))
+
+
+def _replicate_rows(colors: np.ndarray, out_px: int) -> np.ndarray | None:
+    """Repeat each column colour straight out from the seam."""
+    if colors is None or out_px < 1:
+        return None
+    return np.ascontiguousarray(np.repeat(colors[None, :, :], out_px, axis=0))
+
+
+def _clear_crossed_fringe(colors: np.ndarray | None) -> np.ndarray | None:
+    """The other edge's light line crosses the first rows. Extend the ink behind it."""
+    if colors is None or len(colors) <= _INSET_PX * 2:
+        return colors
+    cleaned = np.array(colors, copy=True)
+    cleaned[:_INSET_PX] = cleaned[_INSET_PX]
+    cleaned[-_INSET_PX:] = cleaned[-1 - _INSET_PX]
+    return cleaned
+
+
+def _color_at(colors: np.ndarray | None, at_end: bool) -> np.ndarray | None:
+    """The corner colour is inset from the other edge, past that edge's light line."""
+    if colors is None or len(colors) < 1:
+        return None
+    inset = min(_INSET_PX, len(colors) - 1)
+    return colors[-1 - inset] if at_end else colors[inset]
+
+
+def _blend_corner(vertical: np.ndarray, horizontal: np.ndarray, out_h: int, out_w: int, pin_row_end: bool, pin_col_end: bool) -> np.ndarray:
+    """Blend the two adjacent edge colours. The shared edges stay pinned to that edge."""
+    rows = np.arange(out_h, dtype=np.float32)
+    cols = np.arange(out_w, dtype=np.float32)
+    dist_vertical = ((out_h - 1) - rows) if pin_row_end else rows
+    dist_horizontal = ((out_w - 1) - cols) if pin_col_end else cols
+    together = dist_vertical[:, None] + dist_horizontal[None, :]
+    weight = np.where(together > 0, dist_horizontal[None, :] / np.maximum(together, 1e-6), 0.5).astype(np.float32)
+    blended = vertical.astype(np.float32) * weight[..., None] + horizontal.astype(np.float32) * (1.0 - weight)[..., None]
+    return np.ascontiguousarray(np.clip(np.round(blended), 0, 255).astype(np.uint8))
 
 
 def _paint_cmyk_edge(page, placed) -> None:
-    """Continue each edge from a sample a few pixels inside the page.
+    """Continue each edge from one inset colour per row or column.
 
-    A 1–2 px light or anti-aliased line on the existing bleed is ignored.
-    The margin is a per-row or per-column mirror of that inset sample, with a
-    slight blur only in the added zone. Two pixels of the clean ink cover the
-    join so the light line is not left as a hairline.
+    The sample sits 3 px inside the page, past a 1–2 px light line. A thin
+    column or a curve is carried straight out, with no mirror, tiling, blur,
+    or sharpening. Each corner is a blend of the two edge colours that meet
+    there, and those shared edges keep that colour so the seam has no hairline.
     """
     import pymupdf as fitz
 
     full = page.rect
     pixel = _EDGE_PIXEL_PT
     cover = _SEAM_COVER_PT
-    fringe = pixel * _FRINGE_PX
-    sample_span = pixel * _INSET_SAMPLE_PX
+    inset = pixel * _INSET_PX
+    sample_span = pixel * _INSET_MEDIAN_PX
     placed = fitz.Rect(placed)
     if placed.width < 1 or placed.height < 1:
         return
@@ -1237,87 +1223,121 @@ def _paint_cmyk_edge(page, placed) -> None:
     if max(gaps.values()) < 0.3:
         return
 
-    def clip_of(box):
+    scale = 300.0 / 72.0
+
+    def grab(box):
         rect = fitz.Rect(*box) & page.rect
         if rect.width < 0.12 or rect.height < 0.12:
             return None
-        return rect
+        return _pixmap_cmyk(page, rect)
 
-    def grab(box):
-        return _pixmap_cmyk(page, clip_of(box))
+    def snap(rect):
+        snapped = fitz.Rect(rect)
+        if snapped.x0 - full.x0 < 1.0:
+            snapped.x0 = full.x0
+        if full.x1 - snapped.x1 < 1.0:
+            snapped.x1 = full.x1
+        if snapped.y0 - full.y0 < 1.0:
+            snapped.y0 = full.y0
+        if full.y1 - snapped.y1 < 1.0:
+            snapped.y1 = full.y1
+        return snapped
 
-    scale = 300.0 / 72.0
+    left_colors = right_colors = top_colors = bottom_colors = None
     if gaps["left"] > 0.3:
-        rect = fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1)
-        band = _fit_length(
-            grab((placed.x0 + fringe, placed.y0, placed.x0 + fringe + sample_span, placed.y1)),
-            max(1, int(round(rect.height * scale))),
+        rect = snap(fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0 + inset, placed.y0, placed.x0 + inset + sample_span, placed.y1)),
+            out_h,
             True,
         )
-        _insert_cmyk(page, _extend_from_seam(band, max(1, int(round(rect.width * scale))), True), rect)
+        left_colors = _clear_crossed_fringe(_median_cols(band, False))
+        _insert_cmyk(page, _replicate_cols(left_colors, out_w), rect)
     if gaps["right"] > 0.3:
-        rect = fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1)
-        band = grab((placed.x1 - fringe - sample_span, placed.y0, placed.x1 - fringe, placed.y1))
-        if band is not None:
-            band = band[:, ::-1, :]
-        band = _fit_length(band, max(1, int(round(rect.height * scale))), True)
-        _insert_cmyk(page, _extend_from_seam(band, max(1, int(round(rect.width * scale))), False), rect)
+        rect = snap(fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x1 - inset - sample_span, placed.y0, placed.x1 - inset, placed.y1)),
+            out_h,
+            True,
+        )
+        right_colors = _clear_crossed_fringe(_median_cols(band, True))
+        _insert_cmyk(page, _replicate_cols(right_colors, out_w), rect)
     if gaps["top"] > 0.3:
-        rect = fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover)
-        band = _fit_length(
-            grab((placed.x0, placed.y0 + fringe, placed.x1, placed.y0 + fringe + sample_span)),
-            max(1, int(round(rect.width * scale))),
+        rect = snap(fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0, placed.y0 + inset, placed.x1, placed.y0 + inset + sample_span)),
+            out_w,
             False,
         )
-        _insert_cmyk(page, _extend_rows_from_seam(band, max(1, int(round(rect.height * scale))), True), rect)
+        top_colors = _clear_crossed_fringe(_median_rows(band, False))
+        _insert_cmyk(page, _replicate_rows(top_colors, out_h), rect)
     if gaps["bottom"] > 0.3:
-        rect = fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1)
-        band = grab((placed.x0, placed.y1 - fringe - sample_span, placed.x1, placed.y1 - fringe))
-        if band is not None:
-            band = band[::-1, :, :]
-        band = _fit_length(band, max(1, int(round(rect.width * scale))), False)
-        _insert_cmyk(page, _extend_rows_from_seam(band, max(1, int(round(rect.height * scale))), False), rect)
+        rect = snap(fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1))
+        out_h = max(1, int(round(rect.height * scale)))
+        out_w = max(1, int(round(rect.width * scale)))
+        band = _fit_nearest(
+            grab((placed.x0, placed.y1 - inset - sample_span, placed.x1, placed.y1 - inset)),
+            out_w,
+            False,
+        )
+        bottom_colors = _clear_crossed_fringe(_median_rows(band, True))
+        _insert_cmyk(page, _replicate_rows(bottom_colors, out_h), rect)
+
+    def paint_corner(rect, vertical, horizontal, pin_row_end, pin_col_end):
+        if vertical is None and horizontal is None:
+            return
+        if vertical is None:
+            vertical = horizontal
+        if horizontal is None:
+            horizontal = vertical
+        rect = snap(rect)
+        _insert_cmyk(page, _blend_corner(
+            vertical,
+            horizontal,
+            max(1, int(round(rect.height * scale))),
+            max(1, int(round(rect.width * scale))),
+            pin_row_end,
+            pin_col_end,
+        ), rect)
 
     if gaps["left"] > 0.3 and gaps["top"] > 0.3:
-        rect = fitz.Rect(full.x0, full.y0, placed.x0 + cover, placed.y0 + cover)
-        patch = grab((
-            placed.x0 + fringe, placed.y0 + fringe,
-            placed.x0 + fringe + sample_span, placed.y0 + fringe + sample_span,
-        ))
-        _insert_cmyk(page, _extend_corner(
-            patch, max(1, int(round(rect.height * scale))), max(1, int(round(rect.width * scale))),
-            False, False, True, True,
-        ), rect)
+        paint_corner(
+            fitz.Rect(full.x0, full.y0, placed.x0 + cover, placed.y0 + cover),
+            _color_at(left_colors, False),
+            _color_at(top_colors, False),
+            True,
+            True,
+        )
     if gaps["right"] > 0.3 and gaps["top"] > 0.3:
-        rect = fitz.Rect(placed.x1 - cover, full.y0, full.x1, placed.y0 + cover)
-        patch = grab((
-            placed.x1 - fringe - sample_span, placed.y0 + fringe,
-            placed.x1 - fringe, placed.y0 + fringe + sample_span,
-        ))
-        _insert_cmyk(page, _extend_corner(
-            patch, max(1, int(round(rect.height * scale))), max(1, int(round(rect.width * scale))),
-            False, True, True, False,
-        ), rect)
+        paint_corner(
+            fitz.Rect(placed.x1 - cover, full.y0, full.x1, placed.y0 + cover),
+            _color_at(right_colors, False),
+            _color_at(top_colors, True),
+            True,
+            False,
+        )
     if gaps["left"] > 0.3 and gaps["bottom"] > 0.3:
-        rect = fitz.Rect(full.x0, placed.y1 - cover, placed.x0 + cover, full.y1)
-        patch = grab((
-            placed.x0 + fringe, placed.y1 - fringe - sample_span,
-            placed.x0 + fringe + sample_span, placed.y1 - fringe,
-        ))
-        _insert_cmyk(page, _extend_corner(
-            patch, max(1, int(round(rect.height * scale))), max(1, int(round(rect.width * scale))),
-            True, False, False, True,
-        ), rect)
+        paint_corner(
+            fitz.Rect(full.x0, placed.y1 - cover, placed.x0 + cover, full.y1),
+            _color_at(left_colors, True),
+            _color_at(bottom_colors, False),
+            False,
+            True,
+        )
     if gaps["right"] > 0.3 and gaps["bottom"] > 0.3:
-        rect = fitz.Rect(placed.x1 - cover, placed.y1 - cover, full.x1, full.y1)
-        patch = grab((
-            placed.x1 - fringe - sample_span, placed.y1 - fringe - sample_span,
-            placed.x1 - fringe, placed.y1 - fringe,
-        ))
-        _insert_cmyk(page, _extend_corner(
-            patch, max(1, int(round(rect.height * scale))), max(1, int(round(rect.width * scale))),
-            True, True, False, False,
-        ), rect)
+        paint_corner(
+            fitz.Rect(placed.x1 - cover, placed.y1 - cover, full.x1, full.y1),
+            _color_at(right_colors, True),
+            _color_at(bottom_colors, True),
+            False,
+            False,
+        )
 
 
 def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:

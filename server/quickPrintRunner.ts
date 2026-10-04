@@ -41,6 +41,8 @@ export interface QuickRunResult {
   pressPath: string;
   proofPng: string;
   proofPdf: string;
+  proofPaths: string[];
+  pageCount: number;
   bleedMm: number;
   existingBleedKept: boolean;
   productId: string;
@@ -81,6 +83,8 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     pressPath: String(raw.pressPath || ""),
     proofPng: String(raw.proofPng || ""),
     proofPdf: String(raw.proofPdf || ""),
+    proofPaths: Array.isArray(raw.proofPaths) ? raw.proofPaths.map((item) => String(item)).filter(Boolean) : [],
+    pageCount: Number(raw.pageCount) || 0,
     bleedMm: Number(raw.bleedMm) || 5,
     existingBleedKept: raw.existingBleedKept === true,
     productId: String(raw.productId || ""),
@@ -233,6 +237,10 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     fixesApplied: result.light === "red" ? 0 : checks.length,
     complianceReport: result.decisions.join(" "),
     compiledPdfPath: result.pressPath || undefined,
+    proofPath: result.proofPng || undefined,
+    proofPaths: result.proofPaths.length ? result.proofPaths : undefined,
+    pageCount: result.pageCount || undefined,
+    proofPageCount: result.pageCount || undefined,
     quickPrint: { ...quickPrint, approved: false },
     pressEngine,
     ...reused,
