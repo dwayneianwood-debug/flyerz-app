@@ -529,7 +529,11 @@ def test_canva_a6() -> None:
             )
         )
     seam_note = " ".join(parts)
-    reasons = " ".join(str(item) for item in (result.get("reasons") or []))
+    reasons = " ".join(
+        str(item) for item in list(result.get("decisions") or []) + list(result.get("reasons") or [])
+    )
+    if result.get("clientMessage"):
+        reasons = f"{reasons} {result.get('clientMessage')}"
     problems = []
     if built:
         problems.append(built)
