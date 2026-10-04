@@ -256,7 +256,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
     for badge in page_badges:
         marks.append({"kind": "badge", "cx": badge["cx"], "cy": badge["cy"], "radius": badge["radius"]})
     guide = _guide_boxes(bgr, blocks, chosen)
-    from vector_plate import erase_text, map_rect, place_plate
+    from vector_plate import PRESS_PPI, erase_text, map_rect, place_plate
 
     clean, chosen, skipped = erase_text(bgr, chosen, marks)
     raster_lines.extend(skipped)
@@ -272,7 +272,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
 
     _note(progress, "enlarging", "Enlarging the picture and setting the type.")
     enlarge_started = time.perf_counter()
-    placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+    placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, PRESS_PPI)
     provider = placed["provider"]
     enlarge_s = time.perf_counter() - enlarge_started
     for line in chosen:
@@ -299,7 +299,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
                 timings={"ocr_s": round(ocr_s, 3), "paint_s": round(paint_s, 3)},
             )
         rewrite = time.perf_counter()
-        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, PRESS_PPI)
         provider = placed["provider"]
         for line in chosen:
             line["media_box"] = map_rect(line["ink"], placed, placed["image"].shape)
@@ -329,7 +329,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
                 timings={"ocr_s": round(ocr_s, 3), "paint_s": round(paint_s, 3)},
             )
         rewrite = time.perf_counter()
-        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+        placed = place_plate(clean, guide, trim_w, trim_h, bleed_mm, PRESS_PPI)
         provider = placed["provider"]
         for line in chosen:
             line["media_box"] = map_rect(line["ink"], placed, placed["image"].shape)

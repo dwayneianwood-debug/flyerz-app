@@ -5,11 +5,12 @@ Only a line the trace rejected is considered. It becomes live type when all
 of these hold:
 
 - the page read is confident
-- one face is chosen for the whole style block by comparing rendered
-  candidates to the source ink (weight and serif or sans)
-- every word of that face overlaps the source ink
-- the same overlap still holds on the press page, drawn in this process
-  with the same font objects the PDF embeds
+- one face is chosen for the whole style block
+- the stroke width of that face, measured on the distance-transform core,
+  is within 10% of the source at the same scale
+- every line in the block fits that face; if one fails, the block stays
+  the picture
+- every word overlaps the source, including on the press page
 
 Anything unsure stays in the picture. Icons and neighbouring lines are not
 painted. The face is embedded in the press PDF.
@@ -97,42 +98,26 @@ def retype_rejected(
     if not prepared:
         return []
     fitted = []
-    for group in _style_blocks(prepared):
+    for index, group in enumerate(_style_blocks(prepared)):
         if time.perf_counter() > deadline:
             _dbg("budget")
             break
-        key = _pick_face(pristine, group, deadline)
-        if not key:
-            continue
-        # The block face is tried first. A line it cannot match may use another
-        # face of the same role, still within the 5% width limit.
-        faces = [key] + [other for other in _face_keys(group[0]["text"]) if other != key]
-        for item in group:
-            if time.perf_counter() > deadline:
-                _dbg("budget")
-                break
-            choice = None
-            for face in faces:
-                if time.perf_counter() > deadline:
-                    _dbg("budget")
-                    break
-                placed = _place_font(pristine, item, face, 0.0)
-                if placed is None or not _words_clear(placed):
-                    _dbg(f"fit-reject {face} {item['text'][:50]!r}")
-                    continue
-                placed["font"] = face
-                choice = placed
-                break
-            if choice is not None:
-                fitted.append(choice)
+        placed = _fit_group(pristine, group, deadline)
+        for item in placed:
+            item["group_id"] = index
+            item["group_size"] = len(group)
+        _dbg(f"group {len(placed)}/{len(group)} {group[0]['text'][:40]!r}")
+        fitted.extend(placed)
     _dbg(f"fitted {len(fitted)}")
     if not fitted:
         return []
     confirmed = _press_keep(fitted, pristine.shape)
+    confirmed = _complete_groups(confirmed)
     _dbg(f"confirmed {len(confirmed)} of {len(fitted)} in {time.perf_counter() - started:.2f}s")
     if not confirmed:
         return []
     confirmed = _paint(plate, confirmed)
+    confirmed = _complete_groups(confirmed)
     _dbg(f"painted {len(confirmed)}")
     if not confirmed:
         return []
@@ -166,6 +151,8 @@ _DOUBLE_QUOTES = {'"', "\u201c", "\u201d"}
 _DASH_CHARS = {"-", "\u2010", "\u2011", "\u2012", "\u2013", "\u2014"}
 WIDTH_SCALE_MIN = 0.95
 WIDTH_SCALE_MAX = 1.05
+# Stroke width of the rendered face against the source, at the same scale.
+STROKE_TOL = 0.10
 # The filled hole has to match the paper ring. A visible grey box fails.
 PAINT_MEAN_MAX = 3.0
 PAINT_STD_MAX = 3.5
@@ -944,10 +931,19 @@ def _item_from_mask(mask: np.ndarray, text: str) -> dict | None:
     }
 
 
-def _letter_weight(mask: np.ndarray) -> float:
-    """Median stem weight of the letters, as a fraction of letter height."""
-    from vector_text_v2 import _rel_stroke
+def _ink_height(mask: np.ndarray) -> int:
+    ys, _xs = np.where(mask > 0)
+    if ys.size == 0:
+        return 0
+    return int(ys.max() - ys.min() + 1)
 
+
+def _stroke_core_width(mask: np.ndarray) -> float:
+    """Median stroke width from the distance-transform core, in pixels.
+
+    The core is the medial axis of each letter, so hairline serifs do not
+    set the weight. Both masks have to be at the same scale before this.
+    """
     if mask is None or mask.size == 0:
         return 0.0
     binary = (mask > 0).astype(np.uint8)
@@ -956,41 +952,60 @@ def _letter_weight(mask: np.ndarray) -> float:
     for index in range(1, count):
         height = int(stats[index, cv2.CC_STAT_HEIGHT])
         area = int(stats[index, cv2.CC_STAT_AREA])
-        if height >= 8 and area >= 12:
+        if height >= 6 and area >= 8:
             heights.append(height)
     if not heights:
-        return _rel_stroke(mask)
+        return 0.0
     typical = float(np.median(heights))
-    weights = []
+    widths = []
     for index in range(1, count):
         x, y, width, height, area = [int(stats[index, k]) for k in range(5)]
-        if height < typical * 0.62 or area < 12:
+        if height < typical * 0.70 or area < 8:
             continue
-        weights.append(_rel_stroke(mask[y:y + height, x:x + width]))
-    if not weights:
-        return _rel_stroke(mask)
-    return float(np.median(weights))
+        glyph = binary[y:y + height, x:x + width]
+        # A stem as wide as its box has no zero pixel beside it, and the
+        # distance transform then overflows. One pixel of paper fixes that.
+        glyph = cv2.copyMakeBorder(glyph, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        dist = cv2.distanceTransform(glyph, cv2.DIST_L2, 3)
+        local = cv2.dilate(dist, np.ones((3, 3), np.uint8))
+        core = (dist + 1e-3 >= local) & (dist >= 0.6)
+        if int(core.sum()) < 2:
+            continue
+        widths.append(float(np.median(dist[core]) * 2.0))
+    if not widths:
+        return 0.0
+    return float(np.median(widths))
+
+
+def _stroke_ratio(source: np.ndarray, rendered: np.ndarray) -> float:
+    """Rendered stroke over source stroke, after both are brought to one height."""
+    source_h = _ink_height(source)
+    render_h = _ink_height(rendered)
+    source_w = _stroke_core_width(source)
+    render_w = _stroke_core_width(rendered)
+    if min(source_h, render_h) < 4 or source_w <= 0.4 or render_w <= 0.4:
+        return 0.0
+    return (render_w / float(render_h)) / (source_w / float(source_h))
+
+
+def _stroke_ok(source: np.ndarray, rendered: np.ndarray) -> bool:
+    ratio = _stroke_ratio(source, rendered)
+    return abs(ratio - 1.0) <= STROKE_TOL
 
 
 def _face_score(item: dict, key: str) -> float:
-    """Weight first, then overlap. A lighter or much heavier face is not a match."""
+    """Weight first, then overlap. Outside ±10% stroke is not a match."""
     placed = _place_font(np.zeros((1, 1, 3), np.uint8), item, key, 0.0)
     if placed is None:
         return 0.0
-    source_stroke = _letter_weight(item["mask"])
-    render_stroke = _letter_weight(placed["render_mask"])
-    if source_stroke > 0.02 and render_stroke > 0:
-        if render_stroke < source_stroke * 0.85 or render_stroke > source_stroke * 1.45:
-            _dbg(
-                f"stroke {key} {render_stroke:.3f} vs {source_stroke:.3f} "
-                f"{item.get('text', '')[:40]!r}"
-            )
-            return 0.0
-        stroke_err = abs(source_stroke - render_stroke) / source_stroke
-    else:
-        stroke_err = 0.0
+    ratio = _stroke_ratio(item["mask"], placed["render_mask"])
+    if ratio <= 0.0 or abs(ratio - 1.0) > STROKE_TOL:
+        _dbg(
+            f"stroke {key} {ratio:.3f} {item.get('text', '')[:40]!r}"
+        )
+        return 0.0
     terminals = abs(_terminal_ratio(item["mask"]) - _terminal_ratio(placed["render_mask"]))
-    score = 0.70 * (1.0 - min(1.0, stroke_err)) + 0.30 * float(placed["overlap"])
+    score = 0.70 * (1.0 - min(1.0, abs(ratio - 1.0) / STROKE_TOL)) + 0.30 * float(placed["overlap"])
     if terminals > 0.45:
         score -= 0.12
     return max(0.0, score)
@@ -1040,6 +1055,43 @@ def _pick_face(plate: np.ndarray, group: list, deadline: float) -> str:
         _dbg(f"no-face {best_score:.2f} {sample['text'][:40]!r}")
         return ""
     return best_key
+
+
+def _fit_group(plate: np.ndarray, group: list, deadline: float) -> list:
+    """One face for every line in the group, or nothing.
+
+    A heavier face is not used for the line that happens to fit it. If any
+    line misses the stroke, the width, or the word overlap, the group stays
+    the picture.
+    """
+    sample = max(group, key=lambda item: len(_letters(item["text"])))
+    ranked = []
+    for key in _face_keys(sample["text"]):
+        if time.perf_counter() > deadline:
+            return []
+        score = _face_score(sample, key)
+        _dbg(f"face {score:.2f} {key} {sample['text'][:40]!r}")
+        if score >= 0.42:
+            ranked.append((score, key))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    for score, key in ranked:
+        if time.perf_counter() > deadline:
+            return []
+        placed = []
+        failed = False
+        for item in group:
+            if time.perf_counter() > deadline:
+                return []
+            one = _place_font(plate, item, key, score)
+            if one is None or not _words_clear(one):
+                _dbg(f"fit-reject {key} {item['text'][:50]!r}")
+                failed = True
+                break
+            one["font"] = key
+            placed.append(one)
+        if not failed and len(placed) == len(group):
+            return placed
+    return []
 
 
 def _glyph_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -1300,6 +1352,9 @@ def _place_font(plate: np.ndarray, item: dict, key: str, score: float) -> dict |
     if not _words_sit(mask, placed_mask, len(item["words"])):
         _dbg(f"word-place {key} {item['text'][:50]!r}")
         return None
+    if not _stroke_ok(mask, placed_mask):
+        _dbg(f"stroke {key} {_stroke_ratio(mask, placed_mask):.3f} {item['text'][:50]!r}")
+        return None
     origin_x, origin_y = item["mask_origin"]
     plate_chars = [(ch, origin_x + px) for ch, px in used_chars]
     for run in runs:
@@ -1432,11 +1487,11 @@ def _words_sit(source: np.ndarray, rendered: np.ndarray, word_count: int) -> boo
     return True
 
 
-def _core_bgr(plate: np.ndarray, origin, mask: np.ndarray) -> np.ndarray | None:
-    """Median of the darkest pixels inside the strokes.
+def _core_rgb(plate: np.ndarray, origin, mask: np.ndarray) -> np.ndarray | None:
+    """Darkest 15% of the stroke, as RGB rows.
 
-    Anti-aliased edges are lighter than the stroke. A median of every mask
-    pixel is that grey, and it prints as a grey letter.
+    The choice is the sum of the RGB channels. A grey conversion first would
+    pull a dark green toward neutral black, and the median would be that black.
     """
     ox, oy = int(origin[0]), int(origin[1])
     binary = (mask > 0).astype(np.uint8)
@@ -1445,28 +1500,37 @@ def _core_bgr(plate: np.ndarray, origin, mask: np.ndarray) -> np.ndarray | None:
         return None
     sample_y = np.clip(oy + ys, 0, plate.shape[0] - 1)
     sample_x = np.clip(ox + xs, 0, plate.shape[1] - 1)
-    pixels = plate[sample_y, sample_x][:, :3].astype(np.float32)
-    if pixels.shape[0] > 4000:
-        step = int(pixels.shape[0] / 4000)
-        pixels = pixels[::step]
-    luma = 0.114 * pixels[:, 2] + 0.587 * pixels[:, 1] + 0.299 * pixels[:, 0]
-    darkest = pixels[luma <= np.percentile(luma, 15)]
+    bgr = plate[sample_y, sample_x][:, :3].astype(np.float32)
+    if bgr.shape[0] > 4000:
+        step = int(bgr.shape[0] / 4000)
+        bgr = bgr[::step]
+    rgb = bgr[:, ::-1]
+    darkness = rgb.sum(axis=1)
+    darkest = rgb[darkness <= np.percentile(darkness, 15)]
     if darkest.shape[0] < 4:
-        darkest = pixels
+        darkest = rgb
     return darkest
 
 
 def _ink_cmyk(plate: np.ndarray, origin, mask: np.ndarray):
-    """CMYK of the stroke core, plus the source RGB the gate compares."""
-    from vector_text_v2 import _cmyk
+    """Press CMYK of the RGB stroke core, plus that RGB for the gate.
 
-    pixels = _core_bgr(plate, origin, mask)
+    Near-black type is not snapped to solid K. A dark green has to stay green.
+    """
+    from PIL import Image, ImageCms
+
+    from vector_text_v2 import _press_cmyk
+
+    pixels = _core_rgb(plate, origin, mask)
     if pixels is None:
         return (0.0, 0.0, 0.0, 1.0), (0, 0, 0)
     med = np.median(pixels, axis=0)
-    blue, green, red = [float(v) / 255.0 for v in med[:3]]
-    rgb = (int(round(red * 255)), int(round(green * 255)), int(round(blue * 255)))
-    return _cmyk((red, green, blue)), rgb
+    rgb = tuple(int(round(float(v))) for v in med[:3])
+    rgb = tuple(max(0, min(255, channel)) for channel in rgb)
+    pixel = Image.new("RGB", (1, 1), rgb)
+    converted = ImageCms.applyTransform(pixel, _press_cmyk()).getpixel((0, 0))
+    cmyk = tuple(float(channel) / 255.0 for channel in converted)
+    return cmyk, rgb
 
 
 def _sit_words(source: np.ndarray, rendered: np.ndarray, text: str, chars: list):
@@ -1695,10 +1759,50 @@ def _paint_one(plate: np.ndarray, item: dict, others: list) -> bool:
 
 
 def _paint(plate: np.ndarray, items: list) -> list:
-    kept = []
+    """Paint a style group together. One hole that will not match puts the group back."""
+    buckets: dict = {}
+    order = []
     for item in items:
-        if _paint_one(plate, item, items):
-            kept.append(item)
+        gid = item.get("group_id")
+        if gid not in buckets:
+            order.append(gid)
+            buckets[gid] = []
+        buckets[gid].append(item)
+    kept = []
+    for gid in order:
+        rows = buckets[gid]
+        snapshot = plate.copy()
+        good = True
+        for item in rows:
+            if not _paint_one(plate, item, items):
+                good = False
+                break
+        need = int(rows[0].get("group_size") or len(rows))
+        if not good or len(rows) != need:
+            plate[:] = snapshot
+            continue
+        kept.extend(rows)
+    return kept
+
+
+def _complete_groups(items: list) -> list:
+    """Drop a style group unless every line in it is still present."""
+    buckets: dict = {}
+    order = []
+    for item in items:
+        gid = item.get("group_id")
+        if gid not in buckets:
+            order.append(gid)
+            buckets[gid] = []
+        buckets[gid].append(item)
+    kept = []
+    for gid in order:
+        rows = buckets[gid]
+        need = int(rows[0].get("group_size") or len(rows))
+        if len(rows) == need:
+            kept.extend(rows)
+        else:
+            _dbg(f"group-drop {len(rows)}/{need} {rows[0].get('text', '')[:40]!r}")
     return kept
 
 
@@ -1758,28 +1862,64 @@ def _prepare(plate: np.ndarray, candidates: list) -> list:
 
 
 def _style_blocks(items: list) -> list:
-    """One group shares a column, a size, and capitals or sentence case."""
+    """Headings in one column are one group. Body lines of one item are another.
+
+    An item is the body under a heading, up to the next heading. The group is
+    retyped together. One line that cannot match puts the whole group back.
+    """
+    if not items:
+        return []
     pending = sorted(items, key=lambda item: (item["core"][0], item["core"][1]))
+    columns: list[list] = []
+    for item in pending:
+        height = max(4, item["ink_box"][3] - item["ink_box"][1])
+        placed = False
+        for column in columns:
+            anchor = column[0]
+            limit = max(28, int(height * 1.2))
+            if abs(int(item["core"][0]) - int(anchor["core"][0])) <= limit:
+                column.append(item)
+                placed = True
+                break
+        if not placed:
+            columns.append([item])
+    groups = []
+    for column in columns:
+        column.sort(key=lambda item: item["core"][1])
+        headings = [item for item in column if _is_caps(item["text"])]
+        if headings:
+            groups.append(headings)
+        bodies: list = []
+        for item in column:
+            if _is_caps(item["text"]):
+                if bodies:
+                    groups.extend(_size_clusters(bodies))
+                    bodies = []
+                continue
+            bodies.append(item)
+        if bodies:
+            groups.extend(_size_clusters(bodies))
+    return groups
+
+
+def _size_clusters(items: list) -> list:
+    """Body lines of one item that share a size. A caption is not the body."""
+    pending = list(items)
     used = [False] * len(pending)
     groups = []
     for index, item in enumerate(pending):
         if used[index]:
             continue
-        caps = _is_caps(item["text"])
         height = max(4, item["ink_box"][3] - item["ink_box"][1])
-        left = item["core"][0]
         group = [item]
         used[index] = True
         for other_index, other in enumerate(pending):
-            if used[other_index] or _is_caps(other["text"]) != caps:
+            if used[other_index]:
                 continue
             other_h = max(4, other["ink_box"][3] - other["ink_box"][1])
-            if abs(other_h - height) / float(height) > 0.22:
-                continue
-            if abs(other["core"][0] - left) > max(18, int(height * 0.85)):
-                continue
-            group.append(other)
-            used[other_index] = True
+            if abs(other_h - height) / float(height) <= 0.28:
+                group.append(other)
+                used[other_index] = True
         groups.append(group)
     return groups
 

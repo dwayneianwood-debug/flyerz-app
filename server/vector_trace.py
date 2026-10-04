@@ -2216,7 +2216,7 @@ def trace_fitted(
 
 
 def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started, ocr_already=None) -> dict:
-    from vector_plate import place_plate
+    from vector_plate import PRESS_PPI, place_plate
     from vector_text_v2 import MIN_PPI, _note, _rect, read_blocks
 
     global _spawn_count
@@ -2242,7 +2242,7 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
 
     _note(progress, "enlarging", "Enlarging the picture.")
     enlarge_started = time.perf_counter()
-    placed = place_plate(bgr, guide, trim_w, trim_h, bleed_mm, MIN_PPI)
+    placed = place_plate(bgr, guide, trim_w, trim_h, bleed_mm, PRESS_PPI)
     plate = placed["image"].copy()
     enlarge_s = time.perf_counter() - enlarge_started
     provider = placed["provider"]

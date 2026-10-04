@@ -66,6 +66,7 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
         items.append(_letters(context))
         items.append(_paint_clean(press_path, context))
         items.append(_ink_colour(press_path, context))
+        items.append(_picture_sharp(press_path, context))
         items.append(_fonts(press_path))
         if _page_empty(press_path):
             severity = "red"
@@ -375,6 +376,23 @@ def _retyped_rows(context: dict) -> list:
     return [row for row in list(context.get("textGate") or []) if row.get("retyped")]
 
 
+def _press_matrix(page):
+    """Scale that lands on the embedded picture's pixels.
+
+    600/72 is one pixel off on a 600 PPI page, and that stretch blurs the type.
+    """
+    import pymupdf as fitz
+
+    images = page.get_images() or []
+    if images:
+        info = page.parent.extract_image(images[0][0])
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        if width >= 8 and height >= 8 and page.rect.width > 1 and page.rect.height > 1:
+            return fitz.Matrix(width / page.rect.width, height / page.rect.height)
+    return fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+
+
 def _page_rgb(path: str, zoom: float):
     import pymupdf as fitz
     import numpy as np
@@ -523,8 +541,9 @@ def _ink_colour(path: str, context: dict) -> dict:
                 if int(dark.sum()) < 6:
                     continue
                 pixels = patch[dark].astype(np.float32)
-                luma = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
-                core = pixels[luma <= np.percentile(luma, 15)]
+                # Darkest 15% by the RGB sum. A grey image would lose the green.
+                darkness = pixels.sum(axis=1)
+                core = pixels[darkness <= np.percentile(darkness, 15)]
                 if core.shape[0] < 4:
                     core = pixels
                 samples.append(np.median(core, axis=0))
@@ -532,24 +551,98 @@ def _ink_colour(path: str, context: dict) -> dict:
                 continue
             found = np.median(np.stack(samples, axis=0), axis=0)
             target_px = np.array(target, dtype=np.float32)
-
-            def _luma(px: np.ndarray) -> float:
-                return float(0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2])
-
-            # Solid K previews a little lighter than a sampled core of 0. Both are
-            # still the dark stroke, not the grey edge the check is there to catch.
-            both_dark = _luma(found) < 55.0 and _luma(target_px) < 55.0
-            both_neutral = (float(found.max()) - float(found.min())) < 45.0 and (
-                float(target_px.max()) - float(target_px.min())
-            ) < 45.0
+            source_chroma = float(target_px.max() - target_px.min())
+            found_chroma = float(found.max() - found.min())
             distance = float(np.linalg.norm(found - target_px))
-            if distance > 48.0 and not (both_dark and both_neutral):
+            if source_chroma >= 8.0 and found_chroma < source_chroma * 0.5:
+                bad = group["text"][:60]
+                break
+            if distance > 42.0:
                 bad = group["text"][:60]
                 break
     except Exception as exc:
         return _item("typecolour", label, False, f"The ink colour could not be checked ({str(exc)[:80]}).")
     detail = f"The type is a different colour from the source ({bad})." if bad else ""
     return _item("typecolour", label, not bad, detail)
+
+
+def _picture_sharp(path: str, context: dict) -> dict:
+    """The picture that was not retyped has to stay as sharp as the source.
+
+    Laplacian variance over that raster, press at least 95% of the source
+    at the same scale. Vector lines are left out so crisp type cannot hide
+    a soft picture.
+    """
+    label = "The press picture is as sharp as the source"
+    source = context.get("sourceBgr")
+    placement = context.get("placement") or {}
+    art = placement.get("artBox")
+    if source is None or not art or len(art) < 4:
+        return _item("sharp", label, True, "")
+    try:
+        import cv2
+        import numpy as np
+
+        import pymupdf as fitz
+
+        ppi = float(placement.get("ppi") or 600)
+        if ppi < 72:
+            ppi = 600.0
+        doc = fitz.open(path)
+        try:
+            page = doc[0]
+            matrix = _press_matrix(page)
+            pix = page.get_pixmap(matrix=matrix, alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+        finally:
+            doc.close()
+        ax, ay, aw, ah = [int(v) for v in art[:4]]
+        y0, x0 = max(0, ay), max(0, ax)
+        y1, x1 = min(rgb.shape[0], ay + max(1, ah)), min(rgb.shape[1], ax + max(1, aw))
+        if y1 - y0 < 16 or x1 - x0 < 16:
+            return _item("sharp", label, True, "")
+        press = rgb[y0:y1, x0:x1]
+        src = np.asarray(source)
+        if src.ndim != 3 or src.shape[2] < 3:
+            return _item("sharp", label, True, "")
+        src = cv2.cvtColor(src[:, :, :3], cv2.COLOR_BGR2RGB)
+        if src.shape[1] != press.shape[1] or src.shape[0] != press.shape[0]:
+            src = cv2.resize(src, (press.shape[1], press.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+        # The bleed join is feathered on purpose. The picture inside it is the check.
+        inset = int(round(4.0 / 25.4 * ppi))
+        if press.shape[0] > inset * 4 and press.shape[1] > inset * 4:
+            press = press[inset:-inset, inset:-inset]
+            src = src[inset:-inset, inset:-inset]
+        else:
+            inset = 0
+        mask = np.ones(press.shape[:2], np.uint8)
+        for row in list(context.get("textGate") or []):
+            if row.get("mode") != "vector":
+                continue
+            rect = row.get("plateRect")
+            if not rect or len(rect) < 4:
+                continue
+            rx, ry, rw, rh = [int(v) for v in rect[:4]]
+            left = max(0, rx - x0 - inset)
+            top = max(0, ry - y0 - inset)
+            right = min(mask.shape[1], rx + max(1, rw) - x0 - inset)
+            bottom = min(mask.shape[0], ry + max(1, rh) - y0 - inset)
+            if right > left and bottom > top:
+                mask[top:bottom, left:right] = 0
+        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))
+        if int(mask.sum()) < 400:
+            return _item("sharp", label, True, "")
+        press_gray = cv2.cvtColor(press, cv2.COLOR_RGB2GRAY)
+        src_gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
+        press_var = float(cv2.Laplacian(press_gray, cv2.CV_64F)[mask > 0].var())
+        source_var = float(cv2.Laplacian(src_gray, cv2.CV_64F)[mask > 0].var())
+        if source_var <= 1.0:
+            return _item("sharp", label, True, "")
+        ratio = press_var / source_var
+        detail = "" if ratio >= 0.95 else f"The press picture is softer than the source ({ratio:.2f})."
+        return _item("sharp", label, ratio >= 0.95, detail)
+    except Exception as exc:
+        return _item("sharp", label, False, f"The sharpness could not be checked ({str(exc)[:80]}).")
 
 
 def _fonts(path: str) -> dict:

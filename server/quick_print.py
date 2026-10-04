@@ -1264,6 +1264,7 @@ def make_print_ready(
     ocr_doubtful = False
     ocr_doubtful_reason = ""
     vector_built = None
+    vector_source = None
     lettering_note = "The original lettering is kept."
 
     try:
@@ -1513,6 +1514,8 @@ def make_print_ready(
                 "upscale": upscale,
                 "textGate": (vector_built or {}).get("text_gate") or [],
                 "edge": (vector_built or {}).get("edge") or {},
+                "sourceBgr": vector_source,
+                "placement": (vector_built or {}).get("placement") or {},
             })
             facts["checklist"] = checklist
         except Exception:

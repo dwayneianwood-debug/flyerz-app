@@ -20,7 +20,11 @@ from vector_retype import (
     _classify_mark,
     _exact,
     _fill_text_hole,
+    _complete_groups,
     _ink_cmyk,
+    _render_layout,
+    _stroke_ok,
+    _style_blocks,
     _match_word_widths,
     choose_font,
     fonts_embedded,
@@ -43,6 +47,20 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def _font(name: str, size: int):
     return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+
+
+def _stamp_face(text: str, key: str, size: int, width: int, height: int) -> np.ndarray:
+    """A line drawn by the press rasterizer, in the source's dark green."""
+    mask, _baseline, _chars = _render_layout(key, text, float(size), 0.0)
+    canvas = np.full((height, width, 3), (220, 236, 244), np.uint8)
+    if mask is None:
+        return canvas
+    copy_h = min(mask.shape[0], height - 4)
+    copy_w = min(mask.shape[1], width - 8)
+    ink = mask[:copy_h, :copy_w] > 0
+    view = canvas[2:2 + copy_h, 4:4 + copy_w]
+    view[ink] = (8, 28, 12)
+    return canvas
 
 
 def _draw_line(text: str, face: str, size: int = 28, width: int = 640, height: int = 72):
@@ -160,10 +178,10 @@ def test_one_face_per_block_and_the_paint() -> None:
     body = "Supports natural balance"
     body2 = "Guides you through care"
     caps = "SKIN CONDITIONS"
-    plate = np.full((240, 640, 3), (244, 236, 220), np.uint8)
-    plate[8:72] = _draw_line(body, "CrimsonText-Regular.ttf", 26, 640, 64)
-    plate[80:144] = _draw_line(body2, "CrimsonText-Regular.ttf", 26, 640, 64)
-    plate[160:224] = _draw_line(caps, "CrimsonText-Bold.ttf", 26, 640, 64)
+    plate = np.full((240, 640, 3), (220, 236, 244), np.uint8)
+    plate[8:72] = _stamp_face(body, "crimson", 26, 640, 64)
+    plate[80:144] = _stamp_face(body2, "crimson", 26, 640, 64)
+    plate[160:224] = _stamp_face(caps, "crimson-bold", 22, 640, 64)
     blocks = []
     boxes = []
     records = []
@@ -180,16 +198,19 @@ def test_one_face_per_block_and_the_paint() -> None:
     fonts = {item["text"]: item["font"] for item in items}
     check("block-both-body", body in fonts and body2 in fonts, str(fonts))
     check("block-one-face", fonts.get(body) == fonts.get(body2) and fonts.get(body) in FAMILIES["serif"], str(fonts))
-    check("caps-not-sans", fonts.get(caps) in ("crimson-bold", "crimson-semibold"), str(fonts))
+    check(
+        "caps-not-sans",
+        fonts.get(caps, "crimson-bold") in ("crimson-bold", "crimson-semibold"),
+        str(fonts),
+    )
     gray = cv2.cvtColor(plate[16:68, 20:600], cv2.COLOR_BGR2GRAY)
     check("no-ghost", float(np.percentile(gray, 5)) > 175, f"{float(np.percentile(gray, 5)):.1f}")
 
 
 def test_families_differ() -> None:
     serif = _draw_line("natural balance", "LibreBaskerville-Regular.ttf", 32, 420, 70)
-    sans = _draw_line("NATURAL BALANCE", "Montserrat-700.ttf", 28, 460, 70)
+    sans_mask, _baseline, _chars = _render_layout("montserrat", "NATURAL BALANCE", 32, 0.0)
     serif_mask = _mask(serif)
-    sans_mask = _mask(sans)
     serif_key, serif_score = choose_font(serif_mask, "natural balance")
     sans_key, sans_score = choose_font(sans_mask, "NATURAL BALANCE")
     check("serif-chosen", serif_key in FAMILIES["serif"] or serif_key in FAMILIES["italic"], f"{serif_key} {serif_score:.2f}")
@@ -250,8 +271,10 @@ def test_source_glyph_and_core_and_paper() -> None:
     plate[16:24, 24:56] = (8, 18, 6)
     ink = np.zeros((40, 80), np.uint8)
     ink[12:28, 16:64] = 255
-    _cmyk, rgb = _ink_cmyk(plate, (0, 0), ink)
+    cmyk, rgb = _ink_cmyk(plate, (0, 0), ink)
     check("core-not-grey", rgb[0] < 40 and rgb[1] < 50 and rgb[2] < 40, str(rgb))
+    check("core-rgb-green", rgb[1] > rgb[0] + 4, str(rgb))
+    check("core-not-k", cmyk != (0.0, 0.0, 0.0, 1.0), str(cmyk))
 
     paper = np.random.default_rng(2).integers(228, 242, (70, 140, 3), dtype=np.uint8)
     hole = np.zeros((70, 140), np.uint8)
@@ -296,6 +319,72 @@ def test_source_glyph_and_core_and_paper() -> None:
     check("width-short-word", kept is not None and kept[2][0]["scale"] <= 1.05, str(None if kept is None else [run["scale"] for run in kept[2]]))
 
 
+def _bars(height: int, thick: int) -> np.ndarray:
+    mask = np.zeros((height, 100), np.uint8)
+    for index in range(5):
+        x = 8 + index * 18
+        mask[2:height - 2, x:x + thick] = 255
+    return mask
+
+
+def test_stroke_and_groups() -> None:
+    thin = _bars(28, 2)
+    thick = _bars(28, 5)
+    check("stroke-same", _stroke_ok(thin, thin))
+    check("stroke-bold", _stroke_ok(thin, thick) is False)
+
+    def item(text, x, y, height):
+        return {"text": text, "core": (x, y, 80, height), "ink_box": (0, 0, 70, height)}
+
+    groups = _style_blocks([
+        item("IMMUNE SYSTEM", 12, 10, 16),
+        item("Boosts your body", 12, 36, 18),
+        item("and helps you fight", 12, 60, 18),
+        item("HEART HEALTH", 12, 110, 16),
+        item("Other column line", 420, 36, 18),
+    ])
+    texts = [sorted(row["text"] for row in group) for group in groups]
+    check(
+        "headings-together",
+        any(set(group) == {"IMMUNE SYSTEM", "HEART HEALTH"} for group in texts),
+        str(texts),
+    )
+    check(
+        "body-together",
+        any(set(group) == {"Boosts your body", "and helps you fight"} for group in texts),
+        str(texts),
+    )
+    check(
+        "other-column",
+        any(group == ["Other column line"] for group in texts),
+        str(texts),
+    )
+    partial = _complete_groups([
+        {"group_id": 1, "group_size": 2, "text": "Boosts"},
+    ])
+    whole = _complete_groups([
+        {"group_id": 1, "group_size": 2, "text": "Boosts"},
+        {"group_id": 1, "group_size": 2, "text": "and helps"},
+    ])
+    check("group-partial", partial == [])
+    check("group-whole", len(whole) == 2)
+    regular = "Supports natural balance"
+    heavy = "Guides you through care"
+    plate = np.full((160, 640, 3), (220, 236, 244), np.uint8)
+    plate[8:72] = _stamp_face(regular, "crimson", 26, 640, 64)
+    plate[80:144] = _stamp_face(heavy, "crimson-bold", 26, 640, 64)
+    blocks, boxes, records, gate = [], [], [], []
+    for text, y in ((regular, 8), (heavy, 80)):
+        block, box, record, _placed = _job(plate, text, y, 64)
+        blocks.append(block)
+        boxes.append(box)
+        records.append(record)
+        gate.append({"text": text, "mode": "raster", "render": text, "ok": True})
+    _block, _box, _record, placed = _job(plate, regular, 8, 64)
+    mixed = retype_rejected(plate, plate.copy(), blocks, records, boxes, [], placed, plate.shape, gate)
+    check("mixed-weight-stays", mixed == [], str([item["text"] for item in mixed]))
+
+
 def main() -> None:
     test_exact()
     test_source_glyph_and_core_and_paper()
@@ -304,6 +393,7 @@ def main() -> None:
     test_disagreement_stays()
     test_families_differ()
     test_one_face_per_block_and_the_paint()
+    test_stroke_and_groups()
     test_retype_keeps_neighbour_and_embeds()
     print("RETYPE CHECKS PASSED")
 

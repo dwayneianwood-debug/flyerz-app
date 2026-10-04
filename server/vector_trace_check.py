@@ -1152,9 +1152,13 @@ def _ink_rows(gray: np.ndarray) -> np.ndarray:
 
 
 def _check_medella_swash(card: dict) -> None:
-    """The gap under Medella matches the upscale. The stripe detector runs on it."""
-    from vector_plate import place_plate
-    from vector_text_v2 import MIN_PPI, _rect, read_blocks
+    """The gap under Medella matches the upscale. The stripe detector runs on it.
+
+    The press plate is built at PRESS_PPI. A 400 PPI plate is a second resample
+    of that file, and the gap then differs even when the press picture is intact.
+    """
+    from vector_plate import PRESS_PPI, place_plate
+    from vector_text_v2 import _rect, read_blocks
     from quick_print import vertical_streaks_dominate
 
     gate = card.get("textGate") or []
@@ -1174,7 +1178,7 @@ def _check_medella_swash(card: dict) -> None:
             continue
         rx, ry, rw, rh = _rect(block, bgr.shape[1], bgr.shape[0])
         guide.append((rx, ry, rx + rw, ry + rh))
-    placed = place_plate(bgr, guide, 90, 50, 5.0, MIN_PPI)
+    placed = place_plate(bgr, guide, 90, 50, 5.0, PRESS_PPI)
     clean = placed["image"]
     render = _render_press(card["press"], clean.shape[1], clean.shape[0])
     if render.shape[0] != clean.shape[0] or render.shape[1] != clean.shape[1]:
@@ -1288,8 +1292,8 @@ def _check_card_back_raster(side: dict) -> None:
         return
     if ident[0].get("mode") == "raster":
         check("by-identifying-y-matches", True)
-    from vector_plate import place_plate
-    from vector_text_v2 import MIN_PPI, _rect, read_blocks
+    from vector_plate import PRESS_PPI, place_plate
+    from vector_text_v2 import _rect, read_blocks
 
     src_path = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_back.png")
     bgr = cv2.imread(src_path)
@@ -1309,7 +1313,7 @@ def _check_card_back_raster(side: dict) -> None:
     check("by-identifying-box", raw is not None)
     if raw is None:
         return
-    placed = place_plate(bgr, guide, 90, 50, 5.0, MIN_PPI)
+    placed = place_plate(bgr, guide, 90, 50, 5.0, PRESS_PPI)
     clean = cv2.cvtColor(placed["image"], cv2.COLOR_BGR2GRAY)
     render = cv2.cvtColor(_render_press(side["press"], clean.shape[1], clean.shape[0]), cv2.COLOR_RGB2GRAY)
     if render.shape != clean.shape:

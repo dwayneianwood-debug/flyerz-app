@@ -19,6 +19,9 @@ import numpy as np
 SAFE_TEXT_MM = 3.0
 EDGE_CLEARANCE_MM = 2.5
 MIN_PPI = 400
+# The press raster is judged at 600 DPI. Building it at 400 and enlarging
+# again in the PDF render throws the detail away. One resize, to this grid.
+PRESS_PPI = 600
 # A side pad can leave the long edge a fraction of a millimetre short of the trim.
 # That edge is still flush, so lettering on it is pulled inside the safe zone.
 FLUSH_SLACK_MM = 0.2
@@ -272,7 +275,13 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         px_per_mm=ppm,
     )
     if image.shape[0] != media_h or image.shape[1] != media_w:
-        image = cv2.resize(image, (media_w, media_h), interpolation=cv2.INTER_LANCZOS4)
+        # A one-pixel miss is padded. Resampling the whole picture here is a second scale.
+        canvas = np.empty((media_h, media_w, image.shape[2]), image.dtype)
+        canvas[:] = image[min(image.shape[0] - 1, 0), min(image.shape[1] - 1, 0)]
+        copy_h = min(media_h, image.shape[0])
+        copy_w = min(media_w, image.shape[1])
+        canvas[:copy_h, :copy_w] = image[:copy_h, :copy_w]
+        image = canvas
     px_per_src = ((art_w / float(src_w)) + (art_h / float(src_h))) / 2.0
 
     def mapper(x: float, y: float) -> tuple[float, float]:
@@ -537,9 +546,15 @@ def _residual_mask(clean: np.ndarray, meta: list) -> np.ndarray:
 
 
 def _enlarge(clean: np.ndarray, art_w: int, art_h: int) -> tuple[np.ndarray, str]:
-    """Lanczos, then a light colour match. Real-ESRGAN only when VECTOR_ESRGAN=1."""
+    """One resize onto the plate. Real-ESRGAN only when VECTOR_ESRGAN=1.
+
+    The colour match runs after that model, which shifts chroma. A Lanczos
+    resize is already the source colour, and a second scale would soften it.
+    """
     from host_paths import esrgan_enabled
 
+    if int(clean.shape[1]) == int(art_w) and int(clean.shape[0]) == int(art_h):
+        return clean.copy(), "Lanczos"
     token = ""
     if esrgan_enabled():
         try:
@@ -554,7 +569,7 @@ def _enlarge(clean: np.ndarray, art_w: int, art_h: int) -> tuple[np.ndarray, str
             resized = cv2.resize(enhanced, (art_w, art_h), interpolation=cv2.INTER_LANCZOS4)
             return _colorfix(resized, clean), "Real-ESRGAN"
     resized = cv2.resize(clean, (art_w, art_h), interpolation=cv2.INTER_LANCZOS4)
-    return _colorfix(resized, clean), "Lanczos"
+    return resized, "Lanczos"
 
 
 def _esrgan(clean: np.ndarray):

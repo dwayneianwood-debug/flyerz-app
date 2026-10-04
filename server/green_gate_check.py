@@ -197,6 +197,51 @@ def test_paint_and_ink_colour() -> None:
     check("paint-dirty", dirty_items["paint"]["passed"] is False, str(dirty_items["paint"]))
     check("colour-core", clean_items["typecolour"]["passed"], str(clean_items["typecolour"]))
     check("colour-grey", grey_items["typecolour"]["passed"] is False, str(grey_items["typecolour"]))
+    black = os.path.join(folder, "black.pdf")
+    draw(black, False, (0, 0, 0))
+    black_items = {item["id"]: item for item in assess(black, 50, 20, context)["items"]}
+    check("colour-black", black_items["typecolour"]["passed"] is False, str(black_items["typecolour"]))
+
+
+def test_sharpness_and_one_resample() -> None:
+    import cv2
+    import numpy as np
+    import pymupdf as fitz
+
+    from vector_plate import _enlarge
+
+    rng = np.random.default_rng(3)
+    sharp = rng.integers(0, 255, (160, 220, 3), dtype=np.uint8)
+    soft = cv2.GaussianBlur(sharp, (0, 0), 2.4)
+    same, provider = _enlarge(sharp, sharp.shape[1], sharp.shape[0])
+    check("one-resample", provider == "Lanczos" and np.array_equal(same, sharp))
+
+    def write(image: np.ndarray, path: str) -> None:
+        from PIL import Image
+
+        height, width = image.shape[:2]
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        buffer = __import__("io").BytesIO()
+        Image.fromarray(rgb).save(buffer, format="PNG")
+        doc = fitz.open()
+        page = doc.new_page(width=width * 72 / 600, height=height * 72 / 600)
+        page.insert_image(page.rect, stream=buffer.getvalue())
+        doc.save(path)
+        doc.close()
+
+    folder = tempfile.mkdtemp(prefix="gate-sharp-")
+    sharp_pdf = os.path.join(folder, "sharp.pdf")
+    soft_pdf = os.path.join(folder, "soft.pdf")
+    write(sharp, sharp_pdf)
+    write(soft, soft_pdf)
+    context = {
+        "sourceBgr": sharp,
+        "placement": {"artBox": [0, 0, sharp.shape[1], sharp.shape[0]], "ppi": 600},
+    }
+    sharp_items = {item["id"]: item for item in assess(sharp_pdf, 20, 16, context)["items"]}
+    soft_items = {item["id"]: item for item in assess(soft_pdf, 20, 16, context)["items"]}
+    check("sharp-kept", sharp_items["sharp"]["passed"], str(sharp_items["sharp"]))
+    check("sharp-soft", soft_items["sharp"]["passed"] is False, str(soft_items["sharp"]))
 
 
 def test_esrgan_only_with_token() -> None:
@@ -221,6 +266,7 @@ def main() -> None:
     test_embedded_dpi()
     test_sharpen_keeps_the_hole()
     test_paint_and_ink_colour()
+    test_sharpness_and_one_resample()
     test_esrgan_only_with_token()
     test_bled_pdf_explains_itself()
     test_blank_and_wrong_shape()

@@ -95,26 +95,30 @@ def _crop_pair(name: str, result: dict, src: str, trim_w: float, trim_h: float, 
     doc = fitz.open(result["pressPath"])
     page = doc[0]
     ppi = float(placement.get("ppi") or 400)
-    # The crop is the press PDF rendered at 600 DPI, not a resized plate.
-    zoom = 600.0 / 72.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+    # Land on the embedded pixels. 600/72 is one pixel off and that blurs the type.
+    from green_gate import _press_matrix
+
+    pix = page.get_pixmap(matrix=_press_matrix(page), alpha=False, colorspace=fitz.csRGB)
     press = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
     doc.close()
-    pad = int(round(3.0 / 25.4 * 600.0))
+    plate = placement.get("plate") or [press.shape[0], press.shape[1]]
+    scale_x = press.shape[1] / float(plate[1] or press.shape[1])
+    scale_y = press.shape[0] / float(plate[0] or press.shape[0])
+    pad = int(round(3.0 / 25.4 * ppi * scale_x))
     written = 0
     for index, line in enumerate(lines):
         x, y, bw, bh = [int(v) for v in line["plateRect"]]
-        x0 = max(0, int(round(x * 600.0 / ppi)) - pad)
-        y0 = max(0, int(round(y * 600.0 / ppi)) - pad)
-        x1 = min(press.shape[1], int(round((x + bw) * 600.0 / ppi)) + pad)
-        y1 = min(press.shape[0], int(round((y + bh) * 600.0 / ppi)) + pad)
+        x0 = max(0, int(round(x * scale_x)) - pad)
+        y0 = max(0, int(round(y * scale_y)) - pad)
+        x1 = min(press.shape[1], int(round((x + bw) * scale_x)) + pad)
+        y1 = min(press.shape[0], int(round((y + bh) * scale_y)) + pad)
         if x1 - x0 < 8 or y1 - y0 < 8:
             continue
         after = press[y0:y1, x0:x1]
-        fx0 = int(round((x0 * ppi / 600.0 - paste_x) / max(1, art_w) * traced.shape[1]))
-        fy0 = int(round((y0 * ppi / 600.0 - paste_y) / max(1, art_h) * traced.shape[0]))
-        fx1 = int(round((x1 * ppi / 600.0 - paste_x) / max(1, art_w) * traced.shape[1]))
-        fy1 = int(round((y1 * ppi / 600.0 - paste_y) / max(1, art_h) * traced.shape[0]))
+        fx0 = int(round((x0 / scale_x - paste_x) / max(1, art_w) * traced.shape[1]))
+        fy0 = int(round((y0 / scale_y - paste_y) / max(1, art_h) * traced.shape[0]))
+        fx1 = int(round((x1 / scale_x - paste_x) / max(1, art_w) * traced.shape[1]))
+        fy1 = int(round((y1 / scale_y - paste_y) / max(1, art_h) * traced.shape[0]))
         fx0 = max(0, min(fx0, traced.shape[1] - 1))
         fy0 = max(0, min(fy0, traced.shape[0] - 1))
         fx1 = max(fx0 + 1, min(fx1, traced.shape[1]))
@@ -125,6 +129,72 @@ def _crop_pair(name: str, result: dict, src: str, trim_w: float, trim_h: float, 
         pair = np.concatenate([before, gap, after], axis=1)
         slug = "".join(ch if ch.isalnum() else "_" for ch in str(line.get("text") or ""))[:40]
         dest = os.path.join(folder, f"{name}_{index:02d}_{slug}.png")
+        Image.fromarray(pair).save(dest, dpi=(600, 600))
+        written += 1
+    return written
+
+
+def _column_pairs(name: str, result: dict, src: str, trim_w: float, trim_h: float, folder: str) -> int:
+    """Full-height source|press crops of the left, middle and right of the page."""
+    import pymupdf as fitz
+
+    if not result.get("pressPath"):
+        return 0
+    placement = (result.get("vectorText") or {}).get("placement") or {}
+    art = placement.get("artBox") or [0, 0, 1, 1]
+    paste_x, paste_y, art_w, art_h = [int(v) for v in art]
+    traced = _traced_image(src, trim_w, trim_h)
+    if traced is None:
+        return 0
+    doc = fitz.open(result["pressPath"])
+    page = doc[0]
+    ppi = float(placement.get("ppi") or 600)
+    from green_gate import _press_matrix
+
+    pix = page.get_pixmap(matrix=_press_matrix(page), alpha=False, colorspace=fitz.csRGB)
+    press = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+    doc.close()
+    plate = placement.get("plate") or [press.shape[0], press.shape[1]]
+    scale_x = press.shape[1] / float(plate[1] or press.shape[1])
+    scale_y = press.shape[0] / float(plate[0] or press.shape[0])
+    ax0 = int(round(paste_x * scale_x))
+    ay0 = int(round(paste_y * scale_y))
+    ax1 = int(round((paste_x + art_w) * scale_x))
+    ay1 = int(round((paste_y + art_h) * scale_y))
+    ax0, ay0 = max(0, ax0), max(0, ay0)
+    ax1, ay1 = min(press.shape[1], ax1), min(press.shape[0], ay1)
+    if ax1 - ax0 < 30 or ay1 - ay0 < 30:
+        return 0
+    # Gutters are the quiet vertical bands between columns of type.
+    gray = cv2.cvtColor(press[ay0:ay1, ax0:ax1], cv2.COLOR_RGB2GRAY)
+    dark = (gray < 140).sum(axis=0).astype(np.float32)
+    smooth = cv2.GaussianBlur(dark.reshape(1, -1), (1, 31), 0).ravel()
+    span = smooth.shape[0]
+    cuts = [0]
+    for start, end in ((int(span * 0.2), int(span * 0.45)), (int(span * 0.55), int(span * 0.82))):
+        if end <= start:
+            continue
+        cuts.append(start + int(np.argmin(smooth[start:end])))
+    cuts.append(span)
+    written = 0
+    labels = ("left", "middle", "right")
+    for index in range(min(3, len(cuts) - 1)):
+        x0 = ax0 + cuts[index]
+        x1 = ax0 + cuts[index + 1]
+        after = press[ay0:ay1, x0:x1]
+        fx0 = int(round((x0 / scale_x - paste_x) / max(1, art_w) * traced.shape[1]))
+        fx1 = int(round((x1 / scale_x - paste_x) / max(1, art_w) * traced.shape[1]))
+        fy0 = int(round((ay0 / scale_y - paste_y) / max(1, art_h) * traced.shape[0]))
+        fy1 = int(round((ay1 / scale_y - paste_y) / max(1, art_h) * traced.shape[0]))
+        fx0 = max(0, min(fx0, traced.shape[1] - 1))
+        fy0 = max(0, min(fy0, traced.shape[0] - 1))
+        fx1 = max(fx0 + 1, min(fx1, traced.shape[1]))
+        fy1 = max(fy0 + 1, min(fy1, traced.shape[0]))
+        before = cv2.cvtColor(traced[fy0:fy1, fx0:fx1], cv2.COLOR_BGR2RGB)
+        before = cv2.resize(before, (after.shape[1], after.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+        gap = np.full((after.shape[0], 12, 3), 255, np.uint8)
+        pair = np.concatenate([before, gap, after], axis=1)
+        dest = os.path.join(folder, f"{name}_column_{labels[index]}.png")
         Image.fromarray(pair).save(dest, dpi=(600, 600))
         written += 1
     return written
@@ -186,6 +256,7 @@ def main() -> None:
         items = result.get("checklist") or []
         failed = [item.get("id") for item in items if not item.get("passed")]
         crops = _crop_pair(name, result, src, trim_w, trim_h, OUT)
+        _column_pairs(name, result, src, trim_w, trim_h, OUT)
         line = (
             f"{name}: light={result.get('light')} failed={failed or '-'} "
             f"retype_s={timings.get('retype_s', 0)} total_s={timings.get('total_s', 0)} "
