@@ -483,6 +483,25 @@ def _pdf_exception_suggests_bad_geometry(exc: BaseException) -> bool:
     return any(n in blob for n in needles)
 
 
+def cmyk_raster_bytes(page, matrix, clip) -> tuple[bytes, int, int]:
+    """300 DPI DeviceCMYK pixels. An RGB pixmap cannot tell 100K from rich black."""
+    import io
+
+    import fitz
+    import numpy as np
+    from PIL import Image
+
+    pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False, colorspace=fitz.csCMYK)
+    pix.set_dpi(300, 300)
+    if pix.n < 4 or pix.width < 1 or pix.height < 1:
+        raise RuntimeError("CMYK raster did not produce a 4-channel image")
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    cmyk = np.ascontiguousarray(arr[:, :, :4])
+    buf = io.BytesIO()
+    Image.fromarray(cmyk, mode="CMYK").save(buf, format="TIFF", compression="tiff_adobe_deflate", dpi=(300, 300))
+    return buf.getvalue(), int(pix.width), int(pix.height)
+
+
 def nuclear_rebuild_pdf_visual_mount(
     broken_path: str,
     output_path: str,
@@ -492,9 +511,10 @@ def nuclear_rebuild_pdf_visual_mount(
 ) -> str:
     """
     Nuclear option: **pure raster** rebuild — no vector operators; full pixmap sampling only.
-    Each source page is rendered at 300 DPI via get_pixmap(alpha=False), then mounted on a
+    Each source page is rendered at 300 DPI in DeviceCMYK (not RGB), then mounted on a
     fresh page with trim+bleed dimensions. All page boxes are set to one rectangle before
     insert_image so geometry is ironclad (layer integrity: single raster, no ghost vectors).
+    CMYK keeps K-only text, overprint black and spot-to-K work that an RGB pixmap would undo.
     """
     import fitz
 
@@ -516,21 +536,19 @@ def nuclear_rebuild_pdf_visual_mount(
             raise ValueError("Nuclear rebuild: source PDF has no pages")
         for i in range(n):
             src_pg = broken.load_page(i)
-            pix = src_pg.get_pixmap(matrix=mat, clip=page_raster_clip_rect(src_pg), alpha=False)
-            pix.set_dpi(int(raster_dpi), int(raster_dpi))
-            pw, ph = pix.width, pix.height
+            image_bytes, pw, ph = cmyk_raster_bytes(src_pg, mat, page_raster_clip_rect(src_pg))
 
             target_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
             tw_pt, th_pt = float(target_rect.width), float(target_rect.height)
             clean_page = clean.new_page(width=tw_pt, height=th_pt)
             flush_page_boxes_to_rect(clean_page, target_rect)
             clean_page.insert_image(
-                press_insert_rect_at_origin(tw_pt, th_pt), pixmap=pix, keep_proportion=False
+                press_insert_rect_at_origin(tw_pt, th_pt), stream=image_bytes, keep_proportion=False
             )
-            del pix
+            del image_bytes
 
             sys.stderr.write(
-                f"[COMPILE] Nuclear pure-raster page {i + 1}/{n}: {pw}x{ph}px @ {int(raster_dpi)} DPI → "
+                f"[COMPILE] Nuclear pure-raster page {i + 1}/{n}: {pw}x{ph}px @ {int(raster_dpi)} DPI CMYK → "
                 f"{target_w_pt:.2f}x{target_h_pt:.2f} pt canvas\n"
             )
     finally:
@@ -655,11 +673,7 @@ def _normalize_pdf_geometry(
 
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
-        pix.set_dpi(300, 300)
-        pw_px, ph_px = pix.width, pix.height
-        img_bytes = pix.tobytes("png")
-        pix = None
+        img_bytes, pw_px, ph_px = cmyk_raster_bytes(page, mat, clip)
         gc.collect()
 
         logical_w, logical_h = page_pts_from_px(pw_px, ph_px, FINAL_RASTER_DPI)
@@ -738,10 +752,7 @@ def _apply_creep_shift(input_path: str, output_path: str,
     for i, page in enumerate(src):
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, clip=page_raster_clip_rect(page), alpha=False)
-        pix.set_dpi(300, 300)
-        img_bytes = pix.tobytes("png")
-        pix = None
+        img_bytes, _pw, _ph = cmyk_raster_bytes(page, mat, page_raster_clip_rect(page))
 
         mb = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
         tw, th = float(mb.width), float(mb.height)
@@ -809,14 +820,9 @@ def _enforce_single_layer(
         stats["vectors_purged"] += len(drawings)
         stats["pages_rerasterized"] += 1
 
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(300 / 72.0, 300 / 72.0),
-            clip=page_raster_clip_rect(page),
-            alpha=False,
+        img_bytes, pix_w, pix_h = cmyk_raster_bytes(
+            page, fitz.Matrix(300 / 72.0, 300 / 72.0), page_raster_clip_rect(page)
         )
-        pix.set_dpi(300, 300)
-        img_bytes = pix.tobytes("png")
-        pix_w, pix_h = pix.width, pix.height
         if use_press_target:
             mount_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
         else:
@@ -866,16 +872,15 @@ def _preflatten_for_gs(
     bleed_mm: float = PRESS_DEFAULT_BLEED_MM,
 ) -> str:
     """
-    Pre-flatten the GS handoff file: render each page as a single RGB raster
-    at 300 DPI with alpha=False (white background), inject DPI metadata.
+    Pre-flatten the GS handoff file: render each page as a single CMYK raster
+    at 300 DPI with alpha=False, inject DPI metadata.
     Guarantees Ghostscript receives a clean, flat, alpha-free PDF that
     won't choke under 50 MB memory constraints.
 
-    Normal pages (< PREFLATTEN_LOSSLESS_MAX_PIXELS): lossless PNG — no JPEG softness.
-    Oversized pages: JPEG q95 fallback to keep GS MaxBitmap / RAM safe.
+    The plate is DeviceCMYK TIFF so 100K text stays on the black channel.
+    An RGB pixmap would turn that black into four-colour before Ghostscript runs.
 
-    Uses alpha=False directly in get_pixmap to avoid double-memory from
-    RGBA->RGB conversion. Cleans up prior temp work_path to free /dev/shm space.
+    Cleans up prior temp work_path to free /dev/shm space.
     """
     import fitz
     import gc
@@ -883,67 +888,31 @@ def _preflatten_for_gs(
     sys.stderr.write(f"[PRE-FLATTEN] Flattening GS handoff: {work_path} ({os.path.getsize(work_path) / (1024*1024):.1f} MB)\n")
 
     try:
-        from PIL import Image as _PilImage
         src = fitz.open(work_path)
         dst = fitz.open()
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
 
         for i, page in enumerate(src):
-            pix = page.get_pixmap(matrix=mat, clip=page_raster_clip_rect(page), alpha=False)
-            pix.set_dpi(300, 300)
-            pix_w, pix_h = pix.width, pix.height
+            image_bytes, pix_w, pix_h = cmyk_raster_bytes(page, mat, page_raster_clip_rect(page))
             page_pixels = int(pix_w) * int(pix_h)
-            use_lossless = page_pixels < int(PREFLATTEN_LOSSLESS_MAX_PIXELS)
-
-            pil_img = _PilImage.frombytes("RGB", (pix_w, pix_h), pix.samples)
-            pix = None
-            if pil_img.mode != "RGB":
-                sys.stderr.write(f"[PRE-FLATTEN] Page {i+1}: unexpected mode {pil_img.mode}, converting to RGB\n")
-                pil_img = pil_img.convert("RGB")
-
-            if use_lossless:
-                flat_tmp = tempfile.NamedTemporaryFile(
-                    suffix="_flat.png", delete=False, dir=FAI_TEMP_DIR
-                ).name
-                tmp_chain.append(flat_tmp)
-                try:
-                    pil_img.save(
-                        flat_tmp,
-                        format="PNG",
-                        optimize=True,
-                        dpi=(int(FINAL_RASTER_DPI), int(FINAL_RASTER_DPI)),
-                    )
-                except OSError as save_err:
-                    raise RuntimeError(
-                        f"Pre-flatten PNG save failed for page {i+1} "
-                        f"(mode={pil_img.mode}, size={pix_w}x{pix_h}): {save_err}"
-                    ) from save_err
-                codec_label = "PNG lossless"
-            else:
-                flat_tmp = tempfile.NamedTemporaryFile(
-                    suffix="_flat.jpg", delete=False, dir=FAI_TEMP_DIR
-                ).name
-                tmp_chain.append(flat_tmp)
-                try:
-                    pil_img.save(
-                        flat_tmp,
-                        format="JPEG",
-                        quality=int(PREFLATTEN_JPEG_QUALITY),
-                        optimize=True,
-                        dpi=(int(FINAL_RASTER_DPI), int(FINAL_RASTER_DPI)),
-                    )
-                except OSError as save_err:
-                    raise RuntimeError(
-                        f"Pre-flatten JPEG save failed for page {i+1} "
-                        f"(mode={pil_img.mode}, size={pix_w}x{pix_h}): {save_err}"
-                    ) from save_err
-                codec_label = f"JPEG q{int(PREFLATTEN_JPEG_QUALITY)} (big-page fallback)"
+            flat_tmp = tempfile.NamedTemporaryFile(
+                suffix="_flat.tif", delete=False, dir=FAI_TEMP_DIR
+            ).name
+            tmp_chain.append(flat_tmp)
+            try:
+                with open(flat_tmp, "wb") as handle:
+                    handle.write(image_bytes)
+            except OSError as save_err:
+                raise RuntimeError(
+                    f"Pre-flatten CMYK save failed for page {i+1} "
+                    f"(size={pix_w}x{pix_h}): {save_err}"
+                ) from save_err
+            codec_label = "CMYK TIFF"
+            del image_bytes
 
             if not os.path.exists(flat_tmp) or os.path.getsize(flat_tmp) == 0:
                 raise RuntimeError(f"Pre-flatten save produced empty file for page {i+1}: {flat_tmp}")
-            pil_img.close()
-            pil_img = None
             gc.collect()
 
             mount_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
@@ -1029,11 +998,7 @@ def _prerasterize_pdf(
     for i, page in enumerate(src):
         meta = page_meta[i]
         clip = page_raster_clip_rect(page)
-        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
-        pix.set_dpi(dpi, dpi)
-        img_bytes = pix.tobytes("png")
-        pix_w, pix_h = pix.width, pix.height
-        pix = None
+        img_bytes, pix_w, pix_h = cmyk_raster_bytes(page, mat, clip)
         gc.collect()
 
         logical_w, logical_h = page_pts_from_px(pix_w, pix_h, float(dpi))
@@ -2220,15 +2185,9 @@ def main():
                     for _fb_i, _fb_page in enumerate(_fb_src):
                         _fb_scale = 300.0 / 72.0
                         _fb_mat = _fitz_fb.Matrix(_fb_scale, _fb_scale)
-                        _fb_pix = _fb_page.get_pixmap(
-                            matrix=_fb_mat,
-                            clip=page_raster_clip_rect(_fb_page),
-                            alpha=False,
+                        _fb_img, _fb_pxw, _fb_pxh = cmyk_raster_bytes(
+                            _fb_page, _fb_mat, page_raster_clip_rect(_fb_page)
                         )
-                        _fb_pix.set_dpi(300, 300)
-                        _fb_pxw, _fb_pxh = _fb_pix.width, _fb_pix.height
-                        _fb_img = _fb_pix.tobytes("png")
-                        _fb_pix = None
                         _fb_mr = press_target_media_rect(args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
                         _fb_w, _fb_h = float(_fb_mr.width), float(_fb_mr.height)
                         _fb_new = _fb_dst.new_page(width=_fb_w, height=_fb_h)
@@ -2477,15 +2436,9 @@ def main():
                     for _fb2_i, _fb2_page in enumerate(_fb2_src):
                         _fb2_scale = 300.0 / 72.0
                         _fb2_mat = _fitz_fb2.Matrix(_fb2_scale, _fb2_scale)
-                        _fb2_pix = _fb2_page.get_pixmap(
-                            matrix=_fb2_mat,
-                            clip=page_raster_clip_rect(_fb2_page),
-                            alpha=False,
+                        _fb2_img, _fb2_pxw, _fb2_pxh = cmyk_raster_bytes(
+                            _fb2_page, _fb2_mat, page_raster_clip_rect(_fb2_page)
                         )
-                        _fb2_pix.set_dpi(300, 300)
-                        _fb2_pxw, _fb2_pxh = _fb2_pix.width, _fb2_pix.height
-                        _fb2_img = _fb2_pix.tobytes("png")
-                        _fb2_pix = None
                         _fb2_mr = press_target_media_rect(args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
                         _fb2_w, _fb2_h = float(_fb2_mr.width), float(_fb2_mr.height)
                         _fb2_new = _fb2_dst.new_page(width=_fb2_w, height=_fb2_h)

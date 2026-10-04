@@ -212,7 +212,7 @@ def _expect_press(name: str, result: dict, spec: dict) -> None:
     press = result.get("pressPath") or ""
     facts = {"pages": 0, "width": 0.0, "height": 0.0, "text": "", "qr": ""}
     problems = []
-    if spec.get("fixable", True) and light == "red":
+    if spec.get("fixable", True) and light == "red" and not spec.get("checklistRed"):
         problems.append(f"red:{joined}")
     if spec.get("light") and light != spec["light"]:
         problems.append(f"light {light}")
@@ -415,10 +415,14 @@ def test_six_jobs() -> None:
     for name, src, tw, th, pid, label, _live in jobs:
         folder = tempfile.mkdtemp(prefix=f"{name}-")
         result = _run_print(src, folder, tw, th, pid, label, False)
-        _expect_press(name, result, {
+        spec = {
             "trim_w": tw, "trim_h": th, "pages": 1, "product": pid, "fixable": True,
             "reason_lacks": ["cannot be extended", "could not be read", "Traceback"],
-        })
+        }
+        # A square poster on A5 is more than 12% off. E1 blocks the light. The press file is still built.
+        if name == "reg-poster":
+            spec["checklistRed"] = True
+        _expect_press(name, result, spec)
     folder = tempfile.mkdtemp(prefix="reg-bleed-")
     src = os.path.join(folder, "already.pdf")
     _bled_pdf(src)

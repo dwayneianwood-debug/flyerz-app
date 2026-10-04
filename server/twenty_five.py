@@ -530,6 +530,24 @@ def run_checklist(path: str, trim_w: float | None = None, trim_h: float | None =
     }
 
 
+def attach_extra(report: dict, source: str, press: str = "", order: dict | None = None, apply: bool = False) -> dict:
+    """Add E1–E9 beside the 25 points. The 25-point rows stay as they are."""
+    from extra_checks import assess_extras, worse_light
+
+    extra = assess_extras(source, press, order, apply=apply, source_pages=report.get("pages"))
+    combined = worse_light(
+        {"light": report.get("light"), "reasons": report.get("reasons") or [], "clientMessage": report.get("clientMessage") or ""},
+        extra,
+    )
+    report = dict(report)
+    report["extraChecks"] = extra.get("checks") or []
+    report["checks"] = list(report.get("checks") or []) + list(extra.get("checks") or [])
+    report["light"] = combined["light"]
+    report["reasons"] = combined["reasons"]
+    report["clientMessage"] = combined["clientMessage"]
+    return report
+
+
 def main() -> None:
     import argparse
 
@@ -539,11 +557,22 @@ def main() -> None:
     parser.add_argument("--trim-h", type=float, default=0)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--press-done", action="store_true")
+    parser.add_argument("--press", default="")
+    parser.add_argument("--order", default="")
+    parser.add_argument("--with-extra", action="store_true")
     args = parser.parse_args()
     if args.apply or args.press_done:
         report = run_checklist(args.input, args.trim_w or None, args.trim_h or None, apply=bool(args.apply), press_done=bool(args.press_done))
     else:
         report = assess(args.input, args.trim_w or None, args.trim_h or None)
+    if args.with_extra or args.order or args.press:
+        order = json.loads(args.order) if args.order else {}
+        if args.trim_w and args.trim_h and order.get("explicitSize") is not False and not order.get("widthMm"):
+            order = {**order, "widthMm": args.trim_w, "heightMm": args.trim_h, "explicitSize": True}
+        # Fixes stay on the checklist copy. The uploaded file is not rewritten.
+        copy = str(report.get("fixedPath") or "")
+        apply_extra = bool(args.apply and copy and os.path.isfile(copy))
+        report = attach_extra(report, copy if apply_extra else args.input, args.press, order, apply=apply_extra)
     print(json.dumps(report))
 
 

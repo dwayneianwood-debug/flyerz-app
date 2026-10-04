@@ -902,6 +902,15 @@ export async function registerRoutes(
         severity: c.severity,
       }));
 
+      const chosen = customerTrimFromUploadBody(req.body);
+      const sidesRaw = String(req.body?.sides || "").trim().toLowerCase();
+      const sides = sidesRaw === "single" || sidesRaw === "double" || sidesRaw === "booklet" ? sidesRaw : "";
+      const orderedPages = Number(req.body?.pageCount ?? req.body?.orderedPageCount);
+      const finishRaw = req.body?.finishes;
+      const finishes = Array.isArray(finishRaw)
+        ? finishRaw.map((item: unknown) => String(item)).filter(Boolean)
+        : String(finishRaw || "").split(",").map((item) => item.trim()).filter(Boolean);
+      const headToFoot = req.body?.headToFoot === true || req.body?.headToFoot === "1" || req.body?.headToFoot === "true";
       const auditResults: AuditResults = {
         checks,
         overallPassed: checksAllPassed(checks),
@@ -910,6 +919,15 @@ export async function registerRoutes(
         artworkSize: quickCheckResult.artworkSize,
         savedBleedOptions: bleedOptions,
         pageCount: quickCheckResult.pageCount ?? ingested.pageCount,
+        order: {
+          widthMm: chosen?.width ?? null,
+          heightMm: chosen?.height ?? null,
+          explicitSize: Boolean(chosen),
+          sides: sides || null,
+          pageCount: Number.isFinite(orderedPages) && orderedPages > 0 ? orderedPages : null,
+          finishes,
+          headToFoot,
+        },
         ...(isIllustratorType(normalizedType) ? { sourceFormat: normalizedType as "ai" | "eps" } : {}),
       };
 
@@ -917,6 +935,12 @@ export async function registerRoutes(
         status: 'complete',
         auditResults,
         completedAt: new Date(),
+        productWidthMm: chosen?.width ?? null,
+        productHeightMm: chosen?.height ?? null,
+        sides: sides || null,
+        orderedPageCount: Number.isFinite(orderedPages) && orderedPages > 0 ? orderedPages : null,
+        finishes: finishes.length ? JSON.stringify(finishes) : null,
+        headToFoot,
       });
 
       res.status(201).json({
@@ -4290,15 +4314,30 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const job = await storage.getJob(jobId);
       if (!job || !job.auditResults) return res.json({ checks: [] });
 
-      const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
-      const trimW = Number(saved.targetWidth || saved.trimW || 0);
-      const trimH = Number(saved.targetHeight || saved.trimH || 0);
+      const storedOrder = ((job.auditResults as any)?.order || {}) as Record<string, unknown>;
+      const trimW = Number(job.productWidthMm || storedOrder.widthMm || 0);
+      const trimH = Number(job.productHeightMm || storedOrder.heightMm || 0);
+      const explicit = trimW > 0 && trimH > 0;
       const file = job.originalPath || job.correctedPath;
       if (!file) return res.json({ checks: [] });
       const script = path.join(process.cwd(), "server", "twenty_five.py");
-      const args = [script, "--input", file, "--apply"];
-      if (job.correctedPath && fsSync.existsSync(job.correctedPath)) args.push("--press-done");
-      if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
+      const args = [script, "--input", file, "--apply", "--with-extra"];
+      if (job.correctedPath && fsSync.existsSync(job.correctedPath)) {
+        args.push("--press-done", "--press", job.correctedPath);
+      }
+      const finishSource = storedOrder.finishes ?? job.finishes;
+      const order = {
+        widthMm: explicit ? trimW : null,
+        heightMm: explicit ? trimH : null,
+        explicitSize: explicit,
+        sides: job.sides || storedOrder.sides || "",
+        pageCount: job.orderedPageCount || storedOrder.pageCount || null,
+        finishes: finishSource || [],
+        headToFoot: Boolean(job.headToFoot || storedOrder.headToFoot),
+        cmykOnly: true,
+      };
+      args.push("--order", JSON.stringify(order));
+      if (explicit) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
       const result = execPythonCapture(args, "TwentyFive", 60_000);
       const checks = Array.isArray(result?.checks) ? result.checks : [];
       const body = { checks };

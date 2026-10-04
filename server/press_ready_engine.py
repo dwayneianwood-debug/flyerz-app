@@ -2163,15 +2163,39 @@ def compile_vector_press(
             src_trim = src_page.rect
             if abs(trim_box.width - src_page.mediabox.width) >= 1.5 or abs(trim_box.height - src_page.mediabox.height) >= 1.5:
                 src_trim = trim_box
-            cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
-            clip_w = placed.width / cover
-            clip_h = placed.height / cover
-            clip = fitz.Rect(
-                src_trim.x0 + (src_trim.width - clip_w) / 2,
-                src_trim.y0 + (src_trim.height - clip_h) / 2,
-                src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
-                src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
-            )
+            fit_inside = False
+            try:
+                from extra_checks import should_fit_inside
+
+                fit_inside = should_fit_inside(src_page, src_trim, placed, trim_w_mm, trim_h_mm)
+            except Exception:
+                fit_inside = False
+            if fit_inside:
+                # Text or a face would be cropped, and the aspect gap is within 12%.
+                # Fit the page inside the trim and let the bleed fill the gap.
+                src_aspect = src_trim.width / max(src_trim.height, 1)
+                dest_aspect = placed.width / max(placed.height, 1)
+                fitted = fitz.Rect(placed)
+                if src_aspect > dest_aspect:
+                    new_h = placed.width / src_aspect
+                    y0 = placed.y0 + (placed.height - new_h) / 2
+                    fitted = fitz.Rect(placed.x0, y0, placed.x1, y0 + new_h)
+                else:
+                    new_w = placed.height * src_aspect
+                    x0 = placed.x0 + (placed.width - new_w) / 2
+                    fitted = fitz.Rect(x0, placed.y0, x0 + new_w, placed.y1)
+                placed = fitted
+                clip = fitz.Rect(src_trim)
+            else:
+                cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
+                clip_w = placed.width / cover
+                clip_h = placed.height / cover
+                clip = fitz.Rect(
+                    src_trim.x0 + (src_trim.width - clip_w) / 2,
+                    src_trim.y0 + (src_trim.height - clip_h) / 2,
+                    src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
+                    src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
+                )
             new_page.show_pdf_page(placed, src, index, clip=clip)
             edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
         if len(edge_placements) < index + 1:

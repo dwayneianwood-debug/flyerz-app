@@ -397,13 +397,18 @@ def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None
 
     audit = audit_pdf(path, trim_w, trim_h)
     points = assess_points(path, trim_w, trim_h)
+    from extra_checks import assess_extras
+
+    order = {"widthMm": trim_w, "heightMm": trim_h, "explicitSize": True} if trim_w and trim_h else {"explicitSize": False}
+    extra_rows = assess_extras(path, "", order).get("checks") or []
     extra = {
         "size": _size_check(path, trim_w, trim_h),
         "bleed": _bleed_check(path, client),
         "textCut": _text_cut(path, trim_w, trim_h),
         "qr": _qr(path),
     }
-    reply, actions = reply_from_checks(points.get("checks") or [])
+    checks = list(points.get("checks") or []) + list(extra_rows)
+    reply, actions = reply_from_checks(checks)
     notes = []
     if sized:
         notes.append(f"Applied rule: {sized[2]}")
@@ -420,7 +425,7 @@ def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None
     return {
         "audit": audit,
         "extra": extra,
-        "checks": points.get("checks") or [],
+        "checks": checks,
         "reply": reply,
         "actions": actions,
         "provider": "gemini" if gemini_key_usable() else "rules",

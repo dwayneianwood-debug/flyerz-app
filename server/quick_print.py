@@ -160,16 +160,20 @@ def decide_light(facts: dict) -> dict:
                 "clientMessage": str(checklist.get("clientMessage") or client_message("cut")),
             }
     twenty = facts.get("twentyFive") if isinstance(facts.get("twentyFive"), dict) else None
-    if twenty and twenty.get("light") == "red":
-        extra = [line for line in (twenty.get("reasons") or []) if line not in reasons]
+    extra_checks = facts.get("extraChecks") if isinstance(facts.get("extraChecks"), dict) else None
+    from extra_checks import worse_light
+
+    combined = worse_light(twenty, extra_checks) if (twenty or extra_checks) else None
+    if combined and combined.get("light") == "red":
+        extra = [line for line in (combined.get("reasons") or []) if line not in reasons]
         return {
             "light": "red",
             "reasons": extra + reasons,
-            "clientMessage": str(twenty.get("clientMessage") or ""),
+            "clientMessage": str(combined.get("clientMessage") or ""),
             "checklistRed": True,
         }
-    if twenty and twenty.get("light") == "amber":
-        for line in twenty.get("reasons") or []:
+    if combined and combined.get("light") == "amber":
+        for line in combined.get("reasons") or []:
             if line and line not in reasons:
                 reasons.append(line)
     if reasons:
@@ -1671,10 +1675,28 @@ def make_print_ready(
             facts["twentyFive"] = {**derived, "checks": settled}
         except Exception:
             pass
+        try:
+            from extra_checks import assess_extras
+
+            extra_report = assess_extras(
+                src_path,
+                press_path if press_ok else "",
+                {
+                    "widthMm": trim_w,
+                    "heightMm": trim_h,
+                    "explicitSize": True,
+                    "cmykOnly": True,
+                },
+                apply=False,
+            )
+            facts["extraChecks"] = extra_report
+        except Exception:
+            pass
     info = decide_light(facts)
     result = _blank(info, decisions, product, quantity, notes)
     result["checklist"] = list((checklist or {}).get("items") or [])
     result["prepressChecks"] = list((facts.get("twentyFive") or {}).get("checks") or [])
+    result["extraChecks"] = list((facts.get("extraChecks") or {}).get("checks") or [])
     result["upscale"] = round(upscale, 3)
     result["existingBleedKept"] = existing_kept
     result["enginePassed"] = facts["enginePassed"]

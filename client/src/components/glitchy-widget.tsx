@@ -1093,8 +1093,8 @@ export default function GlitchyWidget() {
             <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5, maxHeight: 220, overflowY: "auto" }}>
               {checklist.map((c, i) => {
                 const status = c.status || (c.pass ? "passed" : "failed");
-                const color = status === "auto" ? "#0f766e" : status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
-                const mark = status === "auto" ? "\u2728" : status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
+                const color = status === "auto" || status === "fixed" ? "#0f766e" : status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
+                const mark = status === "auto" || status === "fixed" ? "\u2728" : status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
                 return (
                   <li
                     key={i}

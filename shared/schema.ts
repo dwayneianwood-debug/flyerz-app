@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index } from "drizzle-orm/sqlite-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -16,6 +16,15 @@ export const fileJobs = sqliteTable("file_jobs", {
   // SQLite has no native JSONB; store JSON as text via Drizzle's JSON mode.
   auditResults: text("audit_results", { mode: "json" }).$type<Record<string, any> | null>(),
   errorMessage: text("error_message"),
+  /** Ordered trim. Null until a person or product sets it. Never invent 148×210 here. */
+  productWidthMm: real("product_width_mm"),
+  productHeightMm: real("product_height_mm"),
+  /** single, double, or booklet. */
+  sides: text("sides"),
+  orderedPageCount: integer("ordered_page_count"),
+  /** JSON array of finish names (varnish, foil, die). */
+  finishes: text("finishes"),
+  headToFoot: integer("head_to_foot", { mode: "boolean" }),
 }, (table) => [
   index("idx_file_jobs_uploaded_at").on(table.uploadedAt),
   index("idx_file_jobs_status_uploaded_at").on(table.status, table.uploadedAt),
@@ -45,6 +54,10 @@ export interface AuditCheck {
   details?: string;
   cmykVerified?: boolean;
   severity?: string;
+  /** extra_E1 … extra_E9 when this row is one of the extra checks. */
+  id?: string;
+  /** pass, fixed, warning, or failed for the extra checks. */
+  status?: string;
 }
 
 export interface ResizeAudit {
@@ -73,6 +86,16 @@ export interface JobAudit {
 // Complete audit results
 export interface AuditResults {
   checks: AuditCheck[];
+  /** Product the job was ordered as. Missing size is not filled with A5. */
+  order?: {
+    widthMm?: number | null;
+    heightMm?: number | null;
+    sides?: string | null;
+    pageCount?: number | null;
+    finishes?: string[];
+    headToFoot?: boolean;
+    explicitSize?: boolean;
+  };
   overallPassed: boolean;
   fixesApplied: number;
   complianceReport: string;
@@ -293,6 +316,12 @@ export interface CreateFileJobRequest {
   originalPath: string;
   fileSize: number;
   fileType: FileType;
+  productWidthMm?: number | null;
+  productHeightMm?: number | null;
+  sides?: string | null;
+  orderedPageCount?: number | null;
+  finishes?: string | null;
+  headToFoot?: boolean | null;
 }
 
 export interface UpdateFileJobRequest {
@@ -301,6 +330,12 @@ export interface UpdateFileJobRequest {
   completedAt?: Date;
   auditResults?: AuditResults;
   errorMessage?: string;
+  productWidthMm?: number | null;
+  productHeightMm?: number | null;
+  sides?: string | null;
+  orderedPageCount?: number | null;
+  finishes?: string | null;
+  headToFoot?: boolean | null;
 }
 
 // Response types
