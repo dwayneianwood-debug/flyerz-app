@@ -1254,7 +1254,6 @@ def make_print_ready(
     decisions = [
         "Sales quick mode decided this file on its own. Nobody was asked a question.",
         "Bleed is 5 mm on every side.",
-        "The press file is CMYK, with rich black kept.",
     ]
     product = {"id": product_id, "label": product_label, "widthMm": trim_w, "heightMm": trim_h}
     ext = _ext(src_path, display)
@@ -1610,7 +1609,13 @@ def make_print_ready(
                 "edge": (vector_built or {}).get("edge") or {},
                 "sourceBgr": vector_source,
                 "placement": (vector_built or {}).get("placement") or {},
+                "sourcePath": src_path,
             })
+            black_row = next((item for item in (checklist.get("items") or []) if item.get("id") == "black"), None)
+            if black_row and black_row.get("passed"):
+                decisions.append("Black ink was checked on the original file.")
+            elif black_row:
+                decisions.append(str(black_row.get("detail") or "Black ink was corrected for press."))
             facts["checklist"] = checklist
         except Exception:
             checklist = None

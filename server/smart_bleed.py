@@ -2618,25 +2618,13 @@ def _compute_ink_savings(neutralization_result: dict) -> int:
 
 
 def verify_font_status(pdf_path: str) -> dict:
-    doc = fitz.open(pdf_path)
-    total_fonts = 0
-    embedded_fonts = 0
-    unembedded_fonts = []
+    from client_file_audit import font_report
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        font_list = page.get_fonts(full=True)
-        for font in font_list:
-            total_fonts += 1
-            font_name = font[3] if len(font) > 3 else "Unknown"
-            font_type = font[2] if len(font) > 2 else ""
-            is_embedded = font[4] if len(font) > 4 else ""
-            if is_embedded:
-                embedded_fonts += 1
-            else:
-                unembedded_fonts.append(font_name)
-
-    doc.close()
+    report = font_report(pdf_path)
+    problems = report.get("problems") or []
+    unembedded_fonts = [row["name"] for row in problems]
+    embedded_fonts = int(report.get("embedded") or 0) + len(report.get("type3") or [])
+    total_fonts = embedded_fonts + len(unembedded_fonts)
 
     fonts_as_vectors = total_fonts == 0
     all_embedded = total_fonts > 0 and embedded_fonts == total_fonts
@@ -5719,8 +5707,15 @@ def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> 
             FREQ_SEP_GAUSSIAN_SIGMA,
         )
     high = src - low
+    # A repeated strip draws echo lines. Keep the measured grain once, and
+    # extend only the flat tone past the end of that sample.
+    if high.shape[0] >= target_bleed_px:
+        grain = high[:target_bleed_px]
+    else:
+        pad = np.zeros((target_bleed_px - high.shape[0],) + high.shape[1:], dtype=np.float32)
+        grain = np.concatenate([high, pad], axis=0)
     low_out = np.repeat(low[:1], target_bleed_px, axis=0)
-    out = np.clip(np.round(low_out + _repeat_depth(high, target_bleed_px)), 0, 255)
+    out = np.clip(np.round(low_out + grain), 0, 255)
     out = out.astype(np.uint8)
     if c == 1:
         return out[:, :, 0]
@@ -5749,7 +5744,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if side == "top":
         if h < start + 2:
             return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, h - start)
+        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), h - start)
         if d < 2:
             return _maybe_fallback()
         strip = work[start : start + d, :, :]
@@ -5771,7 +5766,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if side == "bottom":
         if h < start + 2:
             return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, h - start)
+        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), h - start)
         if d < 2:
             return _maybe_fallback()
         raw = work[h - start - d : h - start, :, :]
@@ -5794,7 +5789,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if side == "left":
         if w < start + 2:
             return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, w - start)
+        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), w - start)
         if d < 2:
             return _maybe_fallback()
         raw = work[:, start : start + d, :]
@@ -5819,7 +5814,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if side == "right":
         if w < start + 2:
             return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, w - start)
+        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), w - start)
         if d < 2:
             return _maybe_fallback()
         raw = work[:, w - start - d : w - start, :]
@@ -8899,37 +8894,41 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
 
     gc.collect()
 
-    if font_status and font_status["fonts_as_vectors"]:
-        checks.append({
-            "name": "Fonts Embedded",
-            "passed": True,
-            "message": "Fonts Secured: Converted to Vector Outlines for Litho. All text characters have been converted to vector paths via Ghostscript -dNoOutputFonts — design integrity guaranteed.",
-            "autoFixed": True,
-            "details": f"Source PDF contained {len(source_font_names)} font reference(s): {', '.join(list(set(source_font_names))[:5]) or 'none'}. All converted to vector outlines (paths). No font dependencies remain."
-        })
-    elif font_status and font_status["all_embedded"]:
-        checks.append({
-            "name": "Fonts Embedded",
-            "passed": True,
-            "message": f"All {font_status['total_fonts']} fonts are fully embedded in the PDF.",
-            "autoFixed": False,
-            "details": f"PyMuPDF verified {font_status['embedded_fonts']}/{font_status['total_fonts']} fonts embedded"
-        })
-    elif font_status and font_status["unembedded_fonts"]:
+    source_fonts = {"checked": False, "problems": []}
+    try:
+        from client_file_audit import font_report
+
+        if str(input_path).lower().endswith(".pdf"):
+            source_fonts = font_report(input_path)
+    except Exception:
+        source_fonts = {"checked": False, "problems": []}
+    font_problems = source_fonts.get("problems") or []
+    if font_problems:
+        names = ", ".join(row["name"] for row in font_problems[:5])
         checks.append({
             "name": "Fonts Embedded",
             "passed": False,
-            "message": f"Font outlining attempted but {len(font_status['unembedded_fonts'])} font(s) remain unembedded: {', '.join(font_status['unembedded_fonts'][:3])}.",
+            "message": f"These fonts are not embedded or were substituted: {names}. Please export with fonts embedded or outlined.",
             "autoFixed": False,
-            "details": "Ghostscript -dNoOutputFonts was applied but some fonts persisted. Manual review recommended."
+            "details": "Checked on the original upload, before Ghostscript could embed a stand-in.",
+            "severity": "FAIL",
+        })
+    elif source_fonts.get("checked"):
+        checks.append({
+            "name": "Fonts Embedded",
+            "passed": True,
+            "message": "The original file's fonts are embedded, or the text was already outlines.",
+            "autoFixed": False,
+            "details": "Checked on the original upload.",
         })
     else:
         checks.append({
             "name": "Fonts Embedded",
-            "passed": True,
-            "message": "Fonts Secured: Converted to Vector Outlines for Litho. No font dependencies in output PDF.",
-            "autoFixed": True,
-            "details": "Ghostscript -dNoOutputFonts converted all text to vector paths"
+            "passed": False,
+            "message": "Fonts were not checked on the original file.",
+            "autoFixed": False,
+            "details": "No pass is recorded without a check of the upload.",
+            "severity": "FAIL",
         })
 
     checks.append({
@@ -9139,9 +9138,9 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
     checks.append({
         "name": "Resolution Check",
         "passed": True,
-        "message": f"Output PDF rasterised at {dpi} DPI, meeting minimum print resolution.",
-        "autoFixed": True,
-        "details": f"All content rendered at {dpi} DPI. Ghostscript -r{dpi} ensures bitmap lenses stay crisp."
+        "message": f"The press bitmap was rendered at {dpi} DPI. That is the output grid, not the resolution of the pictures in the original file.",
+        "autoFixed": False,
+        "details": "Picture resolution is taken from the original file, not from this render."
     })
 
     gc.collect()

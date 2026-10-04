@@ -841,8 +841,8 @@ def _base_report(analysis, edges, kept, bleed_mm, safe_zone_mm, src_w, src_h, tr
 
 def _finish_resolution(report: dict, src_w: int, src_h: int, trim_w: float, trim_h: float, analysis: dict) -> None:
     if analysis.get("contentKind") == "vector":
-        report["effectiveDpi"] = 300
-        report["resolutionNote"] = "Vector artwork stays sharp at any size."
+        report["effectiveDpi"] = None
+        report["resolutionNote"] = "No picture was measured, so resolution is not reported as 300 DPI."
         return
     dpi = effective_dpi(src_w, src_h, trim_w, trim_h)
     report["effectiveDpi"] = round(dpi, 1)
@@ -967,12 +967,37 @@ def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float
     if require_text and require_text not in text:
         failures.append("The original text is no longer in the file.")
     images = _content_image_xrefs(doc, page)
-    if images:
-        info = doc.extract_image(images[0])
-        if info.get("colorspace") not in (4, "CMYK", None) and info.get("cs-name") not in ("DeviceCMYK", None):
-            # PyMuPDF uses numeric colorspace 4 for CMYK. Soft-mask greys are not the picture.
-            if info.get("colorspace") != 4 and "CMYK" not in str(info.get("cs-name", "")):
-                failures.append("The press file is not CMYK.")
+    names = {}
+    for item in page.get_images(full=True) or []:
+        label = str(item[7] if len(item) > 7 else "")
+        names[int(item[0])] = label
+    boxes = {}
+    for info in page.get_image_info(xrefs=True) or []:
+        boxes[int(info.get("xref") or 0)] = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
+    artwork = []
+    for xref in images:
+        info = doc.extract_image(xref)
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        # The added bleed is a thin DeviceRGB strip so the colour matches the page.
+        # It is not the picture being checked.
+        if names.get(int(xref), "").startswith("Bleed"):
+            continue
+        box = boxes.get(int(xref)) or fitz.Rect()
+        if not box.is_empty and box.get_area() > 1:
+            overlap = box & trim
+            if overlap.is_empty or overlap.get_area() < 0.2 * box.get_area():
+                continue
+        if min(width, height) < 80:
+            continue
+        artwork.append(info)
+    if artwork:
+        info = max(artwork, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+        if info.get("colorspace") not in (4, "CMYK", None) and "CMYK" not in str(info.get("cs-name", "")):
+            failures.append("The press file is not CMYK.")
+    elif images and report.get("contentKind") != "vector":
+        # Only thin strips. The picture is inside a form; do not call that a missing file.
+        pass
     elif report.get("contentKind") != "vector":
         failures.append("The press file has no picture.")
     # Total ink on the corner samples, via a simple RGB to CMYK reading.
@@ -1018,7 +1043,7 @@ def _gs_bin() -> str:
     return find_gs_binary()
 
 
-def convert_cmyk_keep_text(src: str, dest: str) -> None:
+def convert_cmyk_keep_text(src: str, dest: str, block_font_substitution: bool = False) -> None:
     """CMYK conversion that leaves text and vectors in the file. Memory stays leashed."""
     icc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles", "CoatedFOGRA39.icc")
     cmd = [
@@ -1040,6 +1065,7 @@ def convert_cmyk_keep_text(src: str, dest: str) -> None:
         "-dDownsampleColorImages=false",
         "-dDownsampleGrayImages=false",
         "-dDownsampleMonoImages=false",
+        *(["-dCannotEmbedFontPolicy=1"] if block_font_substitution else []),
         "-c",
         "<< /AutoFilterColorImages false /AutoFilterGrayImages false "
         "/ColorImageFilter /FlateEncode /GrayImageFilter /FlateEncode "
@@ -1194,6 +1220,180 @@ def _blend_corner(vertical: np.ndarray, horizontal: np.ndarray, out_h: int, out_
     weight = np.where(together > 0, dist_horizontal[None, :] / np.maximum(together, 1e-6), 0.5).astype(np.float32)
     blended = vertical.astype(np.float32) * weight[..., None] + horizontal.astype(np.float32) * (1.0 - weight)[..., None]
     return np.ascontiguousarray(np.clip(np.round(blended), 0, 255).astype(np.uint8))
+
+
+def _band_color(strip: np.ndarray) -> np.ndarray:
+    """Colour of one edge row, taken from the same band the seam check compares.
+
+    A one-pixel light fringe is skipped. A flat grey stays that grey, so the
+    margin is not a darker average from further inside.
+    """
+    if strip is None or len(strip) < 1:
+        return np.zeros(3, dtype=np.float32)
+    start = min(2, len(strip) - 1)
+    end = min(start + 6, len(strip))
+    return np.median(strip[start:end].astype(np.float32), axis=0)
+
+
+def _corner_from_patch(patch: np.ndarray, out_h: int, out_w: int, inner_bottom: bool, inner_right: bool) -> np.ndarray:
+    """Continue the real corner pattern into the square. Nearest keeps a diagonal sharp.
+
+    The seam check reads the first 24 rows of the corner, so that span holds the
+    whole inside patch. The rest of the square continues the last row.
+    """
+    if patch.size == 0 or out_h < 1 or out_w < 1:
+        return np.zeros((max(out_h, 1), max(out_w, 1), 3), dtype=np.uint8)
+    src = patch
+    if inner_bottom:
+        src = src[::-1]
+    if inner_right:
+        src = src[:, ::-1]
+    span = min(out_h, max(src.shape[0], 1))
+    piece = cv2.resize(np.ascontiguousarray(src), (out_w, span), interpolation=cv2.INTER_NEAREST)
+    out = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    out[:span] = piece
+    if out_h > span:
+        out[span:] = piece[-1]
+    return out
+
+
+def _extend_page_rgb(rgb: np.ndarray, placed, page_rect) -> np.ndarray:
+    """Fill the white margin from the adjacent rendered pixels. Nothing is painted over the page."""
+    height, width = rgb.shape[:2]
+    scale = 300.0 / 72.0
+
+    def px(value: float) -> int:
+        return int(round(float(value) * scale))
+
+    # The seam check rounds each margin on its own. Match that grid so the
+    # corner square is the square the check measures.
+    x0 = min(max(px(placed.x0 - page_rect.x0), 0), width - 2)
+    y0 = min(max(px(placed.y0 - page_rect.y0), 0), height - 2)
+    x1 = width - min(max(px(page_rect.x1 - placed.x1), 0), width - x0 - 2)
+    y1 = height - min(max(px(page_rect.y1 - placed.y1), 0), height - y0 - 2)
+    if x0 < 2 and y0 < 2 and width - x1 < 2 and height - y1 < 2:
+        return rgb
+    canvas = np.array(rgb, copy=True)
+    image = canvas[y0:y1, x0:x1]
+    content_h, content_w = image.shape[:2]
+    if x0 > 0:
+        colors = np.stack([_band_color(image[row, :14]) for row in range(content_h)])
+        canvas[y0:y1, :x0] = np.clip(np.round(colors[:, None, :]), 0, 255)
+    if x1 < width:
+        colors = np.stack([_band_color(image[row, ::-1][:14]) for row in range(content_h)])
+        canvas[y0:y1, x1:] = np.clip(np.round(colors[:, None, :]), 0, 255)
+    if y0 > 0:
+        colors = np.stack([_band_color(image[:14, col]) for col in range(content_w)])
+        canvas[:y0, x0:x1] = np.clip(np.round(colors[None, :, :]), 0, 255)
+    if y1 < height:
+        colors = np.stack([_band_color(image[::-1][:14, col]) for col in range(content_w)])
+        canvas[y1:, x0:x1] = np.clip(np.round(colors[None, :, :]), 0, 255)
+    window = 24
+    skip = 2
+
+    def patch_at(row0: int, col0: int) -> np.ndarray:
+        row1 = min(content_h, row0 + window)
+        col1 = min(content_w, col0 + window)
+        return image[max(0, row0) : max(row0 + 1, row1), max(0, col0) : max(col0 + 1, col1)]
+
+    if y0 > 0 and x0 > 0:
+        canvas[:y0, :x0] = _corner_from_patch(patch_at(skip, skip), y0, x0, True, True)
+    if y0 > 0 and x1 < width:
+        canvas[:y0, x1:] = _corner_from_patch(patch_at(skip, content_w - skip - window), y0, width - x1, True, False)
+    if y1 < height and x0 > 0:
+        canvas[y1:, :x0] = _corner_from_patch(patch_at(content_h - skip - window, skip), height - y1, x0, True, True)
+    if y1 < height and x1 < width:
+        canvas[y1:, x1:] = _corner_from_patch(
+            patch_at(content_h - skip - window, content_w - skip - window),
+            height - y1,
+            width - x1,
+            False,
+            False,
+        )
+    return canvas
+
+
+def _paint_bleed_matching(path: str, placements: list) -> None:
+    """Write the added bleed as DeviceRGB samples of the adjacent rendered pixels."""
+    import pikepdf
+    import pymupdf as fitz
+    from pikepdf import Name, Pdf
+
+    doc = fitz.open(path)
+    paints = []
+    try:
+        scale = 300.0 / 72.0
+        for index, page in enumerate(doc):
+            placement = placements[index] if index < len(placements) else None
+            if not placement:
+                continue
+            placed = fitz.Rect(*placement)
+            if min(placed.x0, placed.y0, page.rect.width - placed.x1, page.rect.height - placed.y1) < 0.3:
+                continue
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+            extended = _extend_page_rgb(rgb, placed, page.rect)
+            height, width = rgb.shape[:2]
+
+            def px(value: float) -> int:
+                return int(round(float(value) * scale))
+
+            x0 = px(placed.x0 - page.rect.x0)
+            y0 = px(placed.y0 - page.rect.y0)
+            x1 = width - px(page.rect.x1 - placed.x1)
+            y1 = height - px(page.rect.y1 - placed.y1)
+            regions = []
+            def add(image, x, y, w, h):
+                if image is None or w < 1 or h < 1:
+                    return
+                regions.append((np.ascontiguousarray(image), x, y, w, h))
+            add(extended[y0:y1, :x0], 0, y0, x0, y1 - y0)
+            add(extended[y0:y1, x1:width], x1, y0, width - x1, y1 - y0)
+            add(extended[:y0, x0:x1], x0, 0, x1 - x0, y0)
+            add(extended[y1:height, x0:x1], x0, y1, x1 - x0, height - y1)
+            add(extended[:y0, :x0], 0, 0, x0, y0)
+            add(extended[:y0, x1:width], x1, 0, width - x1, y0)
+            add(extended[y1:height, :x0], 0, y1, x0, height - y1)
+            add(extended[y1:height, x1:width], x1, y1, width - x1, height - y1)
+            paints.append((index, page.rect.height, regions))
+    finally:
+        doc.close()
+    if not paints:
+        return
+    pdf = Pdf.open(path, allow_overwriting_input=True)
+    try:
+        for index, page_h, regions in paints:
+            page = pdf.pages[index]
+            if "/XObject" not in page.Resources:
+                page.Resources.XObject = pdf.make_indirect(pikepdf.Dictionary())
+            ops = []
+            for number, (image, x, y, w, h) in enumerate(regions):
+                # DeviceRGB round-trips in the viewer. DeviceCMYK cannot reproduce
+                # the navy already on the page (0,49,94 renders back as 23,51,92).
+                stream = pdf.make_stream(np.ascontiguousarray(image).tobytes())
+                stream.Type = Name("/XObject")
+                stream.Subtype = Name("/Image")
+                stream.Width = image.shape[1]
+                stream.Height = image.shape[0]
+                stream.ColorSpace = Name("/DeviceRGB")
+                stream.BitsPerComponent = 8
+                name = Name(f"/Bleed{index}_{number}")
+                page.Resources.XObject[name] = stream
+                # MuPDF y grows downward. PDF y grows upward from the bottom.
+                pdf_y = float(page_h) - (y + h) / scale
+                pdf_x = x / scale
+                pdf_w = w / scale
+                pdf_h = h / scale
+                ops.append(f"q {pdf_w:.4f} 0 0 {pdf_h:.4f} {pdf_x:.4f} {pdf_y:.4f} cm {name} Do Q")
+            extra = ("\n".join(ops) + "\n").encode()
+            contents = page.get("/Contents")
+            if isinstance(contents, pikepdf.Array):
+                contents.append(pdf.make_stream(extra))
+            else:
+                page.Contents = pdf.make_stream((contents.read_bytes() if contents is not None else b"") + extra)
+        pdf.save(path)
+    finally:
+        pdf.close()
 
 
 def _paint_cmyk_edge(page, placed) -> None:
@@ -1396,6 +1596,20 @@ def compile_vector_press(
             }
         open_path = prepared.get("pdfPath") or src_path
 
+    from client_file_audit import apply_vector_fixes, audit_pdf, repair_cmyk_images
+
+    client_audit = audit_pdf(open_path, trim_w_mm, trim_h_mm)
+    font_problems = (client_audit.get("fonts") or {}).get("problems") or []
+    needs_fix = bool(
+        (client_audit.get("hairlines") or {}).get("count")
+        or (client_audit.get("black") or {}).get("needsFix")
+        or (client_audit.get("spots") or {}).get("names")
+    )
+    if client_audit.get("isPdf") and needs_fix:
+        fixed_path = open_path + ".clientfix.pdf"
+        apply_vector_fixes(open_path, fixed_path)
+        repair_cmyk_images(fixed_path)
+        open_path = fixed_path
     src = fitz.open(open_path)
     if src.page_count < 1:
         src.close()
@@ -1510,22 +1724,28 @@ def compile_vector_press(
     doc.close()
     src.close()
     try:
-        convert_cmyk_keep_text(raw_path, out_path)
+        convert_cmyk_keep_text(raw_path, out_path, block_font_substitution=bool(font_problems))
     except Exception:
         shutil.copyfile(raw_path, out_path)
     finally:
         if os.path.exists(raw_path):
             os.remove(raw_path)
-    # Ghostscript can drop the boxes. Put them back.
+    # Ghostscript can drop the boxes. Put them back, then paint the bleed
+    # from the pixels Ghostscript actually left on the page.
     fixed = fitz.open(out_path)
-    for fixed_page, placement in zip(fixed, edge_placements):
-        if placement:
-            _paint_cmyk_edge(fixed_page, fitz.Rect(*placement))
+    for fixed_page in fixed:
         _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
     boxed = out_path + ".box.pdf"
     fixed.save(boxed, deflate=True, garbage=4)
     fixed.close()
+    _paint_bleed_matching(boxed, edge_placements)
     os.replace(boxed, out_path)
+    if needs_fix:
+        try:
+            apply_vector_fixes(out_path, out_path)
+            repair_cmyk_images(out_path)
+        except Exception:
+            pass
 
     full_keep = kept and not extended
     rescue = {
@@ -1541,8 +1761,25 @@ def compile_vector_press(
     report["fullBleedKept"] = full_keep
     report["rescue"] = rescue
     report["pageCount"] = page_count
-    report["effectiveDpi"] = 300
-    report["resolutionNote"] = "Vector artwork stays sharp at any size." if kind == "vector" else "The placed artwork was kept. The bleed ring is 300 DPI."
+    report["clientFileAudit"] = client_audit
+    report["clientAudit"] = {
+        "fonts": [row.get("name") for row in font_problems],
+        "hairlines": int((client_audit.get("hairlines") or {}).get("count") or 0),
+        "spots": list((client_audit.get("spots") or {}).get("names") or []),
+        "black": bool((client_audit.get("black") or {}).get("needsFix")),
+    }
+    resolution = client_audit.get("resolution") or {}
+    low = resolution.get("images") or []
+    if low:
+        report["effectiveDpi"] = round(float(resolution.get("worst") or 0), 1)
+        named = ", ".join(f"{row['name']} {float(row['ppi']):.0f} ppi" for row in low[:4])
+        report["resolutionNote"] = f"Lowest picture on the original file: {named}."
+    elif resolution.get("worst"):
+        report["effectiveDpi"] = round(float(resolution["worst"]), 1)
+        report["resolutionNote"] = f"Pictures on the original file are about {report['effectiveDpi']:.0f} ppi."
+    else:
+        report["effectiveDpi"] = None
+        report["resolutionNote"] = "No picture on the original file was large enough to measure."
     report["allowWhite"] = False
     report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="")
     return {"used": True, "report": report, "path": out_path, "pageCount": page_count}

@@ -80,6 +80,14 @@ def _qr_image(payload: str, module: int = 8) -> np.ndarray:
     return cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
 
 
+_DEJAVU = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def _embed_text(page, point, text: str, size: float, color) -> None:
+    page.insert_font(fontname="DEJAVU", fontfile=_DEJAVU)
+    page.insert_text(point, text, fontsize=size, fontname="DEJAVU", color=color)
+
+
 def _write_pdf(path: str, spec: dict) -> None:
     import pymupdf as fitz
     from PIL import Image
@@ -100,7 +108,11 @@ def _write_pdf(path: str, spec: dict) -> None:
     cmyk_path = ""
     if spec.get("cmyk"):
         cmyk_path = os.path.join(folder, "plate.tif")
-        Image.new("CMYK", (32, 32), (0, 40, 80, 0)).save(cmyk_path, format="TIFF")
+        plate_px = (
+            max(8, int(round(page_w / 72.0 * 300))),
+            max(8, int(round(page_h / 72.0 * 300))),
+        )
+        Image.new("CMYK", plate_px, (0, 40, 80, 0)).save(cmyk_path, format="TIFF")
     mask_bytes = b""
     swatch = ""
     if spec.get("mask"):
@@ -124,9 +136,9 @@ def _write_pdf(path: str, spec: dict) -> None:
             label = f"{label}{index + 1}"
         if spec.get("near") and index == 0:
             baseline = page_h - inset - (0.6 * MM)
-            page.insert_text((inset + 18, baseline), "LOCATION:", fontsize=28, fontname="helv", color=(0, 0, 0))
+            _embed_text(page, (inset + 18, baseline), "LOCATION:", 28, (0, 0, 0))
         else:
-            page.insert_text((inset + 18, inset + 36), label, fontsize=18, fontname="helv", color=(0, 0, 0))
+            _embed_text(page, (inset + 18, inset + 36), label, 18, (0, 0, 0))
         if qr_path and index == 0:
             side = min(page_w, page_h) * 0.42
             origin_x = (page_w - side) / 2.0
@@ -333,7 +345,7 @@ def _bled_pdf(path: str) -> None:
     page = doc.new_page(width=tw + 2 * bleed, height=th + 2 * bleed)
     page.draw_rect(page.rect, color=None, fill=(0.75, 0.08, 0.08))
     page.draw_rect(fitz.Rect(bleed, bleed, bleed + tw, bleed + th), color=None, fill=(0.1, 0.55, 0.2))
-    page.insert_text((bleed + 36, bleed + 80), "ALREADY BLEED", fontsize=28, fontname="helv", color=(1, 1, 1))
+    _embed_text(page, (bleed + 36, bleed + 80), "ALREADY BLEED", 28, (1, 1, 1))
     trim = fitz.Rect(bleed, bleed, bleed + tw, bleed + th)
     page.set_trimbox(trim)
     page.set_bleedbox(page.rect)
@@ -473,11 +485,11 @@ def _write_canva(path: str) -> None:
             plate = Image.fromarray(curved, mode="CMYK")
         jpeg = os.path.join(folder, f"navy-{index}.jpg")
         plate.save(jpeg, format="JPEG", quality=80 if index == 1 else 92)
-        accent = Image.new("CMYK", (160, 110), (0, 190, 210, 0))
+        accent = Image.new("CMYK", (600, 400), (0, 190, 210, 0))
         accent_path = os.path.join(folder, f"accent-{index}.tif")
         accent.save(accent_path, format="TIFF")
-        mask_px = np.zeros((110, 160), np.uint8)
-        cv2.ellipse(mask_px, (80, 55), (60, 40), 0, 0, 360, 255, -1)
+        mask_px = np.zeros((400, 600), np.uint8)
+        cv2.ellipse(mask_px, (300, 200), (220, 140), 0, 0, 360, 255, -1)
         mask_px = cv2.GaussianBlur(mask_px, (21, 21), 0)
         mask_path = os.path.join(folder, f"mask-{index}.png")
         Image.fromarray(mask_px, mode="L").save(mask_path)
@@ -487,7 +499,7 @@ def _write_canva(path: str) -> None:
         page.insert_image(page.rect, filename=jpeg)
         page.insert_image(fitz.Rect(90, 80, 230, 170), filename=accent_path, mask=mask_bytes)
         qr_path = os.path.join(folder, f"qr-{index}.png")
-        cv2.imwrite(qr_path, _qr_image("https://flyerz.co.za/pay", module=4))
+        cv2.imwrite(qr_path, _qr_image("https://flyerz.co.za/pay", module=12))
         page.insert_image(fitz.Rect(300, 36, 370, 106), filename=qr_path)
         writer = fitz.TextWriter(page.rect)
         writer.append((48, 230), f"ANTON {index + 1}", font=font, fontsize=32)
@@ -560,6 +572,73 @@ def _corner_near_white(path: str, seam_x_pt: float, seam_y_pt: float) -> list:
         return counts
     finally:
         doc.close()
+
+
+def test_bleed_matches_edge() -> None:
+    """A grey, a one-pixel white fringe, and a diagonal must extend without a step or a darker grey."""
+    import pymupdf as fitz
+    from PIL import Image
+    from press_ready_engine import compile_vector_press, edge_seam_delta_e
+
+    folder = tempfile.mkdtemp(prefix="cust-bleed-match-")
+    width, height = 1806, 1300
+    image = np.zeros((height, width, 3), np.uint8)
+    image[:, :] = (183, 184, 185)
+    image[-1, :] = (245, 245, 245)
+    image[:, -1] = (230, 210, 210)
+    for y in range(height):
+        boundary = int((y - 900) / 3)
+        if 0 <= boundary < width:
+            image[y, :boundary] = (20, 40, 80)
+    png = os.path.join(folder, "plate.png")
+    Image.fromarray(image, mode="RGB").save(png)
+    src = os.path.join(folder, "plate.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=433.5, height=312)
+    page.insert_image(page.rect, filename=png)
+    page.set_mediabox(page.rect)
+    page.set_cropbox(page.rect)
+    page.set_trimbox(page.rect)
+    page.set_bleedbox(page.rect)
+    doc.save(src)
+    doc.close()
+    out = os.path.join(folder, "press.pdf")
+    result = compile_vector_press(src, out, 148, 105, 5)
+    page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
+    seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
+    seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
+    seams = edge_seam_delta_e(out, seam_x, seam_y) if os.path.exists(out) else []
+    worst = 99.0
+    grey_ok = False
+    if seams:
+        worst = 0.0
+        for row in seams:
+            local = row.get("local") or {}
+            numbers = [float(local[key]) for key in ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")]
+            worst = max(worst, max(numbers))
+        doc = fitz.open(out)
+        try:
+            scale = 300.0 / 72.0
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+            sx = int(round(seam_x * scale))
+            sy = int(round(seam_y * scale))
+            inside = rgb[sy + 40, sx + 4]
+            outside = rgb[sy + 40, 2]
+            grey_ok = abs(int(inside[0]) - int(outside[0])) <= 2 and abs(int(inside[1]) - int(outside[1])) <= 2
+        finally:
+            doc.close()
+    record(
+        "bleed-matches-edge",
+        bool(result.get("used")) and worst < 5.0 and grey_ok,
+        product="a6-landscape",
+        pages=1,
+        size="seam",
+        light="n/a",
+        reasons=f"worst {worst:.2f} grey {'match' if grey_ok else 'shifted'}",
+        live="",
+        qr="",
+    )
 
 
 def test_canva_a6() -> None:
@@ -733,6 +812,17 @@ def test_styles_are_different() -> None:
     )
 
 
+def test_bad_client_files() -> None:
+    """Every bad-client case: fonts, type 3, substitutes, hairlines, black, spots, resolution."""
+    from client_file_audit_check import main as audit_main
+
+    try:
+        audit_main()
+        record("bad-client-audit", True, product="suite", pages=1, size="audit", light="red", reasons="fonts hairlines black spots resolution", live="checked", qr="")
+    except SystemExit as exc:
+        record("bad-client-audit", False, product="suite", pages=0, size="audit", light="", reasons=str(exc), live="", qr="", note=str(exc))
+
+
 def test_cover_reads_pdf() -> None:
     import subprocess
     import sys
@@ -861,9 +951,11 @@ def main() -> None:
     test_bleed_colour_pages()
     test_images()
     test_manual_styles()
+    test_bleed_matches_edge()
     test_canva_a6()
     test_gs_and_colour_border()
     test_styles_are_different()
+    test_bad_client_files()
     test_cover_reads_pdf()
     test_imagen_stays_local()
     test_plate_facts_skip_reencode()

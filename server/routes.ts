@@ -1,6 +1,7 @@
 import "./loadEnv";
 import type { Express } from "express";
 import type { Server } from "http";
+import { checksAllPassed } from "./checkVerdict";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import { api, buildUrl } from "@shared/routes";
 import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
@@ -903,7 +904,7 @@ export async function registerRoutes(
 
       const auditResults: AuditResults = {
         checks,
-        overallPassed: checks.every((c: any) => c.passed || c.severity === "WARNING" || c.severity === "MANUAL_REVIEW"),
+        overallPassed: checksAllPassed(checks),
         fixesApplied: 0,
         complianceReport: `Quick check completed. ${checks.filter(c => c.passed).length}/${checks.length} checks passed.`,
         artworkSize: quickCheckResult.artworkSize,
@@ -4289,28 +4290,16 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const job = await storage.getJob(jobId);
       if (!job || !job.auditResults) return res.json({ checks: [] });
 
-      const auditChecks = stripCropBoxNotInMediaBoxFromChecks(job.auditResults.checks || []);
-      const overallPassed = job.auditResults.overallPassed === true;
-      const checks: { label: string; pass: boolean }[] = [];
-
-      const dpiCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-      if (dpiCheck) checks.push({ label: "High Res (300 DPI)", pass: dpiCheck.passed });
-
-      const bleedCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-      if (bleedCheck) checks.push({ label: "Bleed Ready", pass: bleedCheck.passed });
-
-      const cmykCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-      if (cmykCheck) checks.push({ label: "CMYK Colors", pass: cmykCheck.passed });
-
-      const sizeCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("size") || c.name?.toLowerCase().includes("dimension"));
-      if (sizeCheck) checks.push({ label: "Correct Size", pass: sizeCheck.passed });
-
-      if (overallPassed) {
-        for (const row of checks) {
-          row.pass = true;
-        }
-      }
-
+      const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
+      const trimW = Number(saved.targetWidth || saved.trimW || 0);
+      const trimH = Number(saved.targetHeight || saved.trimH || 0);
+      const file = job.originalPath || job.correctedPath;
+      if (!file) return res.json({ checks: [] });
+      const script = path.join(process.cwd(), "server", "twenty_five.py");
+      const args = [script, "--input", file];
+      if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
+      const result = execPythonCapture(args, "TwentyFive", 25_000);
+      const checks = Array.isArray(result?.checks) ? result.checks : [];
       const body = { checks };
       glitchyChecklistCache.set(cacheKey, body);
       if (glitchyChecklistCache.size > 200) {
@@ -4325,117 +4314,63 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
 
   app.post('/api/glitchy-chat', async (req, res) => {
     try {
-      const { message, jobId } = req.body;
-      const msg = (message || '').toLowerCase();
-      let response = "";
-
-      let artworkState: any = null;
-      const warnings: string[] = [];
-      if (jobId) {
-        try {
-          const job = await storage.getJob(jobId);
-          if (job) {
-            const checks = stripCropBoxNotInMediaBoxFromChecks(job.auditResults?.checks || []);
-            artworkState = {
-              filename: job.filename,
-              status: job.status,
-              checks,
-              overallPassed: job.auditResults?.overallPassed,
-              aiEnhanced: job.auditResults?.aiEnhanced,
-              bleedMethod: job.auditResults?.selectedBleedMethod || job.auditResults?.recommendedBleedMethod,
-              hasBleed: checks.some((c: any) => c.name?.toLowerCase().includes("bleed") && c.passed),
-              currentSize: (() => {
-                const sizeCheck = checks.find((c: any) => c.name?.toLowerCase().includes("size") || c.name?.toLowerCase().includes("dimension"));
-                return sizeCheck?.message || "processed";
-              })(),
-            };
-            const dpiCheck = checks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-            if (dpiCheck && !dpiCheck.passed) warnings.push("low_res");
-            const bleedCheck = checks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-            if (bleedCheck && !bleedCheck.passed) warnings.push("no_bleed");
-            const cmykCheck = checks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-            if (cmykCheck && !cmykCheck.passed) warnings.push("wrong_color");
-          }
-        } catch { }
+      const { message, jobId, action } = req.body || {};
+      const text = String(message || "").trim();
+      const greeting = /^(hi|hello|hey)\b/i.test(text) && !action;
+      if (!jobId) {
+        return res.json({
+          reply: greeting
+            ? "Hello. Upload a file, then ask if the artwork is right. I only talk about checks I have run."
+            : "Upload a file first. I won't guess about artwork I haven't seen.",
+          actions: [],
+          provider: "rules",
+        });
       }
-
-      if (warnings.length > 0 && (msg.includes("next") || msg.includes("step") || msg.includes("what now"))) {
-        if (warnings.includes("low_res")) {
-          response = "Wait! Your DPI is too low. It might look blurry when printed! Can we fix that before the next step? 🔍";
-        } else if (warnings.includes("no_bleed")) {
-          response = "Hold on! I don't see proper bleed. Your edges might get cut off during trimming! 📏";
-        } else if (warnings.includes("wrong_color")) {
-          response = "Careful! The colors aren't in CMYK yet. They might shift when printed! 🎨";
-        }
-      } else if (msg.includes("hello") || msg.includes("hi") || msg.includes("hey")) {
-        response = "Hiya! I'm Glitchy, your tiny print-shop assistant! ✨";
-      } else if (msg.includes("day") || msg.includes("how are")) {
-        const silly = [
-          "I'm feeling 100% fluffy today!",
-          "Just eating some leftover pixels!",
-          "Optimizing my cuteness... standby!",
-        ];
-        response = silly[Math.floor(Math.random() * silly.length)];
-      } else if (msg.includes("bleed")) {
-        if (artworkState) {
-          if (artworkState.hasBleed) {
-            const bleedCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-            response = bleedCheck
-              ? `Yup! ${bleedCheck.message}. Method: ${artworkState.bleedMethod || "auto"}. You're safe! ✨`
-              : "Bleed is added. Your edges are safe! ✨";
-          } else {
-            response = "I don't see proper bleed yet. The system will add it during processing! 🤔";
-          }
-        } else {
-          response = "Bleed adds extra space so nothing gets cut off during printing. Upload a file to get started! 📏";
-        }
-      } else if (msg.includes("dpi") || msg.includes("resolution") || msg.includes("resize") || msg.includes("size")) {
-        if (artworkState) {
-          const dpiCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-          response = dpiCheck
-            ? `I've crunched the numbers: ${dpiCheck.message}. ${artworkState.aiEnhanced ? "AI enhancement was applied! 🤖" : "Looking sharp!"}`
-            : "DPI looks good on this file!";
-        } else {
-          response = "For print, you need at least 300 DPI. Upload your artwork and I'll check it for you! 🔍";
-        }
-      } else if (msg.includes("next") || msg.includes("what now") || msg.includes("step")) {
-        if (artworkState) {
-          if (artworkState.status === "complete" && artworkState.overallPassed) {
-            response = "Everything looks green! Your next step is to download the corrected file or share the report. 🚀";
-          } else if (artworkState.status === "complete") {
-            response = "Some checks need attention. Review the failed items and re-upload a corrected version! 🔧";
-          } else {
-            response = "Your file is still processing. Hang tight! ⏳";
-          }
-        } else {
-          response = "Upload your artwork first, then I'll guide you through each step! 🚀";
-        }
-      } else if (msg.includes("warning") || msg.includes("issue") || msg.includes("problem")) {
-        if (warnings.length > 0) {
-          const issues = warnings.map(w => w === "low_res" ? "low DPI" : w === "no_bleed" ? "missing bleed" : w === "wrong_color" ? "not CMYK" : w);
-          response = `I spotted ${issues.length} issue${issues.length > 1 ? "s" : ""}: ${issues.join(", ")}. Want me to explain any of these? ⚠️`;
-        } else if (artworkState) {
-          response = "No issues detected! Everything looks good on this file. 🎉";
-        } else {
-          response = "Upload a file first and I'll check it for issues! 🔍";
-        }
-      } else if (msg.includes("help") || msg.includes("what can")) {
-        response = "I can help with: bleed, DPI/resolution, colors, warnings, and next steps. Just ask! 🌟";
-      } else if (msg.includes("cmyk") || msg.includes("color") || msg.includes("colour")) {
-        if (artworkState) {
-          const cmykCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-          response = cmykCheck ? `Color check says: ${cmykCheck.message} 🎨` : "Colors are looking good! 🎨";
-        } else {
-          response = "For litho printing, artwork needs to be in CMYK color mode. Upload your file and I'll convert it! 🎨";
-        }
-      } else {
-        response = "I'm not sure, but I'm tiny and learning! Ask me about your bleed, DPI, colors, or next steps. 🤔";
+      if (greeting) {
+        return res.json({
+          reply: "Hello. Ask me if this artwork is right and I will run the press checks on this file.",
+          actions: [],
+          provider: "rules",
+        });
       }
-
-      res.json({ reply: response });
+      const job = await storage.getJob(Number(jobId));
+      if (!job?.originalPath) {
+        return res.json({
+          reply: "I can't see an uploaded file on this job, so I have not run any checks.",
+          actions: [],
+          provider: "rules",
+        });
+      }
+      const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
+      const trimW = Number(saved.targetWidth || saved.trimW || 0);
+      const trimH = Number(saved.targetHeight || saved.trimH || 0);
+      const script = path.join(process.cwd(), "server", "designer_assistant.py");
+      const output = path.join(path.dirname(job.originalPath), `designer-${job.id}.pdf`);
+      const args = [script, "--input", job.originalPath, "--message", text, "--output", output];
+      if (action) args.push("--action", String(action));
+      if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
+      const result = execPythonCapture(args, "GlitchyDesigner", 90_000);
+      let downloadUrl = "";
+      if (result?.path && result.ok) {
+        const prior = (job.auditResults || { checks: [], overallPassed: false, fixesApplied: 0, complianceReport: "" }) as AuditResults;
+        const auditResults = { ...prior, compiledPdfPath: result.path };
+        await storage.updateJob(job.id, { correctedPath: result.path, auditResults });
+        downloadUrl = `/api/jobs/${job.id}/download/press-ready`;
+      }
+      res.json({
+        reply: result.reply || "I couldn't read a result from the check.",
+        actions: Array.isArray(result.actions) ? result.actions : [],
+        provider: result.provider || "rules",
+        downloadUrl,
+        ok: result.ok !== false,
+      });
     } catch (error: any) {
-      console.error('[Glitchy] Chat error:', error);
-      res.json({ reply: "Oops, my brain glitched! Try again? 🤯" });
+      console.error("[Glitchy] Chat error:", error);
+      res.json({
+        reply: "I couldn't finish that. I have not run a check, so I won't say the file is fine.",
+        actions: [],
+        provider: "rules",
+      });
     }
   });
 

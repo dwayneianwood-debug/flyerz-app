@@ -6,6 +6,7 @@ type CatMode = "head" | "walking" | "sleeping" | "stretching";
 interface CheckItem {
   label: string;
   pass: boolean;
+  status?: string;
 }
 
 function CatAvatar({ mode, dilated }: { mode: CatMode; dilated: boolean }) {
@@ -147,6 +148,7 @@ export default function GlitchyWidget() {
   const [chatLoading, setChatLoading] = useState(false);
   const [checklist, setChecklist] = useState<CheckItem[]>([]);
   const [responseText, setResponseText] = useState("*Purrs*");
+  const [chatActions, setChatActions] = useState<{ id: string; label: string }[]>([]);
   const [catMode, setCatMode] = useState<CatMode>("head");
   const [uiVisible, setUiVisible] = useState(true);
   const [happyHop, setHappyHop] = useState(false);
@@ -708,12 +710,14 @@ export default function GlitchyWidget() {
     }
   }
 
-  async function askGlitchy() {
-    const val = chatInputRef.current?.value?.trim();
+  async function askGlitchy(actionId?: string) {
+    const id = typeof actionId === "string" ? actionId : "";
+    const val = id || chatInputRef.current?.value?.trim();
     if (!val || chatLoading) return;
-    chatInputRef.current!.value = "";
+    if (!id && chatInputRef.current) chatInputRef.current.value = "";
 
-    setResponseText("...Thinking...");
+    const checking = /artwork|right\?|check this|is this/i.test(val);
+    setResponseText(id ? "Doing that now." : checking ? "Checking this artwork." : "One moment.");
     setChatLoading(true);
 
     try {
@@ -721,12 +725,14 @@ export default function GlitchyWidget() {
       const res = await fetch("/api/glitchy-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: val, jobId }),
+        body: JSON.stringify({ message: val, jobId, action: id }),
       });
       const data = await res.json();
-      setResponseText(data.reply);
+      setResponseText(data.reply || "I couldn't read a reply.");
+      setChatActions(Array.isArray(data.actions) ? data.actions : []);
     } catch {
-      setResponseText("Meow? (Check your connection!)");
+      setResponseText("I couldn't reach the checker, so I have not run a check.");
+      setChatActions([]);
     }
     setChatLoading(false);
   }
@@ -1074,16 +1080,22 @@ export default function GlitchyWidget() {
             <p style={{ margin: "0 0 5px 0", fontSize: 10, fontWeight: "bold", color: "#333" }}>
               Checklist:
             </p>
-            <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5 }}>
-              {checklist.map((c, i) => (
-                <li
-                  key={i}
-                  data-testid={`glitchy-check-${i}`}
-                  style={{ color: c.pass ? "#27ae60" : "#e74c3c", fontWeight: "bold" }}
-                >
-                  {c.pass ? "\u2705" : "\u274C"} {c.label}
-                </li>
-              ))}
+            <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5, maxHeight: 220, overflowY: "auto" }}>
+              {checklist.map((c, i) => {
+                const status = c.status || (c.pass ? "passed" : "failed");
+                const color = status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
+                const mark = status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
+                return (
+                  <li
+                    key={i}
+                    data-testid={`glitchy-check-${i}`}
+                    data-status={status}
+                    style={{ color, fontWeight: "bold" }}
+                  >
+                    {mark} {c.label}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}
@@ -1161,9 +1173,33 @@ export default function GlitchyWidget() {
               )
             ) : (
               <>
-                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee" }}>
+                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee", whiteSpace: "pre-wrap" }}>
                   {responseText}
                 </div>
+                {chatActions.length > 0 && (
+                  <div data-testid="glitchy-actions" style={{ display: "flex", flexDirection: "column", gap: 3, marginBottom: 4 }}>
+                    {chatActions.map((action) => (
+                      <button
+                        key={action.id}
+                        type="button"
+                        data-testid={`glitchy-action-${action.id}`}
+                        onClick={() => askGlitchy(action.id)}
+                        style={{
+                          background: "#333",
+                          color: "#a3e635",
+                          border: "1px solid #555",
+                          borderRadius: 4,
+                          cursor: "pointer",
+                          fontSize: 8,
+                          padding: 3,
+                          textAlign: "left",
+                        }}
+                      >
+                        {action.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <input
                   ref={chatInputRef}
                   data-testid="glitchy-chat-input"
@@ -1183,7 +1219,7 @@ export default function GlitchyWidget() {
                   }}
                 />
                 <button
-                  onClick={askGlitchy}
+                  onClick={() => askGlitchy()}
                   data-testid="glitchy-chat-send"
                   style={{
                     width: "100%",

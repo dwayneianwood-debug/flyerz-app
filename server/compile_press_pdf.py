@@ -1485,6 +1485,7 @@ def main():
                     vector_live = True
                     work_path = live["path"]
                     compile_stats["press_engine"] = live.get("report") or {}
+                    compile_stats["client_audit"] = (live.get("report") or {}).get("clientFileAudit") or {}
                     compile_stats["vector_press_live"] = True
                     compile_stats["cmyk_converted"] = True
                     compile_stats["cmyk_verified"] = True
@@ -1766,6 +1767,22 @@ def main():
             )
             from pdf_geometry_sanitize import aggressive_sanitize_open_document_boxes
 
+            from client_file_audit import apply_vector_fixes, audit_pdf, repair_cmyk_images
+
+            compile_stats["client_audit"] = audit_pdf(input_path, float(args.trim_w), float(args.trim_h))
+            _client = compile_stats["client_audit"]
+            _needs_client_fix = bool(
+                (_client.get("hairlines") or {}).get("count")
+                or (_client.get("black") or {}).get("needsFix")
+                or (_client.get("spots") or {}).get("names")
+            )
+            if _client.get("isPdf") and _needs_client_fix:
+                _fixed_pdf = tempfile.NamedTemporaryFile(suffix="_clientfix.pdf", delete=False, dir=FAI_TEMP_DIR).name
+                _tmp_chain.append(_fixed_pdf)
+                apply_vector_fixes(input_path, _fixed_pdf)
+                repair_cmyk_images(_fixed_pdf)
+                input_path = _fixed_pdf
+                sys.stderr.write("[COMPILE] Vector fixes applied before raster (hairlines, black, spots).\n")
             pdf_try_src = input_path
             _nuclear_pdf_fallback_used = False
             while True:
@@ -2715,6 +2732,14 @@ def main():
             raise
 
         output_size = os.path.getsize(args.output)
+        if not vector_live and ((compile_stats.get("client_audit") or {}).get("black") or {}).get("needsFix"):
+            try:
+                from client_file_audit import repair_cmyk_images
+
+                repair_cmyk_images(args.output)
+                output_size = os.path.getsize(args.output)
+            except Exception as ink_err:
+                sys.stderr.write(f"[COMPILE] CMYK image black repair failed: {ink_err}\n")
         sys.stderr.write(f"[COMPILE] Press-ready PDF complete: {args.output} ({output_size} bytes)\n")
 
         spans_saved = compile_stats["total_spans"]
@@ -2729,7 +2754,7 @@ def main():
             typo_action = f"No vector text detected. Full rasterization at {render_dpi} DPI."
 
         if compile_stats["cmyk_converted"]:
-            ink_action = f"Hazardous RGB neutralized. Converted to CMYK via FOGRA39 ICC profile (verified: {compile_stats['cmyk_verified']}) and clamped to safe total ink limits."
+            ink_action = f"Converted to CMYK via FOGRA39 (verified: {compile_stats['cmyk_verified']})."
             if compile_stats["neutralized_count"] > 0:
                 ink_action += f" {compile_stats['neutralized_count']} near-black colors fixed to K-only overprint."
             if compile_stats.get("fonts_outlined"):
@@ -2779,11 +2804,22 @@ def main():
         if artwork_note:
             res_action = res_action + " " + artwork_note
 
-        if compile_stats["hairlines_fixed"] > 0:
-            hairline_action = f"Hairline strokes detected (below 0.25pt) and bulked to 0.3pt for press stability. {compile_stats['hairlines_fixed']} stroke(s) enforced."
+        client_audit = compile_stats.get("client_audit") or {}
+        hair = client_audit.get("hairlines") or {}
+        if hair.get("checked") and int(hair.get("count") or 0) > 0:
+            hairline_action = (
+                f"Thin lines under 0.25 pt were found on the original file ({int(hair['count'])}). "
+                "They are raised to 0.25 pt."
+            )
+            hairline_auto = True
+        elif hair.get("checked"):
+            hairline_action = "Strokes on the original file were checked. None were under 0.25 pt."
+            hairline_auto = False
+        elif compile_stats["hairlines_fixed"] > 0:
+            hairline_action = f"Hairline strokes under 0.25 pt were raised to 0.25 pt ({compile_stats['hairlines_fixed']})."
             hairline_auto = True
         else:
-            hairline_action = "No hairlines detected; all strokes meet minimum weight requirements."
+            hairline_action = "Hairlines were not checked on a vector source, so none are reported as clear."
             hairline_auto = False
 
         qr_status = compile_stats.get("qr_scan_status", "not_run")
