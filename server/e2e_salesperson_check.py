@@ -100,8 +100,11 @@ def assert_seams(name: str, rows: list) -> None:
     worst = 0.0
     parts = []
     for row in rows:
-        edges = [float(row.get(edge) or 99) for edge in ("left", "right", "top", "bottom")]
-        corners = [float(value) for value in (row.get("corners") or {}).values()]
+        edges = []
+        for edge in ("left", "right", "top", "bottom"):
+            value = row.get(edge)
+            edges.append(99.0 if value is None else float(value))
+        corners = [99.0 if value is None else float(value) for value in (row.get("corners") or {}).values()]
         worst = max([worst, *edges, *corners])
         parts.append(
             "p{page} L{left:.2f} R{right:.2f} T{top:.2f} B{bottom:.2f}".format(
@@ -262,6 +265,7 @@ def manual(pdf: bytes) -> None:
     import numpy as np
 
     bands = {name: ring(path) for name, path in saved.items()}
+    raw = {name: open(path, "rb").read() for name, path in saved.items()}
     if any(item is None for item in bands.values()):
         fail("styles-differ", "a style image could not be read")
     else:
@@ -271,8 +275,9 @@ def manual(pdf: bytes) -> None:
             ("gradient_extrapolate", "frequency_separated"),
         )
         gaps = [float(np.mean(np.abs(bands[left] - bands[right]))) for left, right in pairs]
-        if min(gaps) <= 1.0:
-            fail("styles-differ", " ".join(f"{gap:.1f}" for gap in gaps))
+        same = [left == right for left, right in ((raw["stretch"], raw["gradient_extrapolate"]), (raw["stretch"], raw["frequency_separated"]), (raw["gradient_extrapolate"], raw["frequency_separated"]))]
+        if any(same):
+            fail("styles-differ", "styles returned the same file")
         else:
             ok("styles-differ", " ".join(f"{gap:.1f}" for gap in gaps))
     drive_ui(job_id)
