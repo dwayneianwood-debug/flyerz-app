@@ -578,18 +578,19 @@ def test_bleed_matches_edge() -> None:
     """A grey, a one-pixel white fringe, and a diagonal must extend without a step or a darker grey."""
     import pymupdf as fitz
     from PIL import Image
-    from press_ready_engine import compile_vector_press, edge_seam_delta_e
+    from press_ready_engine import compile_vector_press
 
     folder = tempfile.mkdtemp(prefix="cust-bleed-match-")
     width, height = 1806, 1300
     image = np.zeros((height, width, 3), np.uint8)
     image[:, :] = (183, 184, 185)
-    image[-1, :] = (245, 245, 245)
     image[:, -1] = (230, 210, 210)
     for y in range(height):
         boundary = int((y - 900) / 3)
         if 0 <= boundary < width:
             image[y, :boundary] = (20, 40, 80)
+    # A 0.45 pt keyline blooms to about three pixels. It must not become the bleed.
+    image[-3:, :] = (245, 245, 245)
     png = os.path.join(folder, "plate.png")
     Image.fromarray(image, mode="RGB").save(png)
     src = os.path.join(folder, "plate.pdf")
@@ -607,37 +608,152 @@ def test_bleed_matches_edge() -> None:
     page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
     seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
     seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
-    seams = edge_seam_delta_e(out, seam_x, seam_y) if os.path.exists(out) else []
+    from press_ready_engine import _gs_rgb_pages, _window_max_delta_e
+
+    gs_ok = False
+    gs_note = "no gs page"
     worst = 99.0
-    grey_ok = False
-    if seams:
-        worst = 0.0
-        for row in seams:
-            local = row.get("local") or {}
-            numbers = [float(local[key]) for key in ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")]
-            worst = max(worst, max(numbers))
-        doc = fitz.open(out)
-        try:
-            scale = 300.0 / 72.0
-            pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-            sx = int(round(seam_x * scale))
-            sy = int(round(seam_y * scale))
-            inside = rgb[sy + 40, sx + 4]
-            outside = rgb[sy + 40, 2]
-            grey_ok = abs(int(inside[0]) - int(outside[0])) <= 2 and abs(int(inside[1]) - int(outside[1])) <= 2
-        finally:
-            doc.close()
+    if os.path.exists(out):
+        rendered = _gs_rgb_pages(out)
+        if rendered:
+            gs = rendered[0]
+            doc = fitz.open(out)
+            try:
+                rect = doc[0].rect
+                gs_h, gs_w = gs.shape[:2]
+                sx = int(round(seam_x / float(rect.width) * gs_w))
+                sy = int(round(seam_y / float(rect.height) * gs_h))
+            finally:
+                doc.close()
+            # Adjacent pixels, through the same png16m render as the press. A 6 px
+            # mean looks past a diagonal and reports a step that is not on the seam.
+            pairs = {
+                "left": ((sy, gs_h - sy, sx - 1, sx), (sy, gs_h - sy, sx, sx + 1), "y"),
+                "right": ((sy, gs_h - sy, gs_w - sx, gs_w - sx + 1), (sy, gs_h - sy, gs_w - sx - 1, gs_w - sx), "y"),
+                "top": ((sy - 1, sy, sx, gs_w - sx), (sy, sy + 1, sx, gs_w - sx), "x"),
+                "bottom": ((gs_h - sy, gs_h - sy + 1, sx, gs_w - sx), (gs_h - sy - 1, gs_h - sy, sx, gs_w - sx), "x"),
+            }
+            worst = 0.0
+            worst_name = ""
+            for name, (outside, inside, axis) in pairs.items():
+                value = _window_max_delta_e(gs, outside, inside, axis)
+                score = 99.0 if value is None else float(value)
+                if score >= worst:
+                    worst = score
+                    worst_name = name
+            seam_row = gs[min(gs_h - 1, max(0, gs_h - sy))]
+            white_frac = float(np.mean(np.min(seam_row, axis=1) > 240))
+            spot = gs[min(gs_h - 1, sy + 40), min(gs_w - 1, 2)]
+            inside = gs[min(gs_h - 1, sy + 40), min(gs_w - 1, sx + 4)]
+            gs_grey = abs(int(spot[0]) - int(inside[0])) <= 2 and abs(int(spot[1]) - int(inside[1])) <= 2
+            gs_ok = white_frac < 0.05 and gs_grey and worst < 5.0
+            gs_note = f"white {white_frac:.3f} adj {worst_name} {worst:.2f} grey {'ok' if gs_grey else 'shifted'}"
     record(
         "bleed-matches-edge",
-        bool(result.get("used")) and worst < 5.0 and grey_ok,
+        bool(result.get("used")) and gs_ok,
         product="a6-landscape",
         pages=1,
         size="seam",
         light="n/a",
-        reasons=f"worst {worst:.2f} grey {'match' if grey_ok else 'shifted'}",
+        reasons=gs_note,
         live="",
         qr="",
+    )
+
+
+def test_bleed_diagonal_and_column() -> None:
+    """A diagonal must keep its slope through Ghostscript, and a column must not shear or grow a dark line."""
+    import pymupdf as fitz
+    from PIL import Image
+    from press_ready_engine import _delta_e00, _gs_rgb_pages, compile_vector_press
+
+    folder = tempfile.mkdtemp(prefix="cust-bleed-slope-")
+    width, height = 1806, 1300
+    image = np.full((height, width, 3), (183, 184, 185), np.uint8)
+    image[-1, :] = (250, 250, 250)
+    # The boundary reaches the bottom-left corner and keeps moving left.
+    for y in range(height - 180, height - 1):
+        boundary = int(16 + (height - 2 - y) * 1.2)
+        if 0 <= boundary < width - 20:
+            image[y, boundary:boundary + 260] = (8, 30, 70)
+    image[1000:height - 1, 1100:] = (8, 30, 70)
+    png = os.path.join(folder, "plate.png")
+    Image.fromarray(image, mode="RGB").save(png)
+    src = os.path.join(folder, "plate.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=433.5, height=312)
+    page.insert_image(page.rect, filename=png)
+    page.set_mediabox(page.rect)
+    page.set_cropbox(page.rect)
+    page.set_trimbox(page.rect)
+    page.set_bleedbox(page.rect)
+    doc.save(src)
+    doc.close()
+    out = os.path.join(folder, "press.pdf")
+    result = compile_vector_press(src, out, 148, 105, 5)
+    rendered = _gs_rgb_pages(out) if os.path.exists(out) else []
+    problems = []
+    if not result.get("used") or not rendered:
+        problems.append("no press page")
+    else:
+        gs = rendered[0]
+        doc = fitz.open(out)
+        try:
+            rect = doc[0].rect
+            page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
+            seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
+            seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
+            gs_h, gs_w = gs.shape[:2]
+            sx = int(round(seam_x / float(rect.width) * gs_w))
+            sy = int(round(seam_y / float(rect.height) * gs_h))
+        finally:
+            doc.close()
+        seam = gs[min(gs_h - 1, gs_h - sy)]
+        if float(np.mean(np.min(seam, axis=1) > 240)) > 0.05:
+            problems.append("white seam")
+        flat = gs[sy + 80, 2]
+        if abs(int(flat[0]) - 183) > 2:
+            problems.append(f"grey {tuple(int(v) for v in flat)}")
+
+        def first_navy(row):
+            found = np.where(row[:, 0] < 40)[0]
+            return int(found[0]) if len(found) else -1
+
+        positions = []
+        for y in (gs_h - sy - 36, gs_h - sy - 12, gs_h - sy + 8, gs_h - 3):
+            positions.append(first_navy(gs[y, : sx + 160]))
+        if any(item < 0 for item in positions):
+            problems.append(f"diagonal missing {positions}")
+        elif any(positions[index + 1] > positions[index] + 3 for index in range(len(positions) - 1)):
+            problems.append(f"diagonal step {positions}")
+        jumps = []
+        for y in (gs_h - sy - 6, gs_h - sy + 2, gs_h - sy + 10, gs_h - 2):
+            band = gs[y, sx + 980:sx + 1200, 0].astype(int)
+            delta = np.abs(np.diff(band))
+            strong = np.where(delta > 80)[0]
+            jumps.append(int(strong[0]) if len(strong) else -1)
+        if any(item < 0 for item in jumps) or max(jumps) - min(jumps) > 1:
+            problems.append(f"column shear {jumps}")
+        corner = gs[gs_h - sy:, :sx]
+        grey_px = int(np.sum(corner[:, :, 0] > 150))
+        navy_px = int(np.sum(corner[:, :, 0] < 40))
+        if grey_px < 30 or navy_px < 30:
+            problems.append(f"corner grey {grey_px} navy {navy_px}")
+        seam_px = gs[sy + 80, sx]
+        bleed_px = gs[sy + 80, 1]
+        if _delta_e00(seam_px, bleed_px) > 5:
+            problems.append(f"adjacent dE {_delta_e00(seam_px, bleed_px):.1f}")
+    record(
+        "bleed-diagonal-column",
+        not problems,
+        product="a6-landscape",
+        pages=1,
+        size="slope",
+        light="n/a",
+        reasons="gs slope" if not problems else "; ".join(problems),
+        live="",
+        qr="",
+        note="",
     )
 
 
@@ -952,6 +1068,7 @@ def main() -> None:
     test_images()
     test_manual_styles()
     test_bleed_matches_edge()
+    test_bleed_diagonal_and_column()
     test_canva_a6()
     test_gs_and_colour_border()
     test_styles_are_different()

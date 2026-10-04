@@ -1222,131 +1222,461 @@ def _blend_corner(vertical: np.ndarray, horizontal: np.ndarray, out_h: int, out_
     return np.ascontiguousarray(np.clip(np.round(blended), 0, 255).astype(np.uint8))
 
 
-def _band_color(strip: np.ndarray) -> np.ndarray:
-    """Colour of one edge row, taken from the same band the seam check compares.
+def _gs_page_pixels(page_pt: float) -> int:
+    """Ghostscript png16m at 300 dpi sizes the page with trunc(pt * 300/72 + 0.5)."""
+    return max(1, int(float(page_pt) * 300.0 / 72.0 + 0.5))
 
-    A one-pixel light fringe is skipped. A flat grey stays that grey, so the
-    margin is not a darker average from further inside.
+
+def _gs_rgb_pages(path: str) -> list:
+    """Render each page the way the press does: png16m, 300 dpi, memory leashes on."""
+    import tempfile
+    from PIL import Image
+
+    folder = tempfile.mkdtemp(prefix="bleed-gs-")
+    pattern = os.path.join(folder, "p-%d.png")
+    cmd = [
+        _gs_bin(),
+        "-dNOPAUSE", "-dBATCH", "-dSAFER",
+        "-sDEVICE=png16m",
+        "-r300",
+        "-dNumRenderingThreads=1",
+        "-dBufferSpace=50000000",
+        "-dMaxBitmap=50000000",
+        "-dBandBufferSpace=50000000",
+        f"-sOutputFile={pattern}",
+        path,
+    ]
+    from host_paths import c_numeric_env
+
+    subprocess.run(cmd, check=False, timeout=90, capture_output=True, env=c_numeric_env())
+    pages = []
+    index = 1
+    while True:
+        name = os.path.join(folder, f"p-{index}.png")
+        if not os.path.isfile(name):
+            break
+        pages.append(np.asarray(Image.open(name).convert("RGB")))
+        index += 1
+    shutil.rmtree(folder, ignore_errors=True)
+    return pages
+
+
+# A 0.45 pt keyline blooms to about 3 px at 300 dpi. Anything thicker is a border.
+_HAIRLINE_PX = 4
+
+
+def _row_hairline(row: np.ndarray) -> int:
+    """Leading light pixels that are a hairline, not a white border.
+
+    Up to four light pixels followed by darker ink are the fringe. A light run
+    that continues is the artwork and stays.
     """
-    if strip is None or len(strip) < 1:
-        return np.zeros(3, dtype=np.float32)
-    start = min(2, len(strip) - 1)
-    end = min(start + 6, len(strip))
-    return np.median(strip[start:end].astype(np.float32), axis=0)
+    depth = 0
+    limit = min(_HAIRLINE_PX, int(row.shape[0]) - 1)
+    while depth < limit:
+        pix = row[depth].astype(np.float32)
+        nxt = row[depth + 1].astype(np.float32)
+        if float(pix.mean()) <= 200.0:
+            break
+        if float(nxt.mean()) <= 200.0 and (float(pix.mean()) - float(nxt.mean())) > 25.0:
+            depth += 1
+            break
+        if float(nxt.mean()) > 200.0:
+            depth += 1
+            continue
+        break
+    return depth
 
 
-def _corner_from_patch(patch: np.ndarray, out_h: int, out_w: int, inner_bottom: bool, inner_right: bool) -> np.ndarray:
-    """Continue the real corner pattern into the square. Nearest keeps a diagonal sharp.
+def _leading_hairline(strip: np.ndarray) -> int:
+    """Columns to step past when the whole edge is a short light line."""
+    if strip.ndim < 3 or strip.shape[1] < 2:
+        return 0
+    depth = 0
+    while depth < _HAIRLINE_PX and depth + 1 < strip.shape[1]:
+        seam = strip[:, depth].astype(np.float32).mean(axis=1)
+        nxt = strip[:, depth + 1].astype(np.float32).mean(axis=1)
+        light = seam > 200.0
+        if float(np.mean(light)) <= 0.5:
+            break
+        darker = (~(nxt > 200.0)) & ((seam - nxt) > 25.0)
+        more = nxt > 200.0
+        if float(np.mean(darker | more)) <= 0.5:
+            break
+        depth += 1
+        if float(np.mean(darker)) > 0.5:
+            break
+    return depth
 
-    The seam check reads the first 24 rows of the corner, so that span holds the
-    whole inside patch. The rest of the square continues the last row.
-    """
-    if patch.size == 0 or out_h < 1 or out_w < 1:
-        return np.zeros((max(out_h, 1), max(out_w, 1), 3), dtype=np.uint8)
-    src = patch
-    if inner_bottom:
-        src = src[::-1]
-    if inner_right:
-        src = src[:, ::-1]
-    span = min(out_h, max(src.shape[0], 1))
-    piece = cv2.resize(np.ascontiguousarray(src), (out_w, span), interpolation=cv2.INTER_NEAREST)
-    out = np.empty((out_h, out_w, 3), dtype=np.uint8)
-    out[:span] = piece
-    if out_h > span:
-        out[span:] = piece[-1]
+
+def _clear_short_light_runs(chosen: np.ndarray) -> np.ndarray:
+    """Replace a short light line with the ink beside it. A longer white run stays."""
+    if chosen.shape[0] < 2:
+        return chosen
+    tone = chosen.mean(axis=1)
+    bright = tone > 200.0
+    out = np.array(chosen, copy=True)
+    count = int(chosen.shape[0])
+    index = 0
+    while index < count:
+        if not bright[index]:
+            index += 1
+            continue
+        end = index
+        while end + 1 < count and bright[end + 1]:
+            end += 1
+        length = end - index + 1
+        if length <= _HAIRLINE_PX:
+            before = chosen[index - 1] if index > 0 and tone[index - 1] < 180.0 else None
+            after = chosen[end + 1] if end + 1 < count and tone[end + 1] < 180.0 else None
+            if index == 0 and after is not None:
+                out[index:end + 1] = after
+            elif end == count - 1 and before is not None:
+                out[index:end + 1] = before
+            elif before is not None and after is not None:
+                out[index:end + 1] = (before + after) / 2.0
+            elif before is not None:
+                out[index:end + 1] = before
+            elif after is not None:
+                out[index:end + 1] = after
+        index = end + 1
     return out
 
 
-def _extend_page_rgb(rgb: np.ndarray, placed, page_rect) -> np.ndarray:
-    """Fill the white margin from the adjacent rendered pixels. Nothing is painted over the page."""
+def _seam_colors(strip: np.ndarray) -> np.ndarray:
+    """One colour per row. Match the ink touching the seam, in this same render.
+
+    A short light hairline is skipped. A real white border is kept. Pixels on
+    the far side of a hard edge are not averaged in, so a diagonal stays its
+    own colour. Flat ink uses the median of the pixels that match the seam,
+    which keeps a halftone dot from painting a dark line.
+    """
+    if strip.size == 0:
+        return np.zeros((0, 3), np.float32)
+    if strip.ndim == 2:
+        strip = strip[:, :, None]
+    count = int(strip.shape[0])
+    chosen = np.zeros((count, int(strip.shape[2]) if strip.ndim > 2 else 1), np.float32)
+    if strip.shape[1] < 1:
+        return chosen
+    for index in range(count):
+        row = strip[index]
+        depth = _row_hairline(row)
+        body = row[depth:]
+        if body.shape[0] < 1:
+            body = row[:1]
+        span = min(6, int(body.shape[0]))
+        band = body[:span].astype(np.float32)
+        seam = band[0]
+        if span == 1:
+            chosen[index] = seam
+            continue
+        close = np.abs(band.astype(np.int16) - seam.astype(np.int16)).sum(axis=1) < 60
+        chosen[index] = np.median(band[close], axis=0) if np.any(close) else seam
+    return _clear_short_light_runs(chosen)
+
+
+def _outward_row_shift(strip: np.ndarray) -> np.ndarray:
+    """Rows to step per pixel of outward travel so a diagonal keeps its slope.
+
+    A real boundary separates two colours along the inward ray. Flat ink and a
+    vertical column, which stay the same colour as you walk inward, return
+    zero so the column is copied straight out.
+    """
+    count = int(strip.shape[0])
+    shift = np.zeros(count, np.float32)
+    if strip.ndim < 3 or strip.shape[1] < 4 or count < 5:
+        return shift
+    # A full-width light hairline hides the real boundary. Step past it.
+    fringe = _leading_hairline(strip)
+    if fringe:
+        strip = strip[:, fringe:]
+        if strip.shape[1] < 4:
+            return shift
+    depth = min(int(strip.shape[1]) - 1, 40)
+    diff = np.abs(np.diff(strip[:, : depth + 1].astype(np.int16), axis=1)).sum(axis=2)
+    position = np.argmax(diff, axis=1).astype(np.float32)
+    strength = diff.max(axis=1).astype(np.float32)
+    contrast = np.zeros(count, np.float32)
+    for index in range(count):
+        at = int(position[index])
+        if at >= 1:
+            before = strip[index, :at].astype(np.float32).mean(axis=0)
+        else:
+            before = strip[index, 0].astype(np.float32)
+        end = min(int(strip.shape[1]), at + 4)
+        if end > at + 1:
+            after = strip[index, at + 1:end].astype(np.float32).mean(axis=0)
+        else:
+            after = strip[index, min(at, int(strip.shape[1]) - 1)].astype(np.float32)
+        contrast[index] = float(np.abs(before - after).sum())
+    strong = (strength > 80.0) & (contrast > 90.0)
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], np.float32)
+    kernel /= kernel.sum()
+    smooth = np.convolve(position, kernel, mode="same")
+    slope = np.gradient(smooth)
+    good = strong & (np.abs(slope) > 0.15) & (np.abs(slope) < 4.0)
+    raw = np.zeros(count, np.float32)
+    raw[good] = np.clip(1.0 / slope[good], -6.0, 6.0)
+    support = np.convolve(good.astype(np.float32), np.ones(7, np.float32) / 7.0, mode="same")
+    smoothed = np.convolve(raw, kernel, mode="same")
+    smoothed[support < 0.45] = 0.0
+    return _spread_slope(smoothed).astype(np.float32)
+
+
+def _spread_slope(shift: np.ndarray, reach: int = 36) -> np.ndarray:
+    """Carry a diagonal's slope into the columns it is about to enter.
+
+    The inward ray only sees the boundary once it is already inside that column.
+    The next columns, where the line is heading, would otherwise stay flat and
+    the diagonal would stop.
+    """
+    out = np.array(shift, dtype=np.float32, copy=True)
+    strong = np.where(np.abs(out) > 0.3)[0]
+    if strong.size == 0:
+        return out
+    breaks = np.where(np.diff(strong) > 3)[0]
+    starts = [int(strong[0])]
+    ends = []
+    for cut in breaks:
+        ends.append(int(strong[int(cut)]))
+        starts.append(int(strong[int(cut) + 1]))
+    ends.append(int(strong[-1]))
+    for start, end in zip(starts, ends):
+        slope = float(np.median(out[int(start):int(end) + 1]))
+        if abs(slope) < 0.3:
+            continue
+        if slope > 0:
+            # Colour is sampled from the right, so the line moves left.
+            lo = max(0, int(start) - reach)
+            for index in range(lo, int(start)):
+                if abs(float(out[index])) < 0.3:
+                    out[index] = slope
+        else:
+            hi = min(int(out.size), int(end) + 1 + reach)
+            for index in range(int(end) + 1, hi):
+                if abs(float(out[index])) < 0.3:
+                    out[index] = slope
+    return out
+
+
+def _end_slope(shift: np.ndarray, at_start: bool) -> float:
+    """Slope where this edge meets a corner. A diagonal further along the edge is left alone."""
+    if shift.size == 0:
+        return 0.0
+    window = shift[:24] if at_start else shift[-24:]
+    strong = window[np.abs(window) > 0.3]
+    if strong.size >= 4:
+        return float(np.median(strong))
+    return float(shift[0] if at_start else shift[-1])
+
+
+def _carry_edge_slope(shift: np.ndarray, at_start: bool) -> np.ndarray:
+    """Let a short flat run at the corner use the slope of the diagonal that meets it."""
+    carried = np.array(shift, dtype=np.float32, copy=True)
+    slope = _end_slope(carried, at_start)
+    if abs(slope) < 0.3 or carried.size == 0:
+        return carried
+    limit = min(8, int(carried.size))
+    if at_start:
+        indexes = range(limit)
+    else:
+        indexes = range(int(carried.size) - 1, int(carried.size) - 1 - limit, -1)
+    for index in indexes:
+        if abs(float(carried[index])) < 0.3:
+            carried[index] = slope
+        else:
+            break
+    return carried
+
+
+def _extend_profile(colors: np.ndarray, shift: np.ndarray, extra: int, at_start: bool):
+    """Continue a seam profile into the corner so the diagonal does not stop on the trim."""
+    colors = np.asarray(colors, np.float32)
+    shift = np.asarray(shift, np.float32)
+    count = int(colors.shape[0])
+    width = int(colors.shape[1]) if colors.ndim > 1 else 1
+    slope = float(shift[0] if at_start else shift[-1]) if count else 0.0
+    extra_colors = np.empty((max(extra, 0), width), np.float32)
+    extra_shift = np.full(max(extra, 0), slope, np.float32)
+    if count == 0 or extra < 1:
+        return extra_colors, extra_shift
+
+    def sample(at: float) -> np.ndarray:
+        at = float(np.clip(at, 0, count - 1))
+        low = int(np.floor(at))
+        high = min(count - 1, low + 1)
+        mix = at - low
+        return colors[low] * (1.0 - mix) + colors[high] * mix
+
+    if at_start:
+        for index in range(extra):
+            extra_colors[index] = sample(-slope * float(extra - index))
+        return np.vstack([extra_colors, colors]), np.concatenate([extra_shift, shift])
+    for index in range(extra):
+        extra_colors[index] = sample((count - 1) + slope * float(index + 1))
+    return np.vstack([colors, extra_colors]), np.concatenate([shift, extra_shift])
+
+
+def _corner_from_profile(colors: np.ndarray, shift: np.ndarray, edge_row: np.ndarray, out_h: int, out_w: int, at_start: bool) -> np.ndarray:
+    """Fill the corner from the edge profile that meets it. The shared strip edge stays pinned.
+
+    Row 0 is next to the horizontal trim. Column 0 is next to the page interior when
+    at_start is false, and column -1 is next to the interior when at_start is true.
+    """
+    if out_h < 1 or out_w < 1:
+        return np.zeros((max(out_h, 1), max(out_w, 1), 3), np.uint8)
+    extended_colors, extended_shift = _extend_profile(colors, shift, out_w, at_start)
+    painted = _paint_outward(extended_colors, extended_shift, out_h)
+    block = painted[:out_w] if at_start else painted[-out_w:]
+    oriented = np.transpose(block, (1, 0, 2))[::-1]
+    oriented = np.array(oriented, copy=True)
+    if edge_row is not None and int(np.shape(edge_row)[0]) == int(oriented.shape[1]):
+        oriented[0] = np.clip(np.round(np.asarray(edge_row)), 0, 255).astype(np.uint8)
+    return oriented
+
+
+def _paint_outward(colors: np.ndarray, shift: np.ndarray, margin: int) -> np.ndarray:
+    """Repeat each edge colour outward. A non-zero shift walks along the diagonal."""
+    count = colors.shape[0]
+    if margin < 1 or count < 1:
+        return np.zeros((count, max(margin, 0), 3), np.uint8)
+    canvas = np.empty((count, margin, 3), np.float32)
+    index = np.arange(count)
+    for dist in range(1, margin + 1):
+        sample_at = np.clip(index.astype(np.float32) + shift * float(dist - 1), 0, count - 1)
+        low = np.floor(sample_at).astype(int)
+        high = np.clip(low + 1, 0, count - 1)
+        mix = (sample_at - low)[:, None]
+        canvas[:, margin - dist] = colors[low] * (1.0 - mix) + colors[high] * mix
+    return np.clip(np.round(canvas), 0, 255).astype(np.uint8)
+
+
+def _extend_gs_rgb(rgb: np.ndarray, box) -> np.ndarray:
+    """Fill only the margin. Diagonals keep their slope. Columns stay on their x."""
+    x0, y0, x1, y1 = box
     height, width = rgb.shape[:2]
-    scale = 300.0 / 72.0
-
-    def px(value: float) -> int:
-        return int(round(float(value) * scale))
-
-    # The seam check rounds each margin on its own. Match that grid so the
-    # corner square is the square the check measures.
-    x0 = min(max(px(placed.x0 - page_rect.x0), 0), width - 2)
-    y0 = min(max(px(placed.y0 - page_rect.y0), 0), height - 2)
-    x1 = width - min(max(px(page_rect.x1 - placed.x1), 0), width - x0 - 2)
-    y1 = height - min(max(px(page_rect.y1 - placed.y1), 0), height - y0 - 2)
-    if x0 < 2 and y0 < 2 and width - x1 < 2 and height - y1 < 2:
+    x0 = min(max(int(x0), 0), width)
+    y0 = min(max(int(y0), 0), height)
+    x1 = min(max(int(x1), x0), width)
+    y1 = min(max(int(y1), y0), height)
+    if x0 < 1 and y0 < 1 and width - x1 < 1 and height - y1 < 1:
         return rgb
     canvas = np.array(rgb, copy=True)
-    image = canvas[y0:y1, x0:x1]
-    content_h, content_w = image.shape[:2]
-    if x0 > 0:
-        colors = np.stack([_band_color(image[row, :14]) for row in range(content_h)])
-        canvas[y0:y1, :x0] = np.clip(np.round(colors[:, None, :]), 0, 255)
-    if x1 < width:
-        colors = np.stack([_band_color(image[row, ::-1][:14]) for row in range(content_h)])
-        canvas[y0:y1, x1:] = np.clip(np.round(colors[:, None, :]), 0, 255)
-    if y0 > 0:
-        colors = np.stack([_band_color(image[:14, col]) for col in range(content_w)])
-        canvas[:y0, x0:x1] = np.clip(np.round(colors[None, :, :]), 0, 255)
-    if y1 < height:
-        colors = np.stack([_band_color(image[::-1][:14, col]) for col in range(content_w)])
-        canvas[y1:, x0:x1] = np.clip(np.round(colors[None, :, :]), 0, 255)
-    window = 24
-    skip = 2
+    content = canvas[y0:y1, x0:x1]
+    if content.size == 0:
+        return canvas
+    depth = min(48, content.shape[1], content.shape[0])
 
-    def patch_at(row0: int, col0: int) -> np.ndarray:
-        row1 = min(content_h, row0 + window)
-        col1 = min(content_w, col0 + window)
-        return image[max(0, row0) : max(row0 + 1, row1), max(0, col0) : max(col0 + 1, col1)]
+    def side_strip(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        colors = _seam_colors(image)
+        shift = _carry_edge_slope(_carry_edge_slope(_outward_row_shift(image), True), False)
+        return colors, shift
 
-    if y0 > 0 and x0 > 0:
-        canvas[:y0, :x0] = _corner_from_patch(patch_at(skip, skip), y0, x0, True, True)
-    if y0 > 0 and x1 < width:
-        canvas[:y0, x1:] = _corner_from_patch(patch_at(skip, content_w - skip - window), y0, width - x1, True, False)
-    if y1 < height and x0 > 0:
-        canvas[y1:, :x0] = _corner_from_patch(patch_at(content_h - skip - window, skip), height - y1, x0, True, True)
-    if y1 < height and x1 < width:
-        canvas[y1:, x1:] = _corner_from_patch(
-            patch_at(content_h - skip - window, content_w - skip - window),
-            height - y1,
-            width - x1,
-            False,
-            False,
+    left = right = top = bottom = None
+    left_colors = left_shift = right_colors = right_shift = None
+    top_colors = top_shift = bottom_colors = bottom_shift = None
+    if x0 > 0 and depth > 0:
+        left_colors, left_shift = side_strip(content[:, :depth])
+        left = _paint_outward(left_colors, left_shift, x0)
+        canvas[y0:y1, :x0] = left
+    if x1 < width and depth > 0:
+        right_colors, right_shift = side_strip(content[:, ::-1][:, :depth])
+        right = _paint_outward(right_colors, right_shift, width - x1)
+        canvas[y0:y1, x1:] = right[:, ::-1]
+    if y0 > 0 and depth > 0:
+        top_colors, top_shift = side_strip(np.transpose(content[:depth], (1, 0, 2)))
+        top = _paint_outward(top_colors, top_shift, y0)
+        canvas[:y0, x0:x1] = np.transpose(top, (1, 0, 2))
+    if y1 < height and depth > 0:
+        bottom_colors, bottom_shift = side_strip(np.transpose(content[::-1][:depth], (1, 0, 2)))
+        bottom = _paint_outward(bottom_colors, bottom_shift, height - y1)
+        canvas[y1:, x0:x1] = np.transpose(bottom, (1, 0, 2))[::-1]
+    # One pixel over the fringe, so a renderer cannot leave the seam white.
+    # The seam check skips that pixel.
+    if left is not None and x0 < width:
+        canvas[y0:y1, x0] = left[:, -1]
+    if right is not None and x1 > 0:
+        canvas[y0:y1, x1 - 1] = right[:, -1]
+    if top is not None and y0 < height:
+        canvas[y0, x0:x1] = np.transpose(top, (1, 0, 2))[-1]
+    if bottom is not None and y1 > 0:
+        canvas[y1 - 1, x0:x1] = np.transpose(bottom, (1, 0, 2))[::-1][0]
+
+    # Corners continue the two strips. A diagonal that meets the corner keeps its slope.
+    # Column  -1 of a left corner, and column 0 of a right corner, sit on the page.
+    if y0 > 0 and x0 > 0 and top_colors is not None and left is not None:
+        canvas[:y0, :x0] = _corner_from_profile(top_colors, top_shift, left[0], y0, x0, True)[::-1]
+    if y0 > 0 and x1 < width and top_colors is not None and right is not None:
+        canvas[:y0, x1:] = _corner_from_profile(top_colors, top_shift, right[0, ::-1], y0, width - x1, False)[::-1]
+    if y1 < height and x0 > 0 and bottom_colors is not None and left is not None:
+        canvas[y1:, :x0] = _corner_from_profile(bottom_colors, bottom_shift, left[-1], height - y1, x0, True)
+    if y1 < height and x1 < width and bottom_colors is not None and right is not None:
+        canvas[y1:, x1:] = _corner_from_profile(
+            bottom_colors, bottom_shift, right[-1, ::-1], height - y1, width - x1, False,
         )
     return canvas
 
 
+def _gs_content_box(placed, page_rect, shape) -> tuple:
+    """Map the placed artwork onto the Ghostscript pixel grid."""
+    height, width = shape[:2]
+    page_w = float(page_rect.width) or 1.0
+    page_h = float(page_rect.height) or 1.0
+
+    def x_px(value: float) -> int:
+        return int(np.clip(round(float(value) / page_w * width), 0, width))
+
+    def y_px(value: float) -> int:
+        return int(np.clip(round(float(value) / page_h * height), 0, height))
+
+    return (
+        x_px(placed.x0 - page_rect.x0),
+        y_px(placed.y0 - page_rect.y0),
+        x_px(placed.x1 - page_rect.x0),
+        y_px(placed.y1 - page_rect.y0),
+    )
+
+
 def _paint_bleed_matching(path: str, placements: list) -> None:
-    """Write the added bleed as DeviceRGB samples of the adjacent rendered pixels."""
+    """Write the added bleed from the same Ghostscript render the press uses.
+
+    The strips are DeviceRGB samples of the adjacent pixels, placed on the
+    Ghostscript pixel grid. DeviceCMYK cannot reproduce the navy already on
+    the page (0,49,94 renders back as 23,51,92).
+    """
     import pikepdf
     import pymupdf as fitz
     from pikepdf import Name, Pdf
 
+    rendered = _gs_rgb_pages(path)
     doc = fitz.open(path)
     paints = []
     try:
-        scale = 300.0 / 72.0
         for index, page in enumerate(doc):
             placement = placements[index] if index < len(placements) else None
-            if not placement:
+            if not placement or index >= len(rendered):
                 continue
             placed = fitz.Rect(*placement)
             if min(placed.x0, placed.y0, page.rect.width - placed.x1, page.rect.height - placed.y1) < 0.3:
                 continue
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-            rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-            extended = _extend_page_rgb(rgb, placed, page.rect)
+            rgb = rendered[index]
             height, width = rgb.shape[:2]
-
-            def px(value: float) -> int:
-                return int(round(float(value) * scale))
-
-            x0 = px(placed.x0 - page.rect.x0)
-            y0 = px(placed.y0 - page.rect.y0)
-            x1 = width - px(page.rect.x1 - placed.x1)
-            y1 = height - px(page.rect.y1 - placed.y1)
+            box = _gs_content_box(placed, page.rect, rgb.shape)
+            extended = _extend_gs_rgb(rgb, box)
+            x0, y0, x1, y1 = box
+            # Cover the fringe pixel as well as the margin, so the seam cannot stay white.
+            x0 = min(width - 1, x0 + 1) if x0 > 0 else x0
+            y0 = min(height - 1, y0 + 1) if y0 > 0 else y0
+            x1 = max(1, x1 - 1) if x1 < width else x1
+            y1 = max(1, y1 - 1) if y1 < height else y1
             regions = []
+
             def add(image, x, y, w, h):
                 if image is None or w < 1 or h < 1:
                     return
-                regions.append((np.ascontiguousarray(image), x, y, w, h))
+                regions.append((np.ascontiguousarray(image), int(x), int(y), int(w), int(h)))
+
             add(extended[y0:y1, :x0], 0, y0, x0, y1 - y0)
             add(extended[y0:y1, x1:width], x1, y0, width - x1, y1 - y0)
             add(extended[:y0, x0:x1], x0, 0, x1 - x0, y0)
@@ -1355,21 +1685,19 @@ def _paint_bleed_matching(path: str, placements: list) -> None:
             add(extended[:y0, x1:width], x1, 0, width - x1, y0)
             add(extended[y1:height, :x0], 0, y1, x0, height - y1)
             add(extended[y1:height, x1:width], x1, y1, width - x1, height - y1)
-            paints.append((index, page.rect.height, regions))
+            paints.append((index, float(page.rect.width), float(page.rect.height), width, height, regions))
     finally:
         doc.close()
     if not paints:
         return
     pdf = Pdf.open(path, allow_overwriting_input=True)
     try:
-        for index, page_h, regions in paints:
+        for index, page_w, page_h, gs_w, gs_h, regions in paints:
             page = pdf.pages[index]
             if "/XObject" not in page.Resources:
                 page.Resources.XObject = pdf.make_indirect(pikepdf.Dictionary())
             ops = []
             for number, (image, x, y, w, h) in enumerate(regions):
-                # DeviceRGB round-trips in the viewer. DeviceCMYK cannot reproduce
-                # the navy already on the page (0,49,94 renders back as 23,51,92).
                 stream = pdf.make_stream(np.ascontiguousarray(image).tobytes())
                 stream.Type = Name("/XObject")
                 stream.Subtype = Name("/Image")
@@ -1379,11 +1707,11 @@ def _paint_bleed_matching(path: str, placements: list) -> None:
                 stream.BitsPerComponent = 8
                 name = Name(f"/Bleed{index}_{number}")
                 page.Resources.XObject[name] = stream
-                # MuPDF y grows downward. PDF y grows upward from the bottom.
-                pdf_y = float(page_h) - (y + h) / scale
-                pdf_x = x / scale
-                pdf_w = w / scale
-                pdf_h = h / scale
+                # Place each device pixel on the Ghostscript grid, not MuPDF's.
+                pdf_x = x * page_w / gs_w
+                pdf_w = w * page_w / gs_w
+                pdf_h = h * page_h / gs_h
+                pdf_y = page_h - (y + h) * page_h / gs_h
                 ops.append(f"q {pdf_w:.4f} 0 0 {pdf_h:.4f} {pdf_x:.4f} {pdf_y:.4f} cm {name} Do Q")
             extra = ("\n".join(ops) + "\n").encode()
             contents = page.get("/Contents")

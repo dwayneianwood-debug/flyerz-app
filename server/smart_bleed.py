@@ -3541,8 +3541,11 @@ BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
 FREQ_SEP_STRIP_DEPTH = 28
 FREQ_SEP_INTERIOR_PX = 8
 FREQ_SEP_INTERIOR_MM = 6.0
+FREQ_SEP_SEARCH_MM = 18.0
 FREQ_SEP_GAUSSIAN_KSIZE = (5, 5)
 FREQ_SEP_GAUSSIAN_SIGMA = 1.2
+FREQ_SEP_GRAIN_KSIZE = 15
+FREQ_SEP_GRAIN_SIGMA = 3.0
 
 
 def _median_edge_bgr_u8(bgr: np.ndarray) -> np.ndarray:
@@ -5674,13 +5677,80 @@ def _repeat_depth(vol: np.ndarray, target: int) -> np.ndarray:
     return np.concatenate([vol.astype(np.float32)] * reps, axis=0)[:target]
 
 
-def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> np.ndarray:
+def _odd_kernel(limit: int, wanted: int) -> int:
+    size = min(wanted, int(limit))
+    size = max(3, size)
+    return size if size % 2 else size - 1
+
+
+def _grain_residual_std(strip: np.ndarray) -> float:
+    """High-frequency energy. A wide blur keeps a hard edge from looking like texture."""
+    if strip.size == 0 or min(strip.shape[:2]) < 5:
+        return 0.0
+    src = strip.astype(np.float32)
+    if src.ndim == 2:
+        src = src[:, :, None]
+    kernel = _odd_kernel(min(src.shape[0], src.shape[1]), FREQ_SEP_GRAIN_KSIZE)
+    low = cv2.GaussianBlur(src, (kernel, kernel), FREQ_SEP_GRAIN_SIGMA)
+    return float((src - low).std())
+
+
+def _inward_strip(work: np.ndarray, side: str, start: int, depth: int):
+    """Pixels walking in from one edge. Axis 0 is depth, 0 = closer to the edge."""
+    height, width = work.shape[:2]
+    if depth < 1 or start < 0:
+        return None
+    if side == "top":
+        if start + depth > height:
+            return None
+        return work[start:start + depth]
+    if side == "bottom":
+        if start + depth > height:
+            return None
+        return work[height - start - depth:height - start][::-1]
+    if side == "left":
+        if start + depth > width:
+            return None
+        return np.swapaxes(work[:, start:start + depth], 0, 1)
+    if side == "right":
+        if start + depth > width:
+            return None
+        return np.swapaxes(work[:, width - start - depth:width - start], 0, 1)[::-1]
+    return None
+
+
+def _frequency_grain_strip(work: np.ndarray, side: str, bleed_px: int, dpi: float):
+    """Edge tone, plus the grainiest strip within 18 mm. The tone stays the edge colour."""
+    height, width = work.shape[:2]
+    span = height if side in ("top", "bottom") else width
+    depth = min(max(FREQ_SEP_STRIP_DEPTH, int(bleed_px)), max(0, span - 1))
+    if depth < 2 or span < depth + 1:
+        return None, None
+    reach = max(int(round(FREQ_SEP_SEARCH_MM * float(dpi) / 25.4)), depth)
+    limit = min(reach, span - depth)
+    best = None
+    best_score = -1.0
+    for start in range(0, max(1, limit), 8):
+        strip = _inward_strip(work, side, start, depth)
+        if strip is None:
+            continue
+        score = _grain_residual_std(strip)
+        if score > best_score:
+            best_score = score
+            best = np.ascontiguousarray(strip)
+    tone_strip = _inward_strip(work, side, 0, 1)
+    tone = None if tone_strip is None else tone_strip[:1]
+    return tone, best if best is not None else tone_strip
+
+
+def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int, tone=None) -> np.ndarray:
     """
     Low-frequency colour is the trim-side tone replicated outward. High-frequency
-    grain measured just inside the trim is laid on top of that tone, so a
-    textured edge does not collapse to the same flat band as stretch.
+    grain from the strip is laid on that tone once. A repeated strip draws echo
+    lines, so nothing past the measured sample is tiled.
 
     edge_strip: (D, W, C) or (D, W), depth 0 = just inside the trim.
+    tone: optional (1, W, C) edge colour. When omitted, the strip's own tone is used.
     Returns (target_bleed_px, W, C) uint8.
     """
     if target_bleed_px <= 0 or edge_strip.size == 0:
@@ -5696,25 +5766,32 @@ def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> 
     if min(d, w) < 3:
         low = src
     else:
-        def odd_k(limit: int, wanted: int) -> int:
-            size = min(wanted, int(limit))
-            size = max(3, size)
-            return size if size % 2 else size - 1
-
+        # A wide kernel leaves fine grain. A 5 px kernel turns a hard edge into an echo line.
+        wanted = FREQ_SEP_GRAIN_KSIZE if min(d, w) >= FREQ_SEP_GRAIN_KSIZE else FREQ_SEP_GAUSSIAN_KSIZE[0]
         low = cv2.GaussianBlur(
             src,
-            (odd_k(d, FREQ_SEP_GAUSSIAN_KSIZE[0]), odd_k(w, FREQ_SEP_GAUSSIAN_KSIZE[1])),
-            FREQ_SEP_GAUSSIAN_SIGMA,
+            (_odd_kernel(d, wanted), _odd_kernel(w, wanted)),
+            FREQ_SEP_GRAIN_SIGMA if wanted >= FREQ_SEP_GRAIN_KSIZE else FREQ_SEP_GAUSSIAN_SIGMA,
         )
     high = src - low
-    # A repeated strip draws echo lines. Keep the measured grain once, and
-    # extend only the flat tone past the end of that sample.
     if high.shape[0] >= target_bleed_px:
         grain = high[:target_bleed_px]
     else:
         pad = np.zeros((target_bleed_px - high.shape[0],) + high.shape[1:], dtype=np.float32)
         grain = np.concatenate([high, pad], axis=0)
-    low_out = np.repeat(low[:1], target_bleed_px, axis=0)
+    if tone is None:
+        tone_row = low[:1]
+    else:
+        tone_row = np.asarray(tone, np.float32)
+        if tone_row.ndim == 1:
+            tone_row = tone_row[None, :, None]
+        elif tone_row.ndim == 2:
+            tone_row = tone_row[None, :, :] if tone_row.shape[0] != 1 else tone_row[:, :, None]
+        if tone_row.shape[1] != w:
+            tone_row = low[:1]
+        if tone_row.shape[2] != c:
+            tone_row = low[:1]
+    low_out = np.repeat(tone_row[:1], target_bleed_px, axis=0)
     out = np.clip(np.round(low_out + grain), 0, 255)
     out = out.astype(np.uint8)
     if c == 1:
@@ -5730,10 +5807,6 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if bleed_px <= 0:
         return img
     h, w = img.shape[:2]
-    inset = _prepress_edge_sample_inset(h, w)
-    # A few millimetres in, so a flat existing bleed is not the sample.
-    interior = max(FREQ_SEP_INTERIOR_PX, int(round(FREQ_SEP_INTERIOR_MM * float(dpi) / 25.4)))
-    start = interior if min(h, w) > interior + 8 else inset
     is_gray = img.ndim == 2
     is_bgra = not is_gray and img.shape[2] == 4
     work = img[:, :, :3] if is_bgra else (img[:, :, np.newaxis] if is_gray else img)
@@ -5741,14 +5814,12 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     def _maybe_fallback():
         return _pixel_drift_stretch(img, side, bleed_px)
 
+    tone, strip = _frequency_grain_strip(work, side, bleed_px, dpi)
+    if strip is None or strip.shape[0] < 2:
+        return _maybe_fallback()
+
     if side == "top":
-        if h < start + 2:
-            return _maybe_fallback()
-        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), h - start)
-        if d < 2:
-            return _maybe_fallback()
-        strip = work[start : start + d, :, :]
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             combined = np.vstack([bleed, img])
         else:
@@ -5756,7 +5827,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[start : start + 1, :, 3], (bleed_px, w))
+            aa = np.broadcast_to(img[0:1, :, 3], (bleed_px, w))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:bleed_px] = aa
             base_a[bleed_px:] = img[:, :, 3]
@@ -5764,14 +5835,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "bottom":
-        if h < start + 2:
-            return _maybe_fallback()
-        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), h - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[h - start - d : h - start, :, :]
-        strip = raw[::-1, :, :].copy()
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             combined = np.vstack([img, bleed])
         else:
@@ -5779,7 +5843,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[h - start - 1 : h - start, :, 3], (bleed_px, w))
+            aa = np.broadcast_to(img[h - 1:h, :, 3], (bleed_px, w))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:-bleed_px] = img[:, :, 3]
             base_a[-bleed_px:] = aa
@@ -5787,14 +5851,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "left":
-        if w < start + 2:
-            return _maybe_fallback()
-        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), w - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[:, start : start + d, :]
-        strip = np.swapaxes(raw, 0, 1)
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             bleed_hw = bleed.T
             combined = np.hstack([bleed_hw, img])
@@ -5804,7 +5861,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[:, start : start + 1, 3], (h, bleed_px))
+            aa = np.broadcast_to(img[:, 0:1, 3], (h, bleed_px))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:, :bleed_px] = aa
             base_a[:, bleed_px:] = img[:, :, 3]
@@ -5812,14 +5869,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "right":
-        if w < start + 2:
-            return _maybe_fallback()
-        d = min(max(FREQ_SEP_STRIP_DEPTH, bleed_px), w - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[:, w - start - d : w - start, :]
-        strip = np.swapaxes(raw, 0, 1)[::-1, :, :].copy()
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             bleed_hw = bleed.T
             combined = np.hstack([img, bleed_hw])
@@ -5829,7 +5879,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[:, w - start - 1 : w - start, 3], (h, bleed_px))
+            aa = np.broadcast_to(img[:, w - 1:w, 3], (h, bleed_px))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:, :-bleed_px] = img[:, :, 3]
             base_a[:, -bleed_px:] = aa
