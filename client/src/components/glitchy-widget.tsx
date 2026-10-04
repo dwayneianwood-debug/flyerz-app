@@ -1180,7 +1180,7 @@ export default function GlitchyWidget() {
               )
             ) : (
               <>
-                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee", whiteSpace: "pre-wrap" }}>
+                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee", whiteSpace: "pre-wrap", maxHeight: 140, overflowY: "auto" }}>
                   {responseText}
                 </div>
                 {(previewBefore || previewAfter) && (
