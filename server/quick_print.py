@@ -221,7 +221,7 @@ def _pdf_trim_mm(path: str) -> Optional[tuple]:
 
 
 def _fit_page_to_trim(page_w: float, page_h: float, trim_w: float, trim_h: float, tolerance: float = 2.5):
-    """The page as this trim, in either orientation, including 2–6 mm of bleed already there."""
+    """The page as this trim, in either orientation, including bleed already on the page."""
     from press_ready_engine import inferred_side_bleed
 
     direct = inferred_side_bleed(page_w, page_h, trim_w, trim_h, trim_tol=tolerance)

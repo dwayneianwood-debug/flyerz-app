@@ -41,13 +41,14 @@ def inferred_side_bleed(
     trim_w_mm: float,
     trim_h_mm: float,
     lo: float = 2.0,
-    hi: float = 6.0,
+    hi: float = 15.0,
     trim_tol: float = 2.5,
 ):
-    """Per-side bleed when the page is the trim, or the trim plus 2–6 mm already there.
+    """Per-side bleed when the page is the trim, or the trim plus bleed already there.
 
-    A Canva page often has no TrimBox. The extra millimetres on each side are the
-    bleed that is already in the file. None means the page is a different shape.
+    A Canva page often has no TrimBox. Two to 15 mm on each side is bleed that is
+    already in the file, including a full 5 mm and a more generous bleed. None
+    means the page is a different shape.
     """
     extra_w = float(page_w_mm) - float(trim_w_mm)
     extra_h = float(page_h_mm) - float(trim_h_mm)

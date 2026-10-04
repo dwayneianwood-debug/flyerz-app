@@ -7516,6 +7516,50 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
     }
 
 
+def build_style_previews(pdf_path: str, output_base: str, dpi: float) -> dict:
+    """One style image per bleed method, for every page of the PDF."""
+    variant_doc = fitz.open(pdf_path)
+    try:
+        if len(variant_doc) == 0:
+            return {}
+        variant_dpi = int(min(float(dpi or 150), 150))
+        mat = fitz.Matrix(variant_dpi / 72.0, variant_dpi / 72.0)
+        page_paths = []
+        recommended = "stretch"
+        safety = "SAFE"
+        for page_index in range(len(variant_doc)):
+            page = variant_doc[page_index]
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
+            pix.set_dpi(variant_dpi, variant_dpi)
+            total_pixels = pix.width * pix.height
+            if total_pixels > 40_000_000:
+                sys.stderr.write(f"[BLEED] Variant raster too large ({pix.width}x{pix.height}={total_pixels}px), skipping\n")
+                del pix
+                return {}
+            img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+            alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
+            rgb_ch = img_rgba[:, :, :3].astype(np.float32)
+            white_bg = np.full_like(rgb_ch, 255.0)
+            composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
+            img_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
+            del pix, img_rgba, composited
+            page_base = output_base if page_index == 0 else f"{output_base}_page{page_index + 1}"
+            vr = generate_bleed_variants(img_bgr, variant_dpi, page_base, ".png")
+            del img_bgr
+            page_paths.append(vr.get("paths") or {})
+            recommended = vr.get("recommended", recommended)
+            safety = vr.get("safetyStatus", safety)
+        return {
+            "paths": page_paths[0] if page_paths else {},
+            "pages": page_paths,
+            "pageCount": len(page_paths),
+            "recommended": recommended,
+            "safetyStatus": safety,
+        }
+    finally:
+        variant_doc.close()
+
+
 def _variant_pages_by_method(variant_result: dict) -> dict:
     """method -> [page 1 path, page 2 path, ...]. Page 1 stays in bleedVariants too."""
     paths = variant_result.get("paths") or {}
@@ -9077,47 +9121,8 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
         try:
             variant_source = output_path if os.path.exists(output_path) else input_path
             sys.stderr.write(f"[BLEED] PDF variant source: {variant_source} (using {'corrected' if variant_source == output_path else 'original'})\n")
-            variant_doc = fitz.open(variant_source)
-            if len(variant_doc) == 0:
-                variant_doc.close()
-                return {}
-            variant_dpi = min(dpi, 150)
-            mat = fitz.Matrix(variant_dpi / 72.0, variant_dpi / 72.0)
             output_base = os.path.splitext(output_path)[0]
-            page_paths = []
-            recommended = "stretch"
-            safety = "SAFE"
-            for page_index in range(len(variant_doc)):
-                page = variant_doc[page_index]
-                pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
-                pix.set_dpi(variant_dpi, variant_dpi)
-                total_pixels = pix.width * pix.height
-                if total_pixels > 40_000_000:
-                    sys.stderr.write(f"[BLEED] Variant raster too large ({pix.width}x{pix.height}={total_pixels}px), skipping\n")
-                    del pix
-                    variant_doc.close()
-                    return {}
-                img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
-                alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
-                rgb_ch = img_rgba[:, :, :3].astype(np.float32)
-                white_bg = np.full_like(rgb_ch, 255.0)
-                composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
-                img_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
-                del pix, img_rgba, composited
-                page_base = output_base if page_index == 0 else f"{output_base}_page{page_index + 1}"
-                vr = generate_bleed_variants(img_bgr, variant_dpi, page_base, ".png")
-                del img_bgr
-                page_paths.append(vr.get("paths") or {})
-                recommended = vr.get("recommended", recommended)
-                safety = vr.get("safetyStatus", safety)
-            variant_doc.close()
-            return {
-                "paths": page_paths[0] if page_paths else {},
-                "pages": page_paths,
-                "pageCount": len(page_paths),
-                "recommended": recommended,
-                "safetyStatus": safety,
-            }
+            return build_style_previews(variant_source, output_base, dpi)
         except Exception as e:
             sys.stderr.write(f"[BLEED] PDF variant generation failed: {e}\n")
             return {}
