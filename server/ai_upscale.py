@@ -755,8 +755,14 @@ def apply_ai_upscale(input_path: str, options: Optional[dict] = None) -> dict:
                 else f"Upscale preview ready (scale {plan['model_scale']})."
             )
         else:
-            # Token present (or assumed): call the pinned Real-ESRGAN version.
-            if int(plan["model_scale"]) < 2:
+            # Real-ESRGAN stays off unless VECTOR_ESRGAN is set. A token alone must not call Replicate.
+            from host_paths import esrgan_enabled
+
+            if not esrgan_enabled():
+                enhanced = basic_lanczos_upscale(source, plan["target_w"], plan["target_h"])
+                provider_name = "basic"
+                message = BASIC_MESSAGE
+            elif int(plan["model_scale"]) < 2:
                 enhanced = basic_lanczos_upscale(source, plan["target_w"], plan["target_h"])
                 provider_name = "basic"
                 message = (

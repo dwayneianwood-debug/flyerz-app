@@ -392,9 +392,48 @@ def test_press_upscale_stays_inside_the_job() -> None:
     check("async-token-not-in-result", "super-secret-token" not in json.dumps(created))
 
 
+def test_token_does_not_call_replicate() -> None:
+    import urllib.error
+    import urllib.request
+
+    folder = tempfile.mkdtemp()
+    path = os.path.join(folder, "soft.png")
+    cv2.imwrite(path, np.full((80, 60, 3), 40, np.uint8))
+    saved_token = os.environ.get("REPLICATE_API_TOKEN")
+    saved_flag = os.environ.pop("VECTOR_ESRGAN", None)
+    os.environ["REPLICATE_API_TOKEN"] = "test-token"
+    calls = []
+    old = urllib.request.urlopen
+
+    def boom(req, timeout=None):
+        calls.append(getattr(req, "full_url", "url"))
+        raise urllib.error.URLError("blocked")
+
+    urllib.request.urlopen = boom
+    set_upscale_provider(None)
+    try:
+        result = apply_ai_upscale(path, {
+            "trim_w_mm": 90,
+            "trim_h_mm": 50,
+            "assume_token": True,
+            "output_path": os.path.join(folder, "out.png"),
+        })
+        check("token-stays-local", result.get("provider") == "basic" and not calls, str(result.get("provider")) + str(calls))
+    finally:
+        urllib.request.urlopen = old
+        set_upscale_provider(None)
+        if saved_token is None:
+            os.environ.pop("REPLICATE_API_TOKEN", None)
+        else:
+            os.environ["REPLICATE_API_TOKEN"] = saved_token
+        if saved_flag is not None:
+            os.environ["VECTOR_ESRGAN"] = saved_flag
+
+
 def main() -> None:
     test_scale_plan()
     test_basic_fallback()
+    test_token_does_not_call_replicate()
     test_stub_and_failure()
     test_vector_pdf_skipped()
     test_lanczos_cap()

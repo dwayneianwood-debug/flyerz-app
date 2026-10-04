@@ -7,7 +7,7 @@ test("colour border is a bleed strategy alongside the existing ones", () => {
   assert.ok(BLEED_STRATEGY_IDS.includes("colourBorder"));
   assert.deepEqual(
     BLEED_STRATEGY_IDS.filter((id) => id !== "colourBorder"),
-    ["bgExtract", "stretch", "mirror", "replicate", "upscale", "ai_outpaint"],
+    ["bgExtract", "stretch", "mirror", "replicate", "gradient_extrapolate", "frequency_separated", "upscale", "ai_outpaint"],
   );
 });
 

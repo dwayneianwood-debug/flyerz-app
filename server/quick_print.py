@@ -220,16 +220,54 @@ def _pdf_trim_mm(path: str) -> Optional[tuple]:
         doc.close()
 
 
-def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
-    best = None
-    rotated = False
+def _fit_page_to_trim(page_w: float, page_h: float, trim_w: float, trim_h: float, tolerance: float = 2.5):
+    """The page as this trim, in either orientation, including 2–6 mm of bleed already there."""
+    from press_ready_engine import inferred_side_bleed
+
+    direct = inferred_side_bleed(page_w, page_h, trim_w, trim_h, trim_tol=tolerance)
+    if direct:
+        return {"trimW": float(trim_w), "trimH": float(trim_h), "rotated": False, "bleed": direct}
+    swapped = inferred_side_bleed(page_w, page_h, trim_h, trim_w, trim_tol=tolerance)
+    if swapped:
+        return {"trimW": float(trim_h), "trimH": float(trim_w), "rotated": True, "bleed": swapped}
+    return None
+
+
+def _product_for_trim(trim_w: float, trim_h: float):
     for product in _products():
-        if abs(width_mm - product["widthMm"]) <= tolerance and abs(height_mm - product["heightMm"]) <= tolerance:
-            return product, False
-        if abs(width_mm - product["heightMm"]) <= tolerance and abs(height_mm - product["widthMm"]) <= tolerance:
-            best = product
-            rotated = True
-    return best, rotated
+        if abs(float(product["widthMm"]) - trim_w) <= 0.2 and abs(float(product["heightMm"]) - trim_h) <= 0.2:
+            return product
+    return None
+
+
+def _remember_product(decisions: list, product: dict, trim_w: float, trim_h: float) -> None:
+    line = f"Product set to {product.get('label')} ({trim_w:g} × {trim_h:g} mm)."
+    for index, existing in enumerate(decisions):
+        if str(existing).startswith("Product set to "):
+            decisions[index] = line
+            return
+    decisions.append(line)
+
+
+def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
+    """Best catalog size. An unrotated landscape product wins over turning the portrait one."""
+    best = None
+    for product in _products():
+        fit = _fit_page_to_trim(width_mm, height_mm, float(product["widthMm"]), float(product["heightMm"]), tolerance)
+        if not fit:
+            continue
+        extra = abs(width_mm - fit["trimW"]) + abs(height_mm - fit["trimH"])
+        rank = (1 if fit["rotated"] else 0, extra)
+        if best is None or rank < best[0]:
+            best = (rank, product, fit["rotated"])
+    if not best:
+        return None, False
+    product, rotated = best[1], best[2]
+    if rotated:
+        twin = _product_for_trim(float(product["heightMm"]), float(product["widthMm"]))
+        if twin:
+            return twin, False
+    return product, rotated
 
 
 def _render_pdf_image(path: str):
@@ -1227,7 +1265,19 @@ def make_print_ready(
                 if opened and not prep_error:
                     measured = _pdf_trim_mm(opened)
                     if measured:
-                        found, _rotated = _match_product(*measured)
+                        found, rotated = _match_product(*measured)
+                        if found and rotated:
+                            twin = _product_for_trim(float(found["heightMm"]), float(found["widthMm"]))
+                            if twin:
+                                found = twin
+                            else:
+                                found = {
+                                    **found,
+                                    "id": f"{found.get('id')}-landscape",
+                                    "label": f"{found.get('label')} landscape",
+                                    "widthMm": found["heightMm"],
+                                    "heightMm": found["widthMm"],
+                                }
                         if found:
                             product = found
                             trim_w = float(found["widthMm"])
@@ -1287,14 +1337,35 @@ def make_print_ready(
             # Live text and vector drawings stay as they are. A raster page can still be traced.
             live_type = _pdf_has_live_type(work_path)
             measured = _pdf_trim_mm(work_path)
-            matches = False
+            fit = _fit_page_to_trim(*measured, trim_w, trim_h) if measured else None
+            if fit and fit["rotated"]:
+                turned = _product_for_trim(fit["trimW"], fit["trimH"])
+                if turned:
+                    product = turned
+                else:
+                    product = {
+                        **product,
+                        "widthMm": fit["trimW"],
+                        "heightMm": fit["trimH"],
+                        "label": f"{product.get('label')} landscape",
+                    }
+                trim_w = fit["trimW"]
+                trim_h = fit["trimH"]
+                _remember_product(decisions, product, trim_w, trim_h)
+                decisions.append("The page matches this product when it is turned the other way, so that orientation was used.")
             if measured:
-                matches = abs(measured[0] - trim_w) <= 2 and abs(measured[1] - trim_h) <= 2
                 decisions.append(
                     f"The PDF trim is {measured[0]:.1f} × {measured[1]:.1f} mm."
                 )
-            if matches:
-                decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
+            if fit:
+                bleed = fit["bleed"]
+                if bleed.get("kind") == "existing":
+                    decisions.append(
+                        f"The page is the trim plus about {bleed['left']:.1f} mm of bleed already. "
+                        "That bleed is kept and only the shortfall is added."
+                    )
+                else:
+                    decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
             elif live_type:
                 decisions.append(
                     "This PDF has live type and the wrong proportions. The edges cannot be extended without losing that type."

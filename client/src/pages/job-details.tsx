@@ -145,6 +145,14 @@ const BLEED_METHOD_LABELS = {
     label: "Colour Border",
     description: "Keeps the artwork at trim size and fills the bleed with a solid colour you choose.",
   },
+  gradient_extrapolate: {
+    label: "Gradient Extrapolate",
+    description: "Continues a colour gradient past the edge.",
+  },
+  frequency_separated: {
+    label: "Frequency Separated",
+    description: "Extends the edge by separating smooth colour from fine detail.",
+  },
 } as const;
 
 export default function JobDetails() {
@@ -171,7 +179,6 @@ export default function JobDetails() {
   const [bleedPreview, setBleedPreview] = useState<BleedPreviewData | null>(null);
   const [bleedPreviewLoading, setBleedPreviewLoading] = useState(false);
   const [bleedPreviewError, setBleedPreviewError] = useState<string | null>(null);
-  const [bleedPreviewPage, setBleedPreviewPage] = useState(0);
   const [bleedChecked, setBleedChecked] = useState(false);
   const [comparisonChecked, setComparisonChecked] = useState(false);
   const [phaseOverride, setPhaseOverride] = useState<number | null>(null);
@@ -350,7 +357,7 @@ export default function JobDetails() {
     setBleedPreview(null);
     setBleedPreviewLoading(false);
     setBleedPreviewError(null);
-    setBleedPreviewPage(0);
+    setProofPage(0);
     setBleedChecked(false);
     setComparisonChecked(false);
     setPhaseOverride(null);
@@ -950,7 +957,7 @@ export default function JobDetails() {
       }
       const data = await res.json();
       setBleedPreview(data);
-      setBleedPreviewPage(0);
+      setProofPage(0);
     } catch (err: any) {
       setBleedPreviewError(err.message);
     } finally {
@@ -1004,7 +1011,7 @@ export default function JobDetails() {
     : `/api/jobs/${job.id}/download-bundle?strategy=${encodeURIComponent(selectedBleedMethod)}`;
   const pressDownloadName = quickPressReady ? "Print Ready Artwork.pdf" : "Print Ready Artwork.zip";
 
-  const currentBleedPage = bleedPreview?.previewUrls?.[bleedPreviewPage];
+  const currentBleedPage = bleedPreview?.previewUrls?.[proofPage] || bleedPreview?.previewUrls?.[0];
 
   const isFailed = job.status === "failed";
   const hasUserSelectedBleed = selectedBleedMethod !== "auto";
@@ -1580,10 +1587,8 @@ export default function JobDetails() {
                         trimWidthMm={Number((job.auditResults as { savedBleedOptions?: { targetWidth?: number } }).savedBleedOptions?.targetWidth) || 148}
                         trimHeightMm={Number((job.auditResults as { savedBleedOptions?: { targetHeight?: number } }).savedBleedOptions?.targetHeight) || 210}
                       />
-                      <details className="text-sm" data-testid="advanced-bleed-size">
-                        <summary className="cursor-pointer text-xs text-muted-foreground">
-                          Advanced bleed size. A normal Flyerz job stays at 5 mm.
-                        </summary>
+                      <div className="text-sm space-y-2" data-testid="advanced-bleed-size">
+                        <p className="text-xs text-muted-foreground">Bleed size. A normal Flyerz job stays at 5 mm.</p>
                         <BleedSizeControl
                           value={bleedMm}
                           disabled={bleedMethodLoading || bleedPreviewLoading}
@@ -1602,7 +1607,7 @@ export default function JobDetails() {
                             });
                           }}
                         />
-                      </details>
+                      </div>
                       <BleedMethodSelector
                         jobId={job.id}
                         variants={job.auditResults.bleedVariants ?? {}}
@@ -1613,8 +1618,11 @@ export default function JobDetails() {
                         colourBorder={colourBorder}
                         onColourBorderChange={handleColourBorderChange}
                         pressEngine={job.auditResults.pressEngine}
-                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof` : null}
-                        afterUrl={bleedPreview?.previewUrls?.[0]?.url || null}
+                        beforeUrl={job.auditResults?.proofPath ? `/api/jobs/${job.id}/proof?page=${proofPage}` : null}
+                        afterUrl={bleedPreview?.previewUrls?.[proofPage]?.url || bleedPreview?.previewUrls?.[0]?.url || null}
+                        proofPage={proofPage}
+                        onProofPage={setProofPage}
+                        variantPages={(job.auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages}
                         pressDownloadHref={quickPressReady ? pressDownloadHref : null}
                       />
                     </div>
@@ -1671,8 +1679,8 @@ export default function JobDetails() {
                       bleedPreview={bleedPreview}
                       bleedPreviewLoading={bleedPreviewLoading}
                       bleedPreviewError={bleedPreviewError}
-                      bleedPreviewPage={bleedPreviewPage}
-                      setBleedPreviewPage={setBleedPreviewPage}
+                      bleedPreviewPage={proofPage}
+                      setBleedPreviewPage={setProofPage}
                       currentBleedPage={currentBleedPage}
                       loadBleedPreview={loadBleedPreview}
                       enhancementLoading={aiEnhanceLoading}
@@ -2756,7 +2764,7 @@ function PhaseChecklist({ checks, jobId, filename }: { checks: any[]; jobId?: nu
   );
 }
 
-function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref }: {
+function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect, loading, colourBorder, onColourBorderChange, pressEngine, beforeUrl, afterUrl, pressDownloadHref, proofPage = 0, onProofPage, variantPages }: {
   jobId: number;
   variants: Record<string, string>;
   recommended: string | null;
@@ -2777,6 +2785,9 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
   beforeUrl?: string | null;
   afterUrl?: string | null;
   pressDownloadHref?: string | null;
+  proofPage?: number;
+  onProofPage?: (page: number) => void;
+  variantPages?: Record<string, string[]> | null;
 }) {
   /** Automatic is the default. The older styles stay as manual overrides. */
   const methods = ["auto", ...BLEED_STRATEGY_IDS];
@@ -2809,10 +2820,10 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
         >
           {methods.map((method) => {
             const info = BLEED_METHOD_LABELS[method as keyof typeof BLEED_METHOD_LABELS];
-            const isRecommended = method === "auto" || method === recommended;
+            void recommended;
             return (
               <option key={method} value={method} data-testid={`option-bleed-method-${method}`}>
-                {info?.label ?? method}{method === "auto" ? "" : isRecommended && method === recommended ? " (manual)" : ""}
+                {info?.label ?? method}
               </option>
             );
           })}
@@ -2854,6 +2865,21 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
         )}
         {activeMethod && activeMethod !== "auto" && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
+            {(variantPages?.[activeMethod]?.length || 0) > 1 && (
+              <div className="flex items-center gap-2 flex-wrap p-2" data-testid="style-page-selector">
+                {variantPages?.[activeMethod]?.map((_, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    className={`text-xs px-2 py-1 rounded border ${proofPage === index ? "bg-primary text-primary-foreground" : "bg-background"}`}
+                    onClick={() => onProofPage?.(index)}
+                    data-testid={`button-style-page-${index + 1}`}
+                  >
+                    Page {index + 1}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="aspect-[16/9]">
               {activeMethod === "colourBorder" ? (
               <img
@@ -2864,7 +2890,7 @@ function BleedMethodSelector({ jobId, variants, recommended, selected, onSelect,
               />
               ) : variants[activeMethod] ? (
               <img
-                src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}`}
+                src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}?page=${proofPage || 0}`}
                 alt={activeInfo?.label || activeMethod}
                 className="w-full h-full object-contain"
                 data-testid={`img-bleed-variant-${activeMethod}`}

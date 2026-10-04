@@ -21,6 +21,7 @@ import { ArtworkThumbnail } from "@/components/artwork-thumbnail";
 import { useBeta } from "@/lib/beta-flag";
 import { optimizeImageViaWorker } from "@/lib/optimize-worker-client";
 import { ARTWORK_DROPZONE_ACCEPT, ARTWORK_TYPE_LABEL, isIllustratorFile } from "@/lib/accepted-artwork";
+import { PDFDocument } from "pdf-lib";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -41,6 +42,17 @@ const KNOWN_SIZES: { key: string; label: string; w: number; h: number }[] = [
 ];
 
 function detectFileDimensions(file: globalThis.File): Promise<{ w: number; h: number; pxW: number; pxH: number } | null> {
+  const pdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  if (pdf) {
+    return file.arrayBuffer().then(async (bytes) => {
+      const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const page = doc.getPage(0);
+      const size = page.getSize();
+      const w = Math.round((size.width / 72) * 25.4 * 10) / 10;
+      const h = Math.round((size.height / 72) * 25.4 * 10) / 10;
+      return { w, h, pxW: Math.round(size.width), pxH: Math.round(size.height) };
+    }).catch(() => null);
+  }
   return new Promise((resolve) => {
     if (file.type.startsWith("image/")) {
       const img = new Image();
@@ -588,7 +600,16 @@ export function FileUpload() {
       .then((data) => {
         if (!data) return;
         if (data.previewUrl) setStagedPreviewUrl(data.previewUrl);
-        if (illustrator) setArtboardCount(Number(data.pageCount) || 1);
+        const pdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+        if (illustrator || pdf) setArtboardCount(Number(data.pageCount) || 1);
+        if (Number(data.widthMm) > 0 && Number(data.heightMm) > 0) {
+          setOriginalDims({
+            w: Math.round(Number(data.widthMm) * 10) / 10,
+            h: Math.round(Number(data.heightMm) * 10) / 10,
+            pxW: Number(data.width) || 0,
+            pxH: Number(data.height) || 0,
+          });
+        }
       })
       .catch(() => {});
   }, [toast]);
@@ -939,7 +960,7 @@ export function FileUpload() {
                       }}
                       data-testid="button-artboard-all"
                     >
-                      All artboards
+                      {stagedFile && (stagedFile.type === "application/pdf" || stagedFile.name.toLowerCase().endsWith(".pdf")) ? "All pages" : "All artboards"}
                     </Button>
                     {Array.from({ length: artboardCount }, (_, index) => (
                       <Button
@@ -954,7 +975,7 @@ export function FileUpload() {
                         }}
                         data-testid={`button-artboard-${index + 1}`}
                       >
-                        Artboard {index + 1}
+                        {stagedFile && (stagedFile.type === "application/pdf" || stagedFile.name.toLowerCase().endsWith(".pdf")) ? `Page ${index + 1}` : `Artboard ${index + 1}`}
                       </Button>
                     ))}
                   </div>

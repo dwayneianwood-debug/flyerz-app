@@ -1204,9 +1204,20 @@ def scan_and_fix_qr_codes(pdf_path: str, output_path: str) -> dict:
                     result["qr_count"] += 1
 
                     if not is_readable:
-                        result["qr_unreadable"] += 1
-                        result["actions"].append(f"Page {page_idx+1}: QR code detected but unreadable (damaged or too blurry)")
-                        continue
+                        qr_crop = img_array[y_min:y_max, x_min:x_max]
+                        if qr_crop.size > 0 and min(qr_crop.shape[:2]) >= 8:
+                            big = cv2.resize(qr_crop, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+                            v_ret, v_info, _, _ = cv_detector.detectAndDecodeMulti(cv2.cvtColor(big, cv2.COLOR_RGB2BGR))
+                            if v_ret and v_info:
+                                for vi in v_info:
+                                    if vi:
+                                        decoded_str = vi
+                                        is_readable = True
+                                        break
+                        if not is_readable:
+                            result["qr_unreadable"] += 1
+                            result["actions"].append(f"Page {page_idx+1}: QR code detected but unreadable (damaged or too blurry)")
+                            continue
 
                     result["decoded_data"].append(decoded_str)
                     qr_entries.append({
@@ -1291,10 +1302,12 @@ def scan_and_fix_qr_codes(pdf_path: str, output_path: str) -> dict:
                                 break
 
                 if not verify_ok:
+                    # The code already decoded. A failed cosmetic repair is not an integrity failure.
                     sys.stderr.write(f"[QR] WARNING: post-fix verification failed on page {page_idx+1}, reverting\n")
                     img_array[qz_y1:qz_y2, qz_x1:qz_x2] = orig_array[qz_y1:qz_y2, qz_x1:qz_x2]
-                    result["qr_unreadable"] += 1
-                    result["actions"].append(f"Page {page_idx+1}: QR fix reverted (post-fix verification failed)")
+                    result["actions"].append(
+                        f"Page {page_idx+1}: QR code was readable, so a failed sharpen was left unchanged"
+                    )
                     continue
 
                 qr_fixed_count += 1
@@ -7496,10 +7509,22 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
 
     return {
         "paths": variant_paths,
+        "pages": [variant_paths],
         "recommended": recommended,
         "autoStrategies": auto_strategies,
         "safetyStatus": safety_status,
     }
+
+
+def _variant_pages_by_method(variant_result: dict) -> dict:
+    """method -> [page 1 path, page 2 path, ...]. Page 1 stays in bleedVariants too."""
+    paths = variant_result.get("paths") or {}
+    pages = variant_result.get("pages") or ([paths] if paths else [])
+    by_method = {}
+    for page_paths in pages:
+        for method, vpath in (page_paths or {}).items():
+            by_method.setdefault(method, []).append(vpath)
+    return by_method
 
 
 def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: dict = None) -> dict:
@@ -7985,6 +8010,7 @@ def apply_smart_bleed_to_image(input_path: str, output_path: str, bleed_opts: di
     }
     if variant_result.get("paths"):
         result["bleedVariants"] = variant_result["paths"]
+        result["bleedVariantPages"] = _variant_pages_by_method(variant_result)
         result["recommendedBleedMethod"] = variant_result.get("recommended", "stretch")
     if safety_status_val:
         result["rightSafety"] = safety_status_val
@@ -9055,29 +9081,43 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
             if len(variant_doc) == 0:
                 variant_doc.close()
                 return {}
-            page = variant_doc[0]
             variant_dpi = min(dpi, 150)
             mat = fitz.Matrix(variant_dpi / 72.0, variant_dpi / 72.0)
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
-            pix.set_dpi(variant_dpi, variant_dpi)
-            total_pixels = pix.width * pix.height
-            if total_pixels > 40_000_000:
-                sys.stderr.write(f"[BLEED] Variant raster too large ({pix.width}x{pix.height}={total_pixels}px), skipping\n")
-                del pix
-                variant_doc.close()
-                return {}
-            img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
-            alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
-            rgb_ch = img_rgba[:, :, :3].astype(np.float32)
-            white_bg = np.full_like(rgb_ch, 255.0)
-            composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
-            img_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
-            del pix, img_rgba, composited
-            variant_doc.close()
             output_base = os.path.splitext(output_path)[0]
-            vr = generate_bleed_variants(img_bgr, variant_dpi, output_base, ".png")
-            del img_bgr
-            return vr
+            page_paths = []
+            recommended = "stretch"
+            safety = "SAFE"
+            for page_index in range(len(variant_doc)):
+                page = variant_doc[page_index]
+                pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
+                pix.set_dpi(variant_dpi, variant_dpi)
+                total_pixels = pix.width * pix.height
+                if total_pixels > 40_000_000:
+                    sys.stderr.write(f"[BLEED] Variant raster too large ({pix.width}x{pix.height}={total_pixels}px), skipping\n")
+                    del pix
+                    variant_doc.close()
+                    return {}
+                img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+                alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
+                rgb_ch = img_rgba[:, :, :3].astype(np.float32)
+                white_bg = np.full_like(rgb_ch, 255.0)
+                composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
+                img_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
+                del pix, img_rgba, composited
+                page_base = output_base if page_index == 0 else f"{output_base}_page{page_index + 1}"
+                vr = generate_bleed_variants(img_bgr, variant_dpi, page_base, ".png")
+                del img_bgr
+                page_paths.append(vr.get("paths") or {})
+                recommended = vr.get("recommended", recommended)
+                safety = vr.get("safetyStatus", safety)
+            variant_doc.close()
+            return {
+                "paths": page_paths[0] if page_paths else {},
+                "pages": page_paths,
+                "pageCount": len(page_paths),
+                "recommended": recommended,
+                "safetyStatus": safety,
+            }
         except Exception as e:
             sys.stderr.write(f"[BLEED] PDF variant generation failed: {e}\n")
             return {}
@@ -9136,6 +9176,7 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
         result["criticalSafeZone"] = True
     if variant_result.get("paths"):
         result["bleedVariants"] = variant_result["paths"]
+        result["bleedVariantPages"] = _variant_pages_by_method(variant_result)
         result["recommendedBleedMethod"] = variant_result.get("recommended", "stretch")
     if safety_status_val:
         result["rightSafety"] = safety_status_val

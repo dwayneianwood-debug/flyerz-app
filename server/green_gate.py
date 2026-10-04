@@ -174,23 +174,40 @@ def _boxes(path: str, trim_w: float, trim_h: float) -> dict:
     return _item("boxes", "Trim, bleed and media boxes are correct", ok, detail)
 
 
+def _content_xrefs(page) -> list[int]:
+    """Artwork images. A grey soft mask is not the press picture."""
+    full = page.get_images(full=True) or []
+    masks = set()
+    for item in full:
+        if len(item) > 1 and int(item[1] or 0) > 0:
+            masks.add(int(item[1]))
+    xrefs = []
+    for item in full:
+        xref = int(item[0])
+        if xref in masks:
+            continue
+        xrefs.append(xref)
+    return xrefs
+
+
 def _colour(path: str) -> tuple[dict, dict]:
     import pymupdf as fitz
 
     doc = fitz.open(path)
     try:
-        page = doc[0]
-        images = page.get_images() or []
+        images = []
         spaces = []
         tac = 0.0
         saw_cmyk = False
-        for image in images:
-            info = doc.extract_image(image[0])
-            space = int(info.get("colorspace") or 0)
-            spaces.append(space)
-            if space == 4:
-                saw_cmyk = True
-                tac = max(tac, _tac(info.get("image") or b""))
+        for page in doc:
+            for xref in _content_xrefs(page):
+                images.append(xref)
+                info = doc.extract_image(xref)
+                space = int(info.get("colorspace") or 0)
+                spaces.append(space)
+                if space == 4:
+                    saw_cmyk = True
+                    tac = max(tac, _tac(info.get("image") or b""))
     finally:
         doc.close()
     if not images:
@@ -304,29 +321,65 @@ def _safe_zone(path: str, trim_w: float, trim_h: float, context: dict) -> tuple[
     return _item("safe", "No text or key content within 3 mm of the trim", True, ""), False
 
 
+def _glyph_words(page) -> list[tuple]:
+    """One box per word from the glyph outlines, not the font's em box."""
+    import pymupdf as fitz
+
+    groups = []
+    try:
+        traces = page.get_texttrace() or []
+    except Exception:
+        traces = []
+    for span in traces:
+        current = []
+        for char in span.get("chars") or ():
+            if not isinstance(char, (tuple, list)) or len(char) < 4:
+                continue
+            try:
+                ucs = int(char[0])
+                box = fitz.Rect(char[3])
+            except Exception:
+                continue
+            if ucs <= 32:
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+            current.append((chr(ucs), box))
+        if current:
+            groups.append(current)
+    words = []
+    for group in groups:
+        text = "".join(char for char, _box in group).strip()
+        if not text:
+            continue
+        rect = fitz.Rect(group[0][1])
+        for _char, box in group[1:]:
+            rect |= box
+        words.append((rect, text))
+    return words
+
+
 def _pdf_text_edge(path: str, trim_w: float, trim_h: float) -> tuple[list, list]:
     import pymupdf as fitz
 
+    safe = SAFE_MM * 72.0 / 25.4
+    slack = 0.2 * 72.0 / 25.4
+    over, near = [], []
     doc = fitz.open(path)
     try:
-        page = doc[0]
-        words = page.get_text("words") or []
-        trim = page.trimbox
+        for page in doc:
+            trim = page.trimbox
+            inner = fitz.Rect(trim.x0 + safe, trim.y0 + safe, trim.x1 - safe, trim.y1 - safe)
+            grown = fitz.Rect(trim.x0 - slack, trim.y0 - slack, trim.x1 + slack, trim.y1 + slack)
+            for rect, text in _glyph_words(page):
+                if not grown.contains(rect):
+                    over.append(text)
+                    continue
+                if not inner.contains(rect):
+                    near.append(text)
     finally:
         doc.close()
-    safe = SAFE_MM * 72.0 / 25.4
-    over, near = [], []
-    for word in words:
-        x0, y0, x1, y1, text = word[:5]
-        if not str(text).strip():
-            continue
-        rect = fitz.Rect(x0, y0, x1, y1)
-        if not trim.contains(rect):
-            over.append(str(text))
-            continue
-        inner = fitz.Rect(trim.x0 + safe, trim.y0 + safe, trim.x1 - safe, trim.y1 - safe)
-        if not inner.contains(rect):
-            near.append(str(text))
     return over[:8], near[:8]
 
 

@@ -34,6 +34,43 @@ MIN_HONEST_EFFECTIVE_DPI = 240.0
 TAC_LIMIT = 300.0
 MM_TO_PT = 72.0 / 25.4
 
+
+def inferred_side_bleed(
+    page_w_mm: float,
+    page_h_mm: float,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    lo: float = 2.0,
+    hi: float = 6.0,
+    trim_tol: float = 2.5,
+):
+    """Per-side bleed when the page is the trim, or the trim plus 2–6 mm already there.
+
+    A Canva page often has no TrimBox. The extra millimetres on each side are the
+    bleed that is already in the file. None means the page is a different shape.
+    """
+    extra_w = float(page_w_mm) - float(trim_w_mm)
+    extra_h = float(page_h_mm) - float(trim_h_mm)
+    side_w = extra_w / 2.0
+    side_h = extra_h / 2.0
+    if (lo - 0.05) <= side_w <= (hi + 0.05) and (lo - 0.05) <= side_h <= (hi + 0.05):
+        return {
+            "left": side_w,
+            "right": side_w,
+            "top": side_h,
+            "bottom": side_h,
+            "kind": "existing",
+        }
+    if abs(extra_w) <= trim_tol and abs(extra_h) <= trim_tol:
+        return {
+            "left": max(0.0, side_w),
+            "right": max(0.0, side_w),
+            "top": max(0.0, side_h),
+            "bottom": max(0.0, side_h),
+            "kind": "trim",
+        }
+    return None
+
 SIDES = ("top", "bottom", "left", "right")
 CHAIN = {
     "flat": ("colour", "replicate", "stretch"),
@@ -118,6 +155,11 @@ def replicate_available() -> bool:
 
 
 def replicate_note() -> str:
+    """Local fill unless Real-ESRGAN is explicitly on. Do not contact Replicate otherwise."""
+    from host_paths import esrgan_enabled
+
+    if not esrgan_enabled():
+        return "Real-ESRGAN is off, so nothing was sent to Replicate."
     if not (os.environ.get("REPLICATE_API_TOKEN") or "").strip():
         return "No Replicate token, so the fill was done on this computer."
     if replicate_available():
@@ -876,6 +918,22 @@ def fitz_rect(x0, y0, x1, y1):
     return fitz.Rect(x0, y0, x1, y1)
 
 
+def _content_image_xrefs(doc, page) -> list:
+    """Image xrefs that are the artwork. A soft-mask grey is not one of them."""
+    full = page.get_images(full=True) or []
+    masks = set()
+    for item in full:
+        if len(item) > 1 and int(item[1] or 0) > 0:
+            masks.add(int(item[1]))
+    xrefs = []
+    for item in full:
+        xref = int(item[0])
+        if xref in masks:
+            continue
+        xrefs.append(xref)
+    return xrefs
+
+
 def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float, report: dict, require_text: str = "") -> dict:
     import pymupdf as fitz
 
@@ -907,11 +965,11 @@ def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float
     text = page.get_text("text") or ""
     if require_text and require_text not in text:
         failures.append("The original text is no longer in the file.")
-    images = page.get_images()
+    images = _content_image_xrefs(doc, page)
     if images:
-        info = doc.extract_image(images[0][0])
+        info = doc.extract_image(images[0])
         if info.get("colorspace") not in (4, "CMYK", None) and info.get("cs-name") not in ("DeviceCMYK", None):
-            # PyMuPDF uses numeric colorspace 4 for CMYK.
+            # PyMuPDF uses numeric colorspace 4 for CMYK. Soft-mask greys are not the picture.
             if info.get("colorspace") != 4 and "CMYK" not in str(info.get("cs-name", "")):
                 failures.append("The press file is not CMYK.")
     elif report.get("contentKind") != "vector":
@@ -1011,6 +1069,112 @@ def _page_proxy(page, max_px: int = 500) -> np.ndarray:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
+def _pixmap_rgb(page, clip):
+    import pymupdf as fitz
+
+    if clip is None or clip.width < 0.4 or clip.height < 0.4:
+        return None
+    pix = page.get_pixmap(matrix=fitz.Matrix(300.0 / 72.0, 300.0 / 72.0), clip=clip, alpha=False, colorspace=fitz.csRGB)
+    if pix.width < 1 or pix.height < 1:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    return np.ascontiguousarray(arr[:, :, :3])
+
+
+def _insert_rgb(page, rgb, rect) -> None:
+    if rgb is None or rect is None or rect.width < 0.3 or rect.height < 0.3:
+        return
+    target_w = max(1, int(round(rect.width / 72.0 * 300.0)))
+    target_h = max(1, int(round(rect.height / 72.0 * 300.0)))
+    if rgb.shape[1] != target_w or rgb.shape[0] != target_h:
+        rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(rgb), "RGB").convert("CMYK").save(buf, format="TIFF", dpi=(300, 300))
+    page.insert_image(rect, stream=buf.getvalue())
+
+
+def _paint_margin(dest_page, src_page, src_clip, placed) -> None:
+    """Mirror each edge of the placed art into the margin around it."""
+    import pymupdf as fitz
+
+    full = dest_page.rect
+    gaps = {
+        "left": max(0.0, placed.x0 - full.x0),
+        "right": max(0.0, full.x1 - placed.x1),
+        "top": max(0.0, placed.y0 - full.y0),
+        "bottom": max(0.0, full.y1 - placed.y1),
+    }
+
+    def sample(clip, flip_x: bool, flip_y: bool):
+        rgb = _pixmap_rgb(src_page, clip)
+        if rgb is None:
+            return None
+        if flip_x:
+            rgb = rgb[:, ::-1]
+        if flip_y:
+            rgb = rgb[::-1, :]
+        return np.ascontiguousarray(rgb)
+
+    take_l = min(gaps["left"], src_clip.width)
+    take_r = min(gaps["right"], src_clip.width)
+    take_t = min(gaps["top"], src_clip.height)
+    take_b = min(gaps["bottom"], src_clip.height)
+    if gaps["left"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x0 + take_l, src_clip.y1), True, False)
+        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, placed.y0, placed.x0, placed.y1))
+    if gaps["right"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y0, src_clip.x1, src_clip.y1), True, False)
+        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, placed.y0, full.x1, placed.y1))
+    if gaps["top"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x1, src_clip.y0 + take_t), False, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0))
+    if gaps["bottom"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y1 - take_b, src_clip.x1, src_clip.y1), False, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x0, placed.y1, placed.x1, full.y1))
+    if gaps["left"] > 0.4 and gaps["top"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y0, src_clip.x0 + take_l, src_clip.y0 + take_t), True, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, full.y0, placed.x0, placed.y0))
+    if gaps["right"] > 0.4 and gaps["top"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y0, src_clip.x1, src_clip.y0 + take_t), True, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, full.y0, full.x1, placed.y0))
+    if gaps["left"] > 0.4 and gaps["bottom"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x0, src_clip.y1 - take_b, src_clip.x0 + take_l, src_clip.y1), True, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(full.x0, placed.y1, placed.x0, full.y1))
+    if gaps["right"] > 0.4 and gaps["bottom"] > 0.4:
+        rgb = sample(fitz.Rect(src_clip.x1 - take_r, src_clip.y1 - take_b, src_clip.x1, src_clip.y1), True, True)
+        _insert_rgb(dest_page, rgb, fitz.Rect(placed.x1, placed.y1, full.x1, full.y1))
+
+
+def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:
+    """Box inset when a TrimBox exists, otherwise the size match when every box is equal."""
+    media = page.mediabox
+    trim = page.trimbox if page.trimbox.width > 2 and page.trimbox.height > 2 else media
+    boxes_differ = abs(trim.width - media.width) >= 1.5 or abs(trim.height - media.height) >= 1.5
+    if boxes_differ:
+        existing = {
+            "left": max(0.0, (trim.x0 - media.x0) * 25.4 / 72.0),
+            "bottom": max(0.0, (trim.y0 - media.y0) * 25.4 / 72.0),
+            "right": max(0.0, (media.x1 - trim.x1) * 25.4 / 72.0),
+            "top": max(0.0, (media.y1 - trim.y1) * 25.4 / 72.0),
+        }
+        trim_w = trim.width * 25.4 / 72.0
+        trim_h = trim.height * 25.4 / 72.0
+        if min(existing.values()) >= 1.5 and abs(trim_w - trim_w_mm) <= 2.0 and abs(trim_h - trim_h_mm) <= 2.0:
+            return existing, "boxes"
+        return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
+    page_w = media.width * 25.4 / 72.0
+    page_h = media.height * 25.4 / 72.0
+    bleed = inferred_side_bleed(page_w, page_h, trim_w_mm, trim_h_mm)
+    if bleed and bleed.get("kind") == "existing":
+        return {side: float(bleed[side]) for side in ("left", "right", "top", "bottom")}, "partial"
+    if bleed and bleed.get("kind") == "trim":
+        return {side: float(bleed[side]) for side in ("left", "right", "top", "bottom")}, "trim"
+    return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
+
+
 def compile_vector_press(
     src_path: str,
     out_path: str,
@@ -1041,17 +1205,20 @@ def compile_vector_press(
         open_path = prepared.get("pdfPath") or src_path
 
     src = fitz.open(open_path)
+    if src.page_count < 1:
+        src.close()
+        return {
+            "used": False,
+            "report": {
+                "passed": False,
+                "status": "needs-attention",
+                "headline": "Needs attention",
+                "reason": "The PDF has no pages.",
+                "fix": "Upload the file again.",
+                "edges": [],
+            },
+        }
     page = src[0]
-    media = page.mediabox
-    trim = page.trimbox
-    trim_w_pt = trim.width
-    trim_h_pt = trim.height
-    existing = {
-        "left": max(0.0, (trim.x0 - media.x0) * 25.4 / 72.0),
-        "bottom": max(0.0, (trim.y0 - media.y0) * 25.4 / 72.0),
-        "right": max(0.0, (media.x1 - trim.x1) * 25.4 / 72.0),
-        "top": max(0.0, (media.y1 - trim.y1) * 25.4 / 72.0),
-    }
     text = page.get_text("text") or ""
     images = page.get_images()
     if text.strip() and images:
@@ -1070,67 +1237,73 @@ def compile_vector_press(
     out_h = (trim_h_mm + 2 * bleed_mm) * MM_TO_PT
     bleed_pt = bleed_mm * MM_TO_PT
     doc = fitz.open()
-    new_page = doc.new_page(width=out_w, height=out_h)
-    # Background from the sampled edge colours, in CMYK, only as the page fill.
-    # The original page is placed on top, still as vectors.
-    colour = _median_bgr(proxy)
-    # RGB here is only the under-colour. Ghostscript turns the page into CMYK and leaves the text in place.
-    r = int(colour[2]) / 255.0
-    g = int(colour[1]) / 255.0
-    b = int(colour[0]) / 255.0
-    new_page.draw_rect(new_page.rect, color=None, fill=(r, g, b), fill_opacity=1)
-    have = min(existing.values()) if existing else 0
-    trim_matches = abs(trim_w_pt * 25.4 / 72.0 - trim_w_mm) <= 2 and abs(trim_h_pt * 25.4 / 72.0 - trim_h_mm) <= 2
-    dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
-    if trim_matches and have + 0.4 >= bleed_mm:
-        # Place the existing trim-plus-bleed, clipped to the requested bleed. Do not add another ring.
-        clip = fitz.Rect(
-            trim.x0 - bleed_mm * MM_TO_PT,
-            trim.y0 - bleed_mm * MM_TO_PT,
-            trim.x1 + bleed_mm * MM_TO_PT,
-            trim.y1 + bleed_mm * MM_TO_PT,
-        )
-        new_page.show_pdf_page(new_page.rect, src, 0, clip=clip)
+    kept = False
+    extended = False
+    shrunk = False
+    for index in range(src.page_count):
+        src_page = src[index]
+        new_page = doc.new_page(width=out_w, height=out_h)
+        existing, mode = _vector_page_bleed(src_page, trim_w_mm, trim_h_mm)
+        have = min(existing.values()) if existing else 0.0
+        trim_box = src_page.trimbox if src_page.trimbox.width > 2 else src_page.mediabox
+        if mode == "boxes" and have + 0.4 >= bleed_mm:
+            # Already 5 mm. Clip to that bleed. Do not add another ring and do not shrink.
+            clip = fitz.Rect(
+                trim_box.x0 - bleed_mm * MM_TO_PT,
+                trim_box.y0 - bleed_mm * MM_TO_PT,
+                trim_box.x1 + bleed_mm * MM_TO_PT,
+                trim_box.y1 + bleed_mm * MM_TO_PT,
+            )
+            new_page.show_pdf_page(new_page.rect, src, index, clip=clip)
+            kept = True
+        elif mode in ("partial", "boxes") and have >= 2.0:
+            # Keep the bleed that is already there. Mirror only the shortfall out to 5 mm.
+            extra_l = max(0.0, existing["left"] * MM_TO_PT - bleed_pt)
+            extra_r = max(0.0, existing["right"] * MM_TO_PT - bleed_pt)
+            extra_t = max(0.0, existing["top"] * MM_TO_PT - bleed_pt)
+            extra_b = max(0.0, existing["bottom"] * MM_TO_PT - bleed_pt)
+            src_rect = src_page.rect
+            clip = fitz.Rect(
+                src_rect.x0 + extra_l,
+                src_rect.y0 + extra_t,
+                src_rect.x1 - extra_r,
+                src_rect.y1 - extra_b,
+            )
+            short_l = max(0.0, bleed_pt - existing["left"] * MM_TO_PT)
+            short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
+            placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
+            _paint_margin(new_page, src_page, clip, placed)
+            new_page.show_pdf_page(placed, src, index, clip=clip)
+            extended = True
+        else:
+            dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
+            scale = 1.0
+            if analysis.get("safeHits", 0) > 0:
+                scale = 1.0 - min(SAFE_ZONE_SHRINK_CAP, 0.02)
+                shrunk = scale < 0.999
+            placed = dest
+            if scale < 0.999:
+                margin_x = dest.width * (1 - scale) / 2
+                margin_y = dest.height * (1 - scale) / 2
+                placed = fitz.Rect(dest.x0 + margin_x, dest.y0 + margin_y, dest.x1 - margin_x, dest.y1 - margin_y)
+            src_trim = src_page.rect
+            if abs(trim_box.width - src_page.mediabox.width) >= 1.5 or abs(trim_box.height - src_page.mediabox.height) >= 1.5:
+                src_trim = trim_box
+            cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
+            clip_w = placed.width / cover
+            clip_h = placed.height / cover
+            clip = fitz.Rect(
+                src_trim.x0 + (src_trim.width - clip_w) / 2,
+                src_trim.y0 + (src_trim.height - clip_h) / 2,
+                src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
+                src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
+            )
+            _paint_margin(new_page, src_page, clip, placed)
+            new_page.show_pdf_page(placed, src, index, clip=clip)
+        _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
+    if kept and not extended:
         edges = _edge_lines(analysis, methods, kept=True)
-        kept = True
-    else:
-        scale = 1.0
-        if analysis.get("safeHits", 0) > 0:
-            scale = 1.0 - min(SAFE_ZONE_SHRINK_CAP, 0.02)
-        placed = dest
-        if scale < 0.999:
-            margin_x = dest.width * (1 - scale) / 2
-            margin_y = dest.height * (1 - scale) / 2
-            placed = fitz.Rect(dest.x0 + margin_x, dest.y0 + margin_y, dest.x1 - margin_x, dest.y1 - margin_y)
-        # Cover: clip the source trim so the placed art fills the trim.
-        src_trim = trim if trim.width > 2 and trim.height > 2 else page.rect
-        cover = max(placed.width / max(src_trim.width, 1), placed.height / max(src_trim.height, 1))
-        clip_w = placed.width / cover
-        clip_h = placed.height / cover
-        clip = fitz.Rect(
-            src_trim.x0 + (src_trim.width - clip_w) / 2,
-            src_trim.y0 + (src_trim.height - clip_h) / 2,
-            src_trim.x0 + (src_trim.width - clip_w) / 2 + clip_w,
-            src_trim.y0 + (src_trim.height - clip_h) / 2 + clip_h,
-        )
-        new_page.show_pdf_page(placed, src, 0, clip=clip)
-        kept = False
-        # Photo edges get a raster ring in the bleed only, under the vectors.
-        if any(edge["kind"] in ("photo", "pattern") for edge in analysis["edges"].values()):
-            ring = extend_trim(cover_scale(proxy, max(32, int(trim_w_mm * 4)), max(32, int(trim_h_mm * 4))), max(4, int(bleed_mm * 4)), analysis)[0]
-            # The ring image is only a guide sitting full-page behind; vectors were already placed.
-            # Rebuild order: background image first, then vectors. Recreate the page.
-            doc.close()
-            doc = fitz.open()
-            new_page = doc.new_page(width=out_w, height=out_h)
-            import io
-            from PIL import Image
-            rgb = cv2.cvtColor(ring, cv2.COLOR_BGR2RGB)
-            buf = io.BytesIO()
-            Image.fromarray(rgb).convert("CMYK").save(buf, format="TIFF")
-            new_page.insert_image(new_page.rect, stream=buf.getvalue())
-            new_page.show_pdf_page(placed, src, 0, clip=clip)
-    _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
+    page_count = src.page_count
     raw_path = out_path + ".raw.pdf"
     doc.save(raw_path, deflate=True, garbage=4)
     doc.close()
@@ -1151,22 +1324,24 @@ def compile_vector_press(
     fixed.close()
     os.replace(boxed, out_path)
 
+    full_keep = kept and not extended
     rescue = {
-        "applied": (not kept) and analysis.get("safeHits", 0) > 0,
-        "scale": 0.98 if analysis.get("safeHits", 0) > 0 and not kept else 1.0,
+        "applied": shrunk,
+        "scale": 0.98 if shrunk else 1.0,
         "safeZoneMm": safe_zone_mm,
         "note": "Text and vectors were kept live." if kind != "raster" else "The picture stays as placed. Only the bleed ring was added.",
     }
-    report = _base_report(analysis, edges, kept, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
+    report = _base_report(analysis, edges, full_keep, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
     report["contentKind"] = kind
     report["analysis"]["contentKind"] = kind
-    report["existingBleed"] = kept
+    report["existingBleed"] = full_keep
     report["rescue"] = rescue
+    report["pageCount"] = page_count
     report["effectiveDpi"] = 300
     report["resolutionNote"] = "Vector artwork stays sharp at any size." if kind == "vector" else "The placed artwork was kept. The bleed ring is 300 DPI."
     report["allowWhite"] = False
     report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="")
-    return {"used": True, "report": report, "path": out_path}
+    return {"used": True, "report": report, "path": out_path, "pageCount": page_count}
 
 
 def summary_sentence(report: dict) -> str:
