@@ -8,7 +8,15 @@ import tempfile
 
 from PIL import Image
 
-from green_gate import CUT_MESSAGE, MISSING_MESSAGE, PROPORTION_MESSAGE, assess, client_message
+from green_gate import (
+    CUT_MESSAGE,
+    DECORATIVE_REASON,
+    MISSING_MESSAGE,
+    PROPORTION_MESSAGE,
+    SMALL_PICTURE_REASON,
+    assess,
+    client_message,
+)
 from quick_print import decide_light, make_print_ready
 
 
@@ -244,6 +252,92 @@ def test_sharpness_and_one_resample() -> None:
     check("sharp-soft", soft_items["sharp"]["passed"] is False, str(soft_items["sharp"]))
 
 
+def test_picture_text_is_not_green() -> None:
+    """Raster lettering is amber. Vector and retyped lines stay clear of that."""
+    import numpy as np
+
+    folder = tempfile.mkdtemp(prefix="gate-picture-")
+    path = os.path.join(folder, "page.pdf")
+    # A flat page is read as empty and turns the job red. This one has a picture.
+    rng = np.random.default_rng(2)
+    noisy = Image.fromarray(rng.integers(30, 200, (90, 120, 3), dtype=np.uint8), mode="RGB")
+    import io
+    import pymupdf as fitz
+
+    buffer = io.BytesIO()
+    noisy.save(buffer, format="JPEG", quality=80)
+    doc = fitz.open()
+    page = doc.new_page(width=120, height=90)
+    page.insert_image(page.rect, stream=buffer.getvalue())
+    doc.save(path)
+    doc.close()
+    place = {"artBox": [0, 0, 240, 80], "plate": [80, 240], "ppi": 600}
+    # The box covers the whole plate, so the line is far over 14 pt.
+    display = [{"text": "DISPLAY HEADING", "mode": "raster", "boxMm": [-5, -5, 100, 60]}]
+
+    def report_for(gate, source=None):
+        context = {"textGate": gate}
+        if source is not None:
+            context["sourceBgr"] = source
+            context["placement"] = place
+        report = assess(path, 90, 50, context)
+        return report, {item["id"]: item for item in report["items"]}
+
+    small = [{"text": "Boosts your body's defences", "mode": "raster", "boxMm": [2, 2, 30, 2.0]}]
+    report, items = report_for(small)
+    check(
+        "picture-small",
+        items["picturetext"]["passed"] is False and items["picturetext"]["detail"] == SMALL_PICTURE_REASON,
+        str(items.get("picturetext")),
+    )
+    check("picture-small-not-red", report["severity"] != "red", str(report["severity"]))
+    light = decide_light({"compiled": True, "enginePassed": True, "checklist": {"items": report["items"], "severity": report["severity"]}})
+    check(
+        "picture-small-amber",
+        light["light"] == "amber" and SMALL_PICTURE_REASON in light["reasons"] and light["clientMessage"] == "",
+        str(light),
+    )
+
+    vector = [{"text": "Boosts your body's defences", "mode": "vector", "ok": True, "boxMm": [2, 2, 30, 2.0]}]
+    _report, items = report_for(vector)
+    check("picture-vector", items["picturetext"]["passed"] is True, str(items["picturetext"]))
+    retyped = [{"text": "Boosts your body's defences", "mode": "vector", "retyped": True, "boxMm": [2, 2, 30, 2.0]}]
+    _report, items = report_for(retyped)
+    check("picture-retyped", items["picturetext"]["passed"] is True, str(items["picturetext"]))
+    icon = [{"text": "+", "mode": "raster", "boxMm": [2, 2, 2, 2]}]
+    _report, items = report_for(icon)
+    check("picture-icon", items["picturetext"]["passed"] is True, str(items["picturetext"]))
+
+    flat = np.full((80, 240, 3), 230, np.uint8)
+    flat[20:60, 30:210] = (25, 40, 30)
+    _report, items = report_for(display, flat)
+    check(
+        "picture-heading",
+        items["picturetext"]["passed"] is False and items["picturetext"]["detail"] == SMALL_PICTURE_REASON,
+        str(items.get("picturetext")),
+    )
+    check("picture-heading-not-decor", "decorative" not in items, str(items.get("decorative")))
+
+    gradient = np.full((80, 240, 3), 230, np.uint8)
+    for x in range(30, 210):
+        fade = (x - 30) / 180.0
+        gradient[20:60, x] = (20, int(30 + 140 * fade), int(25 + 20 * fade))
+    _report, items = report_for(display, gradient)
+    check(
+        "picture-decor",
+        items.get("decorative", {}).get("passed") is False and items["decorative"]["detail"] == DECORATIVE_REASON,
+        str(items.get("decorative")),
+    )
+    check("picture-decor-not-small", items["picturetext"]["passed"] is True, str(items.get("picturetext")))
+    sentence = [{"text": "A wide range of conditions today", "mode": "raster", "boxMm": [-5, -5, 100, 60]}]
+    _report, items = report_for(sentence, gradient)
+    check(
+        "picture-body-not-decor",
+        items["picturetext"]["passed"] is False and "decorative" not in items,
+        str(items.get("picturetext")) + str(items.get("decorative")),
+    )
+
+
 def test_esrgan_only_with_token() -> None:
     import numpy as np
 
@@ -267,6 +361,7 @@ def main() -> None:
     test_sharpen_keeps_the_hole()
     test_paint_and_ink_colour()
     test_sharpness_and_one_resample()
+    test_picture_text_is_not_green()
     test_esrgan_only_with_token()
     test_bled_pdf_explains_itself()
     test_blank_and_wrong_shape()

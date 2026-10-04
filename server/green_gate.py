@@ -63,6 +63,7 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
             severity = "red"
             message = client_message("cut")
         items.append(_lines(context))
+        items.extend(_picture_text(context, trim_w, trim_h))
         items.append(_letters(context))
         items.append(_paint_clean(press_path, context))
         items.append(_ink_colour(press_path, context))
@@ -354,6 +355,208 @@ def _lines(context: dict) -> dict:
         bad = weak
         detail = "A text line is still a soft picture."
     return _item("lines", "Every text line is vector, or a sharp picture", not bad, detail if bad else "")
+
+
+# A line this tall on the finished page, or under it, is small type.
+# The box height in points is the size this gate can see.
+PICTURE_PT = 14.0
+SMALL_PICTURE_REASON = "Small text is still part of the picture; designer to check it is sharp enough"
+DECORATIVE_REASON = "Decorative lettering left as the original picture"
+
+
+def _picture_text(context: dict, trim_w: float, trim_h: float) -> list:
+    """Picture lettering is not a green job.
+
+    Vector lines and retyped lines are left alone. A line at or under about
+    14 pt that stayed in the picture asks the designer to check it. A larger
+    heading that stayed in the picture does too, unless the ink is a gradient,
+    a glow, or a texture, which is decorative lettering left as the picture.
+    """
+    label = "Small or display lettering is not left as a soft picture"
+    small = False
+    decorative = False
+    for row in list(context.get("textGate") or []):
+        kind = _picture_kind(row, context, trim_w, trim_h)
+        if kind == "small":
+            small = True
+        elif kind == "decorative":
+            decorative = True
+    items = [_item("picturetext", label, not small, SMALL_PICTURE_REASON if small else "")]
+    if decorative:
+        items.append(_item("decorative", label, False, DECORATIVE_REASON))
+    return items
+
+
+def _picture_kind(row: dict, context: dict, trim_w: float, trim_h: float) -> str:
+    """'small', 'decorative', or '' when this line does not change the light."""
+    text = str(row.get("text") or "").strip()
+    if sum(1 for ch in text if ch.isalnum()) < 3:
+        return ""
+    if row.get("mode") == "vector" or row.get("retyped"):
+        return ""
+    points = _final_pt(row)
+    # Unknown size is treated as small, so a picture line is not waved through.
+    if points <= PICTURE_PT:
+        return "small"
+    # Effects replace the sharpness note only on a heading. Body copy over
+    # 14 pt that stayed in the picture is still the small-text amber.
+    if _is_heading(text) and _decorative_ink(context, row, trim_w, trim_h):
+        return "decorative"
+    return "small"
+
+
+def _final_pt(row: dict) -> float:
+    """Line height on the finished page, in points. Zero when it is unknown."""
+    box = row.get("boxMm") or []
+    if isinstance(box, (list, tuple)) and len(box) >= 4:
+        try:
+            height = float(box[3])
+        except (TypeError, ValueError):
+            height = 0.0
+        if height > 0:
+            return height * 72.0 / 25.4
+    try:
+        points = float(row.get("pt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return points if points > 0 else 0.0
+
+
+def _is_heading(text: str) -> bool:
+    """Caps, or a short display line. A sentence is body copy."""
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) >= 3 and sum(1 for ch in letters if ch.isupper()) / float(len(letters)) >= 0.72:
+        return True
+    words = [word for word in text.replace(",", " ").split() if any(ch.isalpha() for ch in word)]
+    return 0 < len(words) <= 3 and not text.rstrip().endswith(".")
+
+
+def _decorative_ink(context: dict, row: dict, trim_w: float, trim_h: float) -> bool:
+    """True when the source ink is a gradient, a glow, or a texture.
+
+    Flat type is not this, even when the trace was refused for another reason.
+    """
+    crop = _source_crop(context, row, trim_w, trim_h)
+    if crop is None or crop.shape[0] < 12 or crop.shape[1] < 12:
+        return False
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    ink = binary > 0
+    if float(ink.mean()) > 0.7:
+        ink = ~ink
+    if int(ink.sum()) < 40:
+        return False
+    if _ink_gradient(crop, ink):
+        return True
+    if _ink_glow(gray, ink):
+        return True
+    # The middle of a fat stroke. A thin letter's edge is noisy and is not texture.
+    dist = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 3)
+    peak = float(dist.max()) if dist.size else 0.0
+    core = dist >= max(1.2, peak * 0.55)
+    if peak >= 4.0 and int(core.sum()) >= 80 and float(crop[core].std()) >= 32.0:
+        return True
+    return False
+
+
+def _ink_gradient(crop, ink) -> bool:
+    import numpy as np
+
+    cols = np.where(ink.any(axis=0))[0]
+    if cols.size < 9:
+        return False
+    c0, c1 = int(cols[0]), int(cols[-1]) + 1
+    third = max(2, (c1 - c0) // 3)
+
+    def mean_at(start: int, stop: int):
+        piece = crop[:, start:stop]
+        selected = ink[:, start:stop]
+        pixels = piece[selected]
+        if pixels.shape[0] < 8:
+            return None
+        return pixels.astype(np.float32).mean(axis=0)
+
+    left = mean_at(c0, c0 + third)
+    mid = mean_at(c0 + third, c1 - third)
+    right = mean_at(c1 - third, c1)
+    if left is None or mid is None or right is None:
+        return False
+    span = float(np.linalg.norm(left - right))
+    if span < 35.0:
+        return False
+    between = float(np.linalg.norm(mid - (left + right) / 2.0))
+    return between < span * 0.45
+
+
+def _ink_glow(gray, ink) -> bool:
+    import cv2
+    import numpy as np
+
+    kernel = np.ones((7, 7), np.uint8)
+    ring = cv2.dilate(ink.astype(np.uint8), kernel) > 0
+    halo = ring & ~ink
+    if int(halo.sum()) < 20 or int(halo.sum()) < 0.35 * int(ink.sum()):
+        return False
+    paper = gray[~ring]
+    core = cv2.erode(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    ink_px = gray[core] if int(core.sum()) >= 20 else gray[ink]
+    if paper.size < 20 or ink_px.size < 20:
+        return False
+    paper_m = float(np.median(paper))
+    ink_m = float(np.median(ink_px))
+    span = abs(paper_m - ink_m)
+    if span < 40.0:
+        return False
+    mid = gray[halo].astype(np.float32)
+    if paper_m > ink_m:
+        frac = (paper_m - mid) / span
+    else:
+        frac = (mid - paper_m) / span
+    return float(np.median(frac)) >= 0.22
+
+
+def _source_crop(context: dict, row: dict, trim_w: float, trim_h: float):
+    """The source pixels under this line. None when the page was not supplied."""
+    import numpy as np
+
+    source = context.get("sourceBgr")
+    placement = context.get("placement") or {}
+    art = placement.get("artBox") or []
+    plate = placement.get("plate") or []
+    box = row.get("boxMm") or []
+    if source is None or len(art) < 4 or len(plate) < 2 or len(box) < 4:
+        return None
+    src = np.asarray(source)
+    if src.ndim != 3 or src.shape[0] < 8 or src.shape[1] < 8:
+        return None
+    plate_h, plate_w = int(plate[0]), int(plate[1])
+    if plate_h < 8 or plate_w < 8:
+        return None
+    media_w = float(trim_w) + 2.0 * BLEED_MM
+    media_h = float(trim_h) + 2.0 * BLEED_MM
+    if media_w <= 0 or media_h <= 0:
+        return None
+    px = (float(box[0]) + BLEED_MM) / media_w * plate_w
+    py = (float(box[1]) + BLEED_MM) / media_h * plate_h
+    pw = float(box[2]) / media_w * plate_w
+    ph = float(box[3]) / media_h * plate_h
+    ax, ay, aw, ah = [float(v) for v in art[:4]]
+    if aw < 1 or ah < 1:
+        return None
+    x0 = int(round((px - ax) / aw * src.shape[1]))
+    y0 = int(round((py - ay) / ah * src.shape[0]))
+    x1 = int(round((px + pw - ax) / aw * src.shape[1]))
+    y1 = int(round((py + ph - ay) / ah * src.shape[0]))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(src.shape[1], x1), min(src.shape[0], y1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return src[y0:y1, x0:x1]
 
 
 def _letters(context: dict) -> dict:
