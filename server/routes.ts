@@ -4312,16 +4312,49 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
     }
   });
 
+  app.get("/api/glitchy-preview/:jobId/:side", (req, res) => {
+    const jobId = String(req.params.jobId || "");
+    const side = String(req.params.side || "");
+    if (!/^\d+$/.test(jobId) || (side !== "before" && side !== "after")) {
+      return res.status(404).end();
+    }
+    const root = path.resolve(process.cwd(), "uploads", "glitchy", jobId);
+    const file = path.resolve(root, `${side}.png`);
+    if (!file.startsWith(root + path.sep) || !fsSync.existsSync(file)) {
+      return res.status(404).end();
+    }
+    res.type("png");
+    return res.sendFile(file);
+  });
+
   app.post('/api/glitchy-chat', async (req, res) => {
     try {
       const { message, jobId, action } = req.body || {};
       const text = String(message || "").trim();
       const greeting = /^(hi|hello|hey)\b/i.test(text) && !action;
+      const script = path.join(process.cwd(), "server", "designer_assistant.py");
+      const replyJson = (result: any, extras: Record<string, unknown> = {}) => res.json({
+        reply: result?.reply || "I couldn't read a result from the check.",
+        actions: Array.isArray(result?.actions) ? result.actions : [],
+        provider: result?.provider || "rules",
+        ok: result?.ok !== false,
+        previewBefore: "",
+        previewAfter: "",
+        downloadUrl: "",
+        ...extras,
+      });
       if (!jobId) {
+        if (greeting) {
+          return res.json({
+            reply: "Hello. Upload a file, then ask if the artwork is right. I only talk about checks I have run.",
+            actions: [],
+            provider: "rules",
+          });
+        }
+        const ruled = execPythonCapture([script, "--message", text], "GlitchyDesigner", 30_000);
+        if (ruled?.handled) return replyJson(ruled);
         return res.json({
-          reply: greeting
-            ? "Hello. Upload a file, then ask if the artwork is right. I only talk about checks I have run."
-            : "Upload a file first. I won't guess about artwork I haven't seen.",
+          reply: "Upload a file first. I won't guess about artwork I haven't seen.",
           actions: [],
           provider: "rules",
         });
@@ -4335,6 +4368,8 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       }
       const job = await storage.getJob(Number(jobId));
       if (!job?.originalPath) {
+        const ruled = execPythonCapture([script, "--message", text, "--job-id", String(jobId)], "GlitchyDesigner", 30_000);
+        if (ruled?.handled) return replyJson(ruled);
         return res.json({
           reply: "I can't see an uploaded file on this job, so I have not run any checks.",
           actions: [],
@@ -4344,25 +4379,26 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
       const trimW = Number(saved.targetWidth || saved.trimW || 0);
       const trimH = Number(saved.targetHeight || saved.trimH || 0);
-      const script = path.join(process.cwd(), "server", "designer_assistant.py");
+      const source = job.correctedPath && fsSync.existsSync(job.correctedPath) ? job.correctedPath : job.originalPath;
       const output = path.join(path.dirname(job.originalPath), `designer-${job.id}.pdf`);
-      const args = [script, "--input", job.originalPath, "--message", text, "--output", output];
+      const previewDir = path.join(process.cwd(), "uploads", "glitchy", String(job.id));
+      fsSync.mkdirSync(previewDir, { recursive: true });
+      const args = [script, "--input", source, "--message", text, "--output", output, "--job-id", String(job.id), "--preview-dir", previewDir];
       if (action) args.push("--action", String(action));
       if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
       const result = execPythonCapture(args, "GlitchyDesigner", 90_000);
       let downloadUrl = "";
-      if (result?.path && result.ok) {
+      if (result?.path && result.ok && fsSync.existsSync(result.path)) {
         const prior = (job.auditResults || { checks: [], overallPassed: false, fixesApplied: 0, complianceReport: "" }) as AuditResults;
         const auditResults = { ...prior, compiledPdfPath: result.path };
         await storage.updateJob(job.id, { correctedPath: result.path, auditResults });
         downloadUrl = `/api/jobs/${job.id}/download/press-ready`;
       }
-      res.json({
-        reply: result.reply || "I couldn't read a result from the check.",
-        actions: Array.isArray(result.actions) ? result.actions : [],
-        provider: result.provider || "rules",
+      const sides = Array.isArray(result?.previewSides) ? result.previewSides : [];
+      return replyJson(result, {
         downloadUrl,
-        ok: result.ok !== false,
+        previewBefore: sides.includes("before") ? `/api/glitchy-preview/${job.id}/before` : "",
+        previewAfter: sides.includes("after") ? `/api/glitchy-preview/${job.id}/after` : "",
       });
     } catch (error: any) {
       console.error("[Glitchy] Chat error:", error);

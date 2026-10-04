@@ -237,9 +237,13 @@ def _page_boxes(path: str) -> tuple[float, float, float, float]:
         doc.close()
 
 
-def _bleed_check(path: str) -> dict:
+def _bleed_check(path: str, client: str = "") -> dict:
+    from house_rules import bleed_mm
+
+    mm, rule = bleed_mm(client)
+    applied = f" Applied rule: {rule}"
     if not str(path).lower().endswith(".pdf"):
-        return {"ran": True, "ok": False, "partial": False, "detail": "A picture has no bleed box. I can add 5 mm when building the press file."}
+        return {"ran": True, "ok": False, "partial": False, "detail": f"A picture has no bleed box. I can add {mm:.0f} mm when building the press file.{applied}"}
     try:
         trim_w, trim_h, media_w, media_h = _page_boxes(path)
     except Exception as exc:
@@ -247,11 +251,26 @@ def _bleed_check(path: str) -> dict:
     inset_x = (media_w - trim_w) / 2.0
     inset_y = (media_h - trim_h) / 2.0
     inset = min(inset_x, inset_y)
-    if inset >= 4.6:
-        return {"ran": True, "ok": True, "partial": False, "detail": f"Bleed is about {inset:.1f} mm, which covers the 5 mm we need."}
+    if inset >= mm - 0.4:
+        return {"ran": True, "ok": True, "partial": False, "detail": f"Bleed is about {inset:.1f} mm, which covers the {mm:.0f} mm we need.{applied}"}
     if inset >= 0.4:
-        return {"ran": True, "ok": False, "partial": True, "detail": f"Bleed is only about {inset:.1f} mm. It should be 5 mm."}
-    return {"ran": True, "ok": False, "partial": False, "detail": "There is no bleed past the trim."}
+        return {"ran": True, "ok": False, "partial": True, "detail": f"Bleed is only about {inset:.1f} mm. It should be {mm:.0f} mm.{applied}"}
+    return {"ran": True, "ok": False, "partial": False, "detail": f"There is no bleed past the trim.{applied}"}
+
+
+def guess_client(path: str, explicit: str = "") -> str:
+    from house_rules import list_rules
+
+    if (explicit or "").strip():
+        return explicit.strip()
+    name = os.path.splitext(os.path.basename(path or ""))[0]
+    lowered = name.lower()
+    for row in list_rules():
+        if row.get("client") and row["client"].lower() in lowered:
+            return row["client"]
+    if "medella" in lowered:
+        return "Medella"
+    return ""
 
 
 def _size_check(path: str, trim_w: float | None, trim_h: float | None) -> dict:
@@ -317,16 +336,35 @@ def _qr(path: str) -> dict:
     return {"ran": True, "ok": True, "detail": "The QR code reads: " + found[0]}
 
 
-def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None = None) -> dict:
+def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None = None, client: str = "") -> dict:
+    from house_rules import menu_rule, rich_black_for, size_for
+
+    client = guess_client(path, client)
+    sized = size_for(client) if client else None
+    if sized and not trim_w:
+        trim_w, trim_h = sized[0], sized[1]
     audit = audit_pdf(path, trim_w, trim_h)
     extra = {
         "size": _size_check(path, trim_w, trim_h),
-        "bleed": _bleed_check(path),
+        "bleed": _bleed_check(path, client),
         "textCut": _text_cut(path, trim_w, trim_h),
         "qr": _qr(path),
     }
     reply, actions = reply_from_audit(audit, extra)
-    return {"audit": audit, "extra": extra, "reply": reply, "actions": actions, "provider": "gemini" if gemini_key_usable() else "rules"}
+    notes = []
+    if sized:
+        notes.append(f"Applied rule: {sized[2]}")
+    _rich, rich_rule = rich_black_for(client) if client else (None, "")
+    if rich_rule:
+        notes.append(f"Applied rule: {rich_rule}")
+    if "menu" in os.path.basename(path).lower():
+        menu = menu_rule()
+        if menu:
+            notes.append(f"Applied rule: {menu}")
+            actions = [item for item in actions if item["id"] != "print-ready"]
+    if notes:
+        reply = reply + " " + " ".join(notes)
+    return {"audit": audit, "extra": extra, "reply": reply, "actions": actions, "provider": "gemini" if gemini_key_usable() else "rules", "client": client}
 
 
 def client_message_text(path: str, trim_w: float | None, trim_h: float | None) -> str:
@@ -340,7 +378,7 @@ def client_message_text(path: str, trim_w: float | None, trim_h: float | None) -
     size = _size_check(path, trim_w, trim_h)
     if size.get("ran") and not size.get("ok"):
         extra_lines.append(size["detail"])
-    bleed = _bleed_check(path)
+    bleed = _bleed_check(path, guess_client(path))
     if bleed.get("ran") and not bleed.get("ok"):
         extra_lines.append(bleed["detail"])
     note = combined_client_message(audit, extra_lines)
@@ -348,16 +386,24 @@ def client_message_text(path: str, trim_w: float | None, trim_h: float | None) -
 
 
 def perform_action(action: str, src: str, dest: str, trim_w: float, trim_h: float) -> dict:
+    from house_rules import menu_rule, rich_black_for
+
     action = (action or "").strip()
+    client = guess_client(src)
+    if action == "print-ready" and "menu" in os.path.basename(src).lower():
+        menu = menu_rule()
+        if menu:
+            return {"ok": False, "detail": f"This is a menu job. Applied rule: {menu}", "path": ""}
     if action == "client-message":
         return {"ok": True, "detail": client_message_text(src, trim_w, trim_h), "path": ""}
     if action == "download":
-        ready = dest if dest and os.path.isfile(dest) else src
+        ready = dest if dest and os.path.isfile(ready) else src
         return {"ok": os.path.isfile(ready), "detail": "The file is ready to download." if os.path.isfile(ready) else "There is no press file yet. Run Print-ready first.", "path": ready if os.path.isfile(ready) else ""}
     if action in ("fix-black", "thicken-hairlines", "convert-cmyk"):
         if not str(src).lower().endswith(".pdf"):
             return {"ok": False, "detail": "That fix needs a PDF.", "path": ""}
-        fixes = apply_vector_fixes(src, dest)
+        rich, rich_rule = rich_black_for(client) if action == "fix-black" else (None, "")
+        fixes = apply_vector_fixes(src, dest, rich=rich)
         if action == "fix-black":
             repair_cmyk_images(dest)
         if action == "convert-cmyk":
@@ -369,10 +415,15 @@ def perform_action(action: str, src: str, dest: str, trim_w: float, trim_h: floa
                 os.replace(cmyk, dest)
             except Exception as exc:
                 return {"ok": False, "detail": f"CMYK conversion did not finish ({str(exc)[:140]}).", "path": dest}
-        return {"ok": True, "detail": f"Done. {action} changed the file ({fixes}).", "path": dest}
+        detail = f"Done. {action} changed the file ({fixes})."
+        if action == "fix-black" and rich_rule:
+            detail += f" Applied rule: {rich_rule}"
+        return {"ok": True, "detail": detail, "path": dest}
     if action in ("add-bleed", "extend-bleed", "change-size", "print-ready"):
+        from house_rules import bleed_mm
         from press_ready_engine import compile_vector_press
 
+        mm, bleed_rule = bleed_mm(client)
         width, height = float(trim_w), float(trim_h)
         if action == "change-size":
             try:
@@ -382,9 +433,9 @@ def perform_action(action: str, src: str, dest: str, trim_w: float, trim_h: floa
             if abs(page_w - height) < 2.5 and abs(page_h - width) < 2.5:
                 width, height = height, width
         if str(src).lower().endswith(".pdf"):
-            built = compile_vector_press(src, dest, width, height, 5.0)
+            built = compile_vector_press(src, dest, width, height, mm)
             if built.get("used") and os.path.isfile(dest):
-                return {"ok": True, "detail": f"The press file is {width:.0f} x {height:.0f} mm with 5 mm bleed.", "path": dest}
+                return {"ok": True, "detail": f"The press file is {width:.0f} x {height:.0f} mm with {mm:.0f} mm bleed. Applied rule: {bleed_rule}", "path": dest}
         from quick_print import make_print_ready
 
         folder = os.path.dirname(dest) or "."
@@ -400,52 +451,117 @@ def perform_action(action: str, src: str, dest: str, trim_w: float, trim_h: floa
     return {"ok": False, "detail": "I don't know that action.", "path": ""}
 
 
+def _emit(payload: dict) -> None:
+    payload.setdefault("success", True)
+    payload.setdefault("actions", [])
+    payload.setdefault("provider", "rules")
+    payload.setdefault("path", "")
+    payload.setdefault("ok", True)
+    payload.setdefault("handled", True)
+    payload.setdefault("previewSides", [])
+    print(json.dumps(payload))
+
+
 def main() -> None:
     import argparse
 
+    from artwork_edits import _load, cancel, confirm, propose, undo
+    from house_rules import handle_message
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
+    parser.add_argument("--input", default="")
     parser.add_argument("--message", default="")
     parser.add_argument("--action", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--trim-w", type=float, default=0)
     parser.add_argument("--trim-h", type=float, default=0)
+    parser.add_argument("--job-id", default="")
+    parser.add_argument("--preview-dir", default="")
+    parser.add_argument("--client", default="")
     args = parser.parse_args()
     trim_w = args.trim_w or None
     trim_h = args.trim_h or None
     action = (args.action or "").strip()
-    message = (args.message or "").strip().lower()
+    message_raw = (args.message or "").strip()
+    message = message_raw.lower()
+    key = args.job_id or "manual"
+
+    ruled = handle_message(message_raw)
+    if ruled:
+        _emit({"reply": ruled.get("reply") or "", "actions": ruled.get("actions") or [], "ok": bool(ruled.get("ok", True))})
+        return
+
+    pending = bool((_load(key).get("proposal") or {}))
+    edit_action = action if action in ("confirm-edit", "cancel-edit", "undo-edit") else ""
+    if not edit_action and pending and message in ("yes", "do it", "please", "go ahead", "ok", "okay", "apply", "apply this change"):
+        edit_action = "confirm-edit"
+    if message in ("undo", "undo that", "undo the change"):
+        edit_action = "undo-edit"
+    if message in ("leave it", "cancel", "leave it as it is"):
+        edit_action = "cancel-edit"
+    if edit_action:
+        dest = args.output or ((args.input + ".designer.pdf") if args.input else "")
+        if edit_action == "confirm-edit":
+            done = confirm(key, dest)
+        elif edit_action == "cancel-edit":
+            done = cancel(key)
+        else:
+            done = undo(key, dest)
+        _emit({
+            "reply": done.get("reply") or "",
+            "actions": done.get("actions") or [],
+            "ok": bool(done.get("ok")),
+            "path": done.get("path") or "",
+            "action": edit_action,
+        })
+        return
+
+    if not args.input or not os.path.isfile(args.input):
+        _emit({
+            "reply": "I can't see an uploaded file on this job, so I have not run any checks.",
+            "ok": False,
+            "handled": False,
+        })
+        return
+
+    if message_raw and not action:
+        preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.output or args.input), "glitchy-preview")
+        proposed = propose(args.input, message_raw, key, preview_dir)
+        if proposed:
+            _emit({
+                "reply": proposed.get("reply") or "",
+                "actions": proposed.get("actions") or [],
+                "ok": bool(proposed.get("ok", True)),
+                "previewSides": proposed.get("previewSides") or [],
+                "pending": bool(proposed.get("pending")),
+            })
+            return
+
     if not action and message:
-        for key, label in ACTION_LABELS.items():
-            if key in message or label.lower() in message:
-                action = key
+        for label_key, label in ACTION_LABELS.items():
+            if label_key in message or label.lower() in message:
+                action = label_key
                 break
         if message in ("yes", "do it", "please", "go ahead", "ok", "okay"):
-            inspected = inspect_artwork(args.input, trim_w, trim_h)
+            inspected = inspect_artwork(args.input, trim_w, trim_h, args.client)
             offered = [item["id"] for item in inspected["actions"] if item["id"] not in ("download", "print-ready", "client-message")]
             action = offered[0] if offered else "print-ready"
     if action:
         dest = args.output or (args.input + ".designer.pdf")
         done = perform_action(action, args.input, dest, float(trim_w or 148), float(trim_h or 210))
-        print(json.dumps({
-            "success": True,
+        _emit({
             "reply": done.get("detail") or "Done.",
-            "actions": [],
             "action": action,
             "ok": bool(done.get("ok")),
             "path": done.get("path") or "",
-            "provider": "rules",
-        }))
+        })
         return
-    inspected = inspect_artwork(args.input, trim_w, trim_h)
-    print(json.dumps({
-        "success": True,
+    inspected = inspect_artwork(args.input, trim_w, trim_h, args.client)
+    _emit({
         "reply": inspected["reply"],
         "actions": inspected["actions"],
         "provider": inspected["provider"],
-        "path": "",
-        "ok": True,
-    }))
+    })
 
 
 if __name__ == "__main__":

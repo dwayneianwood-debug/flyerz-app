@@ -149,6 +149,8 @@ export default function GlitchyWidget() {
   const [checklist, setChecklist] = useState<CheckItem[]>([]);
   const [responseText, setResponseText] = useState("*Purrs*");
   const [chatActions, setChatActions] = useState<{ id: string; label: string }[]>([]);
+  const [previewBefore, setPreviewBefore] = useState("");
+  const [previewAfter, setPreviewAfter] = useState("");
   const [catMode, setCatMode] = useState<CatMode>("head");
   const [uiVisible, setUiVisible] = useState(true);
   const [happyHop, setHappyHop] = useState(false);
@@ -730,9 +732,14 @@ export default function GlitchyWidget() {
       const data = await res.json();
       setResponseText(data.reply || "I couldn't read a reply.");
       setChatActions(Array.isArray(data.actions) ? data.actions : []);
+      const stamp = Date.now();
+      setPreviewBefore(data.previewBefore ? `${data.previewBefore}?t=${stamp}` : "");
+      setPreviewAfter(data.previewAfter ? `${data.previewAfter}?t=${stamp}` : "");
     } catch {
       setResponseText("I couldn't reach the checker, so I have not run a check.");
       setChatActions([]);
+      setPreviewBefore("");
+      setPreviewAfter("");
     }
     setChatLoading(false);
   }
@@ -1176,6 +1183,16 @@ export default function GlitchyWidget() {
                 <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee", whiteSpace: "pre-wrap" }}>
                   {responseText}
                 </div>
+                {(previewBefore || previewAfter) && (
+                  <div data-testid="glitchy-previews" style={{ display: "flex", gap: 4, marginBottom: 5 }}>
+                    {previewBefore && (
+                      <img data-testid="glitchy-preview-before" src={previewBefore} alt="Before" style={{ width: "48%", maxHeight: 90, objectFit: "contain", background: "#111" }} />
+                    )}
+                    {previewAfter && (
+                      <img data-testid="glitchy-preview-after" src={previewAfter} alt="After" style={{ width: "48%", maxHeight: 90, objectFit: "contain", background: "#111" }} />
+                    )}
+                  </div>
+                )}
                 {chatActions.length > 0 && (
                   <div data-testid="glitchy-actions" style={{ display: "flex", flexDirection: "column", gap: 3, marginBottom: 4 }}>
                     {chatActions.map((action) => (

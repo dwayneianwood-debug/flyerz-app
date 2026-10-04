@@ -124,11 +124,11 @@ def _next_rect(tokens: list[str], index: int, ctm: list[float]) -> tuple[float, 
     return None
 
 
-def _zone(level: float) -> tuple[float, float, float, float, bool] | None:
+def _zone(level: float, ink: tuple[float, float, float, float] = RICH) -> tuple[float, float, float, float, bool] | None:
     """Ian's three zones. Over 70% is rich black with knockout. 30–69% overprints."""
     level = max(0.0, min(1.0, level))
     if level > 0.70:
-        return (*RICH, False)
+        return (*ink, False)
     if level >= 0.30:
         return (0.0, 0.0, 0.0, level, True)
     if level >= 0.05:
@@ -138,33 +138,40 @@ def _zone(level: float) -> tuple[float, float, float, float, bool] | None:
 
 def _black_replacement(
     c: float, m: float, y: float, k: float, small_text: bool, large: bool, registration: bool,
+    ink: tuple[float, float, float, float] = RICH,
 ) -> tuple[float, float, float, float, bool] | None:
     """Text under 18 pt stays 100K. Small items go K-only, then the zones. Large dark areas go rich black."""
     total = c + m + y + k
     near = _near_cmyk(c, m, y, k) or registration
     if total > TAC_LIMIT + 0.001 and max(c, m, y, k) >= 0.80:
-        return (*RICH, False)
+        return (*ink, False)
     if small_text and near:
         return (0.0, 0.0, 0.0, 1.0, True)
     if not near:
         if total > TAC_LIMIT + 0.001:
-            return (*RICH, False)
+            return (*ink, False)
         return None
     if large:
         level = k if c <= 0.08 and m <= 0.08 and y <= 0.08 else max(c, m, y, k)
         if level > 0.70 or registration:
-            return (*RICH, False)
-        return _zone(level)
-    return _zone(max(c, m, y, k))
+            return (*ink, False)
+        return _zone(level, ink)
+    return _zone(max(c, m, y, k), ink)
 
 
 def _fmt(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".") if value != int(value) else f"{value:.4f}"
 
 
-def _process_tokens(tokens: list[str], rewrite: bool, spots: dict[str, list[float]] | None = None) -> tuple[list[str] | None, dict]:
+def _process_tokens(
+    tokens: list[str],
+    rewrite: bool,
+    spots: dict[str, list[float]] | None = None,
+    rich: tuple[float, float, float, float] | None = None,
+) -> tuple[list[str] | None, dict]:
     """Read a content stream. When rewrite is set, thicken hairlines and fix black."""
     spots = spots or {}
+    ink = tuple(rich) if rich else RICH
     found = {
         "hairlines": 0,
         "minStroke": None,
@@ -293,7 +300,7 @@ def _process_tokens(tokens: list[str], rewrite: bool, spots: dict[str, list[floa
                 k_only = c <= 0.02 and m <= 0.02 and y <= 0.02 and k >= 0.85
                 if k_only and large:
                     found["largeKOnly"] = True
-                fixed = _black_replacement(c, m, y, k, small_text, large, registration) if rewrite else None
+                fixed = _black_replacement(c, m, y, k, small_text, large, registration, ink) if rewrite else None
                 if fixed is not None:
                     nc, nm, ny, nk, overprint = fixed
                     if (nc, nm, ny, nk) != (c, m, y, k) or overprint:
@@ -323,7 +330,7 @@ def _process_tokens(tokens: list[str], rewrite: bool, spots: dict[str, list[floa
                         k_op = "k" if op in ("rg", "g") else "K"
                         prefix = stack[:-need]
                         darkness = 1.0 - (max(r, g, b) if rgb else gray)
-                        fixed = _black_replacement(0.0, 0.0, 0.0, max(darkness, 0.85), small_text, large, False)
+                        fixed = _black_replacement(0.0, 0.0, 0.0, max(darkness, 0.85), small_text, large, False, ink)
                         if fixed is not None:
                             nc, nm, ny, nk, overprint = fixed
                             new.extend(prefix)
@@ -1019,7 +1026,7 @@ def combined_client_message(audit: dict, extra: list[str] | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def apply_vector_fixes(src: str, dest: str) -> dict:
+def apply_vector_fixes(src: str, dest: str, rich: tuple[float, float, float, float] | None = None) -> dict:
     """Thicken hairlines, fix black, and convert spot tints in the content stream."""
     import pikepdf
 
@@ -1034,7 +1041,7 @@ def apply_vector_fixes(src: str, dest: str) -> dict:
             original = b"\n".join(parts)
             text = original.decode("latin1", "replace")
             tokens = _tokenize(text)
-            rewritten, found = _process_tokens(tokens, True, spots)
+            rewritten, found = _process_tokens(tokens, True, spots, rich)
             result["hairlines"] += int(found.get("hairlines") or 0)
             result["blackFixes"] += int(found.get("blackFixes") or 0)
             if not rewritten:
