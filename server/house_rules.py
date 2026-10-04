@@ -8,6 +8,9 @@ Finished jobs live in another table and are not part of this store.
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -73,6 +76,125 @@ LOCKED = [
 ]
 
 
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _read(rel: str) -> str:
+    with open(os.path.join(_repo_root(), rel), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _assigned_source(rel: str, name: str) -> str:
+    text = _read(rel)
+    tree = ast.parse(text)
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                return ast.get_source_segment(text, node) or ""
+    return ""
+
+
+def _function_source(rel: str, name: str) -> str:
+    text = _read(rel)
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(text, node) or ""
+    return ""
+
+
+def _ocr_rules() -> str:
+    lines = _read("server/text_clearup.py").splitlines(keepends=True)
+    chunk: list[str] = []
+    grab = False
+    for line in lines:
+        if "CRITICAL RULES:" in line:
+            grab = True
+        if grab:
+            chunk.append(line)
+            if "decorative shapes" in line:
+                break
+    return "".join(chunk)
+
+
+def discovered_rules() -> list[tuple[str, str, str]]:
+    """Exact copies of rule documents already in the repo. The text is not edited."""
+    docs = [
+        ("doc-cursorrules", _read(".cursorrules"), ".cursorrules"),
+        ("doc-prepress-mdc", _read(".cursor/rules/prepress.mdc"), ".cursor/rules/prepress.mdc"),
+        ("doc-agents-md", _read("AGENTS.md"), "AGENTS.md"),
+        ("doc-agent-rules", _read("AGENT_RULES.md"), "AGENT_RULES.md"),
+        ("doc-replit", _read("replit.md"), "replit.md"),
+        ("doc-products", _read("shared/quick-print-products.json"), "shared/quick-print-products.json"),
+        ("doc-glitchy-mdc", _assigned_source("server/glitchy_cursor_agent.py", "MDC_CONTENT"), "server/glitchy_cursor_agent.py"),
+        ("doc-glitchy-prompt", _function_source("server/glitchy_cursor_agent.py", "build_agent_prompt"), "server/glitchy_cursor_agent.py"),
+        ("doc-checks", _assigned_source("server/checks_guide.py", "CHECKS"), "server/checks_guide.py"),
+        ("doc-dashboard-copy", _assigned_source("server/checks_guide.py", "DASHBOARD_RULES_COPY"), "server/checks_guide.py"),
+        ("doc-safe-zone", _assigned_source("server/checks_guide.py", "ENGINE_SAFE_ZONE_SPEC"), "server/checks_guide.py"),
+        ("doc-ocr-critical", _ocr_rules(), "server/text_clearup.py"),
+    ]
+    rows = []
+    for key, text, source in docs:
+        if not text:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        rows.append((f"{key}-{digest}", text, source))
+    return rows
+
+
+def _ledger_paths() -> list[str]:
+    paths = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "house_rules_ledger.jsonl")]
+    override = (os.environ.get("FLYERZ_RULES_LEDGER") or "").strip()
+    if override:
+        paths.append(os.path.abspath(override))
+    else:
+        paths.append(os.path.join(_repo_root(), "data", "house-rules-locked.jsonl"))
+    return paths
+
+
+def _read_ledger(path: str) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _append_ledger(path: str, known: set[str], row: dict) -> None:
+    marker = row["rule_key"] + "\t" + row["text"]
+    if marker in known:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    known.add(marker)
+
+
+def _insert_locked(db: sqlite3.Connection, key: str, text: str, source: str) -> None:
+    """Insert once. An existing key or the same text is left exactly as stored."""
+    db.execute(
+        """
+        INSERT OR IGNORE INTO house_rules (rule_key, text, scope, client, locked, source)
+        SELECT ?, ?, 'global', '', 1, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM house_rules WHERE rule_key = ? OR text = ?
+        )
+        """,
+        (key, text, source, key, text),
+    )
+
+
 def db_path() -> str:
     raw = (os.environ.get("FLYERZ_DB_PATH") or "").strip()
     if raw:
@@ -99,14 +221,45 @@ def connect() -> sqlite3.Connection:
         )
         """
     )
-    for key, text, source in LOCKED:
-        db.execute(
-            """
-            INSERT OR IGNORE INTO house_rules (rule_key, text, scope, client, locked, source)
-            VALUES (?, ?, 'global', '', 1, ?)
-            """,
-            (key, text, source),
-        )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS house_rules_no_delete_locked
+        BEFORE DELETE ON house_rules
+        WHEN OLD.locked = 1
+        BEGIN
+            SELECT RAISE(ABORT, 'locked house rule');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS house_rules_no_update_locked
+        BEFORE UPDATE OF text, rule_key, locked, scope, client, source ON house_rules
+        WHEN OLD.locked = 1
+        BEGIN
+            SELECT RAISE(ABORT, 'locked house rule');
+        END
+        """
+    )
+    ledgers = _ledger_paths()
+    for path in ledgers:
+        for row in _read_ledger(path):
+            _insert_locked(db, str(row["rule_key"]), str(row["text"]), str(row.get("source") or ""))
+    for key, text, source in list(LOCKED) + discovered_rules():
+        _insert_locked(db, key, text, source)
+    durable = ledgers[-1]
+    already = {
+        str(row["rule_key"]) + "\t" + str(row["text"])
+        for row in _read_ledger(durable)
+    }
+    for row in db.execute(
+        "SELECT rule_key, text, source FROM house_rules WHERE locked = 1 ORDER BY id"
+    ):
+        _append_ledger(durable, already, {
+            "rule_key": row["rule_key"],
+            "text": row["text"],
+            "source": row["source"],
+        })
     db.commit()
     return db
 
@@ -115,7 +268,7 @@ def list_rules(client: str = "") -> list[dict]:
     db = connect()
     try:
         rows = db.execute(
-            "SELECT id, text, scope, client, locked, source FROM house_rules ORDER BY id"
+            "SELECT id, rule_key, text, scope, client, locked, source FROM house_rules ORDER BY id"
         ).fetchall()
     finally:
         db.close()
@@ -126,6 +279,7 @@ def list_rules(client: str = "") -> list[dict]:
             continue
         out.append({
             "id": int(row["id"]),
+            "rule_key": row["rule_key"],
             "text": row["text"],
             "scope": row["scope"],
             "client": row["client"],

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ import tempfile
 ROOT = tempfile.mkdtemp(prefix="part3-")
 os.environ["FLYERZ_DB_PATH"] = os.path.join(ROOT, "rules.sqlite")
 os.environ["FLYERZ_EDIT_DIR"] = os.path.join(ROOT, "edits")
+os.environ["FLYERZ_RULES_LEDGER"] = os.path.join(ROOT, "rules.jsonl")
 
 from artwork_edits import confirm, propose, undo
 from designer_assistant import _bleed_check
@@ -97,7 +99,6 @@ def test_rules() -> None:
     db.close()
     check("jobs-do-not-drop-rules", kept >= 16, str(kept))
     fresh = sqlite3.connect(os.environ["FLYERZ_DB_PATH"])
-    fresh.execute("UPDATE house_rules SET text = text WHERE rule_key = 'bleed-5mm'")
     before = fresh.execute("SELECT text FROM house_rules WHERE rule_key = 'bleed-5mm'").fetchone()[0]
     fresh.close()
     connect()
@@ -111,6 +112,46 @@ def test_rules() -> None:
     doc.close()
     named = _bleed_check(blank)
     check("bleed-says-rule", named.get("ran") and "Applied rule: Bleed is always 5 mm." in named.get("detail", ""), named.get("detail", ""))
+    docs = {row["source"]: row["text"] for row in list_rules()}
+    cursorrules = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".cursorrules"), encoding="utf-8").read()
+    check("cursorrules-verbatim", cursorrules in docs.values(), "missing .cursorrules")
+    check("prepress-file", any(row["source"] == ".cursor/rules/prepress.mdc" and row["locked"] and "Zero Regression Policy" in row["text"] for row in list_rules()))
+    check("products-file", any(row["source"] == "shared/quick-print-products.json" and "card-90x55" in row["text"] for row in list_rules()))
+    check("checks-file", any(row["source"] == "server/checks_guide.py" and row["text"].startswith("CHECKS = ") for row in list_rules()))
+    db = connect()
+    try:
+        db.execute("DELETE FROM house_rules WHERE rule_key = 'bleed-5mm'")
+        db.commit()
+        deleted = True
+    except sqlite3.IntegrityError:
+        deleted = False
+    db.close()
+    check("sql-cannot-delete-locked", deleted is False)
+    db = connect()
+    try:
+        db.execute("UPDATE house_rules SET text = 'rewritten' WHERE rule_key = 'bleed-5mm'")
+        db.commit()
+        rewritten_sql = True
+    except sqlite3.IntegrityError:
+        rewritten_sql = False
+    db.close()
+    check("sql-cannot-rewrite-locked", rewritten_sql is False)
+    still = next(row["text"] for row in list_rules() if row["source"] == "seed")
+    check("bleed-text-unchanged", still == "Bleed is always 5 mm.")
+    ledger = os.environ["FLYERZ_RULES_LEDGER"]
+    with open(ledger, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "rule_key": "ledger-only-rule",
+            "text": "always send menu jobs to the designer",
+            "source": "ledger",
+        }) + "\n")
+    db = connect()
+    db.execute("DROP TABLE house_rules")
+    db.commit()
+    db.close()
+    restored = {row["rule_key"]: row["text"] for row in list_rules()}
+    check("ledger-restores-rule", restored.get("ledger-only-rule") == "always send menu jobs to the designer")
+    check("ledger-restores-bleed", "Bleed is always 5 mm." in restored.values())
 
 
 def test_black_ink_stays_default() -> None:

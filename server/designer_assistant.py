@@ -466,7 +466,9 @@ def main() -> None:
     import argparse
 
     from artwork_edits import _load, cancel, confirm, propose, undo
-    from house_rules import handle_message
+    from house_rules import connect, handle_message
+
+    connect()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="")
