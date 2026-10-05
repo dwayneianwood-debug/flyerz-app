@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
+import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
 import { PRINT_TOOL_ACCEPT, PRINT_TOOL_TYPE_LABEL, isPrintToolFile } from "@/lib/accepted-artwork";
 import {
   ArrowLeft,
@@ -67,10 +68,10 @@ export default function SafeMarginShrink() {
       return;
     }
 
-    if (selected.size > 50 * 1024 * 1024) {
+    if (selected.size > UPLOAD_LIMIT_BYTES) {
       toast({
         title: "File too large",
-        description: "Maximum file size is 50MB.",
+        description: uploadTooLargeMessage(selected.size),
         variant: "destructive",
       });
       return;

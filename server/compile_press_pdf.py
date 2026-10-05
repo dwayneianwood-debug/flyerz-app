@@ -1753,10 +1753,13 @@ def main():
 
             compile_stats["client_audit"] = audit_pdf(input_path, float(args.trim_w), float(args.trim_h))
             _client = compile_stats["client_audit"]
+            _black = _client.get("black") or {}
+            _force_k = int(_black.get("rgbSmallBlack") or 0) > 0 or int(_black.get("rgbTextBlack") or 0) > 0
             _needs_client_fix = bool(
                 (_client.get("hairlines") or {}).get("count")
-                or (_client.get("black") or {}).get("needsFix")
+                or _black.get("needsFix")
                 or (_client.get("spots") or {}).get("names")
+                or _force_k
             )
             if _client.get("isPdf") and _needs_client_fix:
                 _fixed_pdf = tempfile.NamedTemporaryFile(suffix="_clientfix.pdf", delete=False, dir=FAI_TEMP_DIR).name

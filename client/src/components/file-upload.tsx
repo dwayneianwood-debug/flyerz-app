@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { useToast } from "@/hooks/use-toast";
+import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
 import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
 import { FULL_PAGE_CROP_NORMALIZED } from "@shared/crop-box";
@@ -618,15 +619,16 @@ export function FileUpload() {
   }, [toast]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
-    const oversized = acceptedFiles.filter(f => f.size > 50 * 1024 * 1024);
+    const oversized = acceptedFiles.filter(f => f.size > UPLOAD_LIMIT_BYTES);
     if (oversized.length > 0) {
+      const biggest = oversized.reduce((left, right) => (left.size > right.size ? left : right));
       toast({
         title: "File too large",
-        description: `${oversized.length} file(s) exceed the 50MB limit.`,
+        description: uploadTooLargeMessage(biggest.size),
         variant: "destructive",
       });
     }
-    const validFiles = acceptedFiles.filter(f => f.size <= 50 * 1024 * 1024);
+    const validFiles = acceptedFiles.filter(f => f.size <= UPLOAD_LIMIT_BYTES);
     if (validFiles.length === 0) return;
 
     if (validFiles.length === 1) {
@@ -1424,7 +1426,7 @@ export function FileUpload() {
               </h3>
 
               <p className="text-xs text-muted-foreground max-w-[200px] font-medium" data-testid="text-upload-description">
-                {ARTWORK_TYPE_LABEL} up to 50MB — drop multiple files for batch processing
+                {ARTWORK_TYPE_LABEL} up to 500MB — drop multiple files for batch processing
               </p>
 
               <div className="mt-4 flex flex-wrap justify-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">

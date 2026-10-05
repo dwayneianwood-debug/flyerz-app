@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import fs from "fs";
 import path from "path";
-import multer from "multer";
+import { diskUpload } from "./uploadLimit";
 import { isAllowedUpload, INVALID_UPLOAD_MESSAGE } from "./illustratorIntake";
 import { storage } from "./storage";
 import { readQuickPrintSettings, writeQuickPrintSettings } from "./quickPrintSettings";
@@ -21,13 +21,9 @@ import type { AuditResults } from "@shared/schema";
 import type { QuickPrintCard } from "@shared/quickPrint";
 
 const uploadDir = path.join(process.cwd(), "uploads");
-const upload = multer({
-  dest: uploadDir,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (isAllowedUpload(file.originalname, file.mimetype)) cb(null, true);
-    else cb(new Error(INVALID_UPLOAD_MESSAGE));
-  },
+const upload = diskUpload(uploadDir, (_req, file, cb) => {
+  if (isAllowedUpload(file.originalname, file.mimetype)) cb(null, true);
+  else cb(new Error(INVALID_UPLOAD_MESSAGE));
 });
 
 function safeUploadName(original: string): string {

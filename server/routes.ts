@@ -12,6 +12,7 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 import multer from "multer";
+import { diskUpload, rejectOversizedUpload, uploadTooLargeMessage } from "./uploadLimit";
 import path from "path";
 import fs from "fs/promises";
 import {
@@ -666,17 +667,13 @@ function sanitizeBleedOptions(parsed: any) {
   return result;
 }
 
-// Configure multer for file uploads
+// Configure multer for file uploads. Bytes stream to disk, up to 500 MB.
 const uploadDir = path.join(process.cwd(), "uploads");
-const upload = multer({
-  dest: uploadDir,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
-  fileFilter: (req, file, cb) => {
-    if (isAllowedUpload(file.originalname, file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(INVALID_UPLOAD_MESSAGE));
-    }
+const upload = diskUpload(uploadDir, (req, file, cb) => {
+  if (isAllowedUpload(file.originalname, file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(INVALID_UPLOAD_MESSAGE));
   }
 });
 
@@ -727,6 +724,7 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   await ensureUploadDir();
+  app.use(rejectOversizedUpload);
 
   startJanitor(60 * 60 * 1000);
   registerJobCleanupRoutes(app);
@@ -950,13 +948,10 @@ export async function registerRoutes(
       });
     } catch (error) {
       console.error('Error uploading file:', error);
-      if (error instanceof multer.MulterError) {
-        if (error.code === 'LIMIT_FILE_SIZE') {
-          return res.status(413).json({
-            message: 'File too large. Maximum size is 50MB.',
-            code: 'FILE_TOO_LARGE'
-          });
-        }
+      if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+        const length = Number(req.headers["content-length"]);
+        const bytes = Number.isFinite(length) && length > 0 ? length : 500 * 1024 * 1024 + 1;
+        return res.status(413).type("text/plain; charset=utf-8").send(uploadTooLargeMessage(bytes));
       }
       res.status(500).json({ message: 'Failed to upload file' });
     }

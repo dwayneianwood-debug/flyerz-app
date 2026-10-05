@@ -164,6 +164,22 @@ def _fmt(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".") if value != int(value) else f"{value:.4f}"
 
 
+_TEXT_SHOW = {"Tj", "TJ", "'", '"'}
+_PATH_PAINT = {"f", "f*", "F", "B", "b", "B*", "b*", "S", "s"}
+_NEXT_COLOUR = {"rg", "RG", "g", "G", "k", "K", "sc", "scn", "SC", "SCN"}
+
+
+def _colour_is_for_text(tokens: list[str], index: int) -> bool:
+    """True when this colour is used by text before the next fill or colour."""
+    limit = min(len(tokens), index + 160)
+    for tok in tokens[index + 1 : limit]:
+        if tok in _TEXT_SHOW:
+            return True
+        if tok in _PATH_PAINT or tok in _NEXT_COLOUR:
+            return False
+    return False
+
+
 def _process_tokens(
     tokens: list[str],
     rewrite: bool,
@@ -180,6 +196,7 @@ def _process_tokens(
         "peakTac": 0.0,
         "richSmallText": 0,
         "rgbSmallBlack": 0,
+        "rgbTextBlack": 0,
         "largeKOnly": False,
         "blackFixes": 0,
     }
@@ -328,9 +345,23 @@ def _process_tokens(
                     else:
                         gray = float(vals[0])
                         near = gray <= 0.12
+                    text_ink = bool(in_text or _colour_is_for_text(tokens, i))
                     if near and small_text:
                         found["rgbSmallBlack"] += 1
-                    if rewrite and near:
+                    if near and text_ink:
+                        found["rgbTextBlack"] += 1
+                    if rewrite and near and text_ink:
+                        # RGB 0,0,0 and near-black type becomes 100K, same as CMYK text.
+                        # A large filled area is not text and stays on the zone rule below.
+                        k_op = "k" if op in ("rg", "g") else "K"
+                        prefix = stack[:-need]
+                        new.extend(prefix)
+                        new.extend(["/FAI_OP_ON", "gs", _fmt(0), _fmt(0), _fmt(0), _fmt(1), k_op])
+                        stack = []
+                        changed = True
+                        replaced = True
+                        found["blackFixes"] += 1
+                    elif rewrite and near:
                         k_op = "k" if op in ("rg", "g") else "K"
                         prefix = stack[:-need]
                         darkness = 1.0 - (max(r, g, b) if rgb else gray)
@@ -787,6 +818,179 @@ def font_report(path: str) -> dict:
     return {"checked": checked, "problems": problems, "type3": type3, "embedded": embedded}
 
 
+_LIVE_WORD = re.compile(r"[A-Za-z]{4,}")
+_SUBSTITUTE_FACE = ("nimbus", "liberation", "texgyre", "urw")
+_BASE14_FACE = {
+    "helvetica", "helv", "courier", "times", "timesroman", "timesnewroman",
+    "symbol", "zapfdingbats",
+}
+LIVE_TEXT_GATE = "live text that was already embedded"
+
+
+def _face_key(name: str) -> str:
+    bare = str(name or "").split("+")[-1].lower()
+    return "".join(ch for ch in bare if ch.isalnum())
+
+
+def _face_is_substitute(key: str) -> bool:
+    if not key:
+        return False
+    if key in _BASE14_FACE:
+        return True
+    return any(tag in key for tag in _SUBSTITUTE_FACE)
+
+
+def _font_file_embedded(font) -> bool:
+    ext = str(font[1] if len(font) > 1 and font[1] is not None else "").strip().lower()
+    stream = 0
+    if len(font) > 6:
+        try:
+            stream = int(font[6] or 0)
+        except (TypeError, ValueError):
+            stream = 0
+    if stream > 0:
+        return True
+    return ext not in ("", "n/a", "none", "-", "not embedded")
+
+
+def _live_word_counts(path: str) -> dict[str, int]:
+    import pymupdf as fitz
+
+    counts: dict[str, int] = {}
+    doc = fitz.open(path)
+    try:
+        for page in doc:
+            for word in _LIVE_WORD.findall(page.get_text("text") or ""):
+                key = word.lower()
+                counts[key] = counts.get(key, 0) + 1
+    finally:
+        doc.close()
+    return counts
+
+
+def _face_keys(path: str) -> tuple[set[str], bool, bool]:
+    """Face keys, whether any live text exists, and whether a live font is embedded."""
+    import pymupdf as fitz
+
+    keys: set[str] = set()
+    live = False
+    embedded = False
+    doc = fitz.open(path)
+    try:
+        for page in doc:
+            if (page.get_text("text") or "").strip():
+                live = True
+            for font in page.get_fonts(full=True) or []:
+                key = _face_key(str(font[3] if len(font) > 3 else ""))
+                if key:
+                    keys.add(key)
+                if _font_file_embedded(font):
+                    embedded = True
+    finally:
+        doc.close()
+    return keys, live, embedded
+
+
+def _mask_is_mostly_clear(doc, xref: int) -> bool:
+    """A bleed ring is a full-page image whose mask is clear over the trim."""
+    import pymupdf as fitz
+
+    try:
+        kind, value = doc.xref_get_key(int(xref), "SMask")
+    except Exception:
+        return False
+    if kind == "null" or not value:
+        return False
+    parts = str(value).split()
+    if not parts or not parts[0].isdigit():
+        return False
+    try:
+        pix = fitz.Pixmap(doc, int(parts[0]))
+        samples = pix.samples
+    except Exception:
+        return False
+    if not samples:
+        return False
+    # Every fourth byte is enough. A ring leaves most of the page clear.
+    step = 4 if len(samples) > 400000 else 1
+    total = 0
+    opaque = 0
+    for index in range(0, len(samples), step):
+        total += 1
+        if samples[index] > 10:
+            opaque += 1
+    if total == 0:
+        return False
+    return (opaque / total) < 0.45
+
+
+def _page_covering_image(path: str) -> bool:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        for page in doc:
+            width = abs(float(page.rect.width)) or 1.0
+            height = abs(float(page.rect.height)) or 1.0
+            for info in page.get_image_info(xrefs=True) or []:
+                box = info.get("bbox") or (0, 0, 0, 0)
+                if len(box) < 4:
+                    continue
+                if abs(float(box[2]) - float(box[0])) <= width * 0.5 or abs(float(box[3]) - float(box[1])) <= height * 0.5:
+                    continue
+                xref = int(info.get("xref") or 0)
+                if xref and _mask_is_mostly_clear(doc, xref):
+                    continue
+                return True
+        return False
+    finally:
+        doc.close()
+
+
+def live_text_press_problems(src_path: str, press_path: str) -> list[str]:
+    """Fail when live embedded type is retyped, doubled, or swapped for another face.
+
+    A picture with no live text is not this check. Vector text rebuild stays for
+    raster and AI text only.
+    """
+    if not src_path or not press_path or not os.path.isfile(src_path) or not os.path.isfile(press_path):
+        return []
+    try:
+        source_faces, live, embedded = _face_keys(src_path)
+        source_words = _live_word_counts(src_path)
+    except Exception:
+        return []
+    if not live or not embedded or not source_words:
+        return []
+    try:
+        press_faces, press_live, _press_embedded = _face_keys(press_path)
+        press_words = _live_word_counts(press_path)
+        covered_before = _page_covering_image(src_path)
+        covered_after = _page_covering_image(press_path)
+    except Exception:
+        return []
+    problems = []
+    for word, count in source_words.items():
+        press_count = int(press_words.get(word) or 0)
+        if count >= 1 and press_count >= count * 2:
+            problems.append(
+                f"The press file repeats {LIVE_TEXT_GATE} "
+                f"({word} is in the press file {press_count} times and in the original {count} "
+                f"{'time' if count == 1 else 'times'})."
+            )
+            break
+    gained = sorted(key for key in press_faces if _face_is_substitute(key) and key not in source_faces)
+    if gained:
+        problems.append(
+            f"The press file substituted a font ({gained[0]}) for {LIVE_TEXT_GATE}."
+        )
+    if press_live and not covered_before and covered_after:
+        problems.append(
+            f"The press file flattened {LIVE_TEXT_GATE} onto a plate and typed it again."
+        )
+    return problems
+
+
 # A full-page plate's mask is the size of the press image. Decoding it is the
 # extra 9–12 s. Tiny placements are decorations from their area alone.
 _MASK_PIXEL_CAP = 1_500_000
@@ -925,6 +1129,7 @@ def _vector_black(path: str) -> dict:
         "peakTac": 0.0,
         "richSmallText": 0,
         "rgbSmallBlack": 0,
+        "rgbTextBlack": 0,
         "largeKOnly": False,
         "hairlines": 0,
         "minStroke": None,
@@ -945,6 +1150,7 @@ def _vector_black(path: str) -> dict:
             summary["peakTac"] = max(summary["peakTac"], found["peakTac"])
             summary["richSmallText"] += found["richSmallText"]
             summary["rgbSmallBlack"] += int(found.get("rgbSmallBlack") or 0)
+            summary["rgbTextBlack"] += int(found.get("rgbTextBlack") or 0)
             summary["largeKOnly"] = summary["largeKOnly"] or found["largeKOnly"]
             summary["hairlines"] += found["hairlines"]
             if found["minStroke"] is not None:

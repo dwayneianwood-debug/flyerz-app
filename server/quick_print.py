@@ -144,6 +144,13 @@ def decide_light(facts: dict) -> dict:
             reasons.append(note)
     if facts.get("enginePassed") is False:
         note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
+        if "live text that was already embedded" in note.lower():
+            return {
+                "light": "red",
+                "reasons": [note],
+                "clientMessage": note,
+                "checklistRed": True,
+            }
         if note not in reasons:
             reasons.append(note)
     checklist = facts.get("checklist") if isinstance(facts.get("checklist"), dict) else None

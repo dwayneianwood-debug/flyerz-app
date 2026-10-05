@@ -1047,7 +1047,15 @@ def _content_image_xrefs(doc, page) -> list:
     return xrefs
 
 
-def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float, report: dict, require_text: str = "") -> dict:
+def preflight_pdf(
+    path: str,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    bleed_mm: float,
+    report: dict,
+    require_text: str = "",
+    source_path: str = "",
+) -> dict:
     import pymupdf as fitz
 
     doc = fitz.open(path)
@@ -1124,13 +1132,17 @@ def preflight_pdf(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float
             failures.append(f"Ink coverage is {tac:.0f}%, above the {TAC_LIMIT:.0f}% limit.")
             break
     doc.close()
+    if source_path:
+        from client_file_audit import live_text_press_problems
+
+        failures = live_text_press_problems(source_path, path) + failures
     checks = {
         "pageSize": not any("page is" in item for item in failures),
         "boxes": not any("box" in item for item in failures),
         "corners": not any("corner" in item or "white" in item for item in failures),
         "cmyk": not any("CMYK" in item for item in failures),
         "ink": not any("Ink coverage" in item for item in failures),
-        "text": not any("text is no longer" in item for item in failures),
+        "text": not any("text is no longer" in item or "live text that was already embedded" in item for item in failures),
     }
     report = dict(report)
     report["preflight"] = {"failures": failures, "checks": checks}
@@ -2758,6 +2770,173 @@ def _overlay_live_text(dest, src, pads: tuple[int, int, int, int]) -> None:
     _rewrite_text_to_cmyk(dest, clip)
 
 
+def _pixmap_rgb(page, clip):
+    """RGB samples from the same renderer the seam check uses."""
+    import pymupdf as fitz
+
+    if clip is None or clip.width < 0.15 or clip.height < 0.15:
+        return None
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(300.0 / 72.0, 300.0 / 72.0),
+        clip=clip,
+        alpha=False,
+        colorspace=fitz.csRGB,
+    )
+    if pix.width < 1 or pix.height < 1 or pix.n < 3:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    return np.ascontiguousarray(arr[:, :, :3])
+
+
+def _insert_rgb(page, rgb, rect) -> None:
+    if rgb is None or rect is None or rect.width < 0.2 or rect.height < 0.2:
+        return
+    target_w = max(1, int(round(rect.width / 72.0 * 300.0)))
+    target_h = max(1, int(round(rect.height / 72.0 * 300.0)))
+    if rgb.shape[1] != target_w or rgb.shape[0] != target_h:
+        rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(rgb), mode="RGB").save(buf, format="PNG")
+    page.insert_image(rect, stream=buf.getvalue(), keep_proportion=False)
+
+
+def _paint_mirrored_strips(page, placed) -> None:
+    """Mirror only the missing bleed. The page underneath stays vector.
+
+    The new strip and the edge it continues are the same rendered pixels, so the
+    seam is not a second colour conversion. The trim itself is left alone.
+    """
+    import pymupdf as fitz
+
+    full = page.rect
+    placed = fitz.Rect(placed)
+    if placed.width < 1 or placed.height < 1:
+        return
+    scale = 300.0 / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+    if pix.width < 2 or pix.height < 2 or pix.n < 3:
+        return
+    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+    height, width = rgb.shape[:2]
+
+    def px(value: float, limit: int) -> int:
+        return min(limit, max(0, int(round(float(value) * scale))))
+
+    x0, y0 = px(placed.x0 - full.x0, width), px(placed.y0 - full.y0, height)
+    x1, y1 = px(placed.x1 - full.x0, width), px(placed.y1 - full.y0, height)
+    if x1 <= x0 or y1 <= y0:
+        return
+    canvas = np.zeros((height, width, 4), np.uint8)
+
+    def paint(image, row, col) -> None:
+        if image is None or image.size == 0:
+            return
+        row_end = min(height, row + int(image.shape[0]))
+        col_end = min(width, col + int(image.shape[1]))
+        view = image[: row_end - row, : col_end - col]
+        if view.size == 0:
+            return
+        canvas[row:row_end, col:col_end, :3] = view
+        canvas[row:row_end, col:col_end, 3] = 255
+
+    left = rgb[y0:y1, x0:x0 + x0] if x0 > 0 else None
+    right_w = width - x1
+    right = rgb[y0:y1, x1 - right_w:x1] if right_w > 0 else None
+    top = rgb[y0:y0 + y0, x0:x1] if y0 > 0 else None
+    bottom_h = height - y1
+    bottom = rgb[y1 - bottom_h:y1, x0:x1] if bottom_h > 0 else None
+    if left is not None and left.size:
+        paint(left[:, ::-1], y0, 0)
+        paint(left, y0, x0)
+    if right is not None and right.size:
+        paint(right[:, ::-1], y0, x1)
+        paint(right, y0, x1 - right.shape[1])
+    if top is not None and top.size:
+        paint(top[::-1, :], 0, x0)
+        paint(top, y0, x0)
+    if bottom is not None and bottom.size:
+        paint(bottom[::-1, :], y1, x0)
+        paint(bottom, y1 - bottom.shape[0], x0)
+
+    def corner(vertical, horizontal, row: int, col: int, end_rows: bool, end_cols: bool) -> None:
+        if vertical is None or horizontal is None or vertical.size == 0 or horizontal.size == 0:
+            return
+        band_h = int(horizontal.shape[0])
+        band_w = int(vertical.shape[1])
+        rows = vertical[-band_h:] if end_rows else vertical[:band_h]
+        cols = horizontal[:, -band_w:] if end_cols else horizontal[:, :band_w]
+        if rows.size == 0 or cols.size == 0:
+            return
+        colour = np.clip(np.round((rows.reshape(-1, 3).mean(0) + cols.reshape(-1, 3).mean(0)) / 2.0), 0, 255).astype(np.uint8)
+        block = np.empty((max(1, rows.shape[0]), max(1, cols.shape[1]), 3), np.uint8)
+        block[:] = colour
+        paint(block, row, col)
+
+    corner(left, top, 0, 0, False, False)
+    corner(right, top, 0, x1, False, True)
+    corner(left, bottom, y1, 0, True, False)
+    corner(right, bottom, y1, x1, True, True)
+    if int(canvas[:, :, 3].max()) == 0:
+        return
+    rgb_f = canvas[:, :, :3].astype(np.float32) / 255.0
+    black = 1.0 - rgb_f.max(axis=2)
+    denom = np.maximum(1.0 - black, 1e-6)
+    cyan = (1.0 - rgb_f[:, :, 0] - black) / denom
+    magenta = (1.0 - rgb_f[:, :, 1] - black) / denom
+    yellow = (1.0 - rgb_f[:, :, 2] - black) / denom
+    pure = black >= 0.999
+    cyan[pure] = 0.0
+    magenta[pure] = 0.0
+    yellow[pure] = 0.0
+    cmyk = np.clip(np.round(np.dstack([cyan, magenta, yellow, black]) * 255.0), 0, 255).astype(np.uint8)
+    _cap_tac_array(cmyk)
+    samples = np.ascontiguousarray(np.dstack([cmyk, canvas[:, :, 3:4]])).tobytes()
+    ring = fitz.Pixmap(fitz.csCMYK, width, height, samples, True)
+    page.insert_image(full, pixmap=ring)
+
+
+def _paint_vector_strips(path: str, placements: list) -> None:
+    """Add the missing bleed. Live type is not flattened and is not retyped.
+
+    A shortfall of about 2.5 mm is a mirror of that edge, including the same
+    pixels over the old bleed, so the seam compares one image with itself.
+    A wider shortfall is only an edge sample. Repainting that far into the
+    page moves the seam window and the colours no longer line up.
+    """
+    import pymupdf as fitz
+
+    wide_pt = 3.2 * 72.0 / 25.4
+    doc = fitz.open(path)
+    tmp = path + ".vstrips.pdf"
+    painted = False
+    try:
+        for index, page in enumerate(doc):
+            placement = placements[index] if index < len(placements) else None
+            if not placement:
+                continue
+            placed = fitz.Rect(*placement)
+            gap = max(
+                placed.x0 - page.rect.x0,
+                placed.y0 - page.rect.y0,
+                page.rect.x1 - placed.x1,
+                page.rect.y1 - placed.y1,
+            )
+            if gap > wide_pt:
+                _paint_cmyk_edge(page, placed)
+            else:
+                _paint_mirrored_strips(page, placed)
+            painted = True
+        if painted:
+            doc.save(tmp, deflate=True, garbage=4)
+    finally:
+        doc.close()
+    if painted and os.path.isfile(tmp):
+        os.replace(tmp, path)
+
+
 def _paint_large_strips(path: str, placements: list) -> None:
     """Draw only the 5 mm bleed. A poster is not flattened to one 300 dpi plate."""
     import pymupdf as fitz
@@ -2778,6 +2957,19 @@ def _paint_large_strips(path: str, placements: list) -> None:
         doc.close()
     if painted and os.path.isfile(tmp):
         os.replace(tmp, path)
+
+
+def _keep_page_vector(page) -> bool:
+    """Live type stays live. A picture with no live text is the only page that becomes one plate."""
+    try:
+        if (page.get_text("text") or "").strip():
+            return True
+    except Exception:
+        return True
+    try:
+        return not page.get_images()
+    except Exception:
+        return True
 
 
 def _place_mirrored_bleed(dest, src, short_l: float, short_r: float, short_t: float, short_b: float) -> None:
@@ -2993,9 +3185,10 @@ def compile_vector_press(
         or (client_audit.get("black") or {}).get("needsFix")
         or (client_audit.get("spots") or {}).get("names")
     )
-    # RGB black under 18 pt is not a card warning. It is still rewritten to K-only
-    # before the CMYK conversion, or the press raster turns it into four colours.
-    force_k = int((client_audit.get("black") or {}).get("rgbSmallBlack") or 0) > 0
+    # RGB black text is not a card warning. It is still rewritten to 100K before
+    # the CMYK conversion, or Ghostscript turns 0 0 0 rg into four-colour black.
+    black_audit = client_audit.get("black") or {}
+    force_k = int(black_audit.get("rgbSmallBlack") or 0) > 0 or int(black_audit.get("rgbTextBlack") or 0) > 0
     soft_images = [
         row for row in ((client_audit.get("resolution") or {}).get("images") or [])
         if 75 <= float(row.get("ppi") or 0) < 300 and float(row.get("area") or 1) < 0.85
@@ -3086,8 +3279,9 @@ def compile_vector_press(
             short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
             short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
             if max(short_l, short_r, short_t, short_b) >= 0.4:
-                if plate_exceeds_memory(trim_w_mm, trim_h_mm):
+                if plate_exceeds_memory(trim_w_mm, trim_h_mm) or _keep_page_vector(src_page):
                     # Keep the page as vectors. The shortfall is a strip, not a full plate.
+                    # Live embedded type is never retyped. A picture with no live text still uses the plate below.
                     placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
                     new_page.show_pdf_page(placed, src, index, clip=clip)
                     kept = True
@@ -3190,11 +3384,21 @@ def compile_vector_press(
         boxed = out_path + ".box.pdf"
         fixed.save(boxed, deflate=True, garbage=4)
         fixed.close()
+        # Posters keep the one-pixel edge sample. A smaller vector page mirrors only
+        # the missing bleed, so the seam matches and live type stays untouched.
         if plate_exceeds_memory(trim_w_mm, trim_h_mm):
             _paint_large_strips(boxed, edge_placements)
+        elif any(not mirrored for mirrored in page_mirrored):
+            _paint_vector_strips(boxed, edge_placements)
         else:
             _paint_bleed_matching(boxed, edge_placements)
         os.replace(boxed, out_path)
+        # The plate path already knocks small black and caps ink. A live page
+        # still has the original pictures, so the same repair runs on those images.
+        try:
+            repair_cmyk_images(out_path, text_only=True)
+        except Exception:
+            pass
 
     full_keep = kept and not extended
     rescue = {
@@ -3235,7 +3439,7 @@ def compile_vector_press(
         report["effectiveDpi"] = None
         report["resolutionNote"] = "No picture on the original file was large enough to measure."
     report["allowWhite"] = False
-    report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="")
+    report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="", source_path=open_path)
     return {"used": True, "report": report, "path": out_path, "pageCount": page_count}
 
 
