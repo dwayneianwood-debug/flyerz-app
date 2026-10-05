@@ -4796,7 +4796,56 @@ def _write_pdf(plate, drawn, output_pdf, trim_w, trim_h, bleed_mm, placed, retyp
     os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
     colour_started = time.perf_counter()
     rgb = cv2.cvtColor(plate, cv2.COLOR_BGR2RGB)
-    cmyk = ImageCms.applyTransform(Image.fromarray(rgb), _press_cmyk())
+    transform = _press_cmyk()
+    rgb_image = Image.fromarray(rgb)
+    plate_h, plate_w = rgb.shape[:2]
+    # The press transform writes straight into this buffer. Repairing a copy of the
+    # finished image was a full extra read of a flyer-sized plate.
+    plate_buf = bytearray(plate_h * plate_w * 4)
+    cmyk = Image.frombuffer("CMYK", (plate_w, plate_h), plate_buf, "raw", "CMYK", 0, 1)
+    try:
+        transform.apply(rgb_image, cmyk)
+        cmyk.info["icc_profile"] = transform.output_profile.tobytes()
+    except Exception:
+        cmyk = ImageCms.applyTransform(rgb_image, transform)
+        plate_buf = None
+    # K-only and the ink cap happen here, while the plate is still an array. Doing it
+    # again on the saved PDF decoded the JPEG and rewrote the file, which was the
+    # multi-second wait. 280% leaves room for JPEG to stay at or under 300%.
+    try:
+        import numpy as np
+        from client_file_audit import _repair_array
+
+        if plate_buf is None:
+            plate_arr = np.array(cmyk)
+            cmyk = Image.fromarray(plate_arr, mode="CMYK")
+        else:
+            plate_arr = np.frombuffer(plate_buf, np.uint8).reshape(plate_h, plate_w, 4)
+        stats = _repair_array(plate_arr, float(MIN_PPI), text_only=True, tac_limit=2.80)
+        # Some Pillow builds keep frombuffer as a copy. The edit would then never
+        # reach the JPEG. One pixel tells us, and a copy-back puts it in the file.
+        why = "in-plate"
+        if plate_buf is not None and stats.get("changed"):
+            probe_y = min(plate_h - 1, plate_h // 2)
+            probe_x = min(plate_w - 1, plate_w // 2)
+            probe = tuple(int(v) for v in cmyk.getpixel((probe_x, probe_y)))
+            sample = tuple(int(v) for v in plate_arr[probe_y, probe_x])
+            if probe != sample:
+                why = "in-plate-copied"
+                profile = cmyk.info.get("icc_profile")
+                cmyk = Image.fromarray(plate_arr, mode="CMYK")
+                if profile:
+                    cmyk.info["icc_profile"] = profile
+        qa["plate_ink"] = {
+            "why": why,
+            "changed": bool(stats.get("changed")),
+            "painted": int(stats.get("painted") or 0),
+            "dark": int(stats.get("dark") or 0),
+            "tac_limit": 280,
+        }
+    except Exception as exc:
+        qa["plate_ink"] = None
+        sys.stderr.write(f"[INK] in-plate repair skipped: {exc}\n")
     qa["colour_s"] = time.perf_counter() - colour_started
     compose_started = time.perf_counter()
     buffer = io.BytesIO()

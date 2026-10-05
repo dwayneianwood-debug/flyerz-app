@@ -771,6 +771,18 @@ def _small_rich_plate(arr) -> bool:
 _INK_CACHE: dict[tuple, dict] = {}
 
 
+def remember_press_ink(path: str, facts: dict) -> None:
+    """Keep a scan the repair already did, so the checklist does not decode the plate again."""
+    try:
+        stat = os.stat(path)
+        key = (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return
+    if len(_INK_CACHE) > 8:
+        _INK_CACHE.clear()
+    _INK_CACHE[key] = dict(facts)
+
+
 def press_ink_facts(path: str) -> dict:
     """Image-sample ink. K-only is K at 90% or more with almost no C, M or Y. This is what konly.py counts."""
     try:
@@ -853,7 +865,9 @@ def check_e3(press: str, order: dict, source_pages: int | None = None) -> dict:
     if ink.get("small_rich"):
         ambers.append("Small black text in the press image is still four-colour, not K-only.")
     rich = []
-    for sample in _text_ink(press):
+    # The plate scan already counted K-only. Sampling every span would decode that plate again.
+    span_ink = [] if ink.get("small_k") and not ink.get("small_rich") and tac <= 300.5 else _text_ink(press)
+    for sample in span_ink:
         if sample["c"] > 12 or sample["m"] > 12 or sample["y"] > 12:
             rich.append(sample)
     if rich:

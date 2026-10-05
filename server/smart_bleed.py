@@ -1361,7 +1361,7 @@ def scan_and_fix_qr_codes(pdf_path: str, output_path: str) -> dict:
         return {"status": "failed", "qr_count": 0, "decoded_data": [], "actions": [], "error": str(e)}
 
 
-def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str) -> bool:
+def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str, dpi: int | None = None) -> bool:
     try:
         from PIL import Image as PILImage
         doc = fitz.open(pdf_path)
@@ -1369,15 +1369,16 @@ def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str) -> bool
             doc.close()
             return False
         page = doc[page_num - 1]
-        _z = DEFAULT_DPI / 72.0
+        screen_dpi = int(dpi or DEFAULT_DPI)
+        _z = screen_dpi / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(_z, _z), colorspace=fitz.csRGB, alpha=True)
-        pix.set_dpi(DEFAULT_DPI, DEFAULT_DPI)
+        pix.set_dpi(screen_dpi, screen_dpi)
         img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
         alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
         rgb_ch = img_rgba[:, :, :3].astype(np.float32)
         white_bg = np.full_like(rgb_ch, 255.0)
         composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
-        PILImage.fromarray(composited, "RGB").save(output_path, dpi=(DEFAULT_DPI, DEFAULT_DPI))
+        PILImage.fromarray(composited, "RGB").save(output_path, dpi=(screen_dpi, screen_dpi))
         del pix, img_rgba, composited
         doc.close()
         sys.stderr.write(f"[FAI] PyMuPDF fallback rendered page {page_num} with forced white bg: {output_path}\n")
@@ -1412,6 +1413,12 @@ def generate_visual_proof(pdf_path: str, output_png_path: str) -> dict:
             page_output = output_png_path
         else:
             page_output = f"{base}{page_num}{ext}"
+
+        # The first "before" view used to wait on Ghostscript for every page. A screen proof is PyMuPDF.
+        # A white page is still a proof. The blank check stays on Ghostscript, which can write white on failure.
+        if _render_page_pymupdf(pdf_path, page_num, page_output, dpi=144):
+            sys.stderr.write(f"[CORE] Rendered proof page {page_num}/{total_pages} via PyMuPDF at 144 DPI.\n")
+            return page_output
 
         gs_cmd = [
             GS_BIN,

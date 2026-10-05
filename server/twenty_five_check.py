@@ -139,6 +139,16 @@ def main() -> None:
     empty.close()
     no_qr = _qr(blank)
     check("qr-absent", "isn't one" in no_qr["detail"], no_qr["detail"])
+    wide = os.path.join(folder, "wide.pdf")
+    wide_doc = fitz.open()
+    wide_doc.new_page(width=620, height=400)
+    wide_doc.save(wide)
+    wide_doc.close()
+    import time as _time
+    started = _time.perf_counter()
+    wide_qr = _qr(wide)
+    qr_s = _time.perf_counter() - started
+    check("qr-large-page-fast", "isn't one" in wide_qr["detail"] and qr_s < 0.4, f"{qr_s:.2f}s {wide_qr['detail']}")
     import numpy as np
     encoder = __import__("cv2").QRCodeEncoder_create()
     modules = encoder.encode("https://flyerz.example/pay")

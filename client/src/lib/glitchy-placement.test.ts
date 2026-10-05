@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { glitchyPlacement } from "./glitchy-placement";
+import { glitchyPlacement, keepAskedReply } from "./glitchy-placement";
 
 const base = {
   narrow: false,
@@ -10,6 +10,11 @@ const base = {
   viewportHeight: 800,
   obstacleTops: [] as number[],
 };
+
+test("an asked reply stays up when a success event arrives", () => {
+  assert.equal(keepAskedReply(true), true);
+  assert.equal(keepAskedReply(false), false);
+});
 
 test("a narrow screen starts as a small collapsed control", () => {
   const place = glitchyPlacement({ ...base, narrow: true });

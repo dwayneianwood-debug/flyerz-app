@@ -381,20 +381,33 @@ def _qr(path: str) -> dict:
         doc = fitz.open(path)
         found = []
         spotted = False
+        # Every file gets one read at the old size. A small PDF page (an A6 or a card)
+        # can hide a code that only shows up larger, so that page also gets the inverse
+        # and zbar pass. A flyer-sized page stays on the single read.
+        is_pdf = _looks_like_pdf(path)
         try:
             for page in doc:
-                for scale in (3, 4):
-                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-                    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                    gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
-                    value, seen = _decode_qr_gray(gray)
-                    if value:
-                        found.append(value)
-                        break
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+                value, points, _straight = cv2.QRCodeDetector().detectAndDecode(gray)
+                seen = points is not None
+                small_page = is_pdf and max(float(page.rect.width), float(page.rect.height)) <= 520
+                if not value and (seen or small_page):
                     if seen:
-                        spotted = True
-                if found:
+                        value, deep_seen = _decode_qr_gray(gray)
+                        seen = seen or deep_seen
+                    if not value and small_page:
+                        big = page.get_pixmap(matrix=fitz.Matrix(4, 4), alpha=False, colorspace=fitz.csRGB)
+                        big_arr = np.frombuffer(big.samples, dtype=np.uint8).reshape(big.h, big.w, big.n)
+                        big_gray = cv2.cvtColor(big_arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+                        value, deep_seen = _decode_qr_gray(big_gray)
+                        seen = seen or deep_seen
+                if value:
+                    found.append(value)
                     break
+                if seen:
+                    spotted = True
         finally:
             doc.close()
     except Exception:

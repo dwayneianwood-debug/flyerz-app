@@ -1176,7 +1176,7 @@ def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
             capture_output=True,
             text=True,
             timeout=240,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(), "PYTHONUNBUFFERED": "1"},
         )
         payload = {}
         if os.path.exists(result.name):
@@ -1267,6 +1267,13 @@ def make_print_ready(
     detect_size: bool = False,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
+    locale_seen = {}
+    try:
+        from host_paths import pin_c_locale
+
+        locale_seen = pin_c_locale() or {}
+    except Exception:
+        pass
     display = _safe_name(filename or os.path.basename(src_path))
     decisions = [
         "Sales quick mode decided this file on its own. Nobody was asked a question.",
@@ -1587,15 +1594,29 @@ def make_print_ready(
 
     press_path = os.path.join(output_dir, "press.pdf")
     _mark("press", lettering_note)
+    ink_report = None
     vector_ok = bool(vector_built and vector_built.get("ok") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
-    if vector_ok:
+    plate_ink = ((vector_built or {}).get("qa") or {}).get("plate_ink") if vector_ok else None
+    if vector_ok and isinstance(plate_ink, dict):
+        ink_report = {
+            "images": 1 if plate_ink.get("changed") else 0,
+            "rewritten": 1 if plate_ink.get("changed") else 0,
+            "why": "in-plate" if plate_ink.get("changed") else "in-plate-unchanged",
+            "painted": plate_ink.get("painted"),
+            "dark": plate_ink.get("dark"),
+            "locale": locale_seen,
+        }
+        sys.stderr.write("[INK] " + json.dumps(ink_report) + "\n")
+    elif vector_ok:
         try:
             from client_file_audit import repair_cmyk_images
 
             # The traced page is already the press file. Small black type in that plate has to be K-only.
-            repair_cmyk_images(press_path, text_only=True)
-        except Exception:
-            pass
+            ink_report = repair_cmyk_images(press_path, text_only=True)
+        except Exception as exc:
+            ink_report = {"images": 0, "rewritten": 0, "why": "raised", "error": str(exc)[:300]}
+            sys.stderr.write(f"[INK] rewrite failed: {exc}\n")
+    if vector_ok:
         compiled = {
             "success": True,
             "pressEngine": {
@@ -1683,6 +1704,11 @@ def make_print_ready(
                     from extra_checks import press_ink_facts
 
                     ink = press_ink_facts(press_path)
+                    if isinstance(ink_report, dict):
+                        ink_report["k_only"] = int(ink.get("k_only") or 0)
+                        ink_report["max_tac"] = round(float(ink.get("max_tac") or 0), 1)
+                        if str(ink_report.get("why") or "").startswith("in-plate") and ink_report["k_only"] <= 0 and not ink.get("small_k"):
+                            ink_report["why"] = "in-plate-not-in-file"
                     for index, row in enumerate(settled):
                         if str(row.get("num")) != "2b":
                             continue
@@ -1755,6 +1781,15 @@ def make_print_ready(
     elif not press_ok:
         result["pressPath"] = ""
     result["decisions"] = decisions
+    if ink_report:
+        result["inkRepair"] = {
+            "rewritten": int(ink_report.get("images") or ink_report.get("rewritten") or 0),
+            "why": str(ink_report.get("why") or ink_report.get("error") or ""),
+            "k_only": int(ink_report.get("k_only") or 0),
+            "max_tac": ink_report.get("max_tac"),
+            "skips": ink_report.get("skips") or [],
+            "locale": ink_report.get("locale") or {},
+        }
     result["letteringNote"] = lettering_note
     if vector_built:
         result["vectorText"] = {

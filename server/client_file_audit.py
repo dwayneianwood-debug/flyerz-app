@@ -1170,23 +1170,152 @@ def _cmyk_channels(value) -> int:
     return 0
 
 
+def _ink_log(path: str, report: dict) -> None:
+    """Laptop-safe note of why a black-text rewrite did or did not land."""
+    import json
+    import sys
+
+    line = "[INK] " + json.dumps(report, default=str)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+    try:
+        with open(path + ".ink.json", "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+    except Exception as exc:
+        sys.stderr.write(f"[INK] could not write the self-check: {exc}\n")
+
+
+def _decode_cmyk(value, rendered) -> tuple:
+    """Native CMYK samples. A JPEG plate makes read_bytes throw, so the pixmap is first.
+
+    The pixmap is what konly.py reads. Closing it here matters: on Windows the PDF stays
+    locked until every pixmap is gone, and the rewrite then cannot replace the file.
+    """
+    import io
+
+    import numpy as np
+    import pymupdf as fitz
+    from PIL import Image
+
+    info = {
+        "channels": _cmyk_channels(value),
+        "w": int(value.get("/Width") or 0),
+        "h": int(value.get("/Height") or 0),
+        "filter": str(value.get("/Filter") or ""),
+    }
+    if info["channels"] != 4:
+        info["skip"] = "not-cmyk"
+        return None, info
+    xref = int(getattr(value, "objgen", (0, 0))[0] or 0)
+    info["xref"] = xref
+    if rendered is not None and xref > 0:
+        pix = None
+        try:
+            pix = fitz.Pixmap(rendered, xref)
+            info["pixmap_n"] = int(pix.n)
+            info["pixmap_cs"] = pix.colorspace.name if pix.colorspace else ""
+            if pix.n >= 4 and pix.w >= 2 and pix.h >= 2:
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
+                info["decode"] = "pixmap"
+                return arr, info
+            info["skip"] = f"pixmap-n-{int(pix.n)}"
+        except Exception as exc:
+            info["pixmap_error"] = str(exc)[:180]
+        finally:
+            if pix is not None:
+                pix = None
+    raw = b""
+    try:
+        raw = value.read_bytes()
+        info["read_bytes"] = len(raw)
+    except Exception as exc:
+        info["read_bytes_error"] = str(exc)[:180]
+        try:
+            raw = value.read_raw_bytes()
+            info["read_raw"] = len(raw)
+        except Exception as raw_exc:
+            info["read_raw_error"] = str(raw_exc)[:180]
+            raw = b""
+    expected = info["w"] * info["h"] * 4
+    if raw and expected and len(raw) == expected:
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(info["h"], info["w"], 4).copy()
+        info["decode"] = "read_bytes"
+        return arr, info
+    if raw[:2] == b"\xff\xd8":
+        try:
+            image = Image.open(io.BytesIO(raw))
+            info["pil_mode"] = image.mode
+            if image.mode == "CMYK":
+                arr = np.asarray(image).copy()
+                info["decode"] = "jpeg"
+                return arr, info
+            info["skip"] = info.get("skip") or f"jpeg-{image.mode}"
+        except Exception as exc:
+            info["jpeg_error"] = str(exc)[:180]
+    if not info.get("skip"):
+        info["skip"] = "no-samples"
+    return None, info
+
+
 def repair_cmyk_images(path: str, text_only: bool = False) -> dict:
     """Small black type becomes 100K. Ink stays at or under 300%. The colour space stays as it was.
 
     text_only leaves photographs alone apart from the ink cap. The full repair also turns a large
-    near-black area into rich black.
+    near-black area into rich black. Readers are closed before the file is replaced, because
+    Windows will not replace a PDF that MuPDF still has open.
     """
-    import pikepdf
-    import zlib
-    from PIL import Image
-    import io
-    import numpy as np
-    import pymupdf as fitz
+    import gc
+    import sys
 
-    changed = 0
-    pdf = pikepdf.open(path)
-    rendered = fitz.open(path)
+    import numpy as np
+    import pikepdf
+    import pymupdf as fitz
+    import zlib
+
+    from host_paths import pin_c_locale
+
+    runtime = {"python": sys.version.split()[0]}
     try:
+        import pikepdf as _pikepdf
+        from PIL import Image as _Image
+        import pymupdf as _fitz
+
+        runtime["pikepdf"] = _pikepdf.__version__
+        runtime["pillow"] = getattr(_Image, "__version__", "")
+        runtime["pymupdf"] = getattr(_fitz, "VersionBind", "")
+    except Exception:
+        pass
+    try:
+        runtime["gs"] = subprocess.check_output(["gs", "--version"], text=True, timeout=5).strip()
+    except Exception as exc:
+        runtime["gs"] = f"unavailable:{exc.__class__.__name__}"
+
+    report = {
+        "seen": 0,
+        "images": 0,
+        "cmyk": 0,
+        "rewritten": 0,
+        "dark": 0,
+        "painted": 0,
+        "textOnly": bool(text_only),
+        "locale": pin_c_locale(),
+        "runtime": runtime,
+        "skips": [],
+        "error": "",
+        "max_tac": 0.0,
+        "k_only": 0,
+        "k90": 0,
+    }
+    pending = ""
+    pdf = None
+    rendered = None
+    max_tac = 0.0
+    k90 = 0
+    k_only = 0
+    saw_all = True
+    try:
+        pdf = pikepdf.open(path)
+        rendered = fitz.open(path)
         masks = set()
         for page in pdf.pages:
             xobjects = (page.get("/Resources") or {}).get("/XObject") or {}
@@ -1212,136 +1341,297 @@ def repair_cmyk_images(path: str, text_only: bool = False) -> dict:
                 try:
                     if str(value.get("/Subtype", "")) != "/Image":
                         continue
+                    report["seen"] += 1
                     if value.objgen in masks:
                         continue
-                    if _cmyk_channels(value) != 4:
+                    arr, info = _decode_cmyk(value, rendered)
+                    if arr is None or getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 4:
+                        saw_all = False
+                        if len(report["skips"]) < 8:
+                            report["skips"].append({k: info.get(k) for k in ("skip", "channels", "filter", "pixmap_n", "pixmap_error", "read_bytes_error", "pil_mode", "w", "h") if info.get(k) not in (None, "")})
                         continue
-                    width = int(value.get("/Width") or 0)
-                    height = int(value.get("/Height") or 0)
-                    try:
-                        raw = value.read_bytes()
-                    except Exception:
-                        raw = b""
-                    arr = None
-                    if width > 0 and height > 0 and len(raw) == width * height * 4:
-                        arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4).copy()
-                    else:
-                        try:
-                            image = Image.open(io.BytesIO(raw))
-                            if image.mode == "CMYK":
-                                arr = np.asarray(image).copy()
-                                width, height = image.size
-                        except Exception:
-                            arr = None
-                    if arr is None:
-                        xref = int(getattr(value, "objgen", (0, 0))[0] or 0)
-                        if xref <= 0:
-                            continue
-                        pix = fitz.Pixmap(rendered, xref)
-                        if pix.n < 4 or pix.w < 2 or pix.h < 2:
-                            continue
-                        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
-                        width, height = pix.w, pix.h
-                    if arr.ndim != 3 or arr.shape[2] < 4:
-                        continue
+                    report["cmyk"] += 1
                     space = value.get("/ColorSpace")
-                    dpi = 72.0 * (arr.shape[1] / page_w)
-                    if not _repair_array(arr, dpi, text_only=text_only):
-                        continue
-                    payload = zlib.compress(np.ascontiguousarray(arr[:, :, :4]).tobytes())
-                    value.write(payload, filter=pikepdf.Name("/FlateDecode"))
-                    value["/Type"] = pikepdf.Name("/XObject")
-                    value["/Subtype"] = pikepdf.Name("/Image")
-                    value["/Width"] = int(width)
-                    value["/Height"] = int(height)
-                    value["/ColorSpace"] = space
-                    value["/BitsPerComponent"] = 8
-                    if "/Decode" in value:
-                        del value["/Decode"]
-                    changed += 1
-                except Exception:
+                    width, height = int(arr.shape[1]), int(arr.shape[0])
+                    dpi = 72.0 * (width / page_w)
+                    stats = _repair_array(arr, dpi, text_only=text_only)
+                    report["dark"] += int(stats.get("dark") or 0)
+                    report["painted"] += int(stats.get("painted") or 0)
+                    if stats.get("changed"):
+                        payload = zlib.compress(np.ascontiguousarray(arr[:, :, :4]).tobytes())
+                        value.write(payload, filter=pikepdf.Name("/FlateDecode"))
+                        value["/Type"] = pikepdf.Name("/XObject")
+                        value["/Subtype"] = pikepdf.Name("/Image")
+                        value["/Width"] = width
+                        value["/Height"] = height
+                        value["/ColorSpace"] = space
+                        value["/BitsPerComponent"] = 8
+                        if "/Decode" in value:
+                            del value["/Decode"]
+                        report["rewritten"] += 1
+                    elif int(stats.get("dark") or 0) < 16 and len(report["skips"]) < 8:
+                        report["skips"].append({
+                            "skip": "no-dark-pixels",
+                            "decode": info.get("decode") or "",
+                            "mean": stats.get("mean") or [],
+                            "w": width,
+                            "h": height,
+                        })
+                    sample = arr[:, :, :4]
+                    max_tac = max(max_tac, float(sample.astype(np.int16).sum(axis=-1).max()) / 2.55)
+                    black = sample[:, :, 3] >= 230
+                    cmy = sample[:, :, :3].astype(np.int16).sum(axis=-1)
+                    k90 += int(black.sum())
+                    k_only += int((black & (cmy <= 13)).sum())
+                except Exception as exc:
+                    saw_all = False
+                    if len(report["skips"]) < 8:
+                        report["skips"].append({"skip": "error", "error": str(exc)[:180]})
                     continue
-        if changed:
-            tmp = path + ".ink.pdf"
-            pdf.save(tmp)
-            os.replace(tmp, path)
+        report["max_tac"] = round(max_tac, 1)
+        report["k90"] = k90
+        report["k_only"] = k_only
+        if report["rewritten"]:
+            pending = path + ".ink.pdf"
+            pdf.save(pending)
+    except Exception as exc:
+        report["error"] = str(exc)[:300]
+        pending = ""
+        sys.stderr.write(f"[INK] rewrite failed before save: {exc}\n")
     finally:
-        pdf.close()
-        rendered.close()
-    return {"images": changed}
+        if pdf is not None:
+            pdf.close()
+        if rendered is not None:
+            rendered.close()
+        rendered = None
+        pdf = None
+    if pending and os.path.exists(pending):
+        gc.collect()
+        try:
+            os.replace(pending, path)
+        except Exception as exc:
+            report["error"] = f"replace:{exc}"[:300]
+            report["rewritten"] = 0
+            sys.stderr.write(f"[INK] could not replace the press file: {exc}\n")
+        else:
+            if saw_all:
+                try:
+                    from extra_checks import remember_press_ink
+
+                    facts = {
+                        "max_tac": float(report["max_tac"]),
+                        "k90": int(report["k90"]),
+                        "k_only": int(report["k_only"]),
+                        "small_k": int(report["k_only"]) > 30,
+                        "small_rich": bool(int(report["k90"]) > 30 and int(report["k_only"]) == 0),
+                    }
+                    remember_press_ink(path, facts)
+                except Exception:
+                    pass
+    if report["rewritten"] == 0 and not report["error"]:
+        report["why"] = report["skips"][0].get("skip") if report["skips"] else "unchanged"
+    else:
+        report["why"] = ""
+    report["images"] = int(report["rewritten"])
+    _ink_log(path, report)
+    return report
 
 
-def _repair_array(arr, dpi: float, text_only: bool = False) -> bool:
+def _repair_text_array(arr, dpi: float, limit: float) -> dict:
+    """K-only text and the ink cap, without a full-plate float copy.
+
+    A flyer plate is about 19 million pixels and only a few percent of them are type.
+    The cap and the darkness test therefore run on the hot pixels, and connected
+    components still decides which of those are small enough to be type.
+    """
     import cv2
     import numpy as np
 
-    c = arr[:, :, 0].astype(np.float32)
-    m = arr[:, :, 1].astype(np.float32)
-    y = arr[:, :, 2].astype(np.float32)
-    k = arr[:, :, 3].astype(np.float32)
-    changed = False
-    total = c + m + y + k
-    over = total > (TAC_LIMIT * 255.0)
-    if int(over.sum()) > 0:
-        extra = total - TAC_LIMIT * 255.0
-        cmy = c + m + y
-        scale = np.ones_like(cmy)
+    result = {"changed": False, "dark": 0, "painted": 0, "components": 0, "mean": []}
+    cap = float(limit) * 255.0
+    total = arr[:, :, 0].astype(np.uint16)
+    total += arr[:, :, 1]
+    total += arr[:, :, 2]
+    total += arr[:, :, 3]
+    over = total > cap
+    flat = arr.reshape(-1, 4) if arr.flags.c_contiguous else None
+    if bool(over.any()):
+        hot = np.flatnonzero(over)
+        pix = (flat[hot] if flat is not None else arr[over]).astype(np.uint16)
+        cmy = pix[:, :3].sum(axis=1).astype(np.float32)
+        extra = pix.sum(axis=1).astype(np.float32) - cap
+        scale = np.ones(pix.shape[0], np.float32)
         good = cmy > 1
         scale[good] = np.clip((cmy[good] - extra[good]) / cmy[good], 0, 1)
-        c[over] *= scale[over]
-        m[over] *= scale[over]
-        y[over] *= scale[over]
-        changed = True
-        arr[:, :, 0] = np.clip(c, 0, 255).astype(np.uint8)
-        arr[:, :, 1] = np.clip(m, 0, 255).astype(np.uint8)
-        arr[:, :, 2] = np.clip(y, 0, 255).astype(np.uint8)
-        arr[:, :, 3] = np.clip(k, 0, 255).astype(np.uint8)
-        c = arr[:, :, 0].astype(np.float32)
-        m = arr[:, :, 1].astype(np.float32)
-        y = arr[:, :, 2].astype(np.float32)
-        k = arr[:, :, 3].astype(np.float32)
+        for channel in range(3):
+            pix[:, channel] = np.clip(pix[:, channel].astype(np.float32) * scale, 0, 255)
+        written = pix.astype(np.uint8)
+        if flat is None:
+            arr[over] = written
+        else:
+            flat[hot] = written
+        result["changed"] = True
+    gate = cv2.inRange(arr, (140, 120, 90, 110), (255, 255, 255, 255))
+    chosen = np.flatnonzero(gate)
+    dark_count = 0
+    if chosen.size >= 16:
+        if flat is not None:
+            picked = flat[chosen].astype(np.float32) / 255.0
+        else:
+            picked = arr[gate > 0].astype(np.float32) / 255.0
+        red = (1.0 - picked[:, 0]) * (1.0 - picked[:, 3])
+        green = (1.0 - picked[:, 1]) * (1.0 - picked[:, 3])
+        blue = (1.0 - picked[:, 2]) * (1.0 - picked[:, 3])
+        high = np.maximum(np.maximum(red, green), blue)
+        low = np.minimum(np.minimum(red, green), blue)
+        keep = (high <= 0.22) & ((high - low) <= 0.10)
+        dark_count = int(keep.sum())
+    result["dark"] = dark_count
+    if dark_count < 16:
+        sample = arr[::32, ::32, :4].astype(np.float32).mean(axis=(0, 1))
+        result["mean"] = [round(float(value), 1) for value in sample]
+        return result
+    mask = np.zeros(gate.shape, np.uint8)
+    mask.ravel()[chosen[keep]] = 255
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    result["components"] = int(max(0, count - 1))
+    if count <= 1:
+        return result
+    area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    width = stats[:, cv2.CC_STAT_WIDTH].astype(np.float64)
+    height = stats[:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+    fill = area / np.maximum(1.0, width * height)
+    text_px = max(8.0, 18.0 / 72.0 * max(dpi, 72.0))
+    item_px = max(text_px, 56.0 / 72.0 * max(dpi, 72.0))
+    eligible = (np.arange(count) > 0) & (area >= 40.0) & (fill >= 0.08)
+    small = (height <= text_px) | ((width <= item_px) & (height <= item_px))
+    wide = (height <= text_px) & (width <= text_px * 24)
+    k_labels = eligible & (small | wide)
+    if not k_labels.any():
+        return result
+    dark_at = np.flatnonzero(mask)
+    paint_at = dark_at[k_labels[labels.ravel()[dark_at]]]
+    ink = np.array([0, 0, 0, 255], np.uint8)
+    if flat is not None:
+        flat[paint_at] = ink
+    else:
+        paint = np.zeros(mask.shape, dtype=bool)
+        paint.ravel()[paint_at] = True
+        arr[paint] = ink
+    result["changed"] = True
+    result["painted"] = int(paint_at.size)
+    return result
+
+
+def _repair_array(arr, dpi: float, text_only: bool = False, tac_limit: float | None = None) -> dict:
+    """One pass over the plate. A Python loop per letter is what made flyer_front hit 300 s.
+
+    tac_limit is the same unit as TAC_LIMIT: 3.0 means 300% of full ink. A plate that is
+    about to be JPEG-compressed uses 2.8 so the file still reads at or under 300%.
+    """
+    import cv2
+    import numpy as np
+
+    limit = TAC_LIMIT if tac_limit is None else float(tac_limit)
+    if text_only:
+        return _repair_text_array(arr, dpi, limit)
+    result = {"changed": False, "dark": 0, "painted": 0, "components": 0, "mean": []}
+    # Integer sums. A full float copy of a flyer plate was the remaining second or two.
+    cu = arr[:, :, 0].astype(np.uint16)
+    mu = arr[:, :, 1].astype(np.uint16)
+    yu = arr[:, :, 2].astype(np.uint16)
+    ku = arr[:, :, 3].astype(np.uint16)
+    cap = limit * 255.0
+    total_u = cu.astype(np.uint16) + mu + yu + ku
+    over = total_u > cap
+    if int(over.sum()) > 0:
+        cmy = (cu + mu + yu).astype(np.float32)
+        extra = total_u.astype(np.float32) - cap
+        scale = np.ones(int(over.sum()), np.float32)
+        cmy_over = cmy[over]
+        good = cmy_over > 1
+        scale[good] = np.clip((cmy_over[good] - extra[over][good]) / cmy_over[good], 0, 1)
+        arr[over, 0] = np.clip(cu[over].astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        arr[over, 1] = np.clip(mu[over].astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        arr[over, 2] = np.clip(yu[over].astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        result["changed"] = True
+        cu = arr[:, :, 0].astype(np.uint16)
+        mu = arr[:, :, 1].astype(np.uint16)
+        yu = arr[:, :, 2].astype(np.uint16)
+        ku = arr[:, :, 3].astype(np.uint16)
     # SWOP black type is about C72 M70 Y58 K67. A loose page-wide mask also catches navy, so only
-    # a small, solid component is rewritten.
-    red = (1.0 - c / 255.0) * (1.0 - k / 255.0)
-    green = (1.0 - m / 255.0) * (1.0 - k / 255.0)
-    blue = (1.0 - y / 255.0) * (1.0 - k / 255.0)
-    high = np.maximum(np.maximum(red, green), blue)
-    low = np.minimum(np.minimum(red, green), blue)
-    dark = (high <= 0.22) & ((high - low) <= 0.10)
-    if not text_only:
+    # a small, solid component is rewritten. Text carries all four inks, so the colour math
+    # runs on that gate only.
+    if text_only:
+        gate = (cu >= 140) & (mu >= 120) & (yu >= 90) & (ku >= 110)
+        dark = np.zeros(cu.shape, dtype=bool)
+        if int(gate.sum()) >= 16:
+            c = cu[gate].astype(np.float32) / 255.0
+            m = mu[gate].astype(np.float32) / 255.0
+            y = yu[gate].astype(np.float32) / 255.0
+            k = ku[gate].astype(np.float32) / 255.0
+            red = (1.0 - c) * (1.0 - k)
+            green = (1.0 - m) * (1.0 - k)
+            blue = (1.0 - y) * (1.0 - k)
+            high = np.maximum(np.maximum(red, green), blue)
+            low = np.minimum(np.minimum(red, green), blue)
+            dark[gate] = (high <= 0.22) & ((high - low) <= 0.10)
+    else:
+        c = cu.astype(np.float32)
+        m = mu.astype(np.float32)
+        y = yu.astype(np.float32)
+        k = ku.astype(np.float32)
+        red = (1.0 - c / 255.0) * (1.0 - k / 255.0)
+        green = (1.0 - m / 255.0) * (1.0 - k / 255.0)
+        blue = (1.0 - y / 255.0) * (1.0 - k / 255.0)
+        high = np.maximum(np.maximum(red, green), blue)
+        low = np.minimum(np.minimum(red, green), blue)
+        dark = (high <= 0.22) & ((high - low) <= 0.10)
         chroma = np.maximum(np.maximum(c, m), y) - np.minimum(np.minimum(c, m), y)
         dark = dark | ((k >= 210) & (c <= 40) & (m <= 40) & (y <= 40))
         dark = dark | ((c >= 240) & (m >= 240) & (y >= 240) & (k >= 240))
         dark = dark | ((k >= 150) & (c >= 40) & (m >= 40) & (y >= 40) & (chroma <= 30))
-    if text_only:
-        # Converted black type carries all four inks. A photograph's shadow does not match that.
-        dark = dark & (c >= 140) & (m >= 120) & (y >= 90) & (k >= 110)
-    if int(dark.sum()) < 16:
-        return changed
+    result["dark"] = int(dark.sum())
+    if result["dark"] < 16:
+        sample = arr[::32, ::32, :4].astype(np.float32).mean(axis=(0, 1))
+        result["mean"] = [round(float(v), 1) for v in sample]
+        return result
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
+    result["components"] = int(max(0, count - 1))
+    if count <= 1:
+        return result
+    area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    width = stats[:, cv2.CC_STAT_WIDTH].astype(np.float64)
+    height = stats[:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+    fill = area / np.maximum(1.0, width * height)
     text_px = max(8.0, 18.0 / 72.0 * max(dpi, 72.0))
     item_px = max(text_px, 56.0 / 72.0 * max(dpi, 72.0))
-    rich = np.array([round(RICH[0] * 255), round(RICH[1] * 255), round(RICH[2] * 255), 255], np.uint8)
+    eligible = (np.arange(count) > 0) & (area >= (40.0 if text_only else 12.0))
+    if text_only:
+        # Anti-aliased type is a thin core inside its box, often under 0.30.
+        eligible &= fill >= 0.08
+    small = (height <= text_px) | ((width <= item_px) & (height <= item_px))
+    wide = (height <= text_px) & (width <= text_px * 24)
+    k_labels = eligible & (small | wide)
+    rich_labels = np.zeros(count, dtype=bool) if text_only else (eligible & ~k_labels)
+    if not k_labels.any() and not rich_labels.any():
+        return result
+    kind = np.zeros(count, dtype=np.uint8)
+    kind[k_labels] = 1
+    kind[rich_labels] = 2
+    painted = kind[labels]
     k_only = np.array([0, 0, 0, 255], np.uint8)
-    for label in range(1, count):
-        _x, _y, width, height, area = stats[label]
-        if area < (40 if text_only else 12):
-            continue
-        fill = float(area) / max(1.0, float(width) * float(height))
-        # Anti-aliased type is a thin core inside its box, often under 0.30. A solid
-        # rectangle is near 1. Photo speckle that slips the ink gate is sparser still.
-        if text_only and fill < 0.08:
-            continue
-        small = height <= text_px or (width <= item_px and height <= item_px)
-        mask = labels == label
-        if small or (height <= text_px and width <= text_px * 24):
-            arr[mask] = k_only
-        elif text_only:
-            continue
-        else:
-            arr[mask] = rich
-        changed = True
-    return changed
+    rich = np.array([round(RICH[0] * 255), round(RICH[1] * 255), round(RICH[2] * 255), 255], np.uint8)
+    k_mask = painted == 1
+    rich_mask = painted == 2
+    if k_mask.any():
+        arr[k_mask] = k_only
+        result["changed"] = True
+    if rich_mask.any():
+        arr[rich_mask] = rich
+        result["changed"] = True
+    result["painted"] = int(k_mask.sum() + rich_mask.sum())
+    return result
 
 
 def _smask_xref(doc, xref: int) -> int:

@@ -2256,8 +2256,45 @@ def _split_pad(total: int, start_share: float) -> tuple[int, int]:
     return start, int(total) - start
 
 
+def _quiet_outlier_edge(arr: np.ndarray) -> np.ndarray:
+    """Drop a one-pixel fringe that is a different colour from a few pixels inside.
+
+    A symmetric mirror repeats that pixel, so a light last row becomes a hairline on both
+    sides of the seam. A smooth edge changes by much less than this over four pixels.
+    """
+    arr = np.ascontiguousarray(arr).copy()
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    inset = 4
+
+    def far(edge: np.ndarray, inner: np.ndarray) -> bool:
+        return float(np.mean(np.abs(edge.astype(np.int16) - inner.astype(np.int16)))) > 40.0
+
+    if height > inset * 2:
+        if far(arr[0], arr[inset]):
+            arr[0] = arr[inset]
+        if far(arr[-1], arr[-1 - inset]):
+            arr[-1] = arr[-1 - inset]
+    if width > inset * 2:
+        if far(arr[:, 0], arr[:, inset]):
+            arr[:, 0] = arr[:, inset]
+        if far(arr[:, -1], arr[:, -1 - inset]):
+            arr[:, -1] = arr[:, -1 - inset]
+    # A single hot corner pixel mirrors into a cross even when the rest of the row is even.
+    if height > inset * 2 and width > inset * 2:
+        corners = (
+            (0, inset, 0, inset),
+            (0, inset, -1, -1 - inset),
+            (-1, -1 - inset, 0, inset),
+            (-1, -1 - inset, -1, -1 - inset),
+        )
+        for y, inner_y, x, inner_x in corners:
+            if far(arr[y, x], arr[inner_y, inner_x]):
+                arr[y, x] = arr[inner_y, inner_x]
+    return arr
+
+
 def _mirror_pad(arr: np.ndarray, target_w: int, target_h: int, short_l: float, short_r: float, short_t: float, short_b: float):
-    """Pad the shortfall by mirroring the outermost pixels. The edge pixel is repeated."""
+    """Pad the shortfall by mirroring pixels from just inside a fringe, when that fringe is an outlier."""
     height, width = int(arr.shape[0]), int(arr.shape[1])
     share_l = short_l / max(short_l + short_r, 1e-6) if (short_l + short_r) > 0 else 0.5
     share_t = short_t / max(short_t + short_b, 1e-6) if (short_t + short_b) > 0 else 0.5
@@ -2268,6 +2305,8 @@ def _mirror_pad(arr: np.ndarray, target_w: int, target_h: int, short_l: float, s
         cut_t, _cut_b = _split_pad(extra_y, share_t)
         arr = np.ascontiguousarray(arr[cut_t:cut_t + min(height, target_h), cut_l:cut_l + min(width, target_w)])
         height, width = int(arr.shape[0]), int(arr.shape[1])
+    arr = _quiet_outlier_edge(arr)
+    height, width = int(arr.shape[0]), int(arr.shape[1])
     pad_x = max(0, target_w - width)
     pad_y = max(0, target_h - height)
     left, right = _split_pad(pad_x, share_l)

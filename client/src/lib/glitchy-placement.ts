@@ -16,6 +16,11 @@ export interface GlitchyPlacement {
 const BASE_BOTTOM = 12;
 const CLEARANCE = 8;
 
+/** A reply the person just asked for stays on screen. A later success event must not cover it. */
+export function keepAskedReply(replyPinned: boolean): boolean {
+  return replyPinned;
+}
+
 /** Keep Glitchy a small corner control, and lift it when it would cover Share or a form. */
 export function glitchyPlacement(input: GlitchyPlacementInput): GlitchyPlacement {
   const busy = input.formFocused || input.shareOrDownloadInView;

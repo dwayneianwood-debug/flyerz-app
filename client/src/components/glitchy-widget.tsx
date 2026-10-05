@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { glitchyPlacement } from "@/lib/glitchy-placement";
+import { glitchyPlacement, keepAskedReply } from "@/lib/glitchy-placement";
 
 type CatMode = "head" | "walking" | "sleeping" | "stretching";
 
@@ -191,6 +191,7 @@ export default function GlitchyWidget() {
   /** ask = invite; reveal = show what we did after click */
   const [achievementPhase, setAchievementPhase] = useState<"ask" | "reveal" | null>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
+  const replyPinned = useRef(false);
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const idleRef = useRef(0);
   const wanderingRef = useRef(false);
@@ -328,6 +329,9 @@ export default function GlitchyWidget() {
         if (items.length === 0) {
           items.push({ label: "Artwork audited and prepared for print", done: true });
         }
+        if (keepAskedReply(replyPinned.current)) {
+          return;
+        }
         setCatMode("head");
         setUiVisible(true);
         setPosX(15);
@@ -360,6 +364,7 @@ export default function GlitchyWidget() {
 
   useEffect(() => {
     const resetGlitchy = () => {
+      replyPinned.current = false;
       setCatMode("head");
       setUiVisible(true);
       setPosX(15);
@@ -370,6 +375,7 @@ export default function GlitchyWidget() {
     };
 
     const offerAchievement = (message: string, items: PreflightItem[]) => {
+      if (keepAskedReply(replyPinned.current)) return;
       resetGlitchy();
       setProcessState("SUCCESS");
       setProcessingMessage(message);
@@ -713,6 +719,7 @@ export default function GlitchyWidget() {
 
     setChatBoxVisible((v) => {
       if (v) {
+        replyPinned.current = false;
         setUserOpened(false);
         setIsInteracting(false);
         setBubbleVisible(false);
@@ -758,6 +765,10 @@ export default function GlitchyWidget() {
       });
       const data = await res.json();
       setResponseText(checkText(data.reply) || "I couldn't read a reply.");
+      replyPinned.current = true;
+      setChatBoxVisible(true);
+      setUserOpened(true);
+      setAchievementPhase(null);
       setChatActions(
         Array.isArray(data.actions)
           ? data.actions.map((action: Partial<ChatAction>) => ({
@@ -775,6 +786,10 @@ export default function GlitchyWidget() {
       setPreviewAfter(data.previewAfter ? `${data.previewAfter}?t=${stamp}` : "");
     } catch {
       setResponseText("I couldn't reach the checker, so I have not run a check.");
+      replyPinned.current = true;
+      setChatBoxVisible(true);
+      setUserOpened(true);
+      setAchievementPhase(null);
       setChatActions([]);
       setPreviewBefore("");
       setPreviewAfter("");
