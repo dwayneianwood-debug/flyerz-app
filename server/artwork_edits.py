@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import tempfile
 
+from edit_style import DATE_IN_TEXT, PHONE_IN_TEXT, TIME_IN_TEXT, VENUE_IN_TEXT, fragment, swap_text
+
 PHONE_ASK = re.compile(
     r"(?:change|update|set|replace|swap)\s+the\s+phone(?:\s+number)?\s+to\s+(.+)$",
     re.I,
@@ -23,17 +25,19 @@ DATE_ASK = re.compile(
     r"(?:change|update|set|replace|swap)\s+the\s+date\s+to\s+(.+)$",
     re.I,
 )
+TIME_ASK = re.compile(
+    r"(?:change|update|set|replace|swap)\s+the\s+time\s+to\s+(.+)$",
+    re.I,
+)
+VENUE_ASK = re.compile(
+    r"(?:change|update|set|replace|swap)\s+the\s+venue\s+to\s+(.+)$",
+    re.I,
+)
 LOGO_ASK = re.compile(r"make\s+the\s+logo\s+(bigger|smaller|larger)\b", re.I)
 LOGO_MOVE_ASK = re.compile(r"move\s+the\s+logo\s+(up|down|left|right)\b", re.I)
 HEADING_ASK = re.compile(r"make\s+the\s+heading\s+(bigger|smaller|larger)\b", re.I)
 MOVE_ASK = re.compile(r"move\s+the\s+text\s+away\s+from\s+the\s+edge", re.I)
-PHONE_IN_TEXT = re.compile(r"(?:\+?\d[\d\s\-()]{6,}\d)")
-DATE_IN_TEXT = re.compile(
-    r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}"
-    r"|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)",
-    re.I,
-)
+FIELD_NAME = {"phone": "phone number", "date": "date", "time": "time", "venue": "venue"}
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -79,6 +83,27 @@ def _spans(page) -> list[dict]:
                     continue
                 found.append(span)
     return found
+
+
+def _stray_chars(kind: str, requested: str) -> str:
+    """Letters Ian typed that are not part of a date, phone, time, or venue.
+
+    The restyle keeps the original format, so a stray mark would otherwise
+    disappear. It is still checked against the font and refused when missing.
+    """
+    if kind == "phone":
+        allowed = set("0123456789 +-().")
+    elif kind == "date":
+        allowed = set("0123456789 /-.,")
+    elif kind == "time":
+        allowed = set("0123456789 :.h")
+    elif kind == "venue":
+        allowed = set(" '-.,&/")
+    else:
+        return ""
+    if kind in ("date", "time", "venue"):
+        return "".join(char for char in requested if not char.isalpha() and char not in allowed)
+    return "".join(char for char in requested if char not in allowed)
 
 
 def _missing_glyphs(fontfile: str, text: str) -> list[str]:
@@ -147,6 +172,12 @@ def _parse(message: str) -> dict | None:
     date = DATE_ASK.search(text)
     if date:
         return {"kind": "date", "new": date.group(1).strip(" .")}
+    time_ask = TIME_ASK.search(text)
+    if time_ask:
+        return {"kind": "time", "new": time_ask.group(1).strip(" .")}
+    venue = VENUE_ASK.search(text)
+    if venue:
+        return {"kind": "venue", "new": venue.group(1).strip(" .")}
     logo_move = LOGO_MOVE_ASK.search(text)
     if logo_move:
         return {"kind": "logo", "scale": 1.0, "direction": logo_move.group(1).lower()}
@@ -178,14 +209,9 @@ def _heading_span(spans: list[dict]) -> dict | None:
 
 
 def _live_target(spans: list[dict], kind: str) -> dict | None:
-    if kind == "phone":
-        for span in spans:
-            if PHONE_IN_TEXT.search(span.get("text") or ""):
-                return span
-    if kind == "date":
-        for span in spans:
-            if DATE_IN_TEXT.search(span.get("text") or ""):
-                return span
+    for span in spans:
+        if fragment(span.get("text") or "", kind):
+            return span
     return None
 
 
@@ -320,19 +346,35 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
         page = doc[0]
         spans = _spans(page)
         proposal = {"kind": parsed["kind"], "page": 0, "live": bool(spans), "src": src}
-        if parsed["kind"] in ("phone", "date", "heading"):
+        if parsed["kind"] in ("phone", "date", "time", "venue", "heading"):
             if parsed["kind"] == "heading":
                 span = _heading_span(spans)
             else:
                 span = _live_target(spans, parsed["kind"])
             if span:
                 old = span["text"]
-                if parsed["kind"] == "phone":
-                    new_text = PHONE_IN_TEXT.sub(parsed["new"], old, count=1)
-                elif parsed["kind"] == "date":
-                    new_text = DATE_IN_TEXT.sub(parsed["new"], old, count=1)
-                else:
+                shown_old = old
+                shown_new = old
+                if parsed["kind"] == "heading":
                     new_text = old
+                else:
+                    try:
+                        swapped = swap_text(old, parsed["kind"], parsed["new"])
+                    except ValueError:
+                        label = FIELD_NAME.get(parsed["kind"], "value")
+                        return {
+                            "ok": False,
+                            "reply": f"I couldn't read that {label}, so I have not changed anything.",
+                            "actions": [],
+                        }
+                    if not swapped:
+                        label = FIELD_NAME.get(parsed["kind"], "text")
+                        return {
+                            "ok": False,
+                            "reply": f"I could not find a {label} on the artwork, so I have not changed anything.",
+                            "actions": [],
+                        }
+                    shown_old, shown_new, new_text = swapped
                 fontfile = _embedded_font(doc, page, str(span.get("font") or ""))
                 if not fontfile:
                     return {
@@ -340,11 +382,12 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                         "reply": f"The text uses {span.get('font') or 'an unknown font'}, and I don't have that font. I have not substituted another one.",
                         "actions": [],
                     }
+                probe = new_text + _stray_chars(parsed["kind"], parsed.get("new") or "")
                 if fontfile in ("helv", "times", "cour"):
                     built = fitz.Font(fontfile)
-                    missing = [char for char in new_text if not char.isspace() and not built.has_glyph(ord(char))]
+                    missing = [char for char in probe if not char.isspace() and not built.has_glyph(ord(char))]
                 else:
-                    missing = _missing_glyphs(fontfile, new_text)
+                    missing = _missing_glyphs(fontfile, probe)
                 if missing:
                     shown = "".join(dict.fromkeys(missing))
                     return {
@@ -356,6 +399,8 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     "mode": "live-text",
                     "old": old,
                     "new": new_text,
+                    "shownOld": shown_old,
+                    "shownNew": shown_new,
                     "bbox": list(span["bbox"]),
                     "origin": list(span.get("origin") or (span["bbox"][0], span["bbox"][3])),
                     "size": float(span.get("size") or 12) * (float(parsed["factor"]) if parsed["kind"] == "heading" else 1.0),
@@ -427,10 +472,16 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
 
 def _preview_sentence(proposal: dict) -> str:
     kind = proposal.get("kind")
+    shown_old = proposal.get("shownOld") or proposal.get("old")
+    shown_new = proposal.get("shownNew") or proposal.get("new")
     if kind == "phone":
-        return f"I would change the phone number from {proposal.get('old')} to {proposal.get('new')}."
+        return f"I would change the phone number from {shown_old} to {shown_new}, in the same format."
     if kind == "date":
-        return f"I would change the date from {proposal.get('old')} to {proposal.get('new')}."
+        return f"I would change the date from {shown_old} to {shown_new}, in the same format."
+    if kind == "time":
+        return f"I would change the time from {shown_old} to {shown_new}, in the same format."
+    if kind == "venue":
+        return f"I would change the venue from {shown_old} to {shown_new}, in the same style."
     if kind == "logo" and proposal.get("direction"):
         return f"I would move the logo {proposal.get('direction')}."
     if kind == "logo":
@@ -551,9 +602,8 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
             "height": max(item["top"] + item["height"] for item in group) - min(item["top"] for item in group),
         }
 
-    if parsed["kind"] in ("phone", "date"):
-        pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
-        singles = [word for word in words if pattern.search(word.get("text") or "")]
+    if parsed["kind"] in ("phone", "date", "time", "venue"):
+        singles = [word for word in words if fragment(word.get("text") or "", parsed["kind"])]
         if singles:
             # The number's own box, not a neighbouring line that happens to share its height.
             word = min(singles, key=lambda item: (len(item["text"]), item["width"] * item["height"]))
@@ -574,7 +624,9 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
             if hit is None or candidate["height"] > hit["height"]:
                 hit = candidate
         return hit
-    pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
+    pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(parsed["kind"])
+    if pattern is None:
+        return None
     for group in _line_groups(words):
         joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
         if not pattern.search(joined):
@@ -656,21 +708,30 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
         image = cv2.imread(png)
         crop = None if hit is None or image is None else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
     if not hit:
-        missing = "a heading" if parsed["kind"] == "heading" else "that text"
+        label = "a heading" if parsed["kind"] == "heading" else "a " + FIELD_NAME.get(parsed["kind"], "text")
         return {
             "ok": False,
-            "reply": f"I read the picture and could not find {missing}, so I have not changed anything.",
+            "reply": f"I read the picture and could not find {label}, so I have not changed anything.",
             "actions": [],
         }
+    shown_old = hit["text"]
+    shown_new = hit["text"]
     if parsed["kind"] == "heading":
         new_text = hit["text"]
     else:
-        pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
-        new_text = pattern.sub(parsed["new"], hit["text"], count=1)
+        try:
+            swapped = swap_text(hit["text"], parsed["kind"], parsed["new"])
+        except ValueError:
+            label = FIELD_NAME.get(parsed["kind"], "value")
+            return {"ok": False, "reply": f"I couldn't read that {label}, so I have not changed anything.", "actions": []}
+        if not swapped:
+            label = FIELD_NAME.get(parsed["kind"], "text")
+            return {"ok": False, "reply": f"I read the picture and could not find a {label}, so I have not changed anything.", "actions": []}
+        shown_old, shown_new, new_text = swapped
     fontfile, score = _closest_font(crop, hit["text"])
     if not fontfile:
         return {"ok": False, "reply": "I found the words but I have no font to set them in. Nothing was changed.", "actions": []}
-    missing = _missing_glyphs(fontfile, new_text)
+    missing = _missing_glyphs(fontfile, new_text + _stray_chars(parsed["kind"], parsed.get("new") or ""))
     if missing:
         return {
             "ok": False,
@@ -681,6 +742,8 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
         "mode": "raster-text",
         "old": hit["text"],
         "new": new_text,
+        "shownOld": shown_old,
+        "shownNew": shown_new,
         "pixelBox": [hit["left"], hit["top"], hit["width"], hit["height"]],
         "renderScale": scale,
         "fontfile": fontfile,

@@ -25,6 +25,11 @@ SCRIPT = os.path.join(os.path.dirname(__file__), "designer_assistant.py")
 FIXTURES = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures"))
 NEW_PHONE = "082 123 4567"
 
+
+def _phone_digits(text: str) -> str:
+    import re
+    return re.sub(r"\D", "", text or "")
+
 ROWS: list[dict] = []
 FAILURES: list[str] = []
 TRANSCRIPT: list[str] = []
@@ -161,7 +166,7 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
         problems.append("preview unchanged")
     staged = os.path.join(preview, "staged.pdf")
     staged_text = _text(staged) if os.path.isfile(staged) else ""
-    if NEW_PHONE not in staged_text:
+    if "0821234567" not in _phone_digits(staged_text):
         problems.append("staged text " + (staged_text[:80] or "missing"))
     if "BISHOP" in reply or "Waterbok" in reply:
         problems.append("replaced more than the number")
@@ -172,7 +177,7 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
         _record(name, False, "; ".join(problems))
         return
     done = _ask(src, "yes", name, preview, dest, width, height)
-    problems.extend([] if done.get("ok") and os.path.isfile(dest) and NEW_PHONE in _text(dest) else ["confirm failed " + (done.get("reply") or "")[:120]])
+    problems.extend([] if done.get("ok") and os.path.isfile(dest) and "0821234567" in _phone_digits(_text(dest)) else ["confirm failed " + (done.get("reply") or "")[:120]])
     if _sha(src) != original:
         problems.append("source changed on confirm")
     check_note = _checks_ran(done)
@@ -180,7 +185,7 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
         problems.append(check_note)
     if undo:
         undone = _ask(src, "undo", name, preview, dest, width, height)
-        if not undone.get("ok") or NEW_PHONE in _text(dest):
+        if not undone.get("ok") or "0821234567" in _phone_digits(_text(dest)):
             problems.append("undo " + (undone.get("reply") or "")[:80])
         else:
             undo_note = _checks_ran(undone)

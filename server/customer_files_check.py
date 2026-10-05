@@ -1107,6 +1107,22 @@ def test_size_matrix() -> None:
     )
 
 
+def test_small_edit_flow() -> None:
+    from small_edit_flow_check import run
+
+    failed = run()
+    record(
+        "small-edit-flow",
+        not failed,
+        product="all",
+        pages="",
+        size=str(len(failed)),
+        light="",
+        reasons="",
+        note=", ".join(failed[:8]),
+    )
+
+
 def test_cat_edits() -> None:
     from cat_edit_check import run
 
@@ -1170,6 +1186,7 @@ def main() -> None:
     test_plate_facts_skip_reencode()
     test_six_jobs()
     test_size_matrix()
+    test_small_edit_flow()
     test_cat_edits()
     test_customer_intake()
     _write_table()
