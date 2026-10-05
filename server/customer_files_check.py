@@ -128,8 +128,9 @@ def _write_pdf(path: str, spec: dict) -> None:
         if cmyk_path:
             page.insert_image(page.rect, filename=cmyk_path)
         else:
-            left = (0.85, 0.12, 0.1) if index % 2 == 0 else (0.1, 0.55, 0.75)
-            right = (0.1, 0.2, 0.8) if index % 2 == 0 else (0.75, 0.15, 0.55)
+            # Each page has its own colour, so a later-page preview cannot be a copy of page 1.
+            left = ((0.25 + 0.22 * index) % 1.0, 0.12 + 0.08 * (index % 3), 0.15)
+            right = (0.1, (0.25 + 0.18 * index) % 1.0, 0.55)
             page.draw_rect(page.rect, color=None, fill=left)
             page.draw_rect(fitz.Rect(page_w / 2.0, 0, page_w, page_h), color=None, fill=right)
         label = spec.get("text") or "SAFE"
@@ -636,14 +637,13 @@ def test_bleed_matches_edge() -> None:
 
     folder = tempfile.mkdtemp(prefix="cust-bleed-match-")
     width, height = 1806, 1300
-    image = np.zeros((height, width, 3), np.uint8)
-    image[:, :] = (183, 184, 185)
-    image[:, -1] = (230, 210, 210)
-    for y in range(height):
-        boundary = int((y - 900) / 3)
-        if 0 <= boundary < width:
-            image[y, :boundary] = (20, 40, 80)
-    image[-3:, :] = (245, 245, 245)
+    image = np.full((height, width, 3), (183, 184, 185), np.uint8)
+    # A unique centre locks the seam measurement. The outer band stays even, which is what a mirror repeats.
+    image[420:980, 500:1300] = (24, 64, 150)
+    for y in range(980, height - 80):
+        boundary = 80 + (y - 980) * 2
+        if boundary < width - 80:
+            image[y, 80:boundary] = (20, 40, 80)
     png = os.path.join(folder, "plate.png")
     Image.fromarray(image, mode="RGB").save(png)
     src = os.path.join(folder, "plate.pdf")
