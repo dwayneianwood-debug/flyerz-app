@@ -1476,6 +1476,11 @@ def _replace_span(page, proposal: dict) -> None:
     if ink is None and loose:
         ink = fitz.Rect(loose)
     origin = trace_origin or proposal.get("origin") or (ink.x0 if ink else 0, ink.y1 if ink else 0)
+    asked = proposal.get("origin")
+    if asked and len(asked) >= 2 and trace_origin:
+        # A move hands in a shifted point. An in-place edit keeps the drawn baseline.
+        if abs(float(asked[0]) - float(trace_origin[0])) > 0.6 or abs(float(asked[1]) - float(trace_origin[1])) > 0.6:
+            origin = (float(asked[0]), float(asked[1]))
     size = float(proposal.get("size") or 12)
     text = str(proposal.get("new") or "")
     rgb = proposal.get("rgb")
