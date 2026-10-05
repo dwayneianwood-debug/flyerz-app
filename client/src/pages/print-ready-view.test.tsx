@@ -36,6 +36,11 @@ test("quick print form lists the product sizes and one button", () => {
   assert.match(html, /Custom size/);
   assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a5" && product.widthMm === 148), true);
   assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a6-landscape" && product.widthMm === 148 && product.heightMm === 105), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a0" && product.widthMm === 841 && product.heightMm === 1189), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a7-landscape" && product.widthMm === 105 && product.heightMm === 74), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "card-50x90" && product.widthMm === 50 && product.heightMm === 90), true);
+  assert.match(html, /A0 \(841 × 1189 mm\)/);
+  assert.match(html, /A7 landscape \(105 × 74 mm\)/);
 });
 
 test("result cards show green download, amber reasons, and a red client message", () => {

@@ -270,6 +270,10 @@ def _case_pdf(name: str, spec: dict) -> None:
 
 def test_every_product() -> None:
     for product in _products():
+        # A2 and larger are detected in the size matrix. A 300 dpi plate of A0
+        # is about 14000 × 10000 and does not belong in this press compile.
+        if max(float(product["widthMm"]), float(product["heightMm"])) > 430:
+            continue
         _case_pdf(f"size-{product['id']}", {
             "trim_w": product["widthMm"],
             "trim_h": product["heightMm"],
@@ -1087,6 +1091,22 @@ def test_manual_styles() -> None:
     )
 
 
+def test_size_matrix() -> None:
+    from size_matrix_check import run
+
+    failed = run()
+    record(
+        "size-matrix",
+        not failed,
+        product="all",
+        pages="",
+        size=str(len(failed)),
+        light="",
+        reasons="",
+        note=", ".join(failed[:8]),
+    )
+
+
 def _write_table() -> None:
     out = "/opt/cursor/artifacts/customer_files_table.txt"
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -1117,6 +1137,7 @@ def main() -> None:
     test_imagen_stays_local()
     test_plate_facts_skip_reencode()
     test_six_jobs()
+    test_size_matrix()
     _write_table()
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failed: {', '.join(FAILURES)}")

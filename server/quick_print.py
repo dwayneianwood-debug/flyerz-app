@@ -267,14 +267,23 @@ def _remember_product(decisions: list, product: dict, trim_w: float, trim_h: flo
 
 
 def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
-    """Best catalog size. An unrotated landscape product wins over turning the portrait one."""
+    """Best catalog size. An unrotated landscape product wins over turning the portrait one.
+
+    Equal bleed on both axes wins over a nearer trim that only explains one axis.
+    A 90 × 50 card with 2.5 mm all round is 95 × 55, which is also close to the
+    90 × 55 card. The even margin is the partial bleed. A real TrimBox is read
+    before this, so an uneven edge is not guessed here.
+    """
     best = None
     for product in _products():
         fit = _fit_page_to_trim(width_mm, height_mm, float(product["widthMm"]), float(product["heightMm"]), tolerance)
         if not fit:
             continue
+        bleed = fit["bleed"]
+        uniform = abs(float(bleed["left"]) - float(bleed["top"]))
         extra = abs(width_mm - fit["trimW"]) + abs(height_mm - fit["trimH"])
-        rank = (1 if fit["rotated"] else 0, extra)
+        kind_rank = 0 if bleed.get("kind") == "trim" else 1
+        rank = (1 if fit["rotated"] else 0, kind_rank, round(uniform, 3), extra)
         if best is None or rank < best[0]:
             best = (rank, product, fit["rotated"])
     if not best:

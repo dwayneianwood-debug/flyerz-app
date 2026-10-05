@@ -289,7 +289,7 @@ def _plain_sentence(rule_key: str, text: str) -> str:
     if key.startswith("doc-replit"):
         return "The app checks and fixes PDF, AI, EPS, JPG, PNG, DOCX and PPTX files for press."
     if key.startswith("doc-products"):
-        return "Print sizes come from the product list, including A6, A5, A4, A3, DL and the business cards. Use the stored width and height."
+        return "Print sizes come from the product list: A0 to A7, DL, the business cards, and a custom size. Use the stored width and height."
     if key.startswith("doc-glitchy-mdc"):
         return "The cat stays at 20% of its size, anchored to the bottom, and only talks about checks it has run."
     if key.startswith("doc-glitchy-prompt"):

@@ -246,8 +246,9 @@ def _embedded_image_dpi(path: str) -> float | None:
 def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float | None = None) -> dict | None:
     """Visual bleed from a TrimBox, or from the page size when every box equals the MediaBox.
 
-    A Canva export often has no TrimBox. If the page is the ordered trim plus 2–15 mm
-    on each side, that extra is bleed that is already in the file.
+    A file often has no TrimBox. If the page is the ordered trim plus about 0.4–15 mm
+    on a side, that extra is bleed that is already in the file. A real TrimBox may
+    be uneven, including a side with no bleed.
     """
     try:
         media = page.mediabox
@@ -277,7 +278,7 @@ def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float |
     bottom = (trim.y0 - media.y0) * 25.4 / 72.0
     left = (trim.x0 - media.x0) * 25.4 / 72.0
     right = (media.x1 - trim.x1) * 25.4 / 72.0
-    if min(top, bottom, left, right) < 1.5:
+    if min(top, bottom, left, right) < -0.2 or max(top, bottom, left, right) < 0.4:
         return None
     return {
         "top": float(top),

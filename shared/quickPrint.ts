@@ -9,7 +9,7 @@ export interface QuickPrintProduct {
   heightMm: number;
 }
 
-/** Finished sizes sales can pick. A3–A6 and 90×50 match the sizes already used in the app. */
+/** Finished sizes sales can pick. A0–A7, DL and the business cards, in both orientations. */
 export const QUICK_PRINT_PRODUCTS: QuickPrintProduct[] = products;
 
 export const QUICK_PRINT_DEFAULT_PRODUCT_ID = "a5";

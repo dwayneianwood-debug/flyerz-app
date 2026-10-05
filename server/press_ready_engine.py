@@ -35,34 +35,59 @@ TAC_LIMIT = 300.0
 MM_TO_PT = 72.0 / 25.4
 
 
+def centred_bleed_mm(
+    page_w_mm: float,
+    page_h_mm: float,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    lo: float = 0.4,
+    hi: float = 15.0,
+) -> dict | None:
+    """Bleed when the page is the trim plus a centred margin.
+
+    Each side may be from none up to hi. One axis can be the trim while the
+    other already has bleed. The margin is centred because equal boxes do not
+    say which edge the extra belongs to.
+    """
+    side_w = (float(page_w_mm) - float(trim_w_mm)) / 2.0
+    side_h = (float(page_h_mm) - float(trim_h_mm)) / 2.0
+    if side_w < -0.05 or side_h < -0.05:
+        return None
+    if side_w > hi + 0.05 or side_h > hi + 0.05:
+        return None
+    if max(side_w, side_h) < lo - 0.05:
+        return None
+    return {
+        "left": max(0.0, side_w),
+        "right": max(0.0, side_w),
+        "top": max(0.0, side_h),
+        "bottom": max(0.0, side_h),
+    }
+
+
 def inferred_side_bleed(
     page_w_mm: float,
     page_h_mm: float,
     trim_w_mm: float,
     trim_h_mm: float,
-    lo: float = 2.0,
+    lo: float = 0.4,
     hi: float = 15.0,
     trim_tol: float = 2.5,
 ):
     """Per-side bleed when the page is the trim, or the trim plus bleed already there.
 
-    A Canva page often has no TrimBox. Two to 15 mm on each side is bleed that is
-    already in the file, including a full 5 mm and a more generous bleed. None
-    means the page is a different shape.
+    Any product, not only A6. A page with no TrimBox can already hold from about
+    0.4 mm up to 15 mm on a side, including a partial bleed under 2 mm and a full
+    5 mm. None means the page is a different shape.
     """
+    found = centred_bleed_mm(page_w_mm, page_h_mm, trim_w_mm, trim_h_mm, lo=lo, hi=hi)
+    if found:
+        return {**found, "kind": "existing"}
     extra_w = float(page_w_mm) - float(trim_w_mm)
     extra_h = float(page_h_mm) - float(trim_h_mm)
-    side_w = extra_w / 2.0
-    side_h = extra_h / 2.0
-    if (lo - 0.05) <= side_w <= (hi + 0.05) and (lo - 0.05) <= side_h <= (hi + 0.05):
-        return {
-            "left": side_w,
-            "right": side_w,
-            "top": side_h,
-            "bottom": side_h,
-            "kind": "existing",
-        }
     if abs(extra_w) <= trim_tol and abs(extra_h) <= trim_tol:
+        side_w = extra_w / 2.0
+        side_h = extra_h / 2.0
         return {
             "left": max(0.0, side_w),
             "right": max(0.0, side_w),
@@ -707,15 +732,52 @@ def _existing_image_bleed(img: np.ndarray, dpi: float, trim_w: float, trim_h: fl
     height, width = img.shape[:2]
     doc_w = width / float(dpi) * 25.4
     doc_h = height / float(dpi) * 25.4
-    extra_w = doc_w - float(trim_w)
-    extra_h = doc_h - float(trim_h)
-    if extra_w < 4 or extra_h < 4:
+    # Partial bleed can differ by axis. A generous uniform margin still counts past 5 mm.
+    found = centred_bleed_mm(doc_w, doc_h, trim_w, trim_h, lo=0.4, hi=5.5)
+    if found is None:
+        found = centred_bleed_mm(doc_w, doc_h, trim_w, trim_h, lo=2.0, hi=25.0)
+        if found and abs(found["left"] - found["top"]) > 1.5:
+            found = None
+    if not found:
         return None
-    left = right = extra_w / 2.0
-    top = bottom = extra_h / 2.0
-    if abs(left - top) > 1.5 or min(left, top) < 2 or max(left, top) > 25:
+    return {**found, "trim_w_mm": float(trim_w), "trim_h_mm": float(trim_h)}
+
+
+def _pad_existing_raster(plane: np.ndarray, existing: dict, trim_w_mm: float, trim_h_mm: float, bleed_mm: float, dpi: float) -> np.ndarray | None:
+    """Keep a raster that already has bleed, and pad only the short edges out to 5 mm."""
+    height, width = plane.shape[:2]
+
+    def px(mm: float) -> int:
+        return int(round(float(mm) / 25.4 * float(dpi)))
+
+    expect_w = px(trim_w_mm + float(existing["left"]) + float(existing["right"]))
+    expect_h = px(trim_h_mm + float(existing["top"]) + float(existing["bottom"]))
+    if abs(width - expect_w) > 3 or abs(height - expect_h) > 3:
         return None
-    return {"top": top, "bottom": bottom, "left": left, "right": right, "trim_w_mm": float(trim_w), "trim_h_mm": float(trim_h)}
+    short_l = px(max(0.0, bleed_mm - float(existing["left"])))
+    short_r = px(max(0.0, bleed_mm - float(existing["right"])))
+    short_t = px(max(0.0, bleed_mm - float(existing["top"])))
+    short_b = px(max(0.0, bleed_mm - float(existing["bottom"])))
+    out = plane
+    if short_l or short_r or short_t or short_b:
+        out = np.pad(out, ((short_t, short_b), (short_l, short_r), (0, 0)), mode="symmetric")
+    target_w = px(trim_w_mm + 2.0 * bleed_mm)
+    target_h = px(trim_h_mm + 2.0 * bleed_mm)
+    if out.shape[1] > target_w:
+        extra = out.shape[1] - target_w
+        left = extra // 2
+        out = out[:, left:left + target_w]
+    if out.shape[0] > target_h:
+        extra = out.shape[0] - target_h
+        top = extra // 2
+        out = out[top:top + target_h, :]
+    if out.shape[1] < target_w or out.shape[0] < target_h:
+        out = np.pad(
+            out,
+            ((0, target_h - out.shape[0]), (0, target_w - out.shape[1]), (0, 0)),
+            mode="edge",
+        )
+    return out
 
 
 def _crop_trim(img: np.ndarray, info: dict) -> np.ndarray:
@@ -803,6 +865,28 @@ def compile_raster_canvas(
                 report["reason"] = problems[0]
                 report["fix"] = "Open the file and extend the background yourself, then upload it again."
             return canvas, report
+        most = max(existing["top"], existing["bottom"], existing["left"], existing["right"])
+        size_ok = abs(existing["trim_w_mm"] - trim_w_mm) <= 2 and abs(existing["trim_h_mm"] - trim_h_mm) <= 2
+        if most >= 0.4 and size_ok and embedded_dpi:
+            topped = _pad_existing_raster(plane, existing, trim_w_mm, trim_h_mm, float(bleed_mm), float(embedded_dpi))
+            if topped is not None:
+                out_w = trim_w_px + 2 * bleed_px
+                out_h = trim_h_px + 2 * bleed_px
+                if topped.shape[1] != out_w or topped.shape[0] != out_h:
+                    topped = cv2.resize(topped, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                analysis = analyse_bgr(trim, dpi, safe_zone_mm)
+                edges = _edge_lines(analysis, {side: "kept" for side in SIDES}, kept=True)
+                report = _base_report(analysis, edges, True, bleed_mm, safe_zone_mm, src_w, src_h, trim_w_mm, trim_h_mm)
+                report["existingBleed"] = True
+                report["rescue"] = {
+                    "applied": False,
+                    "scale": 1.0,
+                    "safeZoneMm": safe_zone_mm,
+                    "note": "Existing bleed kept. Only the shortfall was added.",
+                }
+                _finish_resolution(report, src_w, src_h, trim_w_mm, trim_h_mm, analysis)
+                report["bitmapProblems"] = []
+                return topped, report
     else:
         trim = cover_scale(plane, trim_w_px, trim_h_px)
 
@@ -2779,7 +2863,11 @@ def press_window_seam(src_pdf: str, press_pdf: str) -> list[dict]:
 
 
 def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:
-    """Box inset when a TrimBox exists, otherwise the size match when every box is equal."""
+    """Box inset when a TrimBox exists, otherwise the size match when every box is equal.
+
+    A real TrimBox may be uneven: one edge can be 0 mm and another 5 mm. The trim
+    still has to be this product. Equal boxes use the centred partial-bleed rule.
+    """
     media = page.mediabox
     trim = page.trimbox if page.trimbox.width > 2 and page.trimbox.height > 2 else media
     boxes_differ = abs(trim.width - media.width) >= 1.5 or abs(trim.height - media.height) >= 1.5
@@ -2792,8 +2880,11 @@ def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, 
         }
         trim_w = trim.width * 25.4 / 72.0
         trim_h = trim.height * 25.4 / 72.0
-        if min(existing.values()) >= 1.5 and abs(trim_w - trim_w_mm) <= 2.0 and abs(trim_h - trim_h_mm) <= 2.0:
+        size_ok = abs(trim_w - trim_w_mm) <= 2.0 and abs(trim_h - trim_h_mm) <= 2.0
+        if size_ok and max(existing.values()) >= 0.4:
             return existing, "boxes"
+        if size_ok:
+            return existing, "trim"
         return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
     page_w = media.width * 25.4 / 72.0
     page_h = media.height * 25.4 / 72.0
@@ -2905,6 +2996,7 @@ def compile_vector_press(
         new_page = doc.new_page(width=out_w, height=out_h)
         existing, mode = _vector_page_bleed(src_page, trim_w_mm, trim_h_mm)
         have = min(existing.values()) if existing else 0.0
+        most = max(existing.values()) if existing else 0.0
         trim_box = src_page.trimbox if src_page.trimbox.width > 2 else src_page.mediabox
         if mode == "boxes" and have + 0.4 >= bleed_mm:
             # Already 5 mm. Clip to that bleed. Do not add another ring and do not shrink.
@@ -2917,7 +3009,7 @@ def compile_vector_press(
             new_page.show_pdf_page(new_page.rect, src, index, clip=clip)
             kept = True
             page_mirrored.append(False)
-        elif mode in ("partial", "boxes") and have >= 2.0:
+        elif mode in ("partial", "boxes") and most >= 0.4:
             # Keep the bleed that is already there. Mirror only the shortfall out to 5 mm.
             extra_l = max(0.0, existing["left"] * MM_TO_PT - bleed_pt)
             extra_r = max(0.0, existing["right"] * MM_TO_PT - bleed_pt)

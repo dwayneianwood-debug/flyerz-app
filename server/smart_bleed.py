@@ -7195,30 +7195,10 @@ def choose_automatic_bleed_api(img_bgr: np.ndarray, dpi: float = 300.0) -> str:
 
 
 def _bleed_dict_from_image_dpi(img: np.ndarray, dpi: float, trim_w_mm: float, trim_h_mm: float) -> dict | None:
-    """A centred file whose millimetre size is trim plus a uniform 2–25mm margin already has bleed."""
-    if img is None or dpi is None or dpi < 150 or trim_w_mm <= 0 or trim_h_mm <= 0:
-        return None
-    height, width = img.shape[:2]
-    doc_w = width / float(dpi) * 25.4
-    doc_h = height / float(dpi) * 25.4
-    extra_w = doc_w - float(trim_w_mm)
-    extra_h = doc_h - float(trim_h_mm)
-    if extra_w < 4.0 or extra_h < 4.0:
-        return None
-    left = right = extra_w / 2.0
-    top = bottom = extra_h / 2.0
-    if abs(left - top) > 1.5:
-        return None
-    if min(left, top) < 2.0 or max(left, top) > 25.0:
-        return None
-    return {
-        "top": top,
-        "bottom": bottom,
-        "left": left,
-        "right": right,
-        "trim_w_mm": float(trim_w_mm),
-        "trim_h_mm": float(trim_h_mm),
-    }
+    """A centred file whose millimetre size is the trim plus bleed already in the picture."""
+    from press_ready_engine import _existing_image_bleed
+
+    return _existing_image_bleed(img, dpi, trim_w_mm, trim_h_mm)
 
 
 def crop_to_trim_box(img: np.ndarray, info: dict) -> np.ndarray:
