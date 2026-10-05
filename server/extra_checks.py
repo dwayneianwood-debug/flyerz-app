@@ -593,33 +593,19 @@ def _boxes_wrong(path: str, order: dict) -> str:
 
 
 def _effective_dpi(path: str) -> float:
-    import pymupdf as fitz
+    """Lowest photo PPI on a press PDF. A loose picture has no placement yet, so it is not 96."""
+    from client_file_audit import _image_rows
 
-    from client_file_audit import decorative_xrefs
-
-    doc = _open_pdf(path)
-    if doc is None:
+    if not looks_like_pdf(path):
         return 300.0
-    worst = 300.0
-    soft = decorative_xrefs(path)
     try:
-        for page in doc:
-            margin = _margin_xrefs(page)
-            for info in page.get_image_info(xrefs=True) or []:
-                xref = int(info.get("xref") or 0)
-                if xref in margin or xref in soft:
-                    continue
-                box = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
-                width = int(info.get("width") or 0)
-                height = int(info.get("height") or 0)
-                if box.width < 8 or box.height < 8 or width < 2:
-                    continue
-                ppi_x = width / (box.width / 72.0)
-                ppi_y = height / (box.height / 72.0)
-                worst = min(worst, ppi_x, ppi_y)
-        return worst
-    finally:
-        doc.close()
+        rows = _image_rows(path)
+    except Exception:
+        return 300.0
+    photos = [row for row in rows if not row.get("decorative")]
+    if not photos:
+        return 300.0
+    return min(float(row.get("ppi") or 300) for row in photos)
 
 
 def _span_is_black(color) -> bool:
@@ -632,6 +618,44 @@ def _span_is_black(color) -> bool:
     green = (value >> 8) & 255
     blue = value & 255
     return max(red, green, blue) <= 40 and (max(red, green, blue) - min(red, green, blue)) <= 18
+
+
+def _plate_samples(page):
+    """Decoded CMYK of the full-page plate. A rendered pixmap runs the ICC and invents CMY on 100K."""
+    import numpy as np
+
+    images = page.get_images(full=True) or []
+    if len(images) != 1:
+        return None
+    try:
+        pix = pymupdf_pixmap(page.parent, int(images[0][0]))
+    except Exception:
+        return None
+    if pix is None or pix.n < 4 or pix.w < 8:
+        return None
+    area = abs(float(page.rect.width) * float(page.rect.height)) or 1.0
+    info = page.get_image_info(xrefs=True) or []
+    box = None
+    for row in info:
+        if int(row.get("xref") or 0) == int(images[0][0]):
+            box = row.get("bbox")
+            break
+    if not box:
+        return None
+    placed = abs((float(box[2]) - float(box[0])) * (float(box[3]) - float(box[1])))
+    if placed / area < 0.8:
+        return None
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4]
+    return arr, box
+
+
+def pymupdf_pixmap(doc, xref):
+    import pymupdf as fitz
+
+    try:
+        return fitz.Pixmap(doc, int(xref))
+    except Exception:
+        return None
 
 
 def _text_ink(path: str) -> list[dict]:
@@ -662,15 +686,25 @@ def _text_ink(path: str) -> list[dict]:
                         spans.append((size, box))
             if not spans:
                 continue
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False, colorspace=fitz.csCMYK)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            plate = _plate_samples(page)
+            if plate is not None:
+                arr, placed = plate
+                scale_x = arr.shape[1] / max(float(placed[2]) - float(placed[0]), 1)
+                scale_y = arr.shape[0] / max(float(placed[3]) - float(placed[1]), 1)
+                origin_x = float(placed[0])
+                origin_y = float(placed[1])
+            else:
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False, colorspace=fitz.csCMYK)
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                scale_x = scale_y = 1.2
+                origin_x = origin_y = 0.0
             for size, box in spans:
                 if size >= 18:
                     continue
-                x0 = max(0, int(box.x0 * 1.2))
-                y0 = max(0, int(box.y0 * 1.2))
-                x1 = min(arr.shape[1], int(box.x1 * 1.2))
-                y1 = min(arr.shape[0], int(box.y1 * 1.2))
+                x0 = max(0, int((box.x0 - origin_x) * scale_x))
+                y0 = max(0, int((box.y0 - origin_y) * scale_y))
+                x1 = min(arr.shape[1], int((box.x1 - origin_x) * scale_x))
+                y1 = min(arr.shape[0], int((box.y1 - origin_y) * scale_y))
                 crop = arr[y0:y1, x0:x1, :4]
                 if crop.size == 0:
                     continue
@@ -698,6 +732,88 @@ def _tac_peak(path: str) -> float:
     except Exception:
         return 0.0
     return 0.0
+
+
+def _small_rich_plate(arr) -> bool:
+    """A solid dark blob that is not 100K. Downsampled so a flyer plate stays cheap."""
+    import cv2
+    import numpy as np
+
+    sample = arr[::2, ::2]
+    if sample.shape[0] < 8 or sample.shape[1] < 8:
+        return False
+    c = sample[:, :, 0].astype(np.float32) / 255.0
+    m = sample[:, :, 1].astype(np.float32) / 255.0
+    y = sample[:, :, 2].astype(np.float32) / 255.0
+    k = sample[:, :, 3].astype(np.float32) / 255.0
+    red = (1.0 - c) * (1.0 - k)
+    green = (1.0 - m) * (1.0 - k)
+    blue = (1.0 - y) * (1.0 - k)
+    high = np.maximum(np.maximum(red, green), blue)
+    low = np.minimum(np.minimum(red, green), blue)
+    dark = (high <= 0.22) & ((high - low) <= 0.10)
+    cmy = sample[:, :, :3].sum(axis=-1)
+    rich = dark & (cmy > 13)
+    if int(rich.sum()) < 20:
+        return False
+    count, _labels, stats, _cent = cv2.connectedComponentsWithStats(rich.astype(np.uint8), 8)
+    for label in range(1, count):
+        _x, _y, width, height, area = stats[label]
+        if area < 20:
+            continue
+        if float(area) / max(1.0, float(width) * float(height)) < 0.35:
+            continue
+        if height <= 40 or (width <= 120 and height <= 120):
+            return True
+    return False
+
+
+_INK_CACHE: dict[tuple, dict] = {}
+
+
+def press_ink_facts(path: str) -> dict:
+    """Image-sample ink. K-only is K at 90% or more with almost no C, M or Y. This is what konly.py counts."""
+    try:
+        stat = os.stat(path)
+        key = (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        key = None
+    if key and key in _INK_CACHE:
+        return dict(_INK_CACHE[key])
+    facts = _press_ink_facts_read(path)
+    if key:
+        if len(_INK_CACHE) > 8:
+            _INK_CACHE.clear()
+        _INK_CACHE[key] = facts
+    return dict(facts)
+
+
+def _press_ink_facts_read(path: str) -> dict:
+    import numpy as np
+
+    doc = _open_pdf(path)
+    facts = {"max_tac": 0.0, "k90": 0, "k_only": 0, "small_rich": False, "small_k": False}
+    if doc is None:
+        return facts
+    try:
+        for page in doc:
+            for item in page.get_images(full=True) or []:
+                pix = pymupdf_pixmap(doc, int(item[0]))
+                if pix is None or pix.n < 4 or pix.w < 2:
+                    continue
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].astype(np.int16)
+                facts["max_tac"] = max(facts["max_tac"], float(arr.sum(axis=-1).max()) / 2.55)
+                black = arr[:, :, 3] >= 230
+                cmy = arr[:, :, :3].sum(axis=-1)
+                facts["k90"] += int(black.sum())
+                facts["k_only"] += int((black & (cmy <= 13)).sum())
+                if facts["k_only"] == 0 and not facts["small_rich"]:
+                    facts["small_rich"] = _small_rich_plate(arr)
+        facts["small_k"] = facts["k_only"] > 30
+        facts["small_rich"] = bool(facts["small_rich"] or (facts["k90"] > 30 and facts["k_only"] == 0))
+        return facts
+    finally:
+        doc.close()
 
 
 def check_e3(press: str, order: dict, source_pages: int | None = None) -> dict:
@@ -730,8 +846,12 @@ def check_e3(press: str, order: dict, source_pages: int | None = None) -> dict:
     if dpi < 299:
         ambers.append(f"Effective image DPI is about {dpi:.0f}, under 300.")
     tac = _tac_peak(press)
+    ink = press_ink_facts(press)
+    tac = max(tac, float(ink.get("max_tac") or 0))
     if tac > 300:
         ambers.append(f"TAC is about {tac:.0f}%, over 300%.")
+    if ink.get("small_rich"):
+        ambers.append("Small black text in the press image is still four-colour, not K-only.")
     rich = []
     for sample in _text_ink(press):
         if sample["c"] > 12 or sample["m"] > 12 or sample["y"] > 12:

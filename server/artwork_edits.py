@@ -151,6 +151,8 @@ def _parse(message: str) -> dict | None:
         return {"kind": "logo", "scale": 0.8 if word == "smaller" else 1.25}
     if MOVE_ASK.search(text):
         return {"kind": "move"}
+    if re.search(r"shrink", text, re.I) and re.search(r"safe", text, re.I):
+        return {"kind": "shrink"}
     return None
 
 
@@ -283,6 +285,8 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             proposal.update(_logo_proposal(page, float(parsed["scale"])))
             if proposal.get("error"):
                 return {"ok": False, "reply": proposal["error"], "actions": []}
+        elif parsed["kind"] == "shrink":
+            proposal.update({"mode": "shrink", "amber": False, "count": 1})
         else:
             moved = _move_proposal(page, spans)
             if moved.get("error"):
@@ -335,6 +339,8 @@ def _preview_sentence(proposal: dict) -> str:
         return f"I would make the logo {proposal.get('scale')} times its current size."
     if kind == "move":
         return f"I would move {proposal.get('count', 1)} text item(s) in from the edge. The words stay the same."
+    if kind == "shrink":
+        return "I would shrink the artwork into the safe zone, about 3 mm inside the trim, and show you the preview first."
     return "I would make that one change."
 
 
@@ -473,6 +479,25 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
     return {"proposal": proposal}
 
 
+def _shrink_page(doc, page) -> None:
+    """Place the whole page about 3 mm inside itself so type clears the trim."""
+    import pymupdf as fitz
+
+    inset = 3.0 * 72.0 / 25.4
+    inner = fitz.Rect(page.rect.x0 + inset, page.rect.y0 + inset, page.rect.x1 - inset, page.rect.y1 - inset)
+    if inner.width < 8 or inner.height < 8:
+        return
+    copied = fitz.open()
+    try:
+        copied.insert_pdf(doc, from_page=page.number, to_page=page.number)
+        page.clean_contents()
+        page.add_redact_annot(page.rect, fill=(1, 1, 1))
+        page.apply_redactions(images=2, graphics=2, text=0)
+        page.show_pdf_page(inner, copied, 0)
+    finally:
+        copied.close()
+
+
 def _apply_proposal(src: str, dest: str, proposal: dict) -> None:
     import pymupdf as fitz
 
@@ -482,6 +507,8 @@ def _apply_proposal(src: str, dest: str, proposal: dict) -> None:
         mode = proposal.get("mode")
         if mode == "live-text":
             _replace_span(page, proposal)
+        elif mode == "shrink":
+            _shrink_page(doc, page)
         elif mode == "move":
             for move in proposal.get("moves") or []:
                 _replace_span(page, {

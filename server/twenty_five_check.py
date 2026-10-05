@@ -117,10 +117,19 @@ def main() -> None:
 
     looked = inspect_artwork(path, 148, 210)
     reply = looked["reply"]
-    check("rulebook-points", all(f"{num}. {name}" in reply for num, name in POINTS), reply[:500])
-    check("rulebook-plain", reply.startswith("Here is what needs attention.") and "The rest is fine:" in reply and "I can do these:" in reply, reply[:240])
-    check("rulebook-fallback", looked["provider"] == "rules", looked["provider"])
     from designer_assistant import _qr, reply_from_checks
+
+    full, _full_actions = reply_from_checks(looked["checks"], show_all=True)
+    check("rulebook-points", all(f"{num}. {name}" in full for num, name in POINTS), full[:500])
+    check(
+        "rulebook-plain",
+        "Everything else on your 25-point check" in reply
+        and "Say show all" in reply
+        and "Here is what needs attention" not in reply
+        and "I can do these" not in reply,
+        reply[:240],
+    )
+    check("rulebook-fallback", looked["provider"] == "rules", looked["provider"])
 
     blank = os.path.join(folder, "noqr.pdf")
     import pymupdf as fitz
@@ -157,7 +166,31 @@ def main() -> None:
         {"num": "1", "name": "Bleed Detection & Correction", "status": "passed", "detail": "Bleed is 5 mm."},
         {"num": "7", "name": "Skipped Point", "status": "skipped", "detail": "Not rendered."},
     ])
-    check("reply-order", shaped.index("6d. Scale") < shaped.index("The rest is fine:") < shaped.index("1. Bleed") and "Not run: 7. Skipped Point" in shaped, shaped)
+    shown, _shown_actions = reply_from_checks([
+        {"num": "6d", "name": "Scale & Centre to Target Size", "status": "warning", "detail": "The size does not match."},
+        {"num": "1", "name": "Bleed Detection & Correction", "status": "passed", "detail": "Bleed is 5 mm."},
+        {"num": "7", "name": "Skipped Point", "status": "skipped", "detail": "Not rendered."},
+    ], show_all=True)
+    check(
+        "reply-order",
+        shaped.index("does not match") < shaped.index("Everything else on your 25-point check")
+        and "1. Bleed" not in shaped.split("Everything else")[0]
+        and "Not run: 7. Skipped Point" in shaped,
+        shaped,
+    )
+    check("show-all-names", "6d. Scale & Centre to Target Size" in shown and "1. Bleed Detection & Correction" in shown, shown)
+    located, located_actions = reply_from_checks([
+        {"status": "warning", "detail": "Text is within 3 mm of the trim (LOCATION:)."},
+        {"num": "1", "name": "Bleed Detection & Correction", "status": "passed", "detail": "Bleed is 5 mm."},
+    ])
+    check("location-plain", "LOCATION" in located and "trimmed off" in located and "Say show all" in located, located)
+    check(
+        "location-actions",
+        any(item["id"] == "move-inward" and item["tone"] == "primary" for item in located_actions)
+        and any(item["id"] == "shrink-safe" and item["tone"] == "primary" for item in located_actions)
+        and any(item["id"] == "download" and item["tone"] == "secondary" for item in located_actions),
+        str(located_actions),
+    )
     check("offers-fixes", any(item["id"] == "fix-black" for item in looked["actions"]), str(looked["actions"]))
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failed: {', '.join(FAILURES)}")

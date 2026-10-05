@@ -787,10 +787,21 @@ def font_report(path: str) -> dict:
     return {"checked": checked, "problems": problems, "type3": type3, "embedded": embedded}
 
 
-def _mask_opaque_fraction(doc, xref: int) -> float | None:
-    """Share of a soft mask that is actually visible. None when the image has no mask."""
+# A full-page plate's mask is the size of the press image. Decoding it is the
+# extra 9–12 s. Tiny placements are decorations from their area alone.
+_MASK_PIXEL_CAP = 1_500_000
+_IMAGE_ROW_CACHE: dict[tuple, list] = {}
+
+
+def _mask_opaque_fraction(doc, xref: int, pixel_count: int = 0) -> float | None:
+    """Share of a soft mask that is actually visible. None when the image has no mask.
+
+    A plate larger than 1.5 million pixels is not decoded. It is a photograph, not a decoration.
+    """
     import numpy as np
 
+    if int(pixel_count or 0) > _MASK_PIXEL_CAP:
+        return None
     try:
         kind, value = doc.xref_get_key(int(xref), "SMask")
     except Exception:
@@ -807,6 +818,8 @@ def _mask_opaque_fraction(doc, xref: int) -> float | None:
         import pymupdf as fitz
 
         pix = fitz.Pixmap(doc, mask_xref)
+        if int(pix.w) * int(pix.h) > _MASK_PIXEL_CAP:
+            return None
         samples = np.frombuffer(pix.samples, dtype=np.uint8)
     except Exception:
         return None
@@ -831,6 +844,22 @@ def decorative_xrefs(path: str) -> set[int]:
 
 
 def _image_rows(path: str) -> list[dict]:
+    try:
+        stat = os.stat(path)
+        key = (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        key = None
+    if key and key in _IMAGE_ROW_CACHE:
+        return _IMAGE_ROW_CACHE[key]
+    rows = _image_rows_read(path)
+    if key:
+        if len(_IMAGE_ROW_CACHE) > 24:
+            _IMAGE_ROW_CACHE.clear()
+        _IMAGE_ROW_CACHE[key] = rows
+    return rows
+
+
+def _image_rows_read(path: str) -> list[dict]:
     import pymupdf as fitz
 
     rows = []
@@ -859,16 +888,18 @@ def _image_rows(path: str) -> list[dict]:
                     continue
                 area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
                 area_ratio = area / page_area
-                if area_ratio < MIN_IMAGE_AREA and not _is_decoration(area_ratio, _mask_opaque_fraction(doc, xref) if xref else None):
-                    continue
                 width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
                 height_in = max(0.01, (float(bbox[3]) - float(bbox[1])) / 72.0)
                 px_w = float(image.get("width") or 0)
                 px_h = float(image.get("height") or 0)
                 if px_w < 2 or px_h < 2:
                     continue
-                opaque = _mask_opaque_fraction(doc, xref) if xref else None
-                decorative = _is_decoration(area_ratio, opaque)
+                pixel_count = int(px_w * px_h)
+                # A full-plate mask is millions of pixels. A stretched decoration is small, so its mask is cheap.
+                opaque = None
+                if xref and area_ratio >= 0.08 and pixel_count <= _MASK_PIXEL_CAP:
+                    opaque = _mask_opaque_fraction(doc, xref, pixel_count)
+                decorative = area_ratio < 0.08 or _is_decoration(area_ratio, opaque)
                 if area_ratio < MIN_IMAGE_AREA and not decorative:
                     continue
                 ppi = min(px_w / width_in, px_h / height_in)
@@ -1127,15 +1158,34 @@ def apply_vector_fixes(src: str, dest: str, rich: tuple[float, float, float, flo
     return result
 
 
-def repair_cmyk_images(path: str) -> dict:
-    """Large near-black picture areas become rich black. Small marks stay 100K. Ink stays at or under 300%."""
+def _cmyk_channels(value) -> int:
+    space = value.get("/ColorSpace")
+    if str(space) == "/DeviceCMYK":
+        return 4
+    try:
+        if str(space[0]) == "/ICCBased":
+            return int(space[1].get("/N") or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def repair_cmyk_images(path: str, text_only: bool = False) -> dict:
+    """Small black type becomes 100K. Ink stays at or under 300%. The colour space stays as it was.
+
+    text_only leaves photographs alone apart from the ink cap. The full repair also turns a large
+    near-black area into rich black.
+    """
     import pikepdf
+    import zlib
     from PIL import Image
     import io
     import numpy as np
+    import pymupdf as fitz
 
     changed = 0
     pdf = pikepdf.open(path)
+    rendered = fitz.open(path)
     try:
         masks = set()
         for page in pdf.pages:
@@ -1164,31 +1214,51 @@ def repair_cmyk_images(path: str) -> dict:
                         continue
                     if value.objgen in masks:
                         continue
-                    if str(value.get("/ColorSpace", "")) != "/DeviceCMYK":
+                    if _cmyk_channels(value) != 4:
                         continue
-                    raw = value.read_bytes()
                     width = int(value.get("/Width") or 0)
                     height = int(value.get("/Height") or 0)
+                    try:
+                        raw = value.read_bytes()
+                    except Exception:
+                        raw = b""
+                    arr = None
                     if width > 0 and height > 0 and len(raw) == width * height * 4:
                         arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4).copy()
                     else:
-                        image = Image.open(io.BytesIO(raw))
-                        if image.mode != "CMYK":
+                        try:
+                            image = Image.open(io.BytesIO(raw))
+                            if image.mode == "CMYK":
+                                arr = np.asarray(image).copy()
+                                width, height = image.size
+                        except Exception:
+                            arr = None
+                    if arr is None:
+                        xref = int(getattr(value, "objgen", (0, 0))[0] or 0)
+                        if xref <= 0:
                             continue
-                        arr = np.asarray(image).copy()
+                        pix = fitz.Pixmap(rendered, xref)
+                        if pix.n < 4 or pix.w < 2 or pix.h < 2:
+                            continue
+                        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
+                        width, height = pix.w, pix.h
                     if arr.ndim != 3 or arr.shape[2] < 4:
                         continue
+                    space = value.get("/ColorSpace")
                     dpi = 72.0 * (arr.shape[1] / page_w)
-                    if _repair_array(arr, dpi):
-                        fresh = pikepdf.Stream(pdf, arr[:, :, :4].tobytes())
-                        fresh["/Type"] = pikepdf.Name("/XObject")
-                        fresh["/Subtype"] = pikepdf.Name("/Image")
-                        fresh["/Width"] = width
-                        fresh["/Height"] = height
-                        fresh["/ColorSpace"] = pikepdf.Name("/DeviceCMYK")
-                        fresh["/BitsPerComponent"] = 8
-                        xobjects[pikepdf.Name(str(_key))] = fresh
-                        changed += 1
+                    if not _repair_array(arr, dpi, text_only=text_only):
+                        continue
+                    payload = zlib.compress(np.ascontiguousarray(arr[:, :, :4]).tobytes())
+                    value.write(payload, filter=pikepdf.Name("/FlateDecode"))
+                    value["/Type"] = pikepdf.Name("/XObject")
+                    value["/Subtype"] = pikepdf.Name("/Image")
+                    value["/Width"] = int(width)
+                    value["/Height"] = int(height)
+                    value["/ColorSpace"] = space
+                    value["/BitsPerComponent"] = 8
+                    if "/Decode" in value:
+                        del value["/Decode"]
+                    changed += 1
                 except Exception:
                     continue
         if changed:
@@ -1197,10 +1267,11 @@ def repair_cmyk_images(path: str) -> dict:
             os.replace(tmp, path)
     finally:
         pdf.close()
+        rendered.close()
     return {"images": changed}
 
 
-def _repair_array(arr, dpi: float) -> bool:
+def _repair_array(arr, dpi: float, text_only: bool = False) -> bool:
     import cv2
     import numpy as np
 
@@ -1210,7 +1281,7 @@ def _repair_array(arr, dpi: float) -> bool:
     k = arr[:, :, 3].astype(np.float32)
     changed = False
     total = c + m + y + k
-    over = total > (TAC_LIMIT * 255.0 + 1)
+    over = total > (TAC_LIMIT * 255.0)
     if int(over.sum()) > 0:
         extra = total - TAC_LIMIT * 255.0
         cmy = c + m + y
@@ -1221,28 +1292,52 @@ def _repair_array(arr, dpi: float) -> bool:
         m[over] *= scale[over]
         y[over] *= scale[over]
         changed = True
-    chroma = np.maximum(np.maximum(c, m), y) - np.minimum(np.minimum(c, m), y)
-    dark = ((k >= 210) & (c <= 40) & (m <= 40) & (y <= 40))
-    dark |= (c >= 240) & (m >= 240) & (y >= 240) & (k >= 240)
-    dark |= (k >= 150) & (c >= 40) & (m >= 40) & (y >= 40) & (chroma <= 30)
+        arr[:, :, 0] = np.clip(c, 0, 255).astype(np.uint8)
+        arr[:, :, 1] = np.clip(m, 0, 255).astype(np.uint8)
+        arr[:, :, 2] = np.clip(y, 0, 255).astype(np.uint8)
+        arr[:, :, 3] = np.clip(k, 0, 255).astype(np.uint8)
+        c = arr[:, :, 0].astype(np.float32)
+        m = arr[:, :, 1].astype(np.float32)
+        y = arr[:, :, 2].astype(np.float32)
+        k = arr[:, :, 3].astype(np.float32)
+    # SWOP black type is about C72 M70 Y58 K67. A loose page-wide mask also catches navy, so only
+    # a small, solid component is rewritten.
+    red = (1.0 - c / 255.0) * (1.0 - k / 255.0)
+    green = (1.0 - m / 255.0) * (1.0 - k / 255.0)
+    blue = (1.0 - y / 255.0) * (1.0 - k / 255.0)
+    high = np.maximum(np.maximum(red, green), blue)
+    low = np.minimum(np.minimum(red, green), blue)
+    dark = (high <= 0.22) & ((high - low) <= 0.10)
+    if not text_only:
+        chroma = np.maximum(np.maximum(c, m), y) - np.minimum(np.minimum(c, m), y)
+        dark = dark | ((k >= 210) & (c <= 40) & (m <= 40) & (y <= 40))
+        dark = dark | ((c >= 240) & (m >= 240) & (y >= 240) & (k >= 240))
+        dark = dark | ((k >= 150) & (c >= 40) & (m >= 40) & (y >= 40) & (chroma <= 30))
+    if text_only:
+        # Converted black type carries all four inks. A photograph's shadow does not match that.
+        dark = dark & (c >= 140) & (m >= 120) & (y >= 90) & (k >= 110)
     if int(dark.sum()) < 16:
-        if changed:
-            arr[:, :, 0] = np.clip(c, 0, 255).astype(np.uint8)
-            arr[:, :, 1] = np.clip(m, 0, 255).astype(np.uint8)
-            arr[:, :, 2] = np.clip(y, 0, 255).astype(np.uint8)
-            arr[:, :, 3] = np.clip(k, 0, 255).astype(np.uint8)
         return changed
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
     text_px = max(8.0, 18.0 / 72.0 * max(dpi, 72.0))
+    item_px = max(text_px, 56.0 / 72.0 * max(dpi, 72.0))
     rich = np.array([round(RICH[0] * 255), round(RICH[1] * 255), round(RICH[2] * 255), 255], np.uint8)
     k_only = np.array([0, 0, 0, 255], np.uint8)
     for label in range(1, count):
         _x, _y, width, height, area = stats[label]
-        if area < 12:
+        if area < (40 if text_only else 12):
             continue
+        fill = float(area) / max(1.0, float(width) * float(height))
+        # Anti-aliased type is a thin core inside its box, often under 0.30. A solid
+        # rectangle is near 1. Photo speckle that slips the ink gate is sparser still.
+        if text_only and fill < 0.08:
+            continue
+        small = height <= text_px or (width <= item_px and height <= item_px)
         mask = labels == label
-        if height <= text_px and width <= text_px * 24:
+        if small or (height <= text_px and width <= text_px * 24):
             arr[mask] = k_only
+        elif text_only:
+            continue
         else:
             arr[mask] = rich
         changed = True
@@ -1321,8 +1416,11 @@ def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.
                     continue
                 area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
                 area_ratio = area / page_area
-                opaque = _mask_opaque_fraction(doc, xref)
-                decorative = _is_decoration(area_ratio, opaque)
+                px_w = float(info.get("width") or 0)
+                px_h = float(info.get("height") or 0)
+                pixel_count = int(px_w * px_h)
+                opaque = _mask_opaque_fraction(doc, xref, pixel_count) if area_ratio >= 0.08 and pixel_count <= _MASK_PIXEL_CAP else None
+                decorative = area_ratio < 0.08 or _is_decoration(area_ratio, opaque)
                 if area_ratio >= full_page and not decorative:
                     result["skippedFull"] += 1
                     continue

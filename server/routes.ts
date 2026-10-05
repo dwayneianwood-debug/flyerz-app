@@ -2028,13 +2028,32 @@ export async function registerRoutes(
       const auditResults = job.auditResults as AuditResults | null;
       const pageIndex = Math.max(0, parseInt(req.query.page as string) || 0);
       const pageList = (auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages?.[method];
-      const variantPath = Array.isArray(pageList) && pageList[pageIndex]
+      let variantPath = Array.isArray(pageList) && pageList[pageIndex]
         ? pageList[pageIndex]
         : (pageIndex === 0 ? auditResults?.bleedVariants?.[method as keyof NonNullable<AuditResults["bleedVariants"]>] : null);
+      if (!variantPath && pageIndex > 0) {
+        const artwork = String(job.originalPath || "");
+        if (artwork && isPathSafe(artwork) && fsSync.existsSync(artwork)) {
+          const outPath = path.join(path.dirname(artwork), `style-${method}-page${pageIndex}.png`);
+          try {
+            if (!fsSync.existsSync(outPath)) {
+              const script = path.join(process.cwd(), "server", "smart_bleed.py");
+              execPythonCapture(
+                [script, "--one-style", artwork, method, String(pageIndex), outPath],
+                "BleedStylePage",
+                90_000,
+              );
+            }
+            if (fsSync.existsSync(outPath) && isPathSafe(outPath)) variantPath = outPath;
+          } catch (styleErr) {
+            console.error("[FAI] On-demand bleed page failed:", styleErr);
+          }
+        }
+      }
       if (!variantPath) {
         return res.status(404).json({ message: `No variant found for method: ${method}` });
       }
-      res.setHeader("X-Proof-Page-Count", String(Array.isArray(pageList) && pageList.length ? pageList.length : 1));
+      res.setHeader("X-Proof-Page-Count", String(Math.max(Array.isArray(pageList) ? pageList.length : 1, pageIndex + 1)));
 
       if (!isPathSafe(variantPath)) {
         return res.status(403).json({ message: "Invalid variant file path" });
@@ -2049,7 +2068,7 @@ export async function registerRoutes(
       const ext = path.extname(variantPath).toLowerCase();
       const mimeMap: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf" };
       res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
-      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Cache-Control", "private, no-store");
       const { createReadStream } = await import("fs");
       createReadStream(variantPath).pipe(res);
     } catch (error) {
@@ -4311,12 +4330,14 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       if (row.passed === true) continue;
       const detail = String(row.detail || row.label || "");
       if (!detail) continue;
+      const name = String(row.name || row.label || "Press check");
       rows.push({
         num: "",
-        name: String(row.label || "Press check"),
+        name,
         status: "warning",
         pass: false,
         detail,
+        label: String(row.label || detail || name),
       });
     }
     return rows;
@@ -4418,8 +4439,27 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const script = path.join(process.cwd(), "server", "designer_assistant.py");
       const replyJson = (result: any, extras: Record<string, unknown> = {}) => res.json({
         reply: result?.reply || "I couldn't read a result from the check.",
-        actions: Array.isArray(result?.actions) ? result.actions : [],
-        checks: Array.isArray(result?.checks) ? result.checks : [],
+        actions: Array.isArray(result?.actions)
+          ? result.actions.map((action: any) => ({
+              id: String(action?.id || ""),
+              label: String(action?.label || ""),
+              tone: String(action?.tone || ""),
+            }))
+          : [],
+        checks: Array.isArray(result?.checks)
+          ? result.checks.map((row: any) => {
+              const detail = String(row?.detail || "");
+              const name = String(row?.name || "");
+              const num = String(row?.num || "");
+              return {
+                ...row,
+                num,
+                name,
+                detail,
+                label: String(row?.label || (num ? `${num}. ${name}: ${detail}` : detail || name)),
+              };
+            })
+          : [],
         provider: result?.provider || "rules",
         ok: result?.ok !== false,
         previewBefore: "",

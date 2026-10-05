@@ -7,6 +7,21 @@ interface CheckItem {
   label: string;
   pass: boolean;
   status?: string;
+  detail?: string;
+  name?: string;
+  num?: string;
+}
+
+interface ChatAction {
+  id: string;
+  label: string;
+  tone?: string;
+}
+
+function checkText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  return String(value);
 }
 
 function CatAvatar({ mode, dilated }: { mode: CatMode; dilated: boolean }) {
@@ -132,8 +147,19 @@ type ProcessState = "IDLE" | "PROCESSING" | "QUEUED" | "SUCCESS" | "ERROR";
 
 const GLITCHY_SUPPRESS_CROPBOX_ERR = "cropbox not in mediabox";
 
-function textContainsCropBoxMediaBoxUiNoise(text: string): boolean {
-  return text.toLowerCase().includes(GLITCHY_SUPPRESS_CROPBOX_ERR);
+function textContainsCropBoxMediaBoxUiNoise(text: unknown): boolean {
+  return checkText(text).toLowerCase().includes(GLITCHY_SUPPRESS_CROPBOX_ERR);
+}
+
+function normalizeCheck(row: Partial<CheckItem> | null | undefined): CheckItem {
+  const item = row && typeof row === "object" ? row : {};
+  const detail = checkText(item.detail);
+  const name = checkText(item.name);
+  const num = checkText(item.num);
+  const label = checkText(item.label) || (num ? `${num}. ${name}: ${detail}` : detail || name);
+  const status = checkText(item.status);
+  const pass = item.pass === true || status === "passed" || status === "pass" || status === "auto" || status === "fixed";
+  return { label, pass, status, detail, name, num };
 }
 
 export default function GlitchyWidget() {
@@ -148,7 +174,7 @@ export default function GlitchyWidget() {
   const [chatLoading, setChatLoading] = useState(false);
   const [checklist, setChecklist] = useState<CheckItem[]>([]);
   const [responseText, setResponseText] = useState("*Purrs*");
-  const [chatActions, setChatActions] = useState<{ id: string; label: string }[]>([]);
+  const [chatActions, setChatActions] = useState<ChatAction[]>([]);
   const [previewBefore, setPreviewBefore] = useState("");
   const [previewAfter, setPreviewAfter] = useState("");
   const [catMode, setCatMode] = useState<CatMode>("head");
@@ -189,7 +215,7 @@ export default function GlitchyWidget() {
     try {
       const res = await fetch(`/api/glitchy-checklist/${jobId}`);
       const data = await res.json();
-      const rows: CheckItem[] = data.checks || [];
+      const rows = Array.isArray(data.checks) ? data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)) : [];
       setChecklist(
         rows.map((c) =>
           textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
@@ -283,7 +309,7 @@ export default function GlitchyWidget() {
           try {
             const res = await fetch(`/api/glitchy-checklist/${jobId}`);
             const data = await res.json();
-            const rows: CheckItem[] = data.checks || [];
+            const rows = Array.isArray(data.checks) ? data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)) : [];
             const cleaned = rows.map((c) =>
               textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
             );
@@ -385,9 +411,10 @@ export default function GlitchyWidget() {
       const liveChecks = Array.isArray(detail.checks) ? detail.checks : [];
       if (liveChecks.length) {
         setChecklist(
-          liveChecks.map((c: CheckItem) =>
-            textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
-          ),
+          liveChecks.map((c: Partial<CheckItem>) => {
+            const row = normalizeCheck(c);
+            return textContainsCropBoxMediaBoxUiNoise(row.label) ? { ...row, pass: true } : row;
+          }),
         );
         for (const c of liveChecks) {
           items.push({ label: c.label, done: !!c.pass });
@@ -730,10 +757,18 @@ export default function GlitchyWidget() {
         body: JSON.stringify({ message: val, jobId, action: id }),
       });
       const data = await res.json();
-      setResponseText(data.reply || "I couldn't read a reply.");
-      setChatActions(Array.isArray(data.actions) ? data.actions : []);
+      setResponseText(checkText(data.reply) || "I couldn't read a reply.");
+      setChatActions(
+        Array.isArray(data.actions)
+          ? data.actions.map((action: Partial<ChatAction>) => ({
+              id: checkText(action?.id),
+              label: checkText(action?.label),
+              tone: checkText(action?.tone),
+            }))
+          : [],
+      );
       if (Array.isArray(data.checks) && data.checks.length) {
-        setChecklist(data.checks);
+        setChecklist(data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)));
       }
       const stamp = Date.now();
       setPreviewBefore(data.previewBefore ? `${data.previewBefore}?t=${stamp}` : "");
@@ -1198,26 +1233,30 @@ export default function GlitchyWidget() {
                 )}
                 {chatActions.length > 0 && (
                   <div data-testid="glitchy-actions" style={{ display: "flex", flexDirection: "column", gap: 3, marginBottom: 4 }}>
-                    {chatActions.map((action) => (
+                    {chatActions.map((action) => {
+                      const secondary = action.tone === "secondary";
+                      return (
                       <button
                         key={action.id}
                         type="button"
                         data-testid={`glitchy-action-${action.id}`}
                         onClick={() => askGlitchy(action.id)}
                         style={{
-                          background: "#333",
-                          color: "#a3e635",
+                          background: secondary ? "#333" : "#a3e635",
+                          color: secondary ? "#a3e635" : "#111",
                           border: "1px solid #555",
                           borderRadius: 4,
                           cursor: "pointer",
                           fontSize: 8,
+                          fontWeight: secondary ? 400 : 700,
                           padding: 3,
                           textAlign: "left",
                         }}
                       >
                         {action.label}
                       </button>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
                 <input

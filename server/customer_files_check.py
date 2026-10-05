@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -578,11 +579,60 @@ def _corner_near_white(path: str, seam_x_pt: float, seam_y_pt: float) -> list:
         doc.close()
 
 
+def _window_note(seams: list) -> tuple[float, str]:
+    worst = 0.0
+    parts = []
+    if not seams:
+        return 99.0, "no seam report"
+    for row in seams:
+        page_max = float(row.get("page_max") if row.get("page_max") is not None else 99)
+        worst = max(worst, page_max)
+        edges = row.get("edges") or {}
+        corners = row.get("corners") or {}
+        parts.append(
+            "p{page} max {mx} L{left} R{right} T{top} B{bottom}".format(
+                page=row.get("page"),
+                mx=page_max,
+                left=(edges.get("L") or {}).get("strip_vs_inner_max"),
+                right=(edges.get("R") or {}).get("strip_vs_inner_max"),
+                top=(edges.get("T") or {}).get("strip_vs_inner_max"),
+                bottom=(edges.get("B") or {}).get("strip_vs_inner_max"),
+            )
+        )
+        if corners:
+            parts[-1] += " corners " + " ".join(
+                f"{name}:{max(float(item.get('vs_side_strip') or 0), float(item.get('vs_vert_strip') or 0)):.2f}"
+                for name, item in corners.items()
+            )
+    return worst, " ".join(parts)
+
+
+def _one_cmyk_plate(path: str) -> str:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        notes = []
+        for index, page in enumerate(doc):
+            images = page.get_images(full=True) or []
+            raw = page.read_contents().decode("latin1", "replace")
+            rgb = "rgb" if re.search(r"\b(?:rg|RG)\b|DeviceRGB|CalRGB", raw) else ""
+            spaces = []
+            for item in images:
+                info = doc.extract_image(int(item[0]))
+                spaces.append(str(info.get("colorspace")))
+            if len(images) != 1 or any(space == "3" for space in spaces) or rgb:
+                notes.append(f"p{index + 1} images {len(images)} cs {spaces} {rgb}")
+        return "; ".join(notes)
+    finally:
+        doc.close()
+
+
 def test_bleed_matches_edge() -> None:
-    """A grey, a one-pixel white fringe, and a diagonal must extend without a step or a darker grey."""
+    """A partial bleed is one mirrored CMYK plate. The added strip matches the inner band."""
     import pymupdf as fitz
     from PIL import Image
-    from press_ready_engine import compile_vector_press
+    from press_ready_engine import compile_vector_press, press_window_seam
 
     folder = tempfile.mkdtemp(prefix="cust-bleed-match-")
     width, height = 1806, 1300
@@ -593,7 +643,6 @@ def test_bleed_matches_edge() -> None:
         boundary = int((y - 900) / 3)
         if 0 <= boundary < width:
             image[y, :boundary] = (20, 40, 80)
-    # A 0.45 pt keyline blooms to about three pixels. It must not become the bleed.
     image[-3:, :] = (245, 245, 245)
     png = os.path.join(folder, "plate.png")
     Image.fromarray(image, mode="RGB").save(png)
@@ -609,73 +658,33 @@ def test_bleed_matches_edge() -> None:
     doc.close()
     out = os.path.join(folder, "press.pdf")
     result = compile_vector_press(src, out, 148, 105, 5)
-    page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
-    seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
-    seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
-    from press_ready_engine import _gs_rgb_pages, _window_max_delta_e
-
-    gs_ok = False
-    gs_note = "no gs page"
-    worst = 99.0
-    if os.path.exists(out):
-        rendered = _gs_rgb_pages(out)
-        if rendered:
-            gs = rendered[0]
-            doc = fitz.open(out)
-            try:
-                rect = doc[0].rect
-                gs_h, gs_w = gs.shape[:2]
-                sx = int(round(seam_x / float(rect.width) * gs_w))
-                sy = int(round(seam_y / float(rect.height) * gs_h))
-            finally:
-                doc.close()
-            # Adjacent pixels, through the same png16m render as the press. A 6 px
-            # mean looks past a diagonal and reports a step that is not on the seam.
-            pairs = {
-                "left": ((sy, gs_h - sy, sx - 1, sx), (sy, gs_h - sy, sx, sx + 1), "y"),
-                "right": ((sy, gs_h - sy, gs_w - sx, gs_w - sx + 1), (sy, gs_h - sy, gs_w - sx - 1, gs_w - sx), "y"),
-                "top": ((sy - 1, sy, sx, gs_w - sx), (sy, sy + 1, sx, gs_w - sx), "x"),
-                "bottom": ((gs_h - sy, gs_h - sy + 1, sx, gs_w - sx), (gs_h - sy - 1, gs_h - sy, sx, gs_w - sx), "x"),
-            }
-            worst = 0.0
-            worst_name = ""
-            for name, (outside, inside, axis) in pairs.items():
-                value = _window_max_delta_e(gs, outside, inside, axis)
-                score = 99.0 if value is None else float(value)
-                if score >= worst:
-                    worst = score
-                    worst_name = name
-            seam_row = gs[min(gs_h - 1, max(0, gs_h - sy))]
-            white_frac = float(np.mean(np.min(seam_row, axis=1) > 240))
-            spot = gs[min(gs_h - 1, sy + 40), min(gs_w - 1, 2)]
-            inside = gs[min(gs_h - 1, sy + 40), min(gs_w - 1, sx + 4)]
-            gs_grey = abs(int(spot[0]) - int(inside[0])) <= 2 and abs(int(spot[1]) - int(inside[1])) <= 2
-            gs_ok = white_frac < 0.05 and gs_grey and worst < 5.0
-            gs_note = f"white {white_frac:.3f} adj {worst_name} {worst:.2f} grey {'ok' if gs_grey else 'shifted'}"
+    seams = press_window_seam(src, out) if os.path.exists(out) else []
+    worst, note = _window_note(seams)
+    plate = _one_cmyk_plate(out) if os.path.exists(out) else "missing"
     record(
         "bleed-matches-edge",
-        bool(result.get("used")) and gs_ok,
+        bool(result.get("used")) and worst < 5.0 and not plate,
         product="a6-landscape",
-        pages=1,
-        size="seam",
+        pages=len(seams),
+        size=f"dE {worst:.2f}",
         light="n/a",
-        reasons=gs_note,
+        reasons=note,
         live="",
         qr="",
+        note=plate,
     )
 
 
 def test_bleed_diagonal_and_column() -> None:
-    """A diagonal must keep its slope through Ghostscript, and a column must not shear or grow a dark line."""
+    """A diagonal and a column are mirrored into the shortfall. The seam window stays under 5."""
     import pymupdf as fitz
     from PIL import Image
-    from press_ready_engine import _delta_e00, _gs_rgb_pages, compile_vector_press
+    from press_ready_engine import compile_vector_press, press_window_seam
 
     folder = tempfile.mkdtemp(prefix="cust-bleed-slope-")
     width, height = 1806, 1300
     image = np.full((height, width, 3), (183, 184, 185), np.uint8)
     image[-1, :] = (250, 250, 250)
-    # The boundary reaches the bottom-left corner and keeps moving left.
     for y in range(height - 180, height - 1):
         boundary = int(16 + (height - 2 - y) * 1.2)
         if 0 <= boundary < width - 20:
@@ -695,75 +704,33 @@ def test_bleed_diagonal_and_column() -> None:
     doc.close()
     out = os.path.join(folder, "press.pdf")
     result = compile_vector_press(src, out, 148, 105, 5)
-    rendered = _gs_rgb_pages(out) if os.path.exists(out) else []
+    seams = press_window_seam(src, out) if os.path.exists(out) else []
+    worst, note = _window_note(seams)
+    plate = _one_cmyk_plate(out) if os.path.exists(out) else "missing"
     problems = []
-    if not result.get("used") or not rendered:
-        problems.append("no press page")
-    else:
-        gs = rendered[0]
-        doc = fitz.open(out)
-        try:
-            rect = doc[0].rect
-            page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
-            seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
-            seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
-            gs_h, gs_w = gs.shape[:2]
-            sx = int(round(seam_x / float(rect.width) * gs_w))
-            sy = int(round(seam_y / float(rect.height) * gs_h))
-        finally:
-            doc.close()
-        seam = gs[min(gs_h - 1, gs_h - sy)]
-        if float(np.mean(np.min(seam, axis=1) > 240)) > 0.05:
-            problems.append("white seam")
-        flat = gs[sy + 80, 2]
-        if abs(int(flat[0]) - 183) > 2:
-            problems.append(f"grey {tuple(int(v) for v in flat)}")
-
-        def first_navy(row):
-            found = np.where(row[:, 0] < 40)[0]
-            return int(found[0]) if len(found) else -1
-
-        positions = []
-        for y in (gs_h - sy - 36, gs_h - sy - 12, gs_h - sy + 8, gs_h - 3):
-            positions.append(first_navy(gs[y, : sx + 160]))
-        if any(item < 0 for item in positions):
-            problems.append(f"diagonal missing {positions}")
-        elif any(positions[index + 1] > positions[index] + 3 for index in range(len(positions) - 1)):
-            problems.append(f"diagonal step {positions}")
-        jumps = []
-        for y in (gs_h - sy - 6, gs_h - sy + 2, gs_h - sy + 10, gs_h - 2):
-            band = gs[y, sx + 980:sx + 1200, 0].astype(int)
-            delta = np.abs(np.diff(band))
-            strong = np.where(delta > 80)[0]
-            jumps.append(int(strong[0]) if len(strong) else -1)
-        if any(item < 0 for item in jumps) or max(jumps) - min(jumps) > 1:
-            problems.append(f"column shear {jumps}")
-        corner = gs[gs_h - sy:, :sx]
-        grey_px = int(np.sum(corner[:, :, 0] > 150))
-        navy_px = int(np.sum(corner[:, :, 0] < 40))
-        if grey_px < 30 or navy_px < 30:
-            problems.append(f"corner grey {grey_px} navy {navy_px}")
-        seam_px = gs[sy + 80, sx]
-        bleed_px = gs[sy + 80, 1]
-        if _delta_e00(seam_px, bleed_px) > 5:
-            problems.append(f"adjacent dE {_delta_e00(seam_px, bleed_px):.1f}")
+    if not result.get("used"):
+        problems.append("not used")
+    if worst >= 5.0:
+        problems.append(f"seam {worst:.2f}")
+    if plate:
+        problems.append(plate)
     record(
         "bleed-diagonal-column",
         not problems,
         product="a6-landscape",
-        pages=1,
-        size="slope",
+        pages=len(seams),
+        size=f"dE {worst:.2f}",
         light="n/a",
-        reasons="gs slope" if not problems else "; ".join(problems),
+        reasons=note if not problems else "; ".join(problems),
         live="",
         qr="",
-        note="",
+        note=note,
     )
 
 
 def test_real_a6_file() -> None:
-    """Ian's real A6, kept in /tmp and never committed. Every 2 mm window must be under 5."""
-    from press_ready_engine import edge_seam_delta_e
+    """Ian's real A6, kept in /tmp and never committed. seam.py on the press PDF must be under 5."""
+    from press_ready_engine import press_window_seam
 
     src = "/tmp/real_a6.pdf"
     if not os.path.isfile(src) or os.path.getsize(src) < 1000:
@@ -781,39 +748,38 @@ def test_real_a6_file() -> None:
         )
         return
     folder = tempfile.mkdtemp(prefix="cust-real-a6-")
-    page_w, page_h = 433.5 * 25.4 / 72.0, 312.0 * 25.4 / 72.0
-    seam_x = (5.0 - (page_w - 148.0) / 2.0) * 72.0 / 25.4
-    seam_y = (5.0 - (page_h - 105.0) / 2.0) * 72.0 / 25.4
     result = _run_print(src, folder, 148, 210, "a5", "A5", True)
     press = result.get("pressPath") or ""
-    seams = edge_seam_delta_e(press, seam_x, seam_y) if press and os.path.exists(press) else []
-    local_keys = ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")
-    worst = 0.0
-    parts = []
+    seams = press_window_seam(src, press) if press and os.path.exists(press) else []
+    worst, parts_text = _window_note(seams)
+    parts = [parts_text]
     problems = []
-    if not seams:
+    if not seams or len(seams) < 2:
         worst = 99.0
         problems.append("no seam report")
-    for row in seams:
-        local = row.get("local") or {}
-        numbers = [None if local.get(key) is None else float(local.get(key)) for key in local_keys]
-        if any(item is None for item in numbers):
-            worst = 99.0
-            problems.append(f"p{row.get('page')} missing window")
-        else:
-            worst = max(worst, max(numbers))
-        parts.append(
-            "p{page} L{left} R{right} T{top} B{bottom} tl{tl} tr{tr} bl{bl} br{br}".format(
-                page=row.get("page"), **{key: local.get(key) for key in local_keys},
-            )
-        )
     if worst >= 5.0:
-        problems.append(f"local seam dE {worst}")
+        problems.append(f"seam dE {worst}")
     card = [str(item) for item in (result.get("reasons") or [])]
     if any("does not match" in item or "35 ppi" in item or "no longer K-only" in item or "Under 75" in item for item in card):
         problems.append("false amber")
     if not any("LOCATION" in item for item in card):
         problems.append("missing location")
+    if any("LOCATION" not in item for item in card):
+        problems.append("extra reason")
+    if press and os.path.exists(press):
+        import pymupdf as fitz
+
+        sized = fitz.open(press)
+        try:
+            rect = sized[0].rect
+            width_mm = rect.width * 25.4 / 72.0
+            height_mm = rect.height * 25.4 / 72.0
+            if abs(width_mm - 158.0) > 1.5 or abs(height_mm - 115.0) > 1.5 or sized.page_count != 2:
+                problems.append(f"size {sized.page_count}p {width_mm:.1f}x{height_mm:.1f}")
+        finally:
+            sized.close()
+    if not result.get("existingBleedKept"):
+        problems.append("existing bleed not kept")
     from designer_assistant import reply_from_checks
 
     cat_rows = list(result.get("prepressChecks") or []) + list(result.get("extraChecks") or [])
@@ -841,7 +807,7 @@ def test_real_a6_file() -> None:
 
 
 def test_canva_a6() -> None:
-    from press_ready_engine import edge_seam_delta_e
+    from press_ready_engine import press_window_seam
 
     folder = tempfile.mkdtemp(prefix="cust-canva-")
     src = os.path.join(folder, "canva-a6.pdf")
@@ -854,36 +820,13 @@ def test_canva_a6() -> None:
     result = _run_print(src, folder, 148, 210, "a5", "A5", True)
     result["_seconds"] = round(time.perf_counter() - started, 2)
     press = result.get("pressPath") or ""
-    seams = edge_seam_delta_e(press, seam_x, seam_y) if press and os.path.exists(press) else []
-    worst = 0.0
-    parts = []
-    local_keys = ("left", "right", "top", "bottom", "tl", "tr", "bl", "br")
-    if not seams:
+    seams = press_window_seam(src, press) if press and os.path.exists(press) else []
+    worst, seam_note = _window_note(seams)
+    if not seams or len(seams) < 2:
         worst = 99.0
         problems_seed = ["no seam report"]
     else:
         problems_seed = []
-    for row in seams:
-        local = row.get("local") or {}
-        numbers = [None if local.get(key) is None else float(local.get(key)) for key in local_keys]
-        if any(item is None for item in numbers):
-            worst = 99.0
-        else:
-            worst = max(worst, max(numbers))
-        parts.append(
-            "p{page} local L{left} R{right} T{top} B{bottom} tl{tl} tr{tr} bl{bl} br{br}".format(
-                page=row.get("page"),
-                left=local.get("left"),
-                right=local.get("right"),
-                top=local.get("top"),
-                bottom=local.get("bottom"),
-                tl=local.get("tl"),
-                tr=local.get("tr"),
-                bl=local.get("bl"),
-                br=local.get("br"),
-            )
-        )
-    seam_note = " ".join(parts)
     reasons = " ".join(
         str(item) for item in list(result.get("decisions") or []) + list(result.get("reasons") or [])
     )
@@ -1117,6 +1060,19 @@ def test_manual_styles() -> None:
             target = paths.get(method) if isinstance(paths, dict) else None
             if not target or not os.path.exists(target):
                 missing.append(f"p{index + 1}:{method}")
+                continue
+            image = cv2.imread(target)
+            if image is None or float(np.std(image)) < 2.0:
+                missing.append(f"blank p{index + 1}:{method}")
+                continue
+            if index == 0:
+                continue
+            first = pages[0].get(method) if isinstance(pages[0], dict) else None
+            other = cv2.imread(first) if first else None
+            if other is None or other.shape != image.shape:
+                continue
+            if float(np.mean(np.abs(other.astype(np.float32) - image.astype(np.float32)))) < 1.0:
+                missing.append(f"same p{index + 1}:{method}")
     record(
         "manual-style-pages",
         not missing,

@@ -267,6 +267,35 @@ def connect() -> sqlite3.Connection:
 def _plain_sentence(rule_key: str, text: str) -> str:
     """Code fragments are spoken as rules. The stored text is left unchanged."""
     key = str(rule_key or "")
+    if key == "card-90x50":
+        return "A business card is 90 × 50 mm. Use that stored width and height."
+    if key.startswith("doc-cursorrules"):
+        return (
+            "Keep the Ghostscript memory cap at 50 MB and one render thread. Sample bleed by 1 pixel, "
+            "force 300 DPI, keep rich black, flatten each page to one image, scale with cover, and keep the cat at 20% on the bottom of the screen."
+        )
+    if key.startswith("doc-prepress-mdc"):
+        return (
+            "Keep the 50 MB memory cap, one thread, 1 pixel bleed, 300 DPI, rich black and one image per page. "
+            "No Crop fills the full crop box. Every fix needs a regression test."
+        )
+    if key.startswith("doc-agents-md"):
+        return (
+            "Start the app with SKIP_GATEKEEPER=1 PORT=5000 npm run dev. "
+            "Keep the 50 MB memory cap, one thread, 1 pixel bleed, 300 DPI and rich black."
+        )
+    if key.startswith("doc-agent-rules"):
+        return "Read the architectural rules, keep the Ghostscript RAM cap, and do not change a locked press value to make one job pass."
+    if key.startswith("doc-replit"):
+        return "The app checks and fixes PDF, AI, EPS, JPG, PNG, DOCX and PPTX files for press."
+    if key.startswith("doc-products"):
+        return "Print sizes come from the product list, including A6, A5, A4, A3, DL and the business cards. Use the stored width and height."
+    if key.startswith("doc-glitchy-mdc"):
+        return "The cat stays at 20% of its size, anchored to the bottom, and only talks about checks it has run."
+    if key.startswith("doc-glitchy-prompt"):
+        return "Describe the print problem in plain words. Do not paste source code into the chat."
+    if key.startswith("doc-checks"):
+        return "Run the 25-point list and the extra checks. Report a point only when it ran, and describe a failure in a sentence."
     if key.startswith("doc-dashboard-copy"):
         return (
             "When type sits in the safe zone, copy the picture, shrink it by 30 pixels on each side, "

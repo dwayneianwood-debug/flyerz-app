@@ -1589,6 +1589,13 @@ def make_print_ready(
     _mark("press", lettering_note)
     vector_ok = bool(vector_built and vector_built.get("ok") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
     if vector_ok:
+        try:
+            from client_file_audit import repair_cmyk_images
+
+            # The traced page is already the press file. Small black type in that plate has to be K-only.
+            repair_cmyk_images(press_path, text_only=True)
+        except Exception:
+            pass
         compiled = {
             "success": True,
             "pressEngine": {
@@ -1671,6 +1678,26 @@ def make_print_ready(
                 "dpi": dpi_mode,
                 "dpiDetail": dpi_detail,
             })
+            if press_ok:
+                try:
+                    from extra_checks import press_ink_facts
+
+                    ink = press_ink_facts(press_path)
+                    for index, row in enumerate(settled):
+                        if str(row.get("num")) != "2b":
+                            continue
+                        if ink.get("small_rich") or float(ink.get("max_tac") or 0) > 300.5:
+                            detail = (
+                                f"Black text in the press file is still four-colour"
+                                f" and total ink is about {float(ink.get('max_tac') or 0):.0f}%."
+                            )
+                            settled[index] = {**row, "status": "warning", "pass": False, "detail": detail, "label": f"2b. {row.get('name')}: {detail}"}
+                        elif ink.get("small_k") and float(ink.get("max_tac") or 0) <= 300.5:
+                            detail = "Black text under 18 pt in the press file is K-only, and total ink is within 300%."
+                            settled[index] = {**row, "status": "passed", "pass": True, "detail": detail, "label": f"2b. {row.get('name')}: {detail}"}
+                        break
+                except Exception:
+                    pass
             derived = light_from_checks(settled)
             facts["twentyFive"] = {**derived, "checks": settled}
         except Exception:

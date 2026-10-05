@@ -22,16 +22,22 @@ from client_file_audit import (
 )
 
 ACTION_LABELS = {
+    "move-inward": "Move it inward",
+    "shrink-safe": "Shrink it into the safe zone",
     "add-bleed": "Add 5 mm bleed",
     "extend-bleed": "Extend the bleed to 5 mm",
     "convert-cmyk": "Convert to CMYK",
     "fix-black": "Fix the black",
     "thicken-hairlines": "Thicken hairlines to 0.3 pt",
     "change-size": "Change the size or orientation",
+    "show-all": "Show all",
     "print-ready": "Run Print-ready",
     "client-message": "Write the client message",
     "download": "Download the press file",
 }
+
+PRIMARY_ACTIONS = {"move-inward", "shrink-safe", "add-bleed", "extend-bleed", "convert-cmyk", "fix-black", "thicken-hairlines", "change-size", "show-all"}
+GENERIC_ACTIONS = ("print-ready", "client-message", "download")
 
 
 def gemini_key_usable() -> bool:
@@ -400,34 +406,49 @@ def _qr(path: str) -> dict:
     return {"ran": True, "ok": True, "detail": "I looked for a QR code. There isn't one on this file."}
 
 
+def _row_blob(row: dict) -> str:
+    return " ".join(str(row.get(key) or "") for key in ("num", "name", "detail", "label")).lower()
+
+
+def _near_trim(row: dict) -> bool:
+    blob = _row_blob(row)
+    return "within 3 mm" in blob or "location" in blob or "close to the trim" in blob or "on the cut" in blob
+
+
 def actions_for_checks(checks: list) -> list[dict]:
-    by_num = {row.get("num"): row for row in checks}
+    by_num = {str(row.get("num") or ""): row for row in checks}
 
     def status(num: str) -> str:
         return str((by_num.get(num) or {}).get("status") or "")
 
     actions = []
 
-    def add(action_id: str) -> None:
+    def add(action_id: str, tone: str) -> None:
         if any(item["id"] == action_id for item in actions):
             return
         if action_id not in ACTION_LABELS:
             return
-        actions.append({"id": action_id, "label": ACTION_LABELS[action_id]})
+        actions.append({"id": action_id, "label": ACTION_LABELS[action_id], "tone": tone})
 
+    attention = [row for row in checks if str(row.get("status") or "") in ("failed", "warning")]
+    if any(_near_trim(row) for row in attention):
+        add("move-inward", "primary")
+        add("shrink-safe", "primary")
     if status("1") in ("warning", "failed") or status("6e") in ("warning", "failed"):
-        add("add-bleed")
-    if status("2") in ("warning", "failed") or "Spot" in str((by_num.get("16") or {}).get("detail") or ""):
-        add("convert-cmyk")
+        add("extend-bleed", "primary")
+    if status("2") in ("warning", "failed") or "spot" in _row_blob(by_num.get("16") or {}):
+        add("convert-cmyk", "primary")
     if status("2b") in ("warning", "failed") or status("6f") in ("warning", "failed"):
-        add("fix-black")
+        add("fix-black", "primary")
     if status("2h") in ("warning", "failed"):
-        add("thicken-hairlines")
+        add("thicken-hairlines", "primary")
     if status("6d") in ("warning", "failed"):
-        add("change-size")
-    add("print-ready")
-    add("client-message")
-    add("download")
+        add("change-size", "primary")
+    fine = [row for row in checks if str(row.get("status") or "") in ("passed", "pass", "auto", "fixed")]
+    if fine:
+        add("show-all", "primary")
+    for action_id in GENERIC_ACTIONS:
+        add(action_id, "secondary")
     return actions
 
 
@@ -444,29 +465,46 @@ def _check_title(row: dict) -> str:
     return name
 
 
-def reply_from_checks(checks: list) -> tuple[str, list[dict]]:
-    """Plain sentences from the checks. A model rewrite is not used: it was dropping every point."""
+def _problem_sentence(row: dict) -> str:
+    """One or two sentences: what it is, where it is, and why it matters."""
+    title = _check_title(row)
+    name = title or "This check"
+    detail = " ".join(str(row.get("detail") or "").split())
+    if _near_trim(row):
+        where = detail or "Text sits on the cut."
+        if not where.endswith("."):
+            where += "."
+        body = f"{where} It will be trimmed off or sit in the grip, so it needs to move in or the artwork needs to shrink."
+        if title and title.lower() not in body.lower():
+            return f"{title}. {body}"
+        return body
+    if not detail:
+        return f"{name} needs a look before this goes to press."
+    sentence = detail if detail.endswith(".") else detail + "."
+    if title and title.lower() not in sentence.lower():
+        return f"{title}. {sentence}"
+    return sentence
+
+
+def reply_from_checks(checks: list, show_all: bool = False) -> tuple[str, list[dict]]:
+    """Plain sentences. Passed checks stay as a count unless he asks to see them."""
     attention = [row for row in checks if str(row.get("status") or "") in ("failed", "warning")]
     fine = [row for row in checks if str(row.get("status") or "") in ("passed", "pass", "auto", "fixed")]
     skipped = [row for row in checks if str(row.get("status") or "") == "skipped"]
-    lines = []
-    if attention:
-        lines.append("Here is what needs attention.")
-        for row in attention:
-            lines.append(f"{_check_title(row)}: {row.get('detail')}")
+    lines = [_problem_sentence(row) for row in attention]
     if fine:
-        named = ", ".join(_check_title(row) for row in fine)
-        lines.append("The rest is fine: " + named + ".")
+        lines.append(
+            f"Everything else on your 25-point check and the extra checks passed ({len(fine)} items). "
+            "Say show all if you want every name."
+        )
     elif not attention:
-        lines.append("Ian's 25-point check found nothing to flag.")
+        lines.append("Ian's 25-point check and the extra checks found nothing to flag.")
+    if show_all and fine:
+        lines.append("Passed: " + ", ".join(_check_title(row) for row in fine) + ".")
     if skipped:
-        named = ", ".join(_check_title(row) for row in skipped)
-        lines.append("Not run: " + named + ".")
+        lines.append("Not run: " + ", ".join(_check_title(row) for row in skipped) + ".")
     actions = actions_for_checks(checks)
-    if actions:
-        labels = ", ".join(item["label"] for item in actions)
-        lines.append("I can do these: " + labels + ".")
-    return " ".join(lines), actions
+    return "\n".join(lines), actions
 
 
 def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None = None, client: str = "") -> dict:
@@ -537,7 +575,7 @@ def perform_action(action: str, src: str, dest: str, trim_w: float, trim_h: floa
     if action == "client-message":
         return {"ok": True, "detail": client_message_text(src, trim_w, trim_h), "path": ""}
     if action == "download":
-        ready = dest if dest and os.path.isfile(ready) else src
+        ready = dest if dest and os.path.isfile(dest) else src
         return {"ok": os.path.isfile(ready), "detail": "The file is ready to download." if os.path.isfile(ready) else "There is no press file yet. Run Print-ready first.", "path": ready if os.path.isfile(ready) else ""}
     if action in ("fix-black", "thicken-hairlines", "convert-cmyk"):
         if not str(src).lower().endswith(".pdf"):
@@ -659,14 +697,38 @@ def main() -> None:
         })
         return
 
-    if args.stored and os.path.isfile(args.stored) and _asks_about_artwork(message_raw):
+    if args.stored and os.path.isfile(args.stored) and (_asks_about_artwork(message_raw) or "show all" in message):
         try:
             stored = json.loads(open(args.stored, encoding="utf-8").read())
         except Exception:
             stored = {}
-        checks = list(stored.get("checks") or [])
-        reply, actions = reply_from_checks(checks)
+        checks = []
+        for row in stored.get("checks") or []:
+            item = dict(row) if isinstance(row, dict) else {}
+            detail = str(item.get("detail") or item.get("message") or "")
+            num = str(item.get("num") or "")
+            name = str(item.get("name") or "")
+            item["label"] = str(item.get("label") or (f"{num}. {name}: {detail}" if num else detail or name))
+            item["detail"] = detail
+            item["name"] = name
+            checks.append(item)
+        reply, actions = reply_from_checks(checks, show_all=("show all" in message))
         _emit({"reply": reply, "actions": actions, "checks": checks, "provider": "rules"})
+        return
+
+    if action in ("move-inward", "shrink-safe") and args.input and os.path.isfile(args.input):
+        from artwork_edits import propose
+
+        preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.output or args.input), "glitchy-preview")
+        ask = "move the text away from the edge" if action == "move-inward" else "shrink the content into the safe zone"
+        proposed = propose(args.input, ask, args.job_id or "manual", preview_dir) or {}
+        _emit({
+            "reply": proposed.get("reply") or "I can show that change before anything is applied.",
+            "actions": proposed.get("actions") or [],
+            "ok": proposed.get("ok", True) is not False,
+            "previewSides": proposed.get("previewSides") or [],
+            "pending": bool(proposed.get("pending")),
+        })
         return
 
     if not args.input or not os.path.isfile(args.input):

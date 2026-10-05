@@ -112,12 +112,24 @@ def test_rules() -> None:
     doc.close()
     named = _bleed_check(blank)
     check("bleed-says-rule", named.get("ran") and "Applied rule: Bleed is always 5 mm." in named.get("detail", ""), named.get("detail", ""))
-    docs = {row["source"]: row["text"] for row in list_rules()}
+    spoken = list_rules()
+    stored = connect()
+    try:
+        raw_rows = list(stored.execute("SELECT rule_key, text, source, locked FROM house_rules").fetchall())
+    finally:
+        stored.close()
     cursorrules = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".cursorrules"), encoding="utf-8").read()
-    check("cursorrules-verbatim", cursorrules in docs.values(), "missing .cursorrules")
-    check("prepress-file", any(row["source"] == ".cursor/rules/prepress.mdc" and row["locked"] and "Zero Regression Policy" in row["text"] for row in list_rules()))
-    check("products-file", any(row["source"] == "shared/quick-print-products.json" and "card-90x55" in row["text"] for row in list_rules()))
-    check("checks-file", any(row["source"] == "server/checks_guide.py" and row["text"].startswith("CHECKS = ") for row in list_rules()))
+    check("cursorrules-verbatim", any(cursorrules == row["text"] for row in raw_rows), "missing .cursorrules")
+    check("prepress-file", any(row["source"] == ".cursor/rules/prepress.mdc" and row["locked"] and "Zero Regression Policy" in row["text"] for row in raw_rows))
+    check("products-file", any(row["source"] == "shared/quick-print-products.json" and "card-90x55" in row["text"] for row in raw_rows))
+    check("checks-file", any(row["source"] == "server/checks_guide.py" and str(row["text"]).startswith("CHECKS = ") for row in raw_rows))
+    check(
+        "rules-16-plain",
+        any(str(row["rule_key"]).startswith("doc-cursorrules") and "50 MB" in row["text"] and "BufferSpace" not in row["text"] for row in spoken)
+        and any(str(row["rule_key"]).startswith("doc-products") and "product list" in row["text"] and "card-90x55" not in row["text"] for row in spoken)
+        and any(str(row["rule_key"]).startswith("doc-checks") and row["text"].startswith("Run the 25-point") for row in spoken)
+        and any(row["rule_key"] == "card-90x50" and "90" in row["text"] and "widthMm" not in row["text"] for row in spoken),
+    )
     spoken = list_rules()
     check(
         "dashboard-plain",
@@ -140,7 +152,9 @@ def test_rules() -> None:
         "code-rules-kept",
         any(str(row["rule_key"]).startswith("doc-dashboard-copy") and "DASHBOARD_RULES_COPY" in row["text"] for row in raw_rows)
         and any(str(row["rule_key"]).startswith("doc-safe-zone") and "ENGINE_SAFE_ZONE_SPEC" in row["text"] for row in raw_rows)
-        and any(str(row["rule_key"]).startswith("doc-ocr-critical") and "CRITICAL RULES" in row["text"] for row in raw_rows),
+        and any(str(row["rule_key"]).startswith("doc-ocr-critical") and "CRITICAL RULES" in row["text"] for row in raw_rows)
+        and any(str(row["rule_key"]).startswith("doc-cursorrules") and "BufferSpace" in row["text"] for row in raw_rows)
+        and any(row["rule_key"] == "card-90x50" and "widthMm" in row["text"] for row in raw_rows),
     )
     db = connect()
     try:

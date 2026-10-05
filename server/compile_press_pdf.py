@@ -2685,11 +2685,13 @@ def main():
             raise
 
         output_size = os.path.getsize(args.output)
-        if not vector_live and ((compile_stats.get("client_audit") or {}).get("black") or {}).get("needsFix"):
+        if not vector_live:
             try:
                 from client_file_audit import repair_cmyk_images
 
-                repair_cmyk_images(args.output)
+                # Always. needsFix used to skip picture files, so black type stayed four-colour.
+                full = bool(((compile_stats.get("client_audit") or {}).get("black") or {}).get("needsFix"))
+                repair_cmyk_images(args.output, text_only=not full)
                 output_size = os.path.getsize(args.output)
             except Exception as ink_err:
                 sys.stderr.write(f"[COMPILE] CMYK image black repair failed: {ink_err}\n")

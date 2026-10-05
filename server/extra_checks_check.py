@@ -319,6 +319,16 @@ def test_canva_trim_decorations_and_blue() -> None:
     shutil.rmtree(folder, ignore_errors=True)
 
 
+def test_png_is_not_screen_dpi() -> None:
+    from extra_checks import _effective_dpi, check_e4
+
+    src = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "medella", "card_back.png")
+    dpi = _effective_dpi(src)
+    row = check_e4(src)
+    detail = str(row.get("detail") or "")
+    check("png-not-96", dpi >= 200 and "96 ppi" not in detail, f"dpi {dpi} {detail}")
+
+
 def main() -> None:
     test_order_and_e1()
     test_canva_trim_decorations_and_blue()
@@ -326,6 +336,7 @@ def main() -> None:
     test_e3_and_nuclear()
     test_e6_e7_e8()
     test_e9_and_light()
+    test_png_is_not_screen_dpi()
     if FAILURES:
         print("extra checks failed: " + ", ".join(FAILURES))
         sys.exit(1)

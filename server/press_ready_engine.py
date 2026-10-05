@@ -2226,6 +2226,463 @@ def _paint_cmyk_edge(page, placed) -> None:
         )
 
 
+def _probe_page_pixels(width_pt: float, height_pt: float) -> tuple[int, int]:
+    """MuPDF's 300 dpi pixmap size for this page. Rounding millimetres is one pixel off."""
+    import pymupdf as fitz
+
+    probe = fitz.open()
+    try:
+        page = probe.new_page(width=width_pt, height=height_pt)
+        pix = page.get_pixmap(dpi=300, alpha=False)
+        return int(pix.width), int(pix.height)
+    finally:
+        probe.close()
+
+
+def _render_page_cmyk(page) -> np.ndarray:
+    """One CMYK raster of the untouched page, existing bleed included."""
+    import pymupdf as fitz
+
+    pix = page.get_pixmap(dpi=300, alpha=False, colorspace=fitz.csCMYK)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    return np.ascontiguousarray(arr[:, :, :4].copy())
+
+
+def _split_pad(total: int, start_share: float) -> tuple[int, int]:
+    if total <= 0:
+        return 0, 0
+    start = int(round(total * float(start_share)))
+    start = max(0, min(int(total), start))
+    return start, int(total) - start
+
+
+def _mirror_pad(arr: np.ndarray, target_w: int, target_h: int, short_l: float, short_r: float, short_t: float, short_b: float):
+    """Pad the shortfall by mirroring the outermost pixels. The edge pixel is repeated."""
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    share_l = short_l / max(short_l + short_r, 1e-6) if (short_l + short_r) > 0 else 0.5
+    share_t = short_t / max(short_t + short_b, 1e-6) if (short_t + short_b) > 0 else 0.5
+    if width > target_w or height > target_h:
+        extra_x = max(0, width - target_w)
+        extra_y = max(0, height - target_h)
+        cut_l, _cut_r = _split_pad(extra_x, share_l)
+        cut_t, _cut_b = _split_pad(extra_y, share_t)
+        arr = np.ascontiguousarray(arr[cut_t:cut_t + min(height, target_h), cut_l:cut_l + min(width, target_w)])
+        height, width = int(arr.shape[0]), int(arr.shape[1])
+    pad_x = max(0, target_w - width)
+    pad_y = max(0, target_h - height)
+    left, right = _split_pad(pad_x, share_l)
+    top, bottom = _split_pad(pad_y, share_t)
+    if left or right or top or bottom:
+        # symmetric repeats the edge pixel, so the join is continuous and the pad sits outside the trim.
+        arr = np.pad(arr, ((top, bottom), (left, right), (0, 0)), mode="symmetric")
+    if int(arr.shape[1]) != target_w or int(arr.shape[0]) != target_h:
+        arr = arr[:target_h, :target_w]
+        if arr.shape[0] < target_h or arr.shape[1] < target_w:
+            arr = np.pad(
+                arr,
+                ((0, target_h - arr.shape[0]), (0, target_w - arr.shape[1]), (0, 0)),
+                mode="edge",
+            )
+    return np.ascontiguousarray(arr), (left, right, top, bottom)
+
+
+def _cap_tac_array(arr: np.ndarray, limit: float = 300.0) -> bool:
+    c = arr[:, :, 0].astype(np.float32)
+    m = arr[:, :, 1].astype(np.float32)
+    y = arr[:, :, 2].astype(np.float32)
+    k = arr[:, :, 3].astype(np.float32)
+    total = c + m + y + k
+    cap = float(limit) / 100.0 * 255.0
+    over = total > cap
+    if int(over.sum()) < 1:
+        return False
+    extra = total - cap
+    cmy = c + m + y
+    scale = np.ones_like(cmy)
+    good = cmy > 1
+    scale[good] = np.clip((cmy[good] - extra[good]) / cmy[good], 0, 1)
+    c[over] *= scale[over]
+    m[over] *= scale[over]
+    y[over] *= scale[over]
+    arr[:, :, 0] = np.clip(c, 0, 255).astype(np.uint8)
+    arr[:, :, 1] = np.clip(m, 0, 255).astype(np.uint8)
+    arr[:, :, 2] = np.clip(y, 0, 255).astype(np.uint8)
+    return True
+
+
+def _dark_neutral_pixels(arr: np.ndarray) -> np.ndarray:
+    """Estimated sRGB is dark and neutral. Navy and blue type stay out."""
+    c = arr[:, :, 0].astype(np.float32) / 255.0
+    m = arr[:, :, 1].astype(np.float32) / 255.0
+    y = arr[:, :, 2].astype(np.float32) / 255.0
+    k = arr[:, :, 3].astype(np.float32) / 255.0
+    red = (1.0 - c) * (1.0 - k)
+    green = (1.0 - m) * (1.0 - k)
+    blue = (1.0 - y) * (1.0 - k)
+    high = np.maximum(np.maximum(red, green), blue)
+    low = np.minimum(np.minimum(red, green), blue)
+    return (high <= 0.22) & ((high - low) <= 0.10)
+
+
+def _span_is_small_black(color, size: float) -> bool:
+    try:
+        value = int(color)
+    except (TypeError, ValueError):
+        return False
+    red = (value >> 16) & 255
+    green = (value >> 8) & 255
+    blue = value & 255
+    if max(red, green, blue) > 40 or (max(red, green, blue) - min(red, green, blue)) > 18:
+        return False
+    return float(size or 0) < 56.0
+
+
+def _knock_small_black_text(arr: np.ndarray, page) -> None:
+    """Small black type becomes 100K inside its own box. The photo around it is left alone."""
+    scale = 300.0 / 72.0
+    height, width = arr.shape[:2]
+    origin_x = float(page.rect.x0)
+    origin_y = float(page.rect.y0)
+    try:
+        data = page.get_text("dict") or {}
+    except Exception:
+        return
+    for block in data.get("blocks") or []:
+        for line in block.get("lines") or []:
+            for span in line.get("spans") or []:
+                size = float(span.get("size") or 0)
+                if not _span_is_small_black(span.get("color"), size):
+                    continue
+                box = span.get("bbox") or (0, 0, 0, 0)
+                if len(box) < 4:
+                    continue
+                x0 = max(0, int((float(box[0]) - origin_x) * scale) - 1)
+                y0 = max(0, int((float(box[1]) - origin_y) * scale) - 1)
+                x1 = min(width, int((float(box[2]) - origin_x) * scale) + 2)
+                y1 = min(height, int((float(box[3]) - origin_y) * scale) + 2)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                crop = arr[y0:y1, x0:x1]
+                mask = _dark_neutral_pixels(crop)
+                if int(mask.sum()) < 4:
+                    continue
+                crop[mask] = (0, 0, 0, 255)
+
+
+def _insert_cmyk_plate(page, cmyk: np.ndarray) -> None:
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(cmyk[:, :, :4]), mode="CMYK").save(
+        buf, format="TIFF", compression="raw", dpi=(300, 300),
+    )
+    page.insert_image(page.rect, stream=buf.getvalue(), keep_proportion=False)
+
+
+def _cmyk_k_operator(red: float, green: float, blue: float, size: float) -> str:
+    red_i = int(round(float(red) * 255))
+    green_i = int(round(float(green) * 255))
+    blue_i = int(round(float(blue) * 255))
+    if max(red_i, green_i, blue_i) <= 40 and (max(red_i, green_i, blue_i) - min(red_i, green_i, blue_i)) <= 18 and float(size) < 56:
+        return "0 0 0 1 k"
+    if min(red_i, green_i, blue_i) >= 250:
+        return "0 0 0 0 k"
+    cyan = 1.0 - red_i / 255.0
+    magenta = 1.0 - green_i / 255.0
+    yellow = 1.0 - blue_i / 255.0
+    black = min(cyan, magenta, yellow)
+    if black >= 0.999:
+        cyan = magenta = yellow = 0.0
+    else:
+        cyan = (cyan - black) / (1.0 - black)
+        magenta = (magenta - black) / (1.0 - black)
+        yellow = (yellow - black) / (1.0 - black)
+    total = (cyan + magenta + yellow + black) * 100.0
+    if total > 300.0:
+        cmy = (cyan + magenta + yellow) * 100.0
+        if cmy > 0:
+            scale = max(0.0, (cmy - (total - 300.0)) / cmy)
+            cyan *= scale
+            magenta *= scale
+            yellow *= scale
+    return f"{cyan:.4f} {magenta:.4f} {yellow:.4f} {black:.4f} k"
+
+
+def _rewrite_text_to_cmyk(page, clip) -> None:
+    """TextWriter paints RGB. The press stream has to be CMYK, clipped off the seam band."""
+    import re
+
+    doc = page.parent
+    xrefs = list(page.get_contents() or [])
+    size_re = re.compile(r"/[^\s\[\]]+\s+([0-9]*\.?[0-9]+)\s+Tf\b")
+    color_re = re.compile(r"([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)\s+rg\b")
+    stroke_re = re.compile(r"([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)\s+RG\b")
+    x = float(clip.x0)
+    y = float(page.rect.height) - float(clip.y1)
+    clip_ops = f"q {x:.3f} {y:.3f} {float(clip.width):.3f} {float(clip.height):.3f} re W n\n"
+    for xref in xrefs:
+        try:
+            data = doc.xref_stream(int(xref))
+        except Exception:
+            continue
+        if not data or (b"Tj" not in data and b"TJ" not in data and b" rg" not in data):
+            continue
+        draws_image = b" Do" in data or b" Do\n" in data
+        text = data.decode("latin1", "replace")
+        size = 12.0
+
+        def paint(match, current=[size]):
+            found = size_re.search(text[: match.start()])
+            if found:
+                current[0] = float(found.group(1))
+            return _cmyk_k_operator(match.group(1), match.group(2), match.group(3), current[0])
+
+        rewritten = color_re.sub(paint, text)
+
+        def stroke(match, current=[size]):
+            found = size_re.search(text[: match.start()])
+            if found:
+                current[0] = float(found.group(1))
+            return _cmyk_k_operator(match.group(1), match.group(2), match.group(3), current[0])[:-2] + " K"
+
+        rewritten = stroke_re.sub(stroke, rewritten)
+        if not draws_image and " re W n" not in rewritten:
+            rewritten = clip_ops + rewritten + "\nQ\n"
+        try:
+            doc.update_stream(int(xref), rewritten.encode("latin1", "replace"))
+        except Exception:
+            continue
+
+
+def _overlay_live_text(dest, src, pads: tuple[int, int, int, int]) -> None:
+    """Put the original words back on top, in CMYK, inside the seam band."""
+    import pymupdf as fitz
+
+    left, right, top, bottom = pads
+    pad_l = left * 72.0 / 300.0
+    pad_r = right * 72.0 / 300.0
+    pad_t = top * 72.0 / 300.0
+    pad_b = bottom * 72.0 / 300.0
+    try:
+        data = src.get_text("dict") or {}
+    except Exception:
+        return
+    groups: dict[tuple[int, int, int], list] = {}
+    for block in data.get("blocks") or []:
+        for line in block.get("lines") or []:
+            for span in line.get("spans") or []:
+                text = span.get("text") or ""
+                if not str(text).strip():
+                    continue
+                color = int(span.get("color") or 0)
+                key = ((color >> 16) & 255, (color >> 8) & 255, color & 255)
+                groups.setdefault(key, []).append(span)
+    if not groups:
+        return
+    fonts: dict[str, object] = {}
+
+    def font_for(name: str):
+        if name in fonts:
+            return fonts[name]
+        chosen = None
+        token = "".join(ch for ch in str(name).split("+")[-1].lower() if ch.isalnum())
+        font_dir = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "fonts")
+        if token and os.path.isdir(font_dir):
+            for file in os.listdir(font_dir):
+                stem = "".join(ch for ch in os.path.splitext(file)[0].lower() if ch.isalnum())
+                if not file.lower().endswith((".ttf", ".otf")) or not stem:
+                    continue
+                if token not in stem and stem not in token:
+                    continue
+                try:
+                    chosen = fitz.Font(fontfile=os.path.join(font_dir, file))
+                    break
+                except Exception:
+                    chosen = None
+        if chosen is not None:
+            fonts[name] = chosen
+            return chosen
+        try:
+            for item in src.get_fonts(full=True) or []:
+                face = str(item[3] if len(item) > 3 else "")
+                xref = int(item[0] if item else 0)
+                if name and name not in face and face not in name:
+                    continue
+                extracted = src.parent.extract_font(xref)
+                buffer = extracted[3] if extracted and len(extracted) > 3 else None
+                if buffer:
+                    chosen = fitz.Font(fontbuffer=buffer)
+                    break
+        except Exception:
+            chosen = None
+        if chosen is None:
+            try:
+                chosen = fitz.Font("helv")
+            except Exception:
+                chosen = None
+        fonts[name] = chosen
+        return chosen
+
+    origin_x = float(src.rect.x0)
+    origin_y = float(src.rect.y0)
+    for key, spans in groups.items():
+        for span in spans:
+            face = font_for(str(span.get("font") or ""))
+            if face is None:
+                continue
+            origin = span.get("origin") or (span.get("bbox") or (0, 0, 0, 0))[0:2]
+            x = float(origin[0]) - origin_x + pad_l
+            y = float(origin[1]) - origin_y + pad_t
+            text = str(span.get("text") or "")
+            size = float(span.get("size") or 12)
+            box = span.get("bbox") or (0, 0, 0, 0)
+            box_w = max(0.0, float(box[2]) - float(box[0])) if len(box) >= 4 else 0.0
+            try:
+                natural = float(face.text_length(text, size))
+            except Exception:
+                natural = 0.0
+            # A subset font reloads with the wrong advances. Scale the width only, so the height stays.
+            hscale = 1.0
+            if box_w > 0.4 and natural > box_w * 1.08:
+                hscale = box_w / natural
+            span_writer = fitz.TextWriter(dest.rect)
+            try:
+                span_writer.append((x, y), text, font=face, fontsize=size)
+                morph = (fitz.Point(x, y), fitz.Matrix(hscale, 1)) if hscale < 0.999 else None
+                span_writer.write_text(dest, color=(key[0] / 255.0, key[1] / 255.0, key[2] / 255.0), morph=morph)
+            except Exception:
+                continue
+    clip = fitz.Rect(
+        pad_l + pad_l,
+        pad_t + pad_t,
+        max(pad_l + pad_l + 1, dest.rect.width - pad_r - pad_r),
+        max(pad_t + pad_t + 1, dest.rect.height - pad_b - pad_b),
+    )
+    _rewrite_text_to_cmyk(dest, clip)
+
+
+def _place_mirrored_bleed(dest, src, short_l: float, short_r: float, short_t: float, short_b: float) -> None:
+    """Extend a partial bleed to 5 mm as one mirrored CMYK image, with the type on top."""
+    target_w, target_h = _probe_page_pixels(float(dest.rect.width), float(dest.rect.height))
+    plate = _render_page_cmyk(src)
+    _knock_small_black_text(plate, src)
+    _cap_tac_array(plate)
+    plate, pads = _mirror_pad(plate, target_w, target_h, short_l, short_r, short_t, short_b)
+    _insert_cmyk_plate(dest, plate)
+    _overlay_live_text(dest, src, pads)
+
+
+def press_window_seam(src_pdf: str, press_pdf: str) -> list[dict]:
+    """seam.py on the press PDF: the added strip against an inner band of the same width."""
+    import pymupdf as fitz
+
+    if not src_pdf or not press_pdf or not os.path.isfile(src_pdf) or not os.path.isfile(press_pdf):
+        return []
+    dpi = 300
+    px = dpi / 25.4
+
+    def render(path: str, index: int) -> np.ndarray:
+        doc = fitz.open(path)
+        try:
+            pix = doc[index].get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+            return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+        finally:
+            doc.close()
+
+    def lab(image: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(image.astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab)
+
+    def delta(left: np.ndarray, right: np.ndarray) -> float:
+        return float(np.linalg.norm(left - right))
+
+    press = fitz.open(press_pdf)
+    try:
+        count = press.page_count
+    finally:
+        press.close()
+    rows = []
+    for index in range(count):
+        source = render(src_pdf, index)
+        output = render(press_pdf, index)
+        margin = 30
+        template = source[margin:-margin, margin:-margin]
+        if template.size == 0 or output.shape[0] < template.shape[0] or output.shape[1] < template.shape[1]:
+            rows.append({"page": index + 1, "page_max": 99.0, "edges": {}, "corners": {}})
+            continue
+        _min_val, _max_val, loc, _max_loc = cv2.minMaxLoc(cv2.matchTemplate(output, template, cv2.TM_SQDIFF_NORMED))
+        ox, oy = int(loc[0] - margin), int(loc[1] - margin)
+        sh, sw = source.shape[:2]
+        oh, ow = output.shape[:2]
+        added = {"L": ox, "T": oy, "R": ow - (ox + sw), "B": oh - (oy + sh)}
+        values = lab(output)
+        window = max(2, int(2 * px))
+        step = max(1, window // 2)
+        edges = {}
+        edge_max = 0.0
+        for edge, amount in added.items():
+            if amount <= 0:
+                edges[edge] = {"added_px": amount, "strip_vs_inner_max": 0.0}
+                continue
+            scores = []
+            length = sh if edge in ("L", "R") else sw
+            for start in range(0, max(1, length - window), step):
+                if edge == "L":
+                    strip = values[oy + start:oy + start + window, 0:ox]
+                    inner = values[oy + start:oy + start + window, ox:ox + amount]
+                elif edge == "R":
+                    x0 = ox + sw
+                    strip = values[oy + start:oy + start + window, x0:]
+                    inner = values[oy + start:oy + start + window, x0 - amount:x0]
+                elif edge == "T":
+                    strip = values[0:oy, ox + start:ox + start + window]
+                    inner = values[oy:oy + amount, ox + start:ox + start + window]
+                else:
+                    y0 = oy + sh
+                    strip = values[y0:, ox + start:ox + start + window]
+                    inner = values[y0 - amount:y0, ox + start:ox + start + window]
+                if strip.size == 0 or inner.size == 0:
+                    continue
+                scores.append(delta(strip.reshape(-1, 3).mean(0), inner.reshape(-1, 3).mean(0)))
+            worst = max(scores) if scores else 0.0
+            edge_max = max(edge_max, worst)
+            edges[edge] = {"added_px": amount, "added_mm": round(amount / px, 2), "strip_vs_inner_max": round(worst, 2)}
+        corners = {}
+        corner_max = 0.0
+        boxes = {
+            "tl": (slice(0, oy), slice(0, ox)),
+            "tr": (slice(0, oy), slice(ox + sw, ow)),
+            "bl": (slice(oy + sh, oh), slice(0, ox)),
+            "br": (slice(oy + sh, oh), slice(ox + sw, ow)),
+        }
+        for name, (ys, xs) in boxes.items():
+            block = values[ys, xs].reshape(-1, 3)
+            if block.size == 0 or ox <= 0 or oy <= 0:
+                continue
+            if name[0] == "t":
+                side = values[0:oy, (ox if name[1] == "l" else ox + sw - ox):(2 * ox if name[1] == "l" else ox + sw)]
+            else:
+                side = values[oy + sh:oh, (ox if name[1] == "l" else ox + sw - ox):(2 * ox if name[1] == "l" else ox + sw)]
+            if name[1] == "l":
+                vert = values[(oy if name[0] == "t" else oy + sh - oy):(2 * oy if name[0] == "t" else oy + sh), 0:ox]
+            else:
+                vert = values[(oy if name[0] == "t" else oy + sh - oy):(2 * oy if name[0] == "t" else oy + sh), ox + sw:ow]
+            if side.size == 0 or vert.size == 0:
+                continue
+            vs_side = delta(block.mean(0), side.reshape(-1, 3).mean(0))
+            vs_vert = delta(block.mean(0), vert.reshape(-1, 3).mean(0))
+            corner_max = max(corner_max, vs_side, vs_vert)
+            corners[name] = {"vs_side_strip": round(vs_side, 2), "vs_vert_strip": round(vs_vert, 2)}
+        rows.append({
+            "page": index + 1,
+            "page_max": round(max(edge_max, corner_max), 2),
+            "edges": edges,
+            "corners": corners,
+            "added": added,
+        })
+    return rows
+
+
 def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, str]:
     """Box inset when a TrimBox exists, otherwise the size match when every box is equal."""
     media = page.mediabox
@@ -2347,6 +2804,7 @@ def compile_vector_press(
     extended = False
     shrunk = False
     edge_placements = []
+    page_mirrored = []
     for index in range(src.page_count):
         src_page = src[index]
         new_page = doc.new_page(width=out_w, height=out_h)
@@ -2363,6 +2821,7 @@ def compile_vector_press(
             )
             new_page.show_pdf_page(new_page.rect, src, index, clip=clip)
             kept = True
+            page_mirrored.append(False)
         elif mode in ("partial", "boxes") and have >= 2.0:
             # Keep the bleed that is already there. Mirror only the shortfall out to 5 mm.
             extra_l = max(0.0, existing["left"] * MM_TO_PT - bleed_pt)
@@ -2380,13 +2839,17 @@ def compile_vector_press(
             short_r = max(0.0, bleed_pt - existing["right"] * MM_TO_PT)
             short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
             short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
-            placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
-            new_page.show_pdf_page(placed, src, index, clip=clip)
             if max(short_l, short_r, short_t, short_b) >= 0.4:
+                # One CMYK plate. The shortfall is a mirror of the outermost pixels, not a separate strip.
                 extended = True
-                edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+                _place_mirrored_bleed(new_page, src_page, short_l, short_r, short_t, short_b)
+                page_mirrored.append(True)
+                edge_placements.append(None)
             else:
+                placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
+                new_page.show_pdf_page(placed, src, index, clip=clip)
                 kept = True
+                page_mirrored.append(False)
                 edge_placements.append(None)
         else:
             dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
@@ -2437,33 +2900,43 @@ def compile_vector_press(
                 )
             new_page.show_pdf_page(placed, src, index, clip=clip)
             edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+            page_mirrored.append(False)
         if len(edge_placements) < index + 1:
             edge_placements.append(None)
+        if len(page_mirrored) < index + 1:
+            page_mirrored.append(False)
         _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
     if kept and not extended:
         edges = _edge_lines(analysis, methods, kept=True)
     page_count = src.page_count
-    raw_path = out_path + ".raw.pdf"
-    doc.save(raw_path, deflate=True, garbage=4)
-    doc.close()
-    src.close()
-    try:
-        convert_cmyk_keep_text(raw_path, out_path, block_font_substitution=bool(font_problems))
-    except Exception:
-        shutil.copyfile(raw_path, out_path)
-    finally:
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
-    # Ghostscript can drop the boxes. Put them back, then paint the bleed
-    # from the pixels Ghostscript actually left on the page.
-    fixed = fitz.open(out_path)
-    for fixed_page in fixed:
-        _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
-    boxed = out_path + ".box.pdf"
-    fixed.save(boxed, deflate=True, garbage=4)
-    fixed.close()
-    _paint_bleed_matching(boxed, edge_placements)
-    os.replace(boxed, out_path)
+    all_mirrored = bool(page_mirrored) and all(page_mirrored)
+    if all_mirrored:
+        # The plate is already CMYK at 300 dpi. Ghostscript would resample the mirror.
+        doc.save(out_path, deflate=True, garbage=4)
+        doc.close()
+        src.close()
+    else:
+        raw_path = out_path + ".raw.pdf"
+        doc.save(raw_path, deflate=True, garbage=4)
+        doc.close()
+        src.close()
+        try:
+            convert_cmyk_keep_text(raw_path, out_path, block_font_substitution=bool(font_problems))
+        except Exception:
+            shutil.copyfile(raw_path, out_path)
+        finally:
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+        # Ghostscript can drop the boxes. Put them back, then paint the bleed
+        # from the pixels Ghostscript actually left on the page.
+        fixed = fitz.open(out_path)
+        for fixed_page in fixed:
+            _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
+        boxed = out_path + ".box.pdf"
+        fixed.save(boxed, deflate=True, garbage=4)
+        fixed.close()
+        _paint_bleed_matching(boxed, edge_placements)
+        os.replace(boxed, out_path)
 
     full_keep = kept and not extended
     rescue = {

@@ -7589,7 +7589,13 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         "ai_outpaint": "ai_outpaint",
         "colourBorder": "colourBorder",
     }
+    def _usable(image) -> bool:
+        return image is not None and getattr(image, "size", 0) > 0 and float(np.std(image)) >= 2.0
+
     for _strategy_internal, suffix in all_strategies:
+        key = "bgExtract" if suffix == "bgextract" else suffix
+        variant_path = f"{output_base}_variant_{suffix}{ext}"
+        variant_img = None
         try:
             variant_img, _heal_meta = auto_resolve_safe_zone(
                 cropped.copy(),
@@ -7597,13 +7603,25 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
                 bleed_strategy=api_for_suffix[suffix],
                 dpi=actual_dpi,
             )
-            variant_path = f"{output_base}_variant_{suffix}{ext}"
-            cv2.imwrite(variant_path, variant_img)
-            key = "bgExtract" if suffix == "bgextract" else suffix
-            variant_paths[key] = variant_path
-            print(f"[BLEED] Generated variant: {suffix} -> {variant_path}")
         except Exception as e:
             print(f"[BLEED] Variant {suffix} failed: {e}")
+            variant_img = None
+        if not _usable(variant_img):
+            try:
+                variant_img, _heal_meta = auto_resolve_safe_zone(
+                    cropped.copy(),
+                    target_bleed_px=extend_px,
+                    bleed_strategy="replicate",
+                    dpi=actual_dpi,
+                )
+            except Exception as e:
+                print(f"[BLEED] Variant {suffix} replicate fallback failed: {e}")
+                variant_img = cropped
+        if variant_img is None:
+            variant_img = cropped
+        cv2.imwrite(variant_path, variant_img)
+        variant_paths[key] = variant_path
+        print(f"[BLEED] Generated variant: {suffix} -> {variant_path}")
 
     return {
         "paths": variant_paths,
@@ -9487,5 +9505,59 @@ def main():
                 pass
 
 
+def render_style_page(pdf_path: str, method: str, page_index: int, output_path: str) -> str:
+    """One bleed style for one page. A failed or blank style falls back to edge replication."""
+    import pymupdf as fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_index < 0 or page_index >= len(doc):
+            raise IndexError(f"Page {page_index + 1} is not in this file.")
+        page = doc[page_index]
+        variant_dpi = 150
+        mat = fitz.Matrix(variant_dpi / 72.0, variant_dpi / 72.0)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
+        img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+        alpha = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
+        rgb = img_rgba[:, :, :3].astype(np.float32)
+        composited = (rgb * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+        image = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
+    finally:
+        doc.close()
+    extend_px = _mm_to_px(float(BLEED_TARGET_MM), variant_dpi)
+    try:
+        painted, _meta = auto_resolve_safe_zone(
+            image,
+            target_bleed_px=extend_px,
+            bleed_strategy=method,
+            dpi=float(variant_dpi),
+        )
+    except Exception:
+        painted = None
+    if painted is None or float(np.std(painted)) < 2.0:
+        try:
+            painted, _meta = auto_resolve_safe_zone(
+                image,
+                target_bleed_px=extend_px,
+                bleed_strategy="replicate",
+                dpi=float(variant_dpi),
+            )
+        except Exception:
+            painted = image
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cv2.imwrite(output_path, painted if painted is not None else image)
+    return output_path
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--one-style":
+        import json as _json
+        try:
+            _pdf, _method, _page, _output = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+            _path = render_style_page(_pdf, _method, _page, _output)
+            print(_json.dumps({"ok": True, "success": True, "path": _path}))
+        except Exception as _exc:
+            print(_json.dumps({"ok": False, "success": False, "error": str(_exc)}))
+            sys.exit(1)
+    else:
+        main()
