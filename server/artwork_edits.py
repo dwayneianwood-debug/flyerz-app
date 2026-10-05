@@ -24,6 +24,8 @@ DATE_ASK = re.compile(
     re.I,
 )
 LOGO_ASK = re.compile(r"make\s+the\s+logo\s+(bigger|smaller|larger)\b", re.I)
+LOGO_MOVE_ASK = re.compile(r"move\s+the\s+logo\s+(up|down|left|right)\b", re.I)
+HEADING_ASK = re.compile(r"make\s+the\s+heading\s+(bigger|smaller|larger)\b", re.I)
 MOVE_ASK = re.compile(r"move\s+the\s+text\s+away\s+from\s+the\s+edge", re.I)
 PHONE_IN_TEXT = re.compile(r"(?:\+?\d[\d\s\-()]{6,}\d)")
 DATE_IN_TEXT = re.compile(
@@ -145,15 +147,34 @@ def _parse(message: str) -> dict | None:
     date = DATE_ASK.search(text)
     if date:
         return {"kind": "date", "new": date.group(1).strip(" .")}
+    logo_move = LOGO_MOVE_ASK.search(text)
+    if logo_move:
+        return {"kind": "logo", "scale": 1.0, "direction": logo_move.group(1).lower()}
     logo = LOGO_ASK.search(text)
     if logo:
         word = logo.group(1).lower()
-        return {"kind": "logo", "scale": 0.8 if word == "smaller" else 1.25}
+        return {"kind": "logo", "scale": 0.8 if word == "smaller" else 1.25, "direction": ""}
+    heading = HEADING_ASK.search(text)
+    if heading:
+        word = heading.group(1).lower()
+        return {"kind": "heading", "factor": 0.8 if word == "smaller" else 1.25, "word": "smaller" if word == "smaller" else "bigger"}
     if MOVE_ASK.search(text):
         return {"kind": "move"}
     if re.search(r"shrink", text, re.I) and re.search(r"safe", text, re.I):
         return {"kind": "shrink"}
     return None
+
+
+def _heading_span(spans: list[dict]) -> dict | None:
+    scored = []
+    for span in spans:
+        text = str(span.get("text") or "").strip()
+        if sum(ch.isalpha() for ch in text) < 3:
+            continue
+        scored.append(span)
+    if not scored:
+        return None
+    return max(scored, key=lambda span: (float(span.get("size") or 0), -float(span["bbox"][1])))
 
 
 def _live_target(spans: list[dict], kind: str) -> dict | None:
@@ -168,7 +189,39 @@ def _live_target(spans: list[dict], kind: str) -> dict | None:
     return None
 
 
-def _ocr_words(png: str) -> list[dict]:
+def _rapid_words(png: str) -> list[dict]:
+    """Same local reader the vector rebuild uses, one box per line of type."""
+    import cv2
+    from ocr_reader import local_rows
+
+    image = cv2.imread(png)
+    if image is None:
+        return []
+    rows = local_rows(image) or []
+    words = []
+    for item in rows:
+        box = item[0] if item else None
+        text = str(item[1] or "").strip() if len(item) > 1 else ""
+        if not text or not box or len(box) < 4:
+            continue
+        xs = [float(point[0]) for point in box]
+        ys = [float(point[1]) for point in box]
+        left, top = min(xs), min(ys)
+        width, height = max(xs) - left, max(ys) - top
+        if width < 2 or height < 2:
+            continue
+        words.append({
+            "text": text,
+            "left": int(round(left)),
+            "top": int(round(top)),
+            "width": max(1, int(round(width))),
+            "height": max(1, int(round(height))),
+            "line": ("rapid", str(int(round(top)))),
+        })
+    return words
+
+
+def _tesseract_words(png: str) -> list[dict]:
     try:
         proc = subprocess.run(
             ["tesseract", png, "stdout", "tsv"],
@@ -199,6 +252,33 @@ def _ocr_words(png: str) -> list[dict]:
         except ValueError:
             continue
     return words
+
+
+def _ocr_words(png: str) -> list[dict]:
+    try:
+        found = _rapid_words(png)
+    except Exception:
+        found = []
+    if found:
+        return found
+    return _tesseract_words(png)
+
+
+def _line_groups(words: list[dict]) -> list[list[dict]]:
+    groups: list[dict] = []
+    for word in sorted(words, key=lambda item: (item["top"], item["left"])):
+        mid = word["top"] + word["height"] / 2.0
+        placed = False
+        for group in groups:
+            if abs(mid - group["mid"]) <= max(8.0, group["height"] * 0.55):
+                group["words"].append(word)
+                group["mid"] = (group["mid"] + mid) / 2.0
+                group["height"] = max(group["height"], word["height"])
+                placed = True
+                break
+        if not placed:
+            groups.append({"mid": mid, "height": word["height"], "words": [word]})
+    return [group["words"] for group in groups]
 
 
 def _closest_font(crop, text: str) -> tuple[str, float]:
@@ -240,11 +320,19 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
         page = doc[0]
         spans = _spans(page)
         proposal = {"kind": parsed["kind"], "page": 0, "live": bool(spans), "src": src}
-        if parsed["kind"] in ("phone", "date"):
-            span = _live_target(spans, parsed["kind"])
+        if parsed["kind"] in ("phone", "date", "heading"):
+            if parsed["kind"] == "heading":
+                span = _heading_span(spans)
+            else:
+                span = _live_target(spans, parsed["kind"])
             if span:
                 old = span["text"]
-                new_text = PHONE_IN_TEXT.sub(parsed["new"], old, count=1) if parsed["kind"] == "phone" else DATE_IN_TEXT.sub(parsed["new"], old, count=1)
+                if parsed["kind"] == "phone":
+                    new_text = PHONE_IN_TEXT.sub(parsed["new"], old, count=1)
+                elif parsed["kind"] == "date":
+                    new_text = DATE_IN_TEXT.sub(parsed["new"], old, count=1)
+                else:
+                    new_text = old
                 fontfile = _embedded_font(doc, page, str(span.get("font") or ""))
                 if not fontfile:
                     return {
@@ -270,11 +358,13 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     "new": new_text,
                     "bbox": list(span["bbox"]),
                     "origin": list(span.get("origin") or (span["bbox"][0], span["bbox"][3])),
-                    "size": float(span.get("size") or 12),
+                    "size": float(span.get("size") or 12) * (float(parsed["factor"]) if parsed["kind"] == "heading" else 1.0),
                     "font": str(span.get("font") or ""),
                     "fontfile": fontfile,
                     "color": int(span.get("color") or 0),
                     "amber": False,
+                    "sizeFactor": float(parsed.get("factor") or 1),
+                    "word": parsed.get("word") or "",
                 })
             else:
                 raster = _propose_raster(src, parsed, proposal)
@@ -282,7 +372,7 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     return raster
                 proposal = raster["proposal"]
         elif parsed["kind"] == "logo":
-            proposal.update(_logo_proposal(page, float(parsed["scale"])))
+            proposal.update(_logo_proposal(page, float(parsed["scale"]), str(parsed.get("direction") or "")))
             if proposal.get("error"):
                 return {"ok": False, "reply": proposal["error"], "actions": []}
         elif parsed["kind"] == "shrink":
@@ -316,7 +406,13 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     amber = ""
     if proposal.get("amber"):
         amber = f" Amber for the designer: the closest font is {os.path.basename(proposal.get('fontfile') or '')}, and it is not an exact match."
-    reply = _preview_sentence(proposal) + amber + " Here is the before and after. I have not applied it yet."
+    if proposal.get("mode") == "raster-text":
+        font_note = " The new words are set as vector type in the closest font."
+    elif proposal.get("mode") == "live-text":
+        font_note = " The letters stay in the file's own font."
+    else:
+        font_note = ""
+    reply = _preview_sentence(proposal) + font_note + amber + " Here is the before and after. I have not applied it yet."
     return {
         "ok": True,
         "reply": reply,
@@ -335,8 +431,12 @@ def _preview_sentence(proposal: dict) -> str:
         return f"I would change the phone number from {proposal.get('old')} to {proposal.get('new')}."
     if kind == "date":
         return f"I would change the date from {proposal.get('old')} to {proposal.get('new')}."
+    if kind == "logo" and proposal.get("direction"):
+        return f"I would move the logo {proposal.get('direction')}."
     if kind == "logo":
         return f"I would make the logo {proposal.get('scale')} times its current size."
+    if kind == "heading":
+        return f"I would make the heading \"{proposal.get('old')}\" {proposal.get('word') or 'bigger'}, in the same font."
     if kind == "move":
         return f"I would move {proposal.get('count', 1)} text item(s) in from the edge. The words stay the same."
     if kind == "shrink":
@@ -344,7 +444,7 @@ def _preview_sentence(proposal: dict) -> str:
     return "I would make that one change."
 
 
-def _logo_proposal(page, scale: float) -> dict:
+def _logo_proposal(page, scale: float, direction: str = "") -> dict:
     infos = page.get_image_info(xrefs=True) or []
     page_area = float(page.rect.width * page.rect.height) or 1.0
     logos = []
@@ -358,6 +458,33 @@ def _logo_proposal(page, scale: float) -> dict:
         return {"error": "I can't see a separate logo on this page, so I have not changed anything."}
     info = min(logos, key=lambda item: item[0])[1]
     box = list(info["bbox"])
+    if direction:
+        step = 8.0 * 72.0 / 25.4
+        dx = {"left": -step, "right": step}.get(direction, 0.0)
+        dy = {"up": -step, "down": step}.get(direction, 0.0)
+        grown = [box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy]
+        shift_x = 0.0
+        shift_y = 0.0
+        if grown[0] < page.rect.x0:
+            shift_x = page.rect.x0 - grown[0]
+        elif grown[2] > page.rect.x1:
+            shift_x = page.rect.x1 - grown[2]
+        if grown[1] < page.rect.y0:
+            shift_y = page.rect.y0 - grown[1]
+        elif grown[3] > page.rect.y1:
+            shift_y = page.rect.y1 - grown[3]
+        grown = [grown[0] + shift_x, grown[1] + shift_y, grown[2] + shift_x, grown[3] + shift_y]
+        if abs(grown[0] - box[0]) < 0.4 and abs(grown[1] - box[1]) < 0.4:
+            return {"error": "The logo is already against that edge, so I have not moved it."}
+        return {
+            "mode": "logo",
+            "xref": int(info.get("xref") or 0),
+            "bbox": box,
+            "grown": grown,
+            "scale": 1.0,
+            "direction": direction,
+            "amber": False,
+        }
     cx = (box[0] + box[2]) / 2.0
     cy = (box[1] + box[3]) / 2.0
     half_w = (box[2] - box[0]) * scale / 2.0
@@ -374,6 +501,7 @@ def _logo_proposal(page, scale: float) -> dict:
         "bbox": box,
         "grown": grown,
         "scale": scale,
+        "direction": "",
         "amber": False,
     }
 
@@ -412,52 +540,136 @@ def _move_proposal(page, spans: list[dict]) -> dict:
     return {"mode": "move", "moves": moves, "count": len(moves), "amber": False}
 
 
-def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
-    import cv2
-    import pymupdf as fitz
-
-    doc = fitz.open(src)
-    try:
-        page = doc[0]
-        scale = 2.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-        folder = tempfile.mkdtemp(prefix="edit-ocr-")
-        png = os.path.join(folder, "page.png")
-        pix.save(png)
-    finally:
-        doc.close()
-    words = _ocr_words(png)
-    pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
-    lines: dict[tuple, list[dict]] = {}
-    for word in words:
-        lines.setdefault(word.get("line") or (word["top"] // 12,), []).append(word)
-    hit = None
-    for group in lines.values():
+def _select_hit(words: list[dict], parsed: dict) -> dict | None:
+    def boxed(group: list[dict], joined: str) -> dict:
         group.sort(key=lambda item: item["left"])
-        joined = " ".join(item["text"] for item in group)
-        if not pattern.search(joined):
-            continue
-        candidate = {
+        return {
             "text": joined,
             "left": group[0]["left"],
             "top": min(item["top"] for item in group),
             "width": max(item["left"] + item["width"] for item in group) - group[0]["left"],
             "height": max(item["top"] + item["height"] for item in group) - min(item["top"] for item in group),
         }
+
+    if parsed["kind"] in ("phone", "date"):
+        pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
+        singles = [word for word in words if pattern.search(word.get("text") or "")]
+        if singles:
+            # The number's own box, not a neighbouring line that happens to share its height.
+            word = min(singles, key=lambda item: (len(item["text"]), item["width"] * item["height"]))
+            return {
+                "text": word["text"],
+                "left": word["left"],
+                "top": word["top"],
+                "width": word["width"],
+                "height": word["height"],
+            }
+    hit = None
+    if parsed["kind"] == "heading":
+        for group in _line_groups(words):
+            joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
+            if sum(ch.isalpha() for ch in joined) < 3:
+                continue
+            candidate = boxed(group, joined)
+            if hit is None or candidate["height"] > hit["height"]:
+                hit = candidate
+        return hit
+    pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
+    for group in _line_groups(words):
+        joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
+        if not pattern.search(joined):
+            continue
+        candidate = boxed(group, joined)
         if hit is None or len(candidate["text"]) > len(hit["text"]):
             hit = candidate
+    return hit
+
+
+def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
+    """Read the placed picture at its own pixels, then map the box onto the page render."""
+    import cv2
+
+    infos = [info for info in (page.get_image_info(xrefs=True) or []) if info.get("xref")]
+    if not infos:
+        return None
+    info = max(infos, key=lambda item: max(0.0, (item["bbox"][2] - item["bbox"][0]) * (item["bbox"][3] - item["bbox"][1])))
+    try:
+        raw = doc.extract_image(int(info["xref"])) or {}
+    except Exception:
+        return None
+    blob = raw.get("image")
+    if not blob:
+        return None
+    folder = tempfile.mkdtemp(prefix="edit-src-")
+    path = os.path.join(folder, "art." + str(raw.get("ext") or "png"))
+    with open(path, "wb") as handle:
+        handle.write(blob)
+    image = cv2.imread(path)
+    if image is None:
+        return None
+    hit = _select_hit(_ocr_words(path), parsed)
     if not hit:
+        return None
+    height, width = image.shape[:2]
+    box = info["bbox"]
+    sx = (box[2] - box[0]) / float(width or 1)
+    sy = (box[3] - box[1]) / float(height or 1)
+    x0 = box[0] + hit["left"] * sx
+    y0 = box[1] + hit["top"] * sy
+    x1 = box[0] + (hit["left"] + hit["width"]) * sx
+    y1 = box[1] + (hit["top"] + hit["height"]) * sy
+    crop = image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    return {
+        "text": hit["text"],
+        "left": int(round(x0 * render_scale)),
+        "top": int(round(y0 * render_scale)),
+        "width": max(1, int(round((x1 - x0) * render_scale))),
+        "height": max(1, int(round((y1 - y0) * render_scale))),
+        "crop": crop,
+    }
+
+
+def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
+    import cv2
+    import pymupdf as fitz
+
+    embedded = None
+    doc = fitz.open(src)
+    try:
+        page = doc[0]
+        long_pt = max(float(page.rect.width), float(page.rect.height)) or 1.0
+        scale = 2.0
+        if long_pt * scale < 700:
+            scale = min(6.0, 1200.0 / long_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+        folder = tempfile.mkdtemp(prefix="edit-ocr-")
+        png = os.path.join(folder, "page.png")
+        pix.save(png)
+        embedded = _embedded_hit(doc, page, parsed, scale)
+    finally:
+        doc.close()
+    if embedded:
+        hit = embedded
+        crop = embedded.get("crop")
+    else:
+        hit = _select_hit(_ocr_words(png), parsed)
+        image = cv2.imread(png)
+        crop = None if hit is None or image is None else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    if not hit:
+        missing = "a heading" if parsed["kind"] == "heading" else "that text"
         return {
             "ok": False,
-            "reply": "I read the picture and could not find that text, so I have not changed anything.",
+            "reply": f"I read the picture and could not find {missing}, so I have not changed anything.",
             "actions": [],
         }
-    image = cv2.imread(png)
-    crop = image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    if parsed["kind"] == "heading":
+        new_text = hit["text"]
+    else:
+        pattern = PHONE_IN_TEXT if parsed["kind"] == "phone" else DATE_IN_TEXT
+        new_text = pattern.sub(parsed["new"], hit["text"], count=1)
     fontfile, score = _closest_font(crop, hit["text"])
     if not fontfile:
         return {"ok": False, "reply": "I found the words but I have no font to set them in. Nothing was changed.", "actions": []}
-    new_text = pattern.sub(parsed["new"], hit["text"], count=1)
     missing = _missing_glyphs(fontfile, new_text)
     if missing:
         return {
@@ -470,11 +682,13 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
         "old": hit["text"],
         "new": new_text,
         "pixelBox": [hit["left"], hit["top"], hit["width"], hit["height"]],
-        "renderScale": 2.0,
+        "renderScale": scale,
         "fontfile": fontfile,
         "amber": score > 12.0,
         "fontScore": round(score, 1),
         "kind": parsed["kind"],
+        "sizeFactor": float(parsed.get("factor") or 1),
+        "word": parsed.get("word") or "",
     })
     return {"proposal": proposal}
 
@@ -613,7 +827,7 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     page.insert_image(page.rect, pixmap=painted, overlay=True)
     origin_x = left / scale
     origin_y = (top + height * 0.85) / scale
-    size = max(8.0, (height / scale) * 0.8)
+    size = max(8.0, (height / scale) * 0.8) * float(proposal.get("sizeFactor") or 1.0)
     page.insert_text(
         (origin_x, origin_y),
         str(proposal.get("new") or ""),

@@ -1107,6 +1107,22 @@ def test_size_matrix() -> None:
     )
 
 
+def test_cat_edits() -> None:
+    from cat_edit_check import run
+
+    failed = run()
+    record(
+        "cat-edits",
+        not failed,
+        product="all",
+        pages="",
+        size=str(len(failed)),
+        light="",
+        reasons="",
+        note=", ".join(failed[:8]),
+    )
+
+
 def test_customer_intake() -> None:
     from customer_intake_check import run
 
@@ -1154,6 +1170,7 @@ def main() -> None:
     test_plate_facts_skip_reencode()
     test_six_jobs()
     test_size_matrix()
+    test_cat_edits()
     test_customer_intake()
     _write_table()
     if FAILURES:

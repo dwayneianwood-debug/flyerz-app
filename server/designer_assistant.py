@@ -696,17 +696,33 @@ def main() -> None:
     if edit_action:
         dest = args.output or ((args.input + ".designer.pdf") if args.input else "")
         if edit_action == "confirm-edit":
+            # The staged preview is copied only here, after a confirm.
             done = confirm(key, dest)
         elif edit_action == "cancel-edit":
             done = cancel(key)
         else:
             done = undo(key, dest)
+        checks = []
+        if edit_action in ("confirm-edit", "undo-edit") and done.get("ok") and done.get("path"):
+            try:
+                inspected = inspect_artwork(done["path"], trim_w, trim_h, args.client)
+                checks = inspected.get("checks") or []
+                points = [row for row in checks if str(row.get("num") or "").strip()]
+                extras = [row for row in checks if str(row.get("id") or "").startswith("extra_")]
+                done["reply"] = (
+                    (done.get("reply") or "").rstrip()
+                    + f"\nI ran the 25-point check ({len(points)} items) and E1–E9 ({len(extras)} items) again.\n"
+                    + (inspected.get("reply") or "")
+                )
+            except Exception as exc:
+                done["reply"] = (done.get("reply") or "").rstrip() + f"\nI could not re-run the checks ({str(exc)[:140]})."
         _emit({
             "reply": done.get("reply") or "",
             "actions": done.get("actions") or [],
             "ok": bool(done.get("ok")),
             "path": done.get("path") or "",
             "action": edit_action,
+            "checks": checks,
         })
         return
 
