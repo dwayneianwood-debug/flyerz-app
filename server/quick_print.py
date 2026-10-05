@@ -104,6 +104,9 @@ def decide_light(facts: dict) -> dict:
             "reasons": ["The picture's shape cannot be extended to this print size."],
             "clientMessage": client_message("proportions"),
         }
+    if facts.get("plateSkipped"):
+        reason = str(facts.get("plateReason") or "").strip() or "The press plate was not rendered."
+        return {"light": "amber", "reasons": [reason], "clientMessage": ""}
     if facts.get("missingContent"):
         from green_gate import client_message
 
@@ -1359,6 +1362,8 @@ def make_print_ready(
     lettering_note = "The original lettering is kept."
 
     try:
+        from press_ready_engine import PLATE_SKIP_REASON, plate_exceeds_memory
+
         if ext in (".ai", ".eps"):
             opened, prep_error = _prepare_vector(src_path, ext)
             if prep_error or not opened:
@@ -1416,8 +1421,16 @@ def make_print_ready(
                 decisions.append(
                     "The PDF shape does not match the product. The page was placed whole and the edges were extended. It was not stretched."
                 )
+                if plate_exceeds_memory(trim_w, trim_h):
+                    decisions.append(PLATE_SKIP_REASON)
+                    info = decide_light({"plateSkipped": True, "plateReason": PLATE_SKIP_REASON})
+                    return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
                 raster = _render_pdf_image(work_path)
                 ext = ".png"
+        if plate_exceeds_memory(trim_w, trim_h):
+            decisions.append(PLATE_SKIP_REASON)
+            info = decide_light({"plateSkipped": True, "plateReason": PLATE_SKIP_REASON})
+            return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
         if ext in IMAGE_EXT or raster is not None:
             if raster is None:
                 raster = _read_image(work_path)

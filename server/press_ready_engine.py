@@ -26,6 +26,12 @@ import numpy as np
 
 from http_headers import external_headers
 
+# A 300 dpi plate longer than this does not fit the memory leash (A2 and above).
+PLATE_LIMIT_MM = 430.0
+PLATE_SKIP_REASON = (
+    "This sheet is larger than the press line can hold in memory, so the plate was not rendered. "
+    "The size was read and the file was not damaged."
+)
 SAFE_ZONE_MM = 3.0
 SAFE_ZONE_SHRINK_MIN = 0.01
 SAFE_ZONE_SHRINK_CAP = 0.03
@@ -33,6 +39,11 @@ SAFE_ZONE_SHRINK_CAP = 0.03
 MIN_HONEST_EFFECTIVE_DPI = 240.0
 TAC_LIMIT = 300.0
 MM_TO_PT = 72.0 / 25.4
+
+
+def plate_exceeds_memory(trim_w_mm: float, trim_h_mm: float) -> bool:
+    """True when a 300 dpi plate of this trim would exceed the memory leash."""
+    return max(float(trim_w_mm or 0), float(trim_h_mm or 0)) > PLATE_LIMIT_MM
 
 
 def centred_bleed_mm(

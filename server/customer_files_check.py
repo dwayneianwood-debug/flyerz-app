@@ -1107,6 +1107,22 @@ def test_size_matrix() -> None:
     )
 
 
+def test_customer_intake() -> None:
+    from customer_intake_check import run
+
+    failed = run()
+    record(
+        "customer-intake",
+        not failed,
+        product="all",
+        pages="",
+        size=str(len(failed)),
+        light="",
+        reasons="",
+        note=", ".join(failed[:8]),
+    )
+
+
 def _write_table() -> None:
     out = "/opt/cursor/artifacts/customer_files_table.txt"
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -1138,6 +1154,7 @@ def main() -> None:
     test_plate_facts_skip_reencode()
     test_six_jobs()
     test_size_matrix()
+    test_customer_intake()
     _write_table()
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failed: {', '.join(FAILURES)}")

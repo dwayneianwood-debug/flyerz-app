@@ -1322,6 +1322,14 @@ def main():
     print(f"DEBUG: Crop args received: crop_x={args.crop_x}, crop_y={args.crop_y}, crop_w={args.crop_w}, crop_h={args.crop_h}", flush=True)
     print(f"DEBUG: Trim args received: trim_w={args.trim_w}, trim_h={args.trim_h}", flush=True)
     print(f"CRITICAL DEBUG: Starting from ORIGINAL file. Input path = {args.input}", flush=True)
+    from press_ready_engine import PLATE_LIMIT_MM, PLATE_SKIP_REASON
+
+    if max(float(args.trim_w or 0), float(args.trim_h or 0)) > PLATE_LIMIT_MM:
+        sys.stderr.write(f"[COMPILE] {PLATE_SKIP_REASON}\n")
+        write_status(status_file, "COMPLETE", PLATE_SKIP_REASON)
+        with open(result_file, "w", encoding="utf-8") as handle:
+            json.dump({"success": False, "plateSkipped": True, "error": PLATE_SKIP_REASON}, handle)
+        return
     if args.crop_x >= 0:
         print(f"CRITICAL DEBUG: CROPPING ORIGINAL FILE {args.input} AT {args.crop_x},{args.crop_y} size {args.crop_w}x{args.crop_h}", flush=True)
     if args.auto_shifter > 0:
