@@ -763,6 +763,16 @@ def test_real_a6_file() -> None:
         problems.append("no seam report")
     if worst >= 5.0:
         problems.append(f"seam dE {worst}")
+    # Ian's A6 was verified at dE 0.70. Page 1 has to stay at or under 0.10, page 2 at or under 0.70.
+    limits = {1: 0.10, 2: 0.70}
+    for row in seams:
+        page_no = int(row.get("page") or 0)
+        limit = limits.get(page_no)
+        if limit is None:
+            continue
+        page_max = float(row.get("page_max") or 99)
+        if page_max > limit:
+            problems.append(f"page {page_no} dE {page_max:.2f}")
     card = [str(item) for item in (result.get("reasons") or [])]
     if any("does not match" in item or "35 ppi" in item or "no longer K-only" in item or "Under 75" in item for item in card):
         problems.append("false amber")
@@ -780,6 +790,12 @@ def test_real_a6_file() -> None:
             height_mm = rect.height * 25.4 / 72.0
             if abs(width_mm - 158.0) > 1.5 or abs(height_mm - 115.0) > 1.5 or sized.page_count != 2:
                 problems.append(f"size {sized.page_count}p {width_mm:.1f}x{height_mm:.1f}")
+            faces = " ".join(str(font[3] if len(font) > 3 else "") for font in (sized[0].get_fonts(full=True) or []))
+            text = sized[0].get_text("text") or ""
+            if "Anton-Regular" not in faces or "helv" in faces.lower():
+                problems.append(f"font {faces[:80]}")
+            if text.count("LOCATION") != 1:
+                problems.append(f"LOCATION x{text.count('LOCATION')}")
         finally:
             sized.close()
     if not result.get("existingBleedKept"):

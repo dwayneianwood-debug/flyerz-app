@@ -2806,8 +2806,10 @@ def _insert_rgb(page, rgb, rect) -> None:
 def _paint_mirrored_strips(page, placed) -> None:
     """Mirror only the missing bleed. The page underneath stays vector.
 
-    The new strip and the edge it continues are the same rendered pixels, so the
-    seam is not a second colour conversion. The trim itself is left alone.
+    The strip is the page's own CMYK pixels, flipped. Converting a rendered RGB
+    sample back to CMYK paints a lighter colour than the vector fill. Ghostscript
+    also leaves a 1–2 px light fringe on the content edge, so that fringe is
+    replaced with the clean pixel just inside it. The trim itself is left alone.
     """
     import pymupdf as fitz
 
@@ -2816,11 +2818,11 @@ def _paint_mirrored_strips(page, placed) -> None:
     if placed.width < 1 or placed.height < 1:
         return
     scale = 300.0 / 72.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-    if pix.width < 2 or pix.height < 2 or pix.n < 3:
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csCMYK)
+    if pix.width < 2 or pix.height < 2 or pix.n < 4:
         return
-    rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
-    height, width = rgb.shape[:2]
+    plate = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4]
+    height, width = plate.shape[:2]
 
     def px(value: float, limit: int) -> int:
         return min(limit, max(0, int(round(float(value) * scale))))
@@ -2829,37 +2831,53 @@ def _paint_mirrored_strips(page, placed) -> None:
     x1, y1 = px(placed.x1 - full.x0, width), px(placed.y1 - full.y0, height)
     if x1 <= x0 or y1 <= y0:
         return
-    canvas = np.zeros((height, width, 4), np.uint8)
+    canvas = np.zeros((height, width, 5), np.uint8)
 
     def paint(image, row, col) -> None:
-        if image is None or image.size == 0:
+        if image is None or image.size == 0 or row >= height or col >= width:
             return
+        row = max(0, int(row))
+        col = max(0, int(col))
         row_end = min(height, row + int(image.shape[0]))
         col_end = min(width, col + int(image.shape[1]))
         view = image[: row_end - row, : col_end - col]
         if view.size == 0:
             return
-        canvas[row:row_end, col:col_end, :3] = view
-        canvas[row:row_end, col:col_end, 3] = 255
+        canvas[row:row_end, col:col_end, :4] = view[:, :, :4]
+        canvas[row:row_end, col:col_end, 4] = 255
 
-    left = rgb[y0:y1, x0:x0 + x0] if x0 > 0 else None
+    # Ghostscript leaves a 1–2 px light fringe on the content edge, including the
+    # corners. Copy the clean pixel just inside that fringe over it before the
+    # mirror, or the corner of each strip is a light line.
+    inset = 3
+    inset = min(inset, max(0, (x1 - x0) // 2), max(0, (y1 - y0) // 2))
+    if inset >= 1:
+        plate = np.array(plate, copy=True)
+        plate[y0:y1, x0:x0 + inset] = plate[y0:y1, x0 + inset:x0 + inset + 1]
+        plate[y0:y1, x1 - inset:x1] = plate[y0:y1, x1 - inset - 1:x1 - inset]
+        plate[y0:y0 + inset, x0:x1] = plate[y0 + inset:y0 + inset + 1, x0:x1]
+        plate[y1 - inset:y1, x0:x1] = plate[y1 - inset - 1:y1 - inset, x0:x1]
+
+    left = plate[y0:y1, x0:x0 + max(x0, 1)] if x0 > 0 else None
     right_w = width - x1
-    right = rgb[y0:y1, x1 - right_w:x1] if right_w > 0 else None
-    top = rgb[y0:y0 + y0, x0:x1] if y0 > 0 else None
+    right = plate[y0:y1, max(0, x1 - right_w):x1] if right_w > 0 else None
+    top = plate[y0:y0 + max(y0, 1), x0:x1] if y0 > 0 else None
     bottom_h = height - y1
-    bottom = rgb[y1 - bottom_h:y1, x0:x1] if bottom_h > 0 else None
+    bottom = plate[max(0, y1 - bottom_h):y1, x0:x1] if bottom_h > 0 else None
     if left is not None and left.size:
-        paint(left[:, ::-1], y0, 0)
-        paint(left, y0, x0)
+        paint(left[:, ::-1][:, -x0:] if left.shape[1] >= x0 else left[:, ::-1], y0, 0)
+        paint(left[:, :x0] if left.shape[1] >= x0 else left, y0, x0)
     if right is not None and right.size:
-        paint(right[:, ::-1], y0, x1)
-        paint(right, y0, x1 - right.shape[1])
+        flip = right[:, ::-1]
+        paint(flip[:, :right_w] if flip.shape[1] >= right_w else flip, y0, x1)
+        paint(right[:, -right_w:] if right.shape[1] >= right_w else right, y0, x1 - min(right_w, right.shape[1]))
     if top is not None and top.size:
-        paint(top[::-1, :], 0, x0)
-        paint(top, y0, x0)
+        paint(top[::-1, :][-y0:, :] if top.shape[0] >= y0 else top[::-1, :], 0, x0)
+        paint(top[:y0, :] if top.shape[0] >= y0 else top, y0, x0)
     if bottom is not None and bottom.size:
-        paint(bottom[::-1, :], y1, x0)
-        paint(bottom, y1 - bottom.shape[0], x0)
+        flip = bottom[::-1, :]
+        paint(flip[:bottom_h, :] if flip.shape[0] >= bottom_h else flip, y1, x0)
+        paint(bottom[-bottom_h:, :] if bottom.shape[0] >= bottom_h else bottom, y1 - min(bottom_h, bottom.shape[0]), x0)
 
     def corner(vertical, horizontal, row: int, col: int, end_rows: bool, end_cols: bool) -> None:
         if vertical is None or horizontal is None or vertical.size == 0 or horizontal.size == 0:
@@ -2870,8 +2888,9 @@ def _paint_mirrored_strips(page, placed) -> None:
         cols = horizontal[:, -band_w:] if end_cols else horizontal[:, :band_w]
         if rows.size == 0 or cols.size == 0:
             return
-        colour = np.clip(np.round((rows.reshape(-1, 3).mean(0) + cols.reshape(-1, 3).mean(0)) / 2.0), 0, 255).astype(np.uint8)
-        block = np.empty((max(1, rows.shape[0]), max(1, cols.shape[1]), 3), np.uint8)
+        channels = int(rows.shape[-1])
+        colour = np.clip(np.round((rows.reshape(-1, channels).mean(0) + cols.reshape(-1, channels).mean(0)) / 2.0), 0, 255).astype(np.uint8)
+        block = np.empty((max(1, rows.shape[0]), max(1, cols.shape[1]), channels), np.uint8)
         block[:] = colour
         paint(block, row, col)
 
@@ -2879,22 +2898,10 @@ def _paint_mirrored_strips(page, placed) -> None:
     corner(right, top, 0, x1, False, True)
     corner(left, bottom, y1, 0, True, False)
     corner(right, bottom, y1, x1, True, True)
-    if int(canvas[:, :, 3].max()) == 0:
+    if int(canvas[:, :, 4].max()) == 0:
         return
-    rgb_f = canvas[:, :, :3].astype(np.float32) / 255.0
-    black = 1.0 - rgb_f.max(axis=2)
-    denom = np.maximum(1.0 - black, 1e-6)
-    cyan = (1.0 - rgb_f[:, :, 0] - black) / denom
-    magenta = (1.0 - rgb_f[:, :, 1] - black) / denom
-    yellow = (1.0 - rgb_f[:, :, 2] - black) / denom
-    pure = black >= 0.999
-    cyan[pure] = 0.0
-    magenta[pure] = 0.0
-    yellow[pure] = 0.0
-    cmyk = np.clip(np.round(np.dstack([cyan, magenta, yellow, black]) * 255.0), 0, 255).astype(np.uint8)
-    _cap_tac_array(cmyk)
-    samples = np.ascontiguousarray(np.dstack([cmyk, canvas[:, :, 3:4]])).tobytes()
-    ring = fitz.Pixmap(fitz.csCMYK, width, height, samples, True)
+    _cap_tac_array(canvas[:, :, :4])
+    ring = fitz.Pixmap(fitz.csCMYK, width, height, np.ascontiguousarray(canvas).tobytes(), True)
     page.insert_image(full, pixmap=ring)
 
 
@@ -2972,15 +2979,253 @@ def _keep_page_vector(page) -> bool:
         return True
 
 
-def _place_mirrored_bleed(dest, src, short_l: float, short_r: float, short_t: float, short_b: float) -> None:
-    """Extend a partial bleed to 5 mm as one mirrored CMYK image, with the type on top."""
+def _has_bleed_picture(page) -> bool:
+    """A Canva-style sheet: live type on a picture that already runs to the edge.
+
+    The missing bleed has to mirror that picture and the vector art together.
+    A sampled strip does not match the photo at the trim.
+    """
+    try:
+        if not (page.get_text("text") or "").strip():
+            return False
+    except Exception:
+        return False
+    width = abs(float(page.rect.width)) or 1.0
+    height = abs(float(page.rect.height)) or 1.0
+    try:
+        infos = page.get_image_info() or []
+    except Exception:
+        return False
+    for info in infos:
+        box = info.get("bbox") or ()
+        if len(box) < 4:
+            continue
+        x0, y0, x1, y1 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+        bw, bh = abs(x1 - x0), abs(y1 - y0)
+        if bw >= width * 0.45 and bh >= height * 0.45:
+            return True
+        if bw >= width * 0.85 or bh >= height * 0.85:
+            return True
+    return False
+
+
+_PATH_PAINT = {"f", "F", "f*", "B", "B*", "b", "b*", "S", "s"}
+
+
+def _xobject_image_names(resources) -> set[str]:
+    names: set[str] = set()
+    if resources is None:
+        return names
+    try:
+        xobjects = resources.get("/XObject")
+    except Exception:
+        return names
+    if xobjects is None:
+        return names
+    for key, obj in xobjects.items():
+        try:
+            subtype = str(obj.get("/Subtype") or "")
+        except Exception:
+            continue
+        if subtype == "/Image":
+            names.add(str(key).lstrip("/"))
+    return names
+
+
+def _text_only_stream(data: bytes, images: set[str]) -> bytes:
+    """Keep the original text operators. Drop pictures and filled vector shapes."""
+    from client_file_audit import _tokenize
+
+    tokens = _tokenize(data.decode("latin1", "replace"))
+    out: list[str] = []
+    depth = 0
+    for token in tokens:
+        if token == "BT":
+            depth += 1
+            out.append(token)
+            continue
+        if token == "ET" and depth:
+            depth -= 1
+            out.append(token)
+            continue
+        if depth:
+            out.append(token)
+            continue
+        if token == "Do" and out and out[-1].lstrip("/") in images:
+            out.pop()
+            continue
+        if token == "sh":
+            if out and str(out[-1]).startswith("/"):
+                out.pop()
+            continue
+        if token in _PATH_PAINT:
+            out.append("n")
+            continue
+        out.append(token)
+    # The original type stays. Ink over 300% is scaled back, which is what the
+    # plate did, so a rich black word is not a heavier press file than the mirror.
+    capped: list[str] = []
+    for index, token in enumerate(out):
+        capped.append(token)
+        if token != "k" or index < 4:
+            continue
+        try:
+            channels = [float(out[index - 4]), float(out[index - 3]), float(out[index - 2]), float(out[index - 1])]
+        except ValueError:
+            continue
+        if sum(channels) <= 3.001:
+            continue
+        cyan, magenta, yellow, black = channels
+        room = max(0.0, 3.0 - min(black, 1.0))
+        colour = cyan + magenta + yellow
+        scale = 0.0 if colour <= 0 else room / colour
+        capped[-5] = f"{cyan * scale:.4f}"
+        capped[-4] = f"{magenta * scale:.4f}"
+        capped[-3] = f"{yellow * scale:.4f}"
+        capped[-2] = f"{min(black, 1.0):.4f}"
+    return (" ".join(capped) + "\n").encode("latin1", "replace")
+
+
+def _clean_text_only_pdf(src_path: str, dest_path: str) -> None:
+    """A copy of the file whose pictures and fills no longer paint. The type is untouched."""
+    import pikepdf
+
+    pdf = pikepdf.open(src_path)
+    seen: set[tuple] = set()
+
+    def clean_contents(contents, images: set[str]) -> None:
+        if contents is None:
+            return
+        streams = list(contents) if isinstance(contents, pikepdf.Array) else [contents]
+        for stream in streams:
+            try:
+                stream.write(_text_only_stream(stream.read_bytes(), images))
+            except Exception:
+                continue
+
+    def walk_form(obj) -> None:
+        try:
+            ident = obj.objgen
+        except Exception:
+            return
+        if ident in seen:
+            return
+        seen.add(ident)
+        try:
+            if str(obj.get("/Subtype") or "") != "/Form":
+                return
+        except Exception:
+            return
+        resources = obj.get("/Resources")
+        images = _xobject_image_names(resources)
+        try:
+            obj.write(_text_only_stream(obj.read_bytes(), images))
+        except Exception:
+            pass
+        xobjects = None if resources is None else resources.get("/XObject")
+        if xobjects is not None:
+            for child in list(xobjects.values()):
+                walk_form(child)
+        drop_images(resources)
+
+    def drop_images(resources) -> None:
+        """Unpainted pictures must leave the file. An ink check still opens them."""
+        if resources is None:
+            return
+        try:
+            xobjects = resources.get("/XObject")
+        except Exception:
+            return
+        if xobjects is None:
+            return
+        doomed = []
+        for key, obj in list(xobjects.items()):
+            try:
+                if str(obj.get("/Subtype") or "") == "/Image":
+                    doomed.append(key)
+            except Exception:
+                continue
+        for key in doomed:
+            try:
+                del xobjects[key]
+            except Exception:
+                continue
+
+    try:
+        for page in pdf.pages:
+            resources = page.get("/Resources")
+            images = _xobject_image_names(resources)
+            try:
+                clean_contents(page.get("/Contents"), images)
+            except Exception:
+                pass
+            xobjects = None if resources is None else resources.get("/XObject")
+            if xobjects is None:
+                drop_images(resources)
+                continue
+            for child in list(xobjects.values()):
+                walk_form(child)
+            drop_images(resources)
+        pdf.save(dest_path)
+    finally:
+        pdf.close()
+
+
+def _stamp_original_text(dest, src, short_l: float, short_t: float) -> None:
+    """Place the file's own text operators on the plate. Nothing is retyped."""
+    import tempfile
+
+    import pymupdf as fitz
+
+    source_path = str(getattr(src.parent, "name", "") or "")
+    if not source_path or not os.path.isfile(source_path):
+        return
+    folder = tempfile.mkdtemp(prefix="live-text-")
+    cleaned = os.path.join(folder, "text.pdf")
+    try:
+        _clean_text_only_pdf(source_path, cleaned)
+        text_doc = fitz.open(cleaned)
+        try:
+            index = int(src.number)
+            if index < 0 or index >= text_doc.page_count:
+                return
+            placed = fitz.Rect(
+                float(short_l),
+                float(short_t),
+                float(short_l) + float(src.rect.width),
+                float(short_t) + float(src.rect.height),
+            )
+            dest.show_pdf_page(placed, text_doc, index, clip=src.rect)
+        finally:
+            text_doc.close()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _place_mirrored_bleed(
+    dest,
+    src,
+    short_l: float,
+    short_r: float,
+    short_t: float,
+    short_b: float,
+    keep_original_text: bool = False,
+) -> None:
+    """Extend a partial bleed to 5 mm as one mirrored CMYK image.
+
+    The picture and the vector art are both in that mirror. Live type, when it
+    has to stay, is the original text operators placed on top, not a retype.
+    """
     target_w, target_h = _probe_page_pixels(float(dest.rect.width), float(dest.rect.height))
     plate = _render_page_cmyk(src)
     _knock_small_black_text(plate, src)
     _cap_tac_array(plate)
     plate, pads = _mirror_pad(plate, target_w, target_h, short_l, short_r, short_t, short_b)
     _insert_cmyk_plate(dest, plate)
-    _overlay_live_text(dest, src, pads)
+    if keep_original_text:
+        _stamp_original_text(dest, src, short_l, short_t)
+    else:
+        _overlay_live_text(dest, src, pads)
 
 
 def _seam_dpi(path: str) -> int:
@@ -3279,7 +3524,16 @@ def compile_vector_press(
             short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
             short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
             if max(short_l, short_r, short_t, short_b) >= 0.4:
-                if plate_exceeds_memory(trim_w_mm, trim_h_mm) or _keep_page_vector(src_page):
+                if _has_bleed_picture(src_page) and not plate_exceeds_memory(trim_w_mm, trim_h_mm):
+                    # The photo runs to the edge. Mirror the whole page, and put the
+                    # original text operators back on top. Do not retype them.
+                    extended = True
+                    _place_mirrored_bleed(
+                        new_page, src_page, short_l, short_r, short_t, short_b, keep_original_text=True,
+                    )
+                    page_mirrored.append(True)
+                    edge_placements.append(None)
+                elif plate_exceeds_memory(trim_w_mm, trim_h_mm) or _keep_page_vector(src_page):
                     # Keep the page as vectors. The shortfall is a strip, not a full plate.
                     # Live embedded type is never retyped. A picture with no live text still uses the plate below.
                     placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)

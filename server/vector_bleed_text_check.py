@@ -108,6 +108,99 @@ def test_uneven_wide_gap_keeps_the_seam() -> None:
     check("uneven-seam", bool(seams) and worst < 5.0, f"{worst:.2f}")
 
 
+def test_picture_and_type_keeps_the_original_face() -> None:
+    """A full-bleed picture with live type is mirrored, and the type is not retyped."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    folder = tempfile.mkdtemp(prefix="vector-picture-")
+    src = os.path.join(folder, "src.pdf")
+    photo = os.path.join(folder, "photo.png")
+    trim_w, trim_h = 148.0, 105.0
+    bleed = 2.5
+    page_w = (trim_w + 2 * bleed) * MM
+    page_h = (trim_h + 2 * bleed) * MM
+    Image.new("RGB", (900, 640), (20, 90, 160)).save(photo)
+    doc = fitz.open()
+    page = doc.new_page(width=page_w, height=page_h)
+    page.insert_image(page.rect, filename=photo)
+    page.insert_font(fontname="DEJAVU", fontfile=FONT)
+    page.insert_text((page_w * 0.2, page_h * 0.55), "MARKET", fontsize=28, fontname="DEJAVU", color=(1, 1, 1))
+    rect = page.rect
+    page.set_mediabox(rect)
+    page.set_cropbox(rect)
+    page.set_trimbox(rect)
+    page.set_bleedbox(rect)
+    doc.save(src)
+    doc.close()
+    out = os.path.join(folder, "press.pdf")
+    result = compile_vector_press(src, out, trim_w, trim_h, 5)
+    facts = _press_facts(out) if os.path.exists(out) else {}
+    seams = press_window_seam(src, out) if os.path.exists(out) else []
+    worst = max((float(row.get("page_max") or 0) for row in seams), default=99)
+    faces = " ".join(facts.get("faces") or [])
+    check("picture-used", bool(result.get("used")), str(result.get("reason")))
+    check("picture-once", str(facts.get("text") or "").count("MARKET") == 1, str(facts.get("text")))
+    check("picture-face", "dejavu" in faces and "helv" not in faces, faces)
+    check("picture-seam", bool(seams) and worst < 1.0, f"{worst:.2f}")
+
+
+def test_rich_text_on_a_picture_stays_under_the_ink_limit() -> None:
+    """Live type on a full-bleed picture is not retyped, and its ink stays at or under 300%."""
+    import pikepdf
+    import pymupdf as fitz
+    from PIL import Image
+
+    from extra_checks import press_ink_facts
+
+    folder = tempfile.mkdtemp(prefix="vector-ink-")
+    src = os.path.join(folder, "src.pdf")
+    photo = os.path.join(folder, "photo.png")
+    trim_w, trim_h = 148.0, 105.0
+    bleed = 2.5
+    page_w = (trim_w + 2 * bleed) * MM
+    page_h = (trim_h + 2 * bleed) * MM
+    Image.new("RGB", (900, 640), (20, 90, 160)).save(photo)
+    doc = fitz.open()
+    page = doc.new_page(width=page_w, height=page_h)
+    page.insert_image(page.rect, filename=photo)
+    page.insert_font(fontname="DEJAVU", fontfile=FONT)
+    page.insert_text((page_w * 0.08, page_h * 0.7), "MARKET", fontsize=72, fontname="DEJAVU", color=(0.2, 0.15, 0.1))
+    rect = page.rect
+    page.set_mediabox(rect)
+    page.set_cropbox(rect)
+    page.set_trimbox(rect)
+    page.set_bleedbox(rect)
+    doc.save(src)
+    doc.close()
+    held = pikepdf.open(src, allow_overwriting_input=True)
+    for contents in held.pages[0].get("/Contents") if isinstance(held.pages[0].get("/Contents"), pikepdf.Array) else [held.pages[0].get("/Contents")]:
+        raw = contents.read_bytes().decode("latin1")
+        raw = raw.replace("0.2000 0.1500 0.1000 rg", "0.8400 0.7500 0.6000 1.0000 k")
+        raw = raw.replace("0.2 0.15 0.1 rg", "0.8400 0.7500 0.6000 1.0000 k")
+        contents.write(raw.encode("latin1"))
+    held.save(src)
+    held.close()
+    out = os.path.join(folder, "press.pdf")
+    result = compile_vector_press(src, out, trim_w, trim_h, 5)
+    facts = _press_facts(out) if os.path.exists(out) else {}
+    seams = press_window_seam(src, out) if os.path.exists(out) else []
+    worst = max((float(row.get("page_max") or 0) for row in seams), default=99)
+    faces = " ".join(facts.get("faces") or [])
+    raw = str(facts.get("raw") or "")
+    import re
+    peak = 0.0
+    for parts in re.findall(r"([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+k\b", raw):
+        peak = max(peak, sum(float(channel) for channel in parts) * 100.0)
+    ink = press_ink_facts(out) if os.path.exists(out) else {}
+    check("rich-used", bool(result.get("used")), str(result.get("reason")))
+    check("rich-once", str(facts.get("text") or "").count("MARKET") == 1, str(facts.get("text")))
+    check("rich-face", "dejavu" in faces and "helv" not in faces, faces)
+    check("rich-seam", bool(seams) and worst < 1.0, f"{worst:.2f}")
+    check("rich-vector-tac", peak <= 300.5, f"{peak:.1f}")
+    check("rich-plate-tac", float(ink.get("max_tac") or 999) <= 300.5, str(ink.get("max_tac")))
+
+
 def test_partial_bleed_keeps_live_type() -> None:
     folder = tempfile.mkdtemp(prefix="vector-bleed-")
     for bleed, word in ((2.5, "MARKET"), (3.0, "POSTER")):
@@ -222,6 +315,8 @@ def main() -> None:
     test_rgb_text_becomes_k_only()
     test_partial_bleed_keeps_live_type()
     test_uneven_wide_gap_keeps_the_seam()
+    test_picture_and_type_keeps_the_original_face()
+    test_rich_text_on_a_picture_stays_under_the_ink_limit()
     print("vector-bleed-text OK")
 
 
