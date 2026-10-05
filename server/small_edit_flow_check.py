@@ -112,6 +112,153 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
     _record(name, not problems, "; ".join(problems) or expect)
 
 
+def _full_font() -> None:
+    """A subset tag resolves to the bundled face, and Windows fonts are on the search path."""
+    from fontTools.ttLib import TTFont
+
+    from artwork_edits import _glyphs_present, _named_font, _windows_font_dirs
+
+    wanted = (
+        "PWSYDC+Anton-Regular",
+        "Montserrat-Regular",
+        "Poppins-Regular",
+        "OpenSans-Regular",
+        "Roboto-Regular",
+        "Lato-Regular",
+        "Oswald-Regular",
+        "BebasNeue-Regular",
+        "PlayfairDisplay-Regular",
+        "ABCDEF+Raleway-Regular",
+        "LeagueSpartan-Regular",
+        "ArchivoBlack-Regular",
+        "Inter-Regular",
+        "Nunito-Regular",
+        "GreatVibes-Regular",
+    )
+    problems = []
+    anton = _named_font("PWSYDC+Anton-Regular") or ""
+    if os.path.basename(anton) != "Anton-Regular.ttf":
+        problems.append("anton " + (os.path.basename(anton) or "missing"))
+    for name in wanted:
+        path = _named_font(name) or ""
+        if not path or not _glyphs_present(path, "Community Centre 082"):
+            problems.append(name)
+            continue
+        if "Raleway" in name or "Playfair" in name or name.startswith("Montserrat"):
+            weight = int(TTFont(path)["OS/2"].usWeightClass)
+            if weight != 400:
+                problems.append(f"{name} weight {weight}")
+    windows = any(
+        folder.endswith(os.path.join("Windows", "Fonts")) or folder.endswith("\\Fonts")
+        for folder in _windows_font_dirs()
+    )
+    if not windows:
+        problems.append("windows fonts path")
+    _record("full-font", not problems, "; ".join(problems) or "15 families, regular weight")
+
+
+def _subset_file(text: str, family: str) -> str:
+    """A Canva-style subset that only contains the letters already on the page."""
+    import pymupdf as fitz
+    import pikepdf
+    from fontTools.subset import Options, Subsetter
+    from fontTools.ttLib import TTFont
+
+    anton = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts", "Anton-Regular.ttf"))
+    subset_path = os.path.join(ROOT, family.replace(" ", "") + "-subset.ttf")
+    face = TTFont(anton)
+    subsetter = Subsetter(options=Options())
+    subsetter.populate(text=text)
+    subsetter.subset(face)
+    full = f"{family} Regular"
+    ps = family.replace(" ", "") + "-Regular"
+    for rec in face["name"].names:
+        if rec.nameID in (1, 16):
+            rec.string = family
+        elif rec.nameID in (2, 17):
+            rec.string = "Regular"
+        elif rec.nameID == 4:
+            rec.string = full
+        elif rec.nameID == 6:
+            rec.string = ps
+    face.save(subset_path)
+    src = os.path.join(ROOT, family.replace(" ", "") + "-page.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=420, height=160)
+    page.insert_font(fontname="FACE", fontfile=subset_path)
+    page.insert_text((36, 80), text, fontsize=16, fontname="FACE", fontfile=subset_path, color=(0, 0, 0))
+    doc.save(src)
+    doc.close()
+    pdf = pikepdf.open(src, allow_overwriting_input=True)
+    token = family.replace(" ", "")
+    for item in pdf.pages[0].Resources.Font.values():
+        item["/BaseFont"] = pikepdf.Name(f"/PWSYDC+{token}-Regular")
+    pdf.save(src)
+    pdf.close()
+    return src
+
+
+def _subset_gap() -> None:
+    """The subset lacks the new digits, so the words are set in the full Anton face."""
+    import pymupdf as fitz
+    from artwork_edits import propose
+
+    src = _subset_file("PHONE: 067 1345 937", "Anton")
+    preview = os.path.join(ROOT, "preview-subset-gap")
+    asked = propose(src, "change the phone number to 082 123 4567", "subset-gap", preview)
+    reply = (asked or {}).get("reply") or ""
+    staged = os.path.join(preview, "staged.pdf")
+    text = _text(staged) if os.path.isfile(staged) else ""
+    problems = []
+    if "Anton Regular" not in reply or "amber" in reply.lower():
+        problems.append(reply[:180] or "no reply")
+    if "082 1234 567" not in text or "067 1345 937" in text:
+        problems.append(text.replace("\n", " ")[:120] or "no staged text")
+    if os.path.isfile(staged):
+        doc = fitz.open(staged)
+        try:
+            blob = ""
+            for xref in doc[0].get_contents() or []:
+                blob += (doc.xref_stream(int(xref)) or b"").decode("latin1", "replace")
+            names = [str(item[3]) for item in (doc[0].get_fonts() or [])]
+        finally:
+            doc.close()
+        if "0 0 0 1 k" not in blob:
+            problems.append("black was not kept as K-only")
+        full = [name for name in names if "Anton" in name and "+" not in name]
+        if not full or any(name == "Helvetica" for name in names):
+            problems.append("font " + ", ".join(names))
+    _record("subset-gap", not problems, "; ".join(problems) or "full Anton, 100% K")
+
+
+def _subset_closest() -> None:
+    """An unknown family with a short subset is the closest bundled face, and it says so."""
+    from artwork_edits import propose
+
+    src = _subset_file("PHONE: 067 1345 937", "Xylophone")
+    preview = os.path.join(ROOT, "preview-subset-closest")
+    asked = propose(src, "change the phone number to 082 123 4567", "subset-closest", preview)
+    reply = (asked or {}).get("reply") or ""
+    staged = os.path.join(preview, "staged.pdf")
+    text = _text(staged) if os.path.isfile(staged) else ""
+    problems = []
+    if "amber" not in reply.lower() or "closest font" not in reply.lower():
+        problems.append(reply[:180] or "silent")
+    if "082 1234 567" not in text:
+        problems.append(text.replace("\n", " ")[:120] or "no staged text")
+    if os.path.isfile(staged):
+        import pymupdf as fitz
+
+        doc = fitz.open(staged)
+        try:
+            names = [str(item[3]) for item in (doc[0].get_fonts() or [])]
+        finally:
+            doc.close()
+        if any(name == "Helvetica" for name in names) or not any("+" not in name and "Xylophone" not in name for name in names):
+            problems.append("font " + ", ".join(names))
+    _record("subset-closest", not problems, "; ".join(problems) or "amber closest")
+
+
 def _subset_font() -> None:
     """A Canva subset tag (ABCDEF+Anton-Regular) is still the Anton file."""
     import pymupdf as fitz
@@ -268,6 +415,9 @@ def run() -> list[str]:
     _flow("phone-empty", "Call () 073 703 0766", phone, "082 123 4567", "()")
     _phone_icon()
     _subset_font()
+    _full_font()
+    _subset_gap()
+    _subset_closest()
     _flow("phone-hyphen", "Call 072-971-4247", phone, "082-123-4567", "072-971-4247")
     _flow("phone-parens", "Call (073) 703 0766", phone, "(082) 123 4567", "073")
     time = "change the time to 7:30 pm"

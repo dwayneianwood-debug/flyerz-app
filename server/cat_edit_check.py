@@ -49,12 +49,14 @@ def _sha(path: str) -> str:
     return digest.hexdigest()
 
 
-def _text(path: str) -> str:
+def _text(path: str, page_index: int | None = None) -> str:
     import pymupdf as fitz
 
     doc = fitz.open(path)
     try:
-        return "\n".join((page.get_text("text") or "") for page in doc)
+        if page_index is None:
+            return "\n".join((page.get_text("text") or "") for page in doc)
+        return doc[page_index].get_text("text") or ""
     finally:
         doc.close()
 
@@ -279,34 +281,67 @@ def _heading_and_logo(width: float, height: float, stem: str) -> None:
     _record(stem + "-logo", not logo_problems, "; ".join(logo_problems) or f"{width:.0f}x{height:.0f} logo up")
 
 
+def _real_field(src: str, stem: str, message: str, expect_new: str, expect_old: str) -> None:
+    """Preview, confirm, undo, and the check re-run. The original file stays untouched."""
+    dest = os.path.join(ROOT, f"{stem}-out.pdf")
+    preview = os.path.join(ROOT, f"preview-{stem}")
+    original = _sha(src)
+    job = stem
+    asked = _ask(src, message, job, preview, dest, 148, 105)
+    _keep_previews(preview, stem)
+    problems = []
+    reply = asked.get("reply") or ""
+    if asked.get("pending") is not True or "not applied" not in reply.lower():
+        problems.append(reply[:200] or asked.get("_err") or "no proposal")
+    if os.path.isfile(dest) or _sha(src) != original:
+        problems.append("applied before confirm")
+    if not problems:
+        done = _ask(src, "yes", job, preview, dest, 148, 105)
+        text = _text(dest, 0) if os.path.isfile(dest) else ""
+        if expect_new not in text:
+            problems.append("missing " + expect_new)
+        if expect_old and expect_old in text:
+            problems.append("old remains " + expect_old)
+        note = _checks_ran(done)
+        if note:
+            problems.append("confirm " + note)
+        if not done.get("ok"):
+            problems.append("confirm failed")
+        undone = _ask(src, "undo", job, preview, dest, 148, 105)
+        back = _text(dest, 0) if os.path.isfile(dest) else ""
+        if expect_old and expect_old not in back:
+            problems.append("undo lost " + expect_old)
+        if expect_new in back:
+            problems.append("undo kept " + expect_new)
+        note = _checks_ran(undone)
+        if note:
+            problems.append("undo " + note)
+        if _sha(src) != original:
+            problems.append("source changed")
+    _record(stem, not problems, "; ".join(problems) or expect_new)
+
+
 def _real_a6() -> None:
     src = "/tmp/real_a6.pdf"
     if not os.path.isfile(src) or os.path.getsize(src) < 1000:
         _record("ian-a6", True, "file not on this machine")
         TRANSCRIPT.append("## ian-a6\nIan's A6 file is not on this machine (/tmp/real_a6.pdf), so this case was not run.\n")
         return
-    dest = os.path.join(ROOT, "ian-a6-out.pdf")
-    preview = os.path.join(ROOT, "preview-ian-a6")
-    original = _sha(src)
-    asked = _ask(src, f"change the phone number to {NEW_PHONE}", "ian-a6", preview, dest, 148, 105)
-    if asked.get("pending") is not True:
-        asked = _ask(src, "make the heading bigger", "ian-a6", preview, dest, 148, 105)
-    _keep_previews(preview, "ian-a6")
-    problems = []
-    if "not applied" not in (asked.get("reply") or "").lower():
-        problems.append((asked.get("reply") or "no proposal")[:160])
-    if os.path.isfile(dest) or _sha(src) != original:
-        problems.append("applied or source changed")
-    if not problems:
-        done = _ask(src, "yes", "ian-a6", preview, dest, 148, 105)
-        if _sha(src) != original:
-            problems.append("source changed")
-        note = _checks_ran(done)
-        if note:
-            problems.append(note)
-        if not done.get("ok"):
-            problems.append("confirm")
-    _record("ian-a6", not problems, "; ".join(problems) or "confirmed on the real file")
+    from edit_style import swap_text
+
+    page = _text(src)
+    date = swap_text(page, "date", "12 October 2026")
+    if date:
+        _real_field(src, "ian-a6-date", "change the date to 12 October 2026", date[1], date[0])
+    else:
+        asked = _ask(src, "change the date to 12 October 2026", "ian-a6-date", os.path.join(ROOT, "preview-ian-a6-date"), os.path.join(ROOT, "ian-a6-date-out.pdf"), 148, 105)
+        reply = asked.get("reply") or ""
+        honest = "could not find a date" in reply.lower() or "couldn't read that date" in reply.lower()
+        _record("ian-a6-date", honest and asked.get("pending") is not True, reply[:180] or "no reply")
+    phone = swap_text("PHONE: 067 1345 937", "phone", NEW_PHONE)
+    _real_field(src, "ian-a6-phone", f"change the phone number to {NEW_PHONE}", phone[1] if phone else NEW_PHONE, "067 1345 937")
+    _real_field(src, "ian-a6-time", "change the time to 7:30 pm", "7:30PM", "10:00AM")
+    _real_field(src, "ian-a6-venue", "change the venue to Community Centre", "COMMUNITY CENTRE", "BELLAVISTA")
 
 
 def _write() -> None:

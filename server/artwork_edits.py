@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """One small edit at a time, with a preview and an undo.
 
-Live text stays in its own font. If a glyph is missing, nothing is substituted.
-A picture gets the old words painted out and new vector text in the closest font,
-and that match is amber unless it is exact.
+Live text stays in its own font when that face has the new letters. A Canva
+subset usually does not: the full face is taken from the bundled font folder
+(or C:\\Windows\\Fonts on a laptop) by the name after the subset tag. If that
+face is not there, the closest bundled font is used and the reply says amber.
+A picture gets the old words painted out and new vector text in the closest font.
 """
 
 from __future__ import annotations
@@ -39,12 +41,19 @@ HEADING_ASK = re.compile(r"make\s+the\s+heading\s+(bigger|smaller|larger)\b", re
 MOVE_ASK = re.compile(r"move\s+the\s+text\s+away\s+from\s+the\s+edge", re.I)
 FIELD_NAME = {"phone": "phone number", "date": "date", "time": "time", "venue": "venue"}
 
-FONT_CANDIDATES = [
+_BUNDLED_FONTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_FIXTURE_FONTS = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "fonts"))
+_FALLBACK_FONTS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-]
+)
+_WEIGHT_WORDS = (
+    "extralight", "extrabold", "semibold", "demibold", "regular",
+    "italic", "medium", "black", "bold", "light", "thin", "book",
+)
+_FONT_INDEX: list[dict] | None = None
 
 
 def _state_path(key: str) -> str:
@@ -123,6 +132,303 @@ def _font_token(name: str) -> str:
     """Family name without a PDF subset tag. ABCDEF+Anton-Regular is Anton."""
     tail = str(name or "").split("+")[-1]
     return re.sub(r"[^a-z0-9]", "", tail.lower())
+
+
+def _family_token(name: str) -> str:
+    token = _font_token(name)
+    for word in _WEIGHT_WORDS:
+        token = token.replace(word, "")
+    return token
+
+
+def _weight_hint(name: str) -> str:
+    token = _font_token(name)
+    for word in ("black", "extrabold", "semibold", "bold", "medium", "light", "thin", "italic", "regular", "book"):
+        if word in token:
+            return word
+    return "regular"
+
+
+def _windows_font_dirs() -> list[str]:
+    """Laptop faces live in the Windows font folder. The path is checked when it exists."""
+    windir = os.environ.get("WINDIR") or r"C:\Windows"
+    folders = [os.path.join(windir, "Fonts")]
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        folders.append(os.path.join(local, "Microsoft", "Windows", "Fonts"))
+    return folders
+
+
+def _bundled_font_files() -> list[str]:
+    found = []
+    seen = set()
+    for folder in (_BUNDLED_FONTS, _FIXTURE_FONTS):
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if not name.lower().endswith((".ttf", ".otf")):
+                continue
+            path = os.path.join(folder, name)
+            real = os.path.abspath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            found.append(path)
+    for path in _FALLBACK_FONTS:
+        real = os.path.abspath(path)
+        if os.path.isfile(path) and real not in seen:
+            seen.add(real)
+            found.append(path)
+    return found
+
+
+def _static_face(path: str) -> str:
+    """A variable face whose default master is not regular is instanced at use.
+
+    Raleway ships as the original variable file (the name is reserved). Its
+    default master is Thin, so the words are set from a regular-weight instance
+    that is built beside the temp folder and is not a second copy in the app.
+    """
+    try:
+        from fontTools.ttLib import TTFont
+    except Exception:
+        return path
+    try:
+        font = TTFont(path)
+    except Exception:
+        return path
+    if "fvar" not in font:
+        font.close()
+        return path
+    axes = {axis.axisTag: axis for axis in font["fvar"].axes}
+    loc = {}
+    if "wght" in axes and abs(float(axes["wght"].defaultValue) - 400.0) > 0.5:
+        loc["wght"] = 400
+    if "wdth" in axes and abs(float(axes["wdth"].defaultValue) - 100.0) > 0.5:
+        loc["wdth"] = 100
+    if "opsz" in axes and abs(float(axes["opsz"].defaultValue) - 14.0) > 0.5:
+        loc["opsz"] = 14
+    font.close()
+    if not loc:
+        return path
+    folder = os.path.join(tempfile.gettempdir(), "flyerz-font-static")
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, os.path.splitext(os.path.basename(path))[0].replace("[", "").replace("]", "") + "-regular.ttf")
+    if os.path.isfile(dest) and os.path.getsize(dest) > 1000:
+        return dest
+    from fontTools.varLib.instancer import instantiateVariableFont
+
+    source = TTFont(path)
+    static = instantiateVariableFont(source, loc, inplace=False, updateFontNames=True)
+    source.close()
+    static.save(dest)
+    static.close()
+    return dest
+
+
+def _face_names(path: str) -> tuple[str, str]:
+    try:
+        from PIL import ImageFont
+
+        family, style = ImageFont.truetype(path).getname()
+        return _family_token(family), _weight_hint(f"{style} {family}")
+    except Exception:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        return _family_token(stem), _weight_hint(stem)
+
+
+def _font_index() -> list[dict]:
+    global _FONT_INDEX
+    if _FONT_INDEX is not None:
+        return _FONT_INDEX
+    rows = []
+    seen = set()
+    for path in _bundled_font_files():
+        use = _static_face(path)
+        real = os.path.abspath(use)
+        if real in seen:
+            continue
+        seen.add(real)
+        family, style = _face_names(use)
+        kind = "system" if os.path.abspath(path).startswith("/usr/share/fonts") else "bundled"
+        rows.append({"path": use, "kind": kind, "family": family, "style": style})
+    for folder in _windows_font_dirs():
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if not name.lower().endswith((".ttf", ".otf", ".ttc")):
+                continue
+            path = os.path.join(folder, name)
+            real = os.path.abspath(path)
+            if real in seen or not os.path.isfile(path):
+                continue
+            seen.add(real)
+            family, style = _face_names(path)
+            rows.append({"path": path, "kind": "windows", "family": family, "style": style})
+    _FONT_INDEX = rows
+    return rows
+
+
+def _candidate_fonts() -> list[str]:
+    return [row["path"] for row in _font_index() if row["kind"] in ("bundled", "system")]
+
+
+def _named_font(fontname: str) -> str | None:
+    """Full face for a subset tag. PWSYDC+Anton-Regular is the bundled Anton."""
+    wanted = _family_token(fontname)
+    if len(wanted) < 3:
+        return None
+    hint = _weight_hint(fontname)
+    best = None
+    best_key = (9, 9)
+    for row in _font_index():
+        if row["family"] != wanted:
+            continue
+        style_rank = 0 if row["style"] == hint or (hint == "regular" and row["style"] in ("regular", "book")) else 1
+        kind_rank = 0 if row["kind"] == "bundled" else 1 if row["kind"] == "windows" else 2
+        key = (style_rank, kind_rank)
+        if key < best_key:
+            best_key = key
+            best = row["path"]
+    return best
+
+
+def _glyphs_present(fontfile: str, text: str) -> bool:
+    if not fontfile or not text:
+        return False
+    import pymupdf as fitz
+
+    if fontfile in ("helv", "times", "cour"):
+        built = fitz.Font(fontfile)
+        return all(char.isspace() or built.has_glyph(ord(char)) for char in text)
+    return not _missing_glyphs(fontfile, text)
+
+
+def _closest_among(crop, text: str, paths: list[str]) -> tuple[str, float]:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    usable = [path for path in paths if os.path.isfile(path)]
+    if not usable:
+        return "", 999.0
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return usable[0], 999.0
+    best_path = usable[0]
+    best_score = 1e9
+    height = max(12, crop.shape[0])
+    for path in usable:
+        try:
+            font = ImageFont.truetype(path, max(10, height - 2))
+        except Exception:
+            continue
+        canvas = Image.new("RGB", (max(crop.shape[1], 8), max(height, 8)), (255, 255, 255))
+        ImageDraw.Draw(canvas).text((0, 0), text, font=font, fill=(0, 0, 0))
+        plate = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
+        plate = cv2.resize(plate, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA)
+        score = float(np.mean(np.abs(plate.astype(np.float32) - crop.astype(np.float32))))
+        if score < best_score:
+            best_score = score
+            best_path = path
+    return best_path, best_score
+
+
+def _span_crop(page, bbox) -> object:
+    import pymupdf as fitz
+    import numpy as np
+
+    rect = fitz.Rect(bbox)
+    if rect.width < 1 or rect.height < 1:
+        return None
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect & page.rect, alpha=False, colorspace=fitz.csRGB)
+    if pix.width < 1 or pix.height < 1:
+        return None
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+
+
+def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
+    """Embedded face, then the full family, then the closest face that has the letters."""
+    embedded = _embedded_font(doc, page, fontname)
+    if _glyphs_present(embedded or "", text):
+        return {"fontfile": embedded, "amber": False, "fontSource": "embedded"}
+    full = _named_font(fontname)
+    if full and _glyphs_present(full, text):
+        return {"fontfile": full, "amber": False, "fontSource": "full"}
+    paths = [row["path"] for row in _font_index() if row["kind"] in ("bundled", "system") and _glyphs_present(row["path"], text)]
+    if not paths:
+        missing = _missing_glyphs(embedded, text) if embedded and embedded not in ("helv", "times", "cour") else [
+            char for char in text if not char.isspace()
+        ]
+        shown = "".join(dict.fromkeys(missing))[:24] or "the new letters"
+        return {
+            "fontfile": "",
+            "amber": False,
+            "fontSource": "none",
+            "reply": (
+                f"The font {fontname or 'on the page'} has no glyph for {shown}, "
+                "and none of the installed fonts do either. Nothing was changed."
+            ),
+        }
+    crop = _span_crop(page, bbox) if bbox else None
+    path, score = _closest_among(crop, text, paths)
+    return {"fontfile": path, "amber": True, "fontSource": "closest", "fontScore": round(score, 1)}
+
+
+def _span_rgb(page, span) -> tuple[tuple[float, float, float], bool]:
+    """RGB of this span, and whether that black has to stay K-only."""
+    rgb = _color_tuple(int(span.get("color") or 0))
+    text = str(span.get("text") or "").strip()
+    try:
+        for item in page.get_texttrace() or []:
+            chars = item.get("chars") or []
+            got = "".join(chr(ch[0]) for ch in chars if ch).strip()
+            if got != text:
+                continue
+            color = item.get("color") or ()
+            if len(color) >= 4 and int(item.get("colorspace") or 0) == 4:
+                cyan, magenta, yellow, black = (float(color[0]), float(color[1]), float(color[2]), float(color[3]))
+                if cyan <= 0.02 and magenta <= 0.02 and yellow <= 0.02 and black >= 0.9:
+                    return (0.0, 0.0, 0.0), True
+                if cyan <= 0.02 and magenta <= 0.02 and yellow <= 0.02 and black <= 0.02:
+                    return (1.0, 1.0, 1.0), False
+            if len(color) >= 3:
+                rgb = (float(color[0]), float(color[1]), float(color[2]))
+            break
+    except Exception:
+        pass
+    channels = [int(round(channel * 255)) for channel in rgb]
+    k_only = max(channels) <= 40 and (max(channels) - min(channels)) <= 18
+    return rgb, k_only
+
+
+def _ink_operator(rgb, size: float) -> str:
+    """Same text ink as the press file. Near-black stays 100% K. White stays unprinted."""
+    red_i = int(round(float(rgb[0]) * 255))
+    green_i = int(round(float(rgb[1]) * 255))
+    blue_i = int(round(float(rgb[2]) * 255))
+    if max(red_i, green_i, blue_i) <= 40 and (max(red_i, green_i, blue_i) - min(red_i, green_i, blue_i)) <= 18 and float(size) < 56:
+        return "0 0 0 1 k"
+    if min(red_i, green_i, blue_i) >= 250:
+        return "0 0 0 0 k"
+    cyan = 1.0 - red_i / 255.0
+    magenta = 1.0 - green_i / 255.0
+    yellow = 1.0 - blue_i / 255.0
+    black = min(cyan, magenta, yellow)
+    if black >= 0.999:
+        cyan = magenta = yellow = 0.0
+    else:
+        cyan = (cyan - black) / (1.0 - black)
+        magenta = (magenta - black) / (1.0 - black)
+        yellow = (yellow - black) / (1.0 - black)
+    total = (cyan + magenta + yellow + black) * 100.0
+    if total > 300.0:
+        cmy = (cyan + magenta + yellow) * 100.0
+        if cmy > 0:
+            scale = max(0.0, (cmy - (total - 300.0)) / cmy)
+            cyan *= scale
+            magenta *= scale
+            yellow *= scale
+    return f"{cyan:.4f} {magenta:.4f} {yellow:.4f} {black:.4f} k"
 
 
 def _embedded_font(doc, page, fontname: str) -> str | None:
@@ -318,13 +624,14 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont
 
+    paths = _candidate_fonts()
     if crop is None or crop.size == 0:
-        path = next((item for item in FONT_CANDIDATES if os.path.isfile(item)), "")
+        path = next((item for item in paths if os.path.isfile(item)), "")
         return path, 999.0
     best_path = ""
     best_score = 1e9
     height = max(12, crop.shape[0])
-    for path in FONT_CANDIDATES:
+    for path in paths:
         if not os.path.isfile(path):
             continue
         font = ImageFont.truetype(path, max(10, height - 2))
@@ -381,39 +688,32 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                             "actions": [],
                         }
                     shown_old, shown_new, new_text = swapped
-                fontfile = _embedded_font(doc, page, str(span.get("font") or ""))
-                if not fontfile:
-                    return {
-                        "ok": False,
-                        "reply": f"The text uses {span.get('font') or 'an unknown font'}, and I don't have that font. I have not substituted another one.",
-                        "actions": [],
-                    }
                 probe = new_text + _stray_chars(parsed["kind"], parsed.get("new") or "")
-                if fontfile in ("helv", "times", "cour"):
-                    built = fitz.Font(fontfile)
-                    missing = [char for char in probe if not char.isspace() and not built.has_glyph(ord(char))]
-                else:
-                    missing = _missing_glyphs(fontfile, probe)
-                if missing:
-                    shown = "".join(dict.fromkeys(missing))
-                    return {
-                        "ok": False,
-                        "reply": f"The font {span.get('font')} has no glyph for {shown}. I have not substituted another font, and nothing was changed.",
-                        "actions": [],
-                    }
+                face = _resolve_face(doc, page, str(span.get("font") or ""), probe, span.get("bbox"))
+                if face.get("fontSource") == "none":
+                    return {"ok": False, "reply": face.get("reply") or "Nothing was changed.", "actions": []}
+                rgb, k_only = _span_rgb(page, span)
+                bbox = list(span["bbox"])
+                center = (float(bbox[0]) + float(bbox[2])) / 2.0
+                mid = (float(page.rect.x0) + float(page.rect.x1)) / 2.0
                 proposal.update({
                     "mode": "live-text",
                     "old": old,
                     "new": new_text,
                     "shownOld": shown_old,
                     "shownNew": shown_new,
-                    "bbox": list(span["bbox"]),
+                    "bbox": bbox,
                     "origin": list(span.get("origin") or (span["bbox"][0], span["bbox"][3])),
+                    "align": "center" if abs(center - mid) <= 14 else "left",
                     "size": float(span.get("size") or 12) * (float(parsed["factor"]) if parsed["kind"] == "heading" else 1.0),
                     "font": str(span.get("font") or ""),
-                    "fontfile": fontfile,
+                    "fontfile": face["fontfile"],
+                    "fontSource": face.get("fontSource") or "",
                     "color": int(span.get("color") or 0),
-                    "amber": False,
+                    "rgb": [rgb[0], rgb[1], rgb[2]],
+                    "kOnly": k_only,
+                    "amber": bool(face.get("amber")),
+                    "fontScore": face.get("fontScore"),
                     "sizeFactor": float(parsed.get("factor") or 1),
                     "word": parsed.get("word") or "",
                 })
@@ -433,14 +733,13 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             if moved.get("error"):
                 return {"ok": False, "reply": moved["error"], "actions": []}
             for move in moved.get("moves") or []:
-                fontfile = _embedded_font(doc, page, move.get("font") or "")
-                if not fontfile:
-                    return {
-                        "ok": False,
-                        "reply": f"The text uses {move.get('font') or 'an unknown font'}, and I don't have that font. I have not substituted another one.",
-                        "actions": [],
-                    }
-                move["fontfile"] = fontfile
+                face = _resolve_face(doc, page, move.get("font") or "", str(move.get("old") or ""), move.get("bbox"))
+                if face.get("fontSource") == "none":
+                    return {"ok": False, "reply": face.get("reply") or "Nothing was changed.", "actions": []}
+                move["fontfile"] = face["fontfile"]
+                move["fontSource"] = face.get("fontSource") or ""
+                if face.get("amber"):
+                    moved["amber"] = True
             proposal.update(moved)
     finally:
         doc.close()
@@ -457,7 +756,10 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     amber = ""
     if proposal.get("amber"):
         amber = f" Amber for the designer: the closest font is {os.path.basename(proposal.get('fontfile') or '')}, and it is not an exact match."
-    if proposal.get("mode") == "raster-text":
+    if proposal.get("fontSource") == "full":
+        face_name = os.path.splitext(os.path.basename(proposal.get("fontfile") or ""))[0].replace("-", " ")
+        font_note = f" The new words are set in {face_name}."
+    elif proposal.get("mode") == "raster-text" or proposal.get("amber"):
         font_note = " The new words are set as vector type in the closest font."
     elif proposal.get("mode") == "live-text":
         font_note = " The letters stay in the file's own font."
@@ -864,6 +1166,50 @@ def _nearby_fill(page, box) -> tuple[float, float, float]:
     return (float(med[0]) / 255.0, float(med[1]) / 255.0, float(med[2]) / 255.0)
 
 
+def _recolor_new_text(page, before: list, operator: str) -> None:
+    """The new words only. The rest of the page keeps the colours it already had."""
+    import re
+
+    doc = page.parent
+    fresh = [xref for xref in (page.get_contents() or []) if xref not in before]
+    color_re = re.compile(r"[0-9]*\.?[0-9]+ [0-9]*\.?[0-9]+ [0-9]*\.?[0-9]+ rg\b")
+    for xref in fresh:
+        try:
+            data = doc.xref_stream(int(xref))
+        except Exception:
+            continue
+        if not data:
+            continue
+        text = data.decode("latin1", "replace")
+        rewritten = color_re.sub(operator, text, count=1)
+        if rewritten != text:
+            doc.update_stream(int(xref), rewritten.encode("latin1"))
+
+
+def _install_face(page, fontfile: str) -> str:
+    """insert_text ignores a font file unless that face is already on the page."""
+    if not fontfile or fontfile in ("helv", "times", "cour"):
+        return fontfile or "helv"
+    name = "E" + str(len(page.get_fonts() or []) + 1)
+    page.insert_font(fontname=name, fontfile=fontfile)
+    return name
+
+
+def _place_font_text(page, point, text: str, size: float, rgb, fontfile: str) -> None:
+    before = list(page.get_contents() or [])
+    page.insert_text(
+        (float(point[0]), float(point[1])),
+        text,
+        fontsize=float(size),
+        fontname=_install_face(page, fontfile),
+        color=(float(rgb[0]), float(rgb[1]), float(rgb[2])),
+    )
+    # Coloured type keeps its RGB. Black becomes 100% K, and white stays unprinted.
+    operator = _ink_operator(rgb, size)
+    if operator in ("0 0 0 1 k", "0 0 0 0 k"):
+        _recolor_new_text(page, before, operator)
+
+
 def _replace_span(page, proposal: dict) -> None:
     import pymupdf as fitz
 
@@ -872,18 +1218,18 @@ def _replace_span(page, proposal: dict) -> None:
     page.add_redact_annot(box, fill=_nearby_fill(page, raw))
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
     origin = proposal.get("origin") or (box.x0, box.y1 - 1)
-    kwargs = {
-        "fontsize": float(proposal.get("size") or 12),
-        "color": _color_tuple(int(proposal.get("color") or 0)),
-    }
+    size = float(proposal.get("size") or 12)
+    text = str(proposal.get("new") or "")
+    rgb = proposal.get("rgb")
+    if not rgb or len(rgb) < 3:
+        rgb = list(_color_tuple(int(proposal.get("color") or 0)))
     fontfile = proposal.get("fontfile") or ""
-    if fontfile in ("helv", "times", "cour"):
-        kwargs["fontname"] = fontfile
-    elif fontfile:
-        kwargs["fontfile"] = fontfile
-    else:
-        kwargs["fontname"] = "helv"
-    page.insert_text((float(origin[0]), float(origin[1])), str(proposal.get("new") or ""), **kwargs)
+    if proposal.get("align") == "center" and fontfile:
+        face = fitz.Font(fontfile) if fontfile in ("helv", "times", "cour") else fitz.Font(fontfile=fontfile)
+        width = float(face.text_length(text, fontsize=size))
+        center = (raw.x0 + raw.x1) / 2.0
+        origin = (center - width / 2.0, float(origin[1]))
+    _place_font_text(page, origin, text, size, rgb, fontfile)
 
 
 def _resize_logo(doc, page, proposal: dict) -> None:
@@ -929,13 +1275,8 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     origin_x = left / scale
     origin_y = (top + height * 0.85) / scale
     size = max(8.0, (height / scale) * 0.8) * float(proposal.get("sizeFactor") or 1.0)
-    page.insert_text(
-        (origin_x, origin_y),
-        str(proposal.get("new") or ""),
-        fontsize=size,
-        fontfile=proposal.get("fontfile") or FONT_CANDIDATES[0],
-        color=(0, 0, 0),
-    )
+    fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
+    _place_font_text(page, (origin_x, origin_y), str(proposal.get("new") or ""), size, (0, 0, 0), fontfile)
 
 
 def confirm(key: str, dest: str) -> dict:
