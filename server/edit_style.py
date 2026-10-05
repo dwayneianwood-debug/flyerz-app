@@ -225,16 +225,38 @@ def _weekday(year: int, month: int, day: int, sample: str) -> str:
     return _like(sample, word)
 
 
+def _phone_groups(text: str) -> tuple[int, ...]:
+    return tuple(len(part) for part in re.findall(r"\d+", text or ""))
+
+
+def _house_phone(original: str) -> bool:
+    """A grouping the artwork is clearly using on purpose.
+
+    Parentheses, hyphen groups, and the usual 3-3-4 local number stay.
+    An odd split such as 3-4-3 does not: the digits keep the grouping Ian typed.
+    """
+    groups = _phone_groups(original)
+    if re.search(r"\(\s*\d", original or ""):
+        return True
+    letters = re.sub(r"[A-Za-z]", "", original or "")
+    if "-" in original and " " not in letters and len(groups) >= 2:
+        return True
+    return groups in {(3, 3, 4), (4, 3, 3), (3, 4, 4), (2, 3, 4)}
+
+
 def _restyle_phone(original: str, requested: str) -> str:
     original = _clean_phone(original)
     old_digits = re.sub(r"\D", "", original)
     new_digits = re.sub(r"\D", "", requested)
     if not new_digits:
         raise ValueError("phone")
+    typed = requested.strip()
+    if not _house_phone(original):
+        return typed
     if len(old_digits) == len(new_digits):
         digits = iter(new_digits)
         return "".join(next(digits) if char.isdigit() else char for char in original)
-    groups = [len(part) for part in re.findall(r"\d+", original)]
+    groups = list(_phone_groups(original))
     sep = "-" if "-" in original and " " not in original else (" " if " " in original else "")
     if sep and groups and sum(groups) == len(new_digits):
         parts = []
@@ -243,7 +265,7 @@ def _restyle_phone(original: str, requested: str) -> str:
             parts.append(new_digits[cursor: cursor + size])
             cursor += size
         return sep.join(parts)
-    return requested.strip()
+    return typed
 
 
 def _parse_time(text: str) -> tuple[int, int]:

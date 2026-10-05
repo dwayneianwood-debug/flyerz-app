@@ -178,6 +178,13 @@ def _checks_ran(payload: dict) -> str:
         problems.append(f"extras {len(extras)}")
     if "25-point" not in reply or "E1" not in reply:
         problems.append("reply missed the re-run")
+    for row in checks:
+        status = str(row.get("status") or "").lower()
+        if status != "failed":
+            continue
+        blob = " ".join(str(row.get(key) or "") for key in ("name", "detail", "message", "id", "num")).lower()
+        if any(word in blob for word in ("font", "embed", "substitut", "helvetica")):
+            problems.append("font check failed " + str(row.get("name") or row.get("num") or "font")[:60])
     return ", ".join(problems)
 
 

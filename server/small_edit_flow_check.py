@@ -230,7 +230,7 @@ def _subset_gap() -> None:
     problems = []
     if "Anton Regular" not in reply or "amber" in reply.lower():
         problems.append(reply[:180] or "no reply")
-    if "082 1234 567" not in text or "067 1345 937" in text:
+    if "082 123 4567" not in text or "067 1345 937" in text or "082 1234 567" in text:
         problems.append(text.replace("\n", " ")[:120] or "no staged text")
     if os.path.isfile(staged):
         doc = fitz.open(staged)
@@ -264,7 +264,7 @@ def _subset_closest() -> None:
     problems = []
     if "amber" not in reply.lower() or "closest font" not in reply.lower():
         problems.append(reply[:180] or "silent")
-    if "082 1234 567" not in text:
+    if "082 123 4567" not in text or "082 1234 567" in text:
         problems.append(text.replace("\n", " ")[:120] or "no staged text")
     if os.path.isfile(staged):
         import pymupdf as fitz
@@ -410,6 +410,11 @@ def _cat_yes() -> None:
     reply = done.get("reply") or ""
     if "25-point" not in reply or "E1" not in reply:
         problems.append("checks not re-run")
+    for row in done.get("checks") or []:
+        status = str(row.get("status") or "").lower()
+        blob = " ".join(str(row.get(key) or "") for key in ("name", "detail", "id", "num")).lower()
+        if status == "failed" and any(word in blob for word in ("font", "embed", "substitut", "helvetica")):
+            problems.append("font check failed " + str(row.get("name") or row.get("num") or "")[:60])
     if _sha(src) != original:
         problems.append("source changed")
     undone = ask("undo")
@@ -417,6 +422,11 @@ def _cat_yes() -> None:
         problems.append("undo " + _text(dest).replace("\n", " ")[:80])
     if "25-point" not in (undone.get("reply") or ""):
         problems.append("undo checks")
+    for row in undone.get("checks") or []:
+        status = str(row.get("status") or "").lower()
+        blob = " ".join(str(row.get(key) or "") for key in ("name", "detail", "id", "num")).lower()
+        if status == "failed" and any(word in blob for word in ("font", "embed", "substitut", "helvetica")):
+            problems.append("undo font check failed " + str(row.get("name") or "")[:40])
     _record("cat-yes-undo", not problems, "; ".join(problems) or f"Monday 12 October, then back {gate}")
 
 
@@ -518,6 +528,173 @@ def _shrink_venue() -> None:
     _record("venue-shrink", not problems and bool(asked), "; ".join(problems) or f"shrunk to fit {gate}")
 
 
+def _windows_font_paths() -> None:
+    """Bundled faces come first. The two Windows folders are resolved with os.path."""
+    from pathlib import Path
+
+    import artwork_edits as edits
+
+    folder = tempfile.mkdtemp(prefix="win-fonts-")
+    windir = os.path.join(folder, "Windows")
+    local = os.path.join(folder, "Local")
+    system = os.path.join(windir, "Fonts")
+    user = os.path.join(local, "Microsoft", "Windows", "Fonts")
+    os.makedirs(system)
+    os.makedirs(user)
+    bundled_face = os.path.join(os.path.dirname(edits.__file__), "fonts", "Anton-Regular.ttf")
+    shutil.copyfile(bundled_face, os.path.join(system, "Arial.ttf"))
+    shutil.copyfile(FONT, os.path.join(user, "UserFace.ttf"))
+    old_win = os.environ.get("WINDIR")
+    old_local = os.environ.get("LOCALAPPDATA")
+    old_index = edits._FONT_INDEX
+    problems = []
+    try:
+        os.environ["WINDIR"] = windir
+        os.environ["LOCALAPPDATA"] = local
+        edits._FONT_INDEX = None
+        dirs = edits._font_search_dirs()
+        windows = edits._windows_font_dirs()
+        bundled = os.path.normpath(str(Path(edits.__file__).resolve().parent / "fonts"))
+        system_path = os.path.normpath(os.path.abspath(system))
+        user_path = os.path.normpath(os.path.abspath(user))
+        if not dirs or os.path.normpath(dirs[0]) != bundled:
+            problems.append("bundled not first " + repr(dirs[:1]))
+        if system_path not in windows or user_path not in windows:
+            problems.append("windows dirs " + repr(windows))
+        if system_path not in dirs or user_path not in dirs:
+            problems.append("search dirs " + repr(dirs))
+        elif dirs.index(system_path) == 0 or dirs.index(user_path) == 0:
+            problems.append("windows ranked above bundled")
+        rows = edits._font_index()
+        folders = {os.path.normpath(os.path.dirname(os.path.abspath(row["path"]))) for row in rows if row["kind"] == "windows"}
+        if system_path not in folders or user_path not in folders:
+            problems.append("indexed " + repr(sorted(folders)))
+        named = edits._named_font("PWSYDC+Anton-Regular")
+        if not named or os.path.normpath(os.path.dirname(os.path.abspath(named))) != bundled:
+            problems.append("named " + str(named))
+    finally:
+        if old_win is None:
+            os.environ.pop("WINDIR", None)
+        else:
+            os.environ["WINDIR"] = old_win
+        if old_local is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = old_local
+        edits._FONT_INDEX = old_index
+        shutil.rmtree(folder, ignore_errors=True)
+    _record("windows-font-paths", not problems, "; ".join(problems) or "bundled, then both Windows folders")
+
+
+def _windows_ocr_shape() -> None:
+    """A numpy box must not be thrown away by a truth-value check."""
+    import numpy as np
+    from artwork_edits import _words_from_rows
+    from ocr_reader import rows_from_output
+
+    class Output:
+        txts = ["073 703 0766", "12 March"]
+        boxes = np.array([
+            [[10, 20], [80, 20], [80, 40], [10, 40]],
+            [[4, 50], [90, 50], [90, 70], [4, 70]],
+        ], dtype=np.float32)
+        scores = np.array([0.91, 0.82], dtype=np.float32)
+
+    rows = rows_from_output((Output(), [0.2]))
+    words = _words_from_rows(rows)
+    flat = rows_from_output([[np.array([4.0, 8.0, 40.0, 22.0]), "Saturday", 0.5]])
+    raw = _words_from_rows([[np.array([[1, 2], [30, 2], [30, 18], [1, 18]], dtype=np.float32), "082 123 4567", np.float32(0.99)]])
+    problems = []
+    texts = [item["text"] for item in words]
+    if texts != ["073 703 0766", "12 March"]:
+        problems.append("rows " + repr(texts))
+    if not flat or flat[0][1] != "Saturday":
+        problems.append("flat " + repr(flat))
+    if not raw or raw[0]["text"] != "082 123 4567" or raw[0]["width"] < 2:
+        problems.append("raw " + repr(raw))
+    _record("windows-ocr-shape", not problems, "; ".join(problems) or "numpy boxes kept")
+
+
+def _phone_grouping() -> None:
+    """An odd 3-4-3 split keeps the digits Ian typed. Hyphens and 3-3-4 stay."""
+    from edit_style import swap_text
+
+    problems = []
+    _found, styled, full = swap_text("PHONE: 067 1345 937", "phone", "082 123 4567")
+    if styled != "082 123 4567" or full != "PHONE: 082 123 4567":
+        problems.append(f"typed {styled!r} {full!r}")
+    _found, hyphen, _full = swap_text("072-971-4247", "phone", "082 123 4567")
+    if hyphen != "082-123-4567":
+        problems.append(f"hyphen {hyphen!r}")
+    _found, local, _full = swap_text("073 703 0766", "phone", "082 123 4567")
+    if local != "082 123 4567":
+        problems.append(f"local {local!r}")
+    _record("phone-grouping", not problems, "; ".join(problems) or "082 123 4567")
+
+
+def _no_helvetica() -> None:
+    """Base Helvetica is not a file, so it is never inserted."""
+    import pymupdf as fitz
+    from artwork_edits import _install_face
+
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=80)
+    raised = False
+    try:
+        _install_face(page, "helv")
+    except ValueError:
+        raised = True
+    finally:
+        doc.close()
+    _record("no-helvetica", raised, "base-14 refused" if raised else "helvetica installed")
+
+
+def _baked_contact() -> None:
+    """CONTACT is painted into the picture and set as live text. The phone edit leaves the heading."""
+    import pymupdf as fitz
+    from artwork_edits import propose
+
+    anton = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts", "Anton-Regular.ttf"))
+    plate = fitz.open()
+    drawn = plate.new_page(width=360, height=200)
+    drawn.insert_font(fontname="ANTON", fontfile=anton)
+    drawn.insert_text((80, 70), "CONTACT", fontsize=28, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    drawn.insert_text((70, 108), "PHONE: 067 1345 937", fontsize=14, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    pix = drawn.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
+    png = os.path.join(ROOT, "baked-contact.png")
+    pix.save(png)
+    plate.close()
+
+    src = os.path.join(ROOT, "baked-contact.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=360, height=200)
+    page.insert_image(page.rect, filename=png)
+    page.insert_font(fontname="ANTON", fontfile=anton)
+    page.insert_text((80, 70), "CONTACT", fontsize=28, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    page.insert_text((70, 108), "PHONE: 067 1345 937", fontsize=14, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    doc.save(src)
+    doc.close()
+
+    preview = os.path.join(ROOT, "preview-baked-contact")
+    asked = propose(src, "change the phone number to 082 123 4567", "baked-contact", preview)
+    reply = (asked or {}).get("reply") or ""
+    TRANSCRIPT.append(f"## baked-contact\n{reply}\n")
+    staged = os.path.join(preview, "staged.pdf")
+    text = _text(staged) if os.path.isfile(staged) else ""
+    problems = []
+    if "Anton Regular" not in reply:
+        problems.append(reply[:180] or "no face name")
+    if "CONTACT" not in text or "082 123 4567" not in text or "067 1345 937" in text or "082 1234 567" in text:
+        problems.append(text.replace("\n", " ")[:160] or "text")
+    gate, gate_problems = _visual(src, preview, "baked-contact")
+    problems.extend(gate_problems)
+    if os.path.isfile(os.path.join(preview, "after.png")):
+        os.makedirs(ART, exist_ok=True)
+        shutil.copyfile(os.path.join(preview, "before.png"), os.path.join(ART, "baked-contact-before.png"))
+        shutil.copyfile(os.path.join(preview, "after.png"), os.path.join(ART, "baked-contact-after.png"))
+    _record("baked-contact", not problems and bool(asked), "; ".join(problems) or f"heading kept, phone retyped {gate}")
+
+
 def _write() -> None:
     os.makedirs(ART, exist_ok=True)
     lines = ["case\tresult\tdetail"]
@@ -530,6 +707,10 @@ def _write() -> None:
 
 
 def run() -> list[str]:
+    _windows_font_paths()
+    _windows_ocr_shape()
+    _phone_grouping()
+    _no_helvetica()
     date = "change the date to 12 October 2026"
     _flow("date-slash", "Doors 5/3", date, "12/10", "5/3")
     _flow("date-slash-year", "Doors 05/03/25", date, "12/10/26", "05/03/25")
@@ -558,6 +739,7 @@ def run() -> list[str]:
     _flow("venue-caps", "CITY HALL", venue, "COMMUNITY CENTRE", "CITY HALL")
     _flow("venue-lower", "community hall", venue, "community centre", "community hall")
     _raster_date()
+    _baked_contact()
     _overlap_time()
     _shrink_venue()
     _cat_yes()

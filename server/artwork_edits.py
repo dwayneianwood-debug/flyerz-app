@@ -150,13 +150,28 @@ def _weight_hint(name: str) -> str:
 
 
 def _windows_font_dirs() -> list[str]:
-    """Laptop faces live in the Windows font folder. The path is checked when it exists."""
-    windir = os.environ.get("WINDIR") or r"C:\Windows"
-    folders = [os.path.join(windir, "Fonts")]
-    local = os.environ.get("LOCALAPPDATA") or ""
-    if local:
-        folders.append(os.path.join(local, "Microsoft", "Windows", "Fonts"))
-    return folders
+    """The two Windows font folders, after the bundled faces.
+
+    Paths are built with pathlib and normalised with os.path so a laptop and
+    this container resolve the same way. A missing folder is simply skipped.
+    """
+    from pathlib import Path
+
+    windir = Path(os.environ.get("WINDIR") or os.path.join("C:\\", "Windows"))
+    local_root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    folders = (
+        windir / "Fonts",
+        Path(local_root) / "Microsoft" / "Windows" / "Fonts",
+    )
+    return [os.path.normpath(os.path.abspath(str(folder))) for folder in folders]
+
+
+def _font_search_dirs() -> list[str]:
+    """Bundled fonts first, then the Windows folders."""
+    from pathlib import Path
+
+    bundled = Path(__file__).resolve().parent / "fonts"
+    return [os.path.normpath(str(bundled))] + _windows_font_dirs()
 
 
 def _bundled_font_files() -> list[str]:
@@ -226,6 +241,25 @@ def _static_face(path: str) -> str:
     return dest
 
 
+def _face_label(fontfile: str, fallback: str = "") -> str:
+    """The name a person would recognise, from the font file that will be embedded."""
+    if not fontfile or fontfile in ("helv", "times", "cour"):
+        return {"helv": "Helvetica", "times": "Times", "cour": "Courier"}.get(fontfile or "", fallback or "the bundled font")
+    try:
+        from PIL import ImageFont
+
+        family, style = ImageFont.truetype(fontfile).getname()
+        style = str(style or "").strip()
+        if style.lower() in ("regular", "book", "normal"):
+            return f"{family} Regular"
+        if style and style.lower() not in family.lower():
+            return f"{family} {style}"
+        return family
+    except Exception:
+        stem = os.path.splitext(os.path.basename(fontfile))[0].replace("-", " ")
+        return stem or fallback or "the bundled font"
+
+
 def _face_names(path: str) -> tuple[str, str]:
     try:
         from PIL import ImageFont
@@ -270,7 +304,7 @@ def _font_index() -> list[dict]:
 
 
 def _candidate_fonts() -> list[str]:
-    return [row["path"] for row in _font_index() if row["kind"] in ("bundled", "system")]
+    return [row["path"] for row in _font_index() if row["kind"] in ("bundled", "windows", "system")]
 
 
 def _named_font(fontname: str) -> str | None:
@@ -349,12 +383,19 @@ def _span_crop(page, bbox) -> object:
 def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
     """Embedded face, then the full family, then the closest face that has the letters."""
     embedded = _embedded_font(doc, page, fontname)
-    if _glyphs_present(embedded or "", text):
-        return {"fontfile": embedded, "amber": False, "fontSource": "embedded"}
+    # Base-14 names are not files. Inserting them leaves Helvetica unembedded.
+    if embedded in ("helv", "times", "cour"):
+        embedded = None
+    if embedded and _glyphs_present(embedded, text):
+        return {"fontfile": embedded, "amber": False, "fontSource": "embedded", "faceLabel": _face_label(embedded, fontname)}
     full = _named_font(fontname)
     if full and _glyphs_present(full, text):
-        return {"fontfile": full, "amber": False, "fontSource": "full"}
-    paths = [row["path"] for row in _font_index() if row["kind"] in ("bundled", "system") and _glyphs_present(row["path"], text)]
+        return {"fontfile": full, "amber": False, "fontSource": "full", "faceLabel": _face_label(full, fontname)}
+    paths = [
+        row["path"]
+        for row in _font_index()
+        if row["kind"] in ("bundled", "windows", "system") and _glyphs_present(row["path"], text)
+    ]
     if not paths:
         missing = _missing_glyphs(embedded, text) if embedded and embedded not in ("helv", "times", "cour") else [
             char for char in text if not char.isspace()
@@ -371,7 +412,13 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
         }
     crop = _span_crop(page, bbox) if bbox else None
     path, score = _closest_among(crop, text, paths)
-    return {"fontfile": path, "amber": True, "fontSource": "closest", "fontScore": round(score, 1)}
+    return {
+        "fontfile": path,
+        "amber": True,
+        "fontSource": "closest",
+        "fontScore": round(score, 1),
+        "faceLabel": _face_label(path, fontname),
+    }
 
 
 def _span_rgb(page, span) -> tuple[tuple[float, float, float], bool]:
@@ -535,27 +582,46 @@ def _rapid_words(png: str) -> list[dict]:
     image = cv2.imread(png)
     if image is None:
         return []
-    rows = local_rows(image) or []
+    try:
+        rows = local_rows(image) or []
+    except Exception:
+        return []
+    return _words_from_rows(rows)
+
+
+def _words_from_rows(rows) -> list[dict]:
+    """One word box per OCR row. A numpy box must not be tested with `not`."""
+    from ocr_reader import _plain_box
+
     words = []
-    for item in rows:
-        box = item[0] if item else None
-        text = str(item[1] or "").strip() if len(item) > 1 else ""
-        if not text or not box or len(box) < 4:
+    for item in rows or []:
+        try:
+            if isinstance(item, dict):
+                box = item.get("box") or item.get("boxes")
+                text = str(item.get("text") or item.get("txt") or "")
+            else:
+                box = item[0]
+                text = str(item[1] or "") if len(item) > 1 else ""
+            text = text.strip()
+            points = _plain_box(box)
+            if not text or len(points) < 4:
+                continue
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            left, top = min(xs), min(ys)
+            width, height = max(xs) - left, max(ys) - top
+            if width < 2 or height < 2:
+                continue
+            words.append({
+                "text": text,
+                "left": int(round(left)),
+                "top": int(round(top)),
+                "width": max(1, int(round(width))),
+                "height": max(1, int(round(height))),
+                "line": ("rapid", str(int(round(top)))),
+            })
+        except Exception:
             continue
-        xs = [float(point[0]) for point in box]
-        ys = [float(point[1]) for point in box]
-        left, top = min(xs), min(ys)
-        width, height = max(xs) - left, max(ys) - top
-        if width < 2 or height < 2:
-            continue
-        words.append({
-            "text": text,
-            "left": int(round(left)),
-            "top": int(round(top)),
-            "width": max(1, int(round(width))),
-            "height": max(1, int(round(height))),
-            "line": ("rapid", str(int(round(top)))),
-        })
     return words
 
 
@@ -729,6 +795,7 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     "font": str(span.get("font") or ""),
                     "fontfile": face["fontfile"],
                     "fontSource": face.get("fontSource") or "",
+                    "faceLabel": face.get("faceLabel") or _face_label(face["fontfile"], str(span.get("font") or "")),
                     "color": int(span.get("color") or 0),
                     "rgb": [rgb[0], rgb[1], rgb[2]],
                     "kOnly": k_only,
@@ -738,6 +805,13 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     "word": parsed.get("word") or "",
                 })
             else:
+                if spans and parsed["kind"] in ("phone", "date", "time", "venue"):
+                    label = FIELD_NAME.get(parsed["kind"], "text")
+                    return {
+                        "ok": False,
+                        "reply": f"I could not find a {label} on the artwork, so I have not changed anything.",
+                        "actions": [],
+                    }
                 raster = _propose_raster(src, parsed, proposal)
                 if raster.get("ok") is False:
                     return raster
@@ -773,18 +847,18 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     _render_page(staged, after)
     proposal["staged"] = staged
     _save(key, {"proposal": proposal, "undo": "", "current": src})
-    amber = ""
+    label = ""
+    if proposal.get("faceLabel") or proposal.get("fontfile"):
+        label = proposal.get("faceLabel") or _face_label(proposal.get("fontfile") or "", proposal.get("font") or "")
     if proposal.get("amber"):
-        amber = f" Amber for the designer: the closest font is {os.path.basename(proposal.get('fontfile') or '')}, and it is not an exact match."
-    if proposal.get("fontSource") == "full":
-        face_name = os.path.splitext(os.path.basename(proposal.get("fontfile") or ""))[0].replace("-", " ")
-        font_note = f" The new words are set in {face_name}."
-    elif proposal.get("mode") == "raster-text" or proposal.get("amber"):
-        font_note = " The new words are set as vector type in the closest font."
-    elif proposal.get("mode") == "live-text":
-        font_note = " The letters stay in the file's own font."
+        font_note = f" The new words are set in {label}, the closest font."
+        amber = " Amber for the designer: it is not an exact match."
+    elif label:
+        font_note = f" The new words are set in {label}."
+        amber = ""
     else:
         font_note = ""
+        amber = ""
     fit_note = ""
     if proposal.get("shrunk"):
         fit_note = " I made the words smaller so they stay inside the column."
@@ -1211,9 +1285,13 @@ def _recolor_new_text(page, before: list, operator: str) -> None:
 
 
 def _install_face(page, fontfile: str) -> str:
-    """insert_text ignores a font file unless that face is already on the page."""
-    if not fontfile or fontfile in ("helv", "times", "cour"):
-        return fontfile or "helv"
+    """insert_text ignores a font file unless that face is already on the page.
+
+    The file has to be a real TTF or OTF. Base Helvetica is not embedded, so it
+    is never installed here.
+    """
+    if not fontfile or fontfile in ("helv", "times", "cour") or not os.path.isfile(fontfile):
+        raise ValueError("no embeddable font")
     name = "E" + str(len(page.get_fonts() or []) + 1)
     page.insert_font(fontname=name, fontfile=fontfile)
     return name
@@ -1509,7 +1587,79 @@ def _replace_span(page, proposal: dict) -> None:
         images=fitz.PDF_REDACT_IMAGE_NONE,
         graphics=fitz.PDF_REDACT_LINE_ART_NONE,
     )
+    # A Canva heading can also be painted into the picture under the live letters.
+    # Clear only this word's leftover pixels, so the live copy is the one that remains.
+    _clear_baked(page, ink)
     _place_font_text(page, origin, text, size, rgb, fontfile)
+
+
+def _clear_baked(page, ink) -> None:
+    """Inpaint word-shaped ink that is still in an image after the live glyphs are gone.
+
+    The colour sample is a thin ring just outside the word, so the baked letters
+    are not mistaken for the background. A heading that also lives in the text
+    layer stays, because only this word's box is painted. A photograph is left.
+    """
+    import pymupdf as fitz
+    import numpy as np
+
+    if ink is None or ink.width < 0.4 or ink.height < 0.4:
+        return
+    overlaps = False
+    for info in page.get_image_info() or []:
+        if fitz.Rect(info.get("bbox") or page.rect).intersects(ink):
+            overlaps = True
+            break
+    if not overlaps:
+        return
+    pad = 2.0
+    outer = fitz.Rect(ink.x0 - pad, ink.y0 - pad, ink.x1 + pad, ink.y1 + pad) & page.rect
+    if outer.width < 1 or outer.height < 1:
+        return
+    scale = 4.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=outer, alpha=False, colorspace=fitz.csRGB)
+    if pix.width < 4 or pix.height < 4:
+        return
+    image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+    ix0 = max(0, int(round((ink.x0 - outer.x0) * scale)))
+    iy0 = max(0, int(round((ink.y0 - outer.y0) * scale)))
+    ix1 = min(image.shape[1], int(round((ink.x1 - outer.x0) * scale)))
+    iy1 = min(image.shape[0], int(round((ink.y1 - outer.y0) * scale)))
+    if ix1 - ix0 < 2 or iy1 - iy0 < 2:
+        return
+    ring_mask = np.ones(image.shape[:2], dtype=bool)
+    ring_mask[iy0:iy1, ix0:ix1] = False
+    ring = image[ring_mask]
+    if ring.shape[0] < 8:
+        return
+    ring_f = ring.astype(np.float32)
+    background = np.median(ring_f, axis=0)
+    # A few baked glyph edges leak into the ring and inflate the spread. The
+    # panel is still flat when most of the ring matches the median.
+    near = np.linalg.norm(ring_f - background, axis=1) <= 28.0
+    flat = float(near.mean()) if near.size else 0.0
+    crop = image[iy0:iy1, ix0:ix1]
+    distance = np.linalg.norm(crop.astype(np.float32) - background, axis=2)
+    mask = distance > 18.0
+    share = float(mask.mean()) if mask.size else 0.0
+    # Letters on a flat panel can fill a tight box. A photograph's ring does not
+    # match one colour, so that case is left alone.
+    if int(mask.sum()) < 8 or share > 0.85:
+        return
+    if flat < 0.55 and share > 0.45:
+        return
+    import cv2
+
+    mask_u8 = cv2.dilate(mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
+    painted = cv2.inpaint(crop, mask_u8, 3, cv2.INPAINT_TELEA)
+    target = fitz.Rect(
+        outer.x0 + ix0 / scale,
+        outer.y0 + iy0 / scale,
+        outer.x0 + ix1 / scale,
+        outer.y0 + iy1 / scale,
+    )
+    overlay = fitz.Pixmap(fitz.csRGB, painted.shape[1], painted.shape[0], np.ascontiguousarray(painted).tobytes(), 0)
+    page.insert_image(target, pixmap=overlay, overlay=True)
 
 
 def _resize_logo(doc, page, proposal: dict) -> None:
@@ -1718,12 +1868,43 @@ def _read_as(text: str, digits: bool) -> str:
     return compact
 
 
+def _fresh_font_problems(before_pdf: str, after_pdf: str) -> list[str]:
+    """Embedding or substitution problems the edit added. Problems already in the file stay."""
+    from client_file_audit import font_report
+
+    def marked(path: str) -> set[tuple[str, str]]:
+        report = font_report(path)
+        found = set()
+        for row in report.get("problems") or []:
+            name = str(row.get("name") or "")
+            reason = str(row.get("reason") or "")
+            low = f"{name} {reason}".lower()
+            if "embed" in low or "substitut" in low or "helvetica" in low:
+                found.add((name, reason))
+        return found
+
+    fresh = []
+    for name, reason in sorted(_marked_safe(after_pdf, marked) - _marked_safe(before_pdf, marked)):
+        fresh.append(f"{name} ({reason})")
+    return fresh
+
+
+def _marked_safe(path: str, marked) -> set[tuple[str, str]]:
+    try:
+        return marked(path)
+    except Exception:
+        return {("unreadable", "not embedded")}
+
+
 def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_text: str) -> list[str]:
-    """Three gates. A neighbour deleted, a flat block, or a missing new word fails the case.
+    """Four gates. A neighbour deleted, a flat block, a missing new word, or a new unembedded font fails.
 
     (a) Outside a small margin of the old word box, the page pixels stay put.
     (b) OCR of that region reads the new words.
-    (c) OCR of the whole page changes only by those words.
+    (c) OCR of the whole page changes only by those words. The edit rectangle is
+        painted back from the before image first, so a re-read of decoration
+        that did not move cannot fail this gate.
+    (d) The edit did not add an unembedded or substituted font.
     """
     import numpy as np
     from collections import Counter
@@ -1788,24 +1969,32 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
                 found.append(token)
         return found
 
-    before_out = Counter(outside(before_words))
-    after_out = Counter(outside(after_words))
-    if before_out != after_out:
-        problems.append("page OCR changed more than the words")
+    # Put the before pixels back over the edit, then read the page. Identical
+    # pixels outside the word cannot be reported as a changed page.
+    masked = after.copy()
+    masked[y0:y1, x0:x1] = before[y0:y1, x0:x1]
+    if changed > 0:
+        if Counter(outside(before_words)) != Counter(outside(_tsv_words(masked))):
+            problems.append("page OCR changed more than the words")
+    fresh_fonts = _fresh_font_problems(before_pdf, after_pdf)
+    if fresh_fonts:
+        problems.append("font not embedded " + "; ".join(fresh_fonts))
     return problems
 
 
 def gate_line(problems: list[str]) -> str:
-    """Pass or fail for the pixel gate, the region read, and the rest of the page."""
+    """Pass or fail for the pixel gate, the region read, the rest of the page, and the embedded face."""
     blob = " ".join(problems or [])
     structural = "no word box" in blob or "missing preview" in blob
     pixel = structural or "pixels outside" in blob or "page size changed" in blob
     region = structural or "region OCR" in blob
     page = structural or "page OCR" in blob or "page size changed" in blob
-    return "a={0} b={1} c={2}".format(
+    font = structural or "font not embedded" in blob
+    return "a={0} b={1} c={2} font={3}".format(
         "fail" if pixel else "pass",
         "fail" if region else "pass",
         "fail" if page else "pass",
+        "fail" if font else "pass",
     )
 
 
