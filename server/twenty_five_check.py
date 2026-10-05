@@ -36,7 +36,7 @@ def main() -> None:
     spots = by_num["16"]
     check("spots-named", "Pantone-123" in spots["detail"] and spots["pass"] is False, spots["detail"])
     resolution = by_num["3"]
-    check("dpi-ran", resolution["status"] in ("passed", "warning", "failed"), resolution["detail"])
+    check("dpi-ran", resolution["status"] in ("passed", "warning", "failed", "auto"), resolution["detail"])
     for row in rows:
         if row["pass"]:
             check(f"claimed-{row['num']}", row["status"] in ("passed", "auto") and "did not run" not in row["detail"].lower(), row["detail"])
@@ -118,7 +118,46 @@ def main() -> None:
     looked = inspect_artwork(path, 148, 210)
     reply = looked["reply"]
     check("rulebook-points", all(f"{num}. {name}" in reply for num, name in POINTS), reply[:500])
+    check("rulebook-plain", reply.startswith("Here is what needs attention.") and "The rest is fine:" in reply and "I can do these:" in reply, reply[:240])
     check("rulebook-fallback", looked["provider"] == "rules", looked["provider"])
+    from designer_assistant import _qr, reply_from_checks
+
+    blank = os.path.join(folder, "noqr.pdf")
+    import pymupdf as fitz
+    empty = fitz.open()
+    empty.new_page(width=200, height=200)
+    empty.save(blank)
+    empty.close()
+    no_qr = _qr(blank)
+    check("qr-absent", "isn't one" in no_qr["detail"], no_qr["detail"])
+    import numpy as np
+    encoder = __import__("cv2").QRCodeEncoder_create()
+    modules = encoder.encode("https://flyerz.example/pay")
+    sharp = np.where(modules < 128, 0, 255).astype(np.uint8)
+    sharp = np.repeat(np.repeat(sharp, 8, axis=0), 8, axis=1)
+    quiet = 32
+    canvas = np.full((sharp.shape[0] + quiet * 2, sharp.shape[1] + quiet * 2), 255, np.uint8)
+    canvas[quiet:quiet + sharp.shape[0], quiet:quiet + sharp.shape[1]] = sharp
+    from PIL import Image as _Image
+    code_png = os.path.join(folder, "code.png")
+    _Image.fromarray(canvas, mode="L").convert("RGB").save(code_png)
+    code_pdf = os.path.join(folder, "code.pdf")
+    coded = fitz.open()
+    code_page = coded.new_page(width=canvas.shape[1], height=canvas.shape[0])
+    code_page.insert_image(code_page.rect, filename=code_png)
+    coded.save(code_pdf)
+    coded.close()
+    read = _qr(code_pdf)
+    check("qr-reads", "flyerz.example/pay" in read["detail"], read["detail"])
+    if os.path.isfile("/tmp/real_a6.pdf"):
+        real_qr = _qr("/tmp/real_a6.pdf")
+        check("real-a6-qr", "isn't one" not in real_qr["detail"].lower() and real_qr["ok"] is True, real_qr["detail"])
+    shaped, _actions = reply_from_checks([
+        {"num": "6d", "name": "Scale & Centre to Target Size", "status": "warning", "detail": "The size does not match."},
+        {"num": "1", "name": "Bleed Detection & Correction", "status": "passed", "detail": "Bleed is 5 mm."},
+        {"num": "7", "name": "Skipped Point", "status": "skipped", "detail": "Not rendered."},
+    ])
+    check("reply-order", shaped.index("6d. Scale") < shaped.index("The rest is fine:") < shaped.index("1. Bleed") and "Not run: 7. Skipped Point" in shaped, shaped)
     check("offers-fixes", any(item["id"] == "fix-black" for item in looked["actions"]), str(looked["actions"]))
     if FAILURES:
         raise SystemExit(f"{len(FAILURES)} failed: {', '.join(FAILURES)}")

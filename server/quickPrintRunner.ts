@@ -59,7 +59,8 @@ export interface QuickRunResult {
   rebuildPdf?: string;
   rebuildBefore?: string;
   rebuildAfter?: string;
-  extraChecks?: { id?: string; name?: string; status?: string; pass?: boolean; detail?: string; message?: string; autoFixed?: boolean }[];
+  extraChecks?: { id?: string; num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string; message?: string; autoFixed?: boolean }[];
+  prepressChecks?: { num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string }[];
 }
 
 function asResult(raw: Record<string, unknown>): QuickRunResult {
@@ -113,6 +114,22 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
             detail: String(row.detail || row.message || ""),
             message: String(row.message || row.detail || ""),
             autoFixed: row.autoFixed === true || row.status === "fixed",
+            num: String(row.num || ""),
+            label: String(row.label || ""),
+          };
+        })
+      : [],
+    prepressChecks: Array.isArray(raw.prepressChecks)
+      ? raw.prepressChecks.map((item) => {
+          const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          const status = String(row.status || "");
+          return {
+            num: String(row.num || ""),
+            name: String(row.name || ""),
+            label: String(row.label || ""),
+            status,
+            pass: row.pass === true || status === "passed" || status === "auto" || status === "fixed",
+            detail: String(row.detail || ""),
           };
         })
       : [],
@@ -254,8 +271,7 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
       status: extra.status,
     });
   }
-  const { pressEngine, extraChecks: _extraRows, ...quickPrint } = result;
-  void _extraRows;
+  const { pressEngine, ...quickPrint } = result;
   const reused = publishQuickReuse(jobId, result);
   const audit = {
     checks,

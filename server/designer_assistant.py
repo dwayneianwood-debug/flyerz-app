@@ -275,14 +275,28 @@ def guess_client(path: str, explicit: str = "") -> str:
     return ""
 
 
+def _looks_like_pdf(path: str) -> bool:
+    if str(path).lower().endswith(".pdf"):
+        return True
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _size_check(path: str, trim_w: float | None, trim_h: float | None) -> dict:
     try:
-        if str(path).lower().endswith(".pdf"):
+        if _looks_like_pdf(path):
             page_w, page_h, _mw, _mh = _page_boxes(path)
         else:
             return {"ran": True, "ok": True, "detail": "This is a picture. Size is decided when it is fitted to the order."}
     except Exception as exc:
         return {"ran": False, "ok": False, "detail": str(exc)[:120]}
+    if trim_w and trim_h:
+        from press_ready_engine import detected_trim_mm
+
+        page_w, page_h = detected_trim_mm(page_w, page_h, float(trim_w), float(trim_h))
     measured = f"The trim is {page_w:.0f} x {page_h:.0f} mm."
     if not trim_w or not trim_h:
         return {"ran": True, "ok": True, "detail": measured + " No order size was saved, so I did not call it a mismatch."}
@@ -296,7 +310,7 @@ def _size_check(path: str, trim_w: float | None, trim_h: float | None) -> dict:
 
 
 def _text_cut(path: str, trim_w: float | None, trim_h: float | None) -> dict:
-    if not str(path).lower().endswith(".pdf"):
+    if not _looks_like_pdf(path):
         return {"ran": False, "ok": False, "detail": ""}
     try:
         from green_gate import _pdf_text_edge
@@ -313,6 +327,45 @@ def _text_cut(path: str, trim_w: float | None, trim_h: float | None) -> dict:
     return {"ran": True, "ok": True, "detail": "Text is inside the safe area."}
 
 
+def _decode_qr_gray(gray) -> tuple[str, bool]:
+    """Return (payload, seen). A code that is visible but not readable still counts as seen."""
+    import cv2
+
+    detector = cv2.QRCodeDetector()
+    seen = False
+    for image in (gray, 255 - gray):
+        value, points, _straight = detector.detectAndDecode(image)
+        if points is not None:
+            seen = True
+        if value:
+            return str(value)[:80], True
+        try:
+            ok, decoded, _points, _straight = detector.detectAndDecodeMulti(image)
+        except Exception:
+            ok, decoded = False, []
+        if ok and decoded:
+            seen = True
+            for item in decoded or []:
+                if item:
+                    return str(item)[:80], True
+    try:
+        from pyzbar.pyzbar import decode as zbar_decode
+    except Exception:
+        zbar_decode = None
+    if zbar_decode is not None:
+        for image in (gray, 255 - gray):
+            for symbol in zbar_decode(image) or []:
+                payload = getattr(symbol, "data", b"") or b""
+                if payload:
+                    return payload.decode("utf-8", "replace")[:80], True
+    if not seen:
+        try:
+            seen = bool(detector.detect(gray)[0])
+        except Exception:
+            seen = False
+    return "", seen
+
+
 def _qr(path: str) -> dict:
     try:
         import cv2
@@ -321,21 +374,30 @@ def _qr(path: str) -> dict:
 
         doc = fitz.open(path)
         found = []
+        spotted = False
         try:
             for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
-                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
-                value, _points, _straight = cv2.QRCodeDetector().detectAndDecode(gray)
-                if value:
-                    found.append(str(value)[:80])
+                for scale in (3, 4):
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+                    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                    gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+                    value, seen = _decode_qr_gray(gray)
+                    if value:
+                        found.append(value)
+                        break
+                    if seen:
+                        spotted = True
+                if found:
+                    break
         finally:
             doc.close()
     except Exception:
         return {"ran": False, "ok": False, "detail": ""}
-    if not found:
-        return {"ran": True, "ok": True, "detail": "I looked for a QR code. There isn't one on this file."}
-    return {"ran": True, "ok": True, "detail": "The QR code reads: " + found[0]}
+    if found:
+        return {"ran": True, "ok": True, "detail": "The QR code reads: " + found[0]}
+    if spotted:
+        return {"ran": True, "ok": True, "detail": "There is a QR code on this file. I could not read the link from the picture."}
+    return {"ran": True, "ok": True, "detail": "I looked for a QR code. There isn't one on this file."}
 
 
 def actions_for_checks(checks: list) -> list[dict]:
@@ -369,21 +431,42 @@ def actions_for_checks(checks: list) -> list[dict]:
     return actions
 
 
+def _asks_about_artwork(message: str) -> bool:
+    text = " ".join((message or "").lower().split())
+    return "artwork" in text and any(word in text for word in ("right", "ok", "okay", "correct", "wrong", "fine", "good"))
+
+
+def _check_title(row: dict) -> str:
+    num = str(row.get("num") or "").strip()
+    name = str(row.get("name") or "").strip()
+    if num:
+        return f"{num}. {name}"
+    return name
+
+
 def reply_from_checks(checks: list) -> tuple[str, list[dict]]:
-    lines = ["I ran Ian's 25-point prepress check on this file."]
-    for row in checks:
-        lines.append(f"{row.get('num')}. {row.get('name')}: {row.get('status')}. {row.get('detail')}")
+    """Plain sentences from the checks. A model rewrite is not used: it was dropping every point."""
+    attention = [row for row in checks if str(row.get("status") or "") in ("failed", "warning")]
+    fine = [row for row in checks if str(row.get("status") or "") in ("passed", "pass", "auto", "fixed")]
+    skipped = [row for row in checks if str(row.get("status") or "") == "skipped"]
+    lines = []
+    if attention:
+        lines.append("Here is what needs attention.")
+        for row in attention:
+            lines.append(f"{_check_title(row)}: {row.get('detail')}")
+    if fine:
+        named = ", ".join(_check_title(row) for row in fine)
+        lines.append("The rest is fine: " + named + ".")
+    elif not attention:
+        lines.append("Ian's 25-point check found nothing to flag.")
+    if skipped:
+        named = ", ".join(_check_title(row) for row in skipped)
+        lines.append("Not run: " + named + ".")
     actions = actions_for_checks(checks)
     if actions:
         labels = ", ".join(item["label"] for item in actions)
-        lines.append("I can do these: " + labels + ". Tell me which, or press a button.")
-    failed = [row for row in checks if row.get("status") == "failed"]
-    if failed:
-        named = "; ".join(f"{row.get('num')} {row.get('name')}" for row in failed)
-        lines.append("Failed items for the client: " + named + ".")
-    reply = " ".join(lines)
-    polished = _polish(reply)
-    return polished or reply, actions
+        lines.append("I can do these: " + labels + ".")
+    return " ".join(lines), actions
 
 
 def inspect_artwork(path: str, trim_w: float | None = None, trim_h: float | None = None, client: str = "") -> dict:
@@ -537,6 +620,7 @@ def main() -> None:
     parser.add_argument("--job-id", default="")
     parser.add_argument("--preview-dir", default="")
     parser.add_argument("--client", default="")
+    parser.add_argument("--stored", default="")
     args = parser.parse_args()
     trim_w = args.trim_w or None
     trim_h = args.trim_h or None
@@ -573,6 +657,16 @@ def main() -> None:
             "path": done.get("path") or "",
             "action": edit_action,
         })
+        return
+
+    if args.stored and os.path.isfile(args.stored) and _asks_about_artwork(message_raw):
+        try:
+            stored = json.loads(open(args.stored, encoding="utf-8").read())
+        except Exception:
+            stored = {}
+        checks = list(stored.get("checks") or [])
+        reply, actions = reply_from_checks(checks)
+        _emit({"reply": reply, "actions": actions, "checks": checks, "provider": "rules"})
         return
 
     if not args.input or not os.path.isfile(args.input):

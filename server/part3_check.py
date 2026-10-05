@@ -118,6 +118,30 @@ def test_rules() -> None:
     check("prepress-file", any(row["source"] == ".cursor/rules/prepress.mdc" and row["locked"] and "Zero Regression Policy" in row["text"] for row in list_rules()))
     check("products-file", any(row["source"] == "shared/quick-print-products.json" and "card-90x55" in row["text"] for row in list_rules()))
     check("checks-file", any(row["source"] == "server/checks_guide.py" and row["text"].startswith("CHECKS = ") for row in list_rules()))
+    spoken = list_rules()
+    check(
+        "dashboard-plain",
+        any(str(row["rule_key"]).startswith("doc-dashboard-copy") and "shrink it by 30 pixels" in row["text"] and "DASHBOARD_RULES_COPY" not in row["text"] for row in spoken),
+    )
+    check(
+        "safe-zone-plain",
+        any(str(row["rule_key"]).startswith("doc-safe-zone") and "3 mm inside the trim" in row["text"] and "ENGINE_SAFE_ZONE_SPEC" not in row["text"] for row in spoken),
+    )
+    check(
+        "ocr-plain",
+        any(str(row["rule_key"]).startswith("doc-ocr-critical") and "Transcribe the lettering exactly" in row["text"] and "CRITICAL RULES" not in row["text"] for row in spoken),
+    )
+    stored = connect()
+    try:
+        raw_rows = stored.execute("SELECT rule_key, text FROM house_rules").fetchall()
+    finally:
+        stored.close()
+    check(
+        "code-rules-kept",
+        any(str(row["rule_key"]).startswith("doc-dashboard-copy") and "DASHBOARD_RULES_COPY" in row["text"] for row in raw_rows)
+        and any(str(row["rule_key"]).startswith("doc-safe-zone") and "ENGINE_SAFE_ZONE_SPEC" in row["text"] for row in raw_rows)
+        and any(str(row["rule_key"]).startswith("doc-ocr-critical") and "CRITICAL RULES" in row["text"] for row in raw_rows),
+    )
     db = connect()
     try:
         db.execute("DELETE FROM house_rules WHERE rule_key = 'bleed-5mm'")

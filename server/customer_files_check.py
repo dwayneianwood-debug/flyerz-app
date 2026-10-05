@@ -809,6 +809,23 @@ def test_real_a6_file() -> None:
         )
     if worst >= 5.0:
         problems.append(f"local seam dE {worst}")
+    card = [str(item) for item in (result.get("reasons") or [])]
+    if any("does not match" in item or "35 ppi" in item or "no longer K-only" in item or "Under 75" in item for item in card):
+        problems.append("false amber")
+    if not any("LOCATION" in item for item in card):
+        problems.append("missing location")
+    from designer_assistant import reply_from_checks
+
+    cat_rows = list(result.get("prepressChecks") or []) + list(result.get("extraChecks") or [])
+    for item in result.get("checklist") or []:
+        if item.get("passed"):
+            continue
+        detail = str(item.get("detail") or item.get("label") or "")
+        if detail:
+            cat_rows.append({"num": "", "name": str(item.get("label") or "Press check"), "status": "warning", "detail": detail})
+    reply, _actions = reply_from_checks(cat_rows)
+    print("A6-REASONS " + " | ".join(card))
+    print("A6-REPLY " + reply)
     record(
         "real-a6-seam",
         not problems and worst < 5.0,
@@ -819,7 +836,7 @@ def test_real_a6_file() -> None:
         reasons=" ".join(parts),
         live="",
         qr="",
-        note="; ".join(problems),
+        note="; ".join(problems + card),
     )
 
 

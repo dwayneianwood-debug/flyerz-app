@@ -214,10 +214,20 @@ def local_font_match(name: str) -> str:
     return ""
 
 
+def looks_like_pdf(path: str) -> bool:
+    if str(path).lower().endswith(".pdf"):
+        return True
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _open_pdf(path: str):
     import pymupdf as fitz
 
-    if not path or not os.path.isfile(path) or not str(path).lower().endswith(".pdf"):
+    if not path or not os.path.isfile(path) or not looks_like_pdf(path):
         return None
     try:
         return fitz.open(path)
@@ -280,6 +290,9 @@ def check_e1(path: str, order: dict, apply: bool = False) -> dict:
             status = _worse_status(status, "failed")
             notes.append(f"{label} aspect differs by {delta * 100:.0f}%, which is over 12%.")
             continue
+        from press_ready_engine import detected_trim_mm
+
+        width, height = detected_trim_mm(width, height, order_w, order_h)
         if _close(width, order_w) and _close(height, order_h):
             continue
         if _swapped(width, height, order_w, order_h):
@@ -582,16 +595,19 @@ def _boxes_wrong(path: str, order: dict) -> str:
 def _effective_dpi(path: str) -> float:
     import pymupdf as fitz
 
+    from client_file_audit import decorative_xrefs
+
     doc = _open_pdf(path)
     if doc is None:
         return 300.0
     worst = 300.0
+    soft = decorative_xrefs(path)
     try:
         for page in doc:
             margin = _margin_xrefs(page)
             for info in page.get_image_info(xrefs=True) or []:
                 xref = int(info.get("xref") or 0)
-                if xref in margin:
+                if xref in margin or xref in soft:
                     continue
                 box = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
                 width = int(info.get("width") or 0)
@@ -606,8 +622,20 @@ def _effective_dpi(path: str) -> float:
         doc.close()
 
 
+def _span_is_black(color) -> bool:
+    """True when the source span was black or a neutral grey. Blue type is not reported."""
+    try:
+        value = int(color)
+    except (TypeError, ValueError):
+        return False
+    red = (value >> 16) & 255
+    green = (value >> 8) & 255
+    blue = value & 255
+    return max(red, green, blue) <= 40 and (max(red, green, blue) - min(red, green, blue)) <= 18
+
+
 def _text_ink(path: str) -> list[dict]:
-    """Sample C, M, Y under text. Rich black or four-colour on small type is the amber case."""
+    """Sample C, M, Y under text that was black. A coloured span is not a K-only failure."""
     import numpy as np
     import pymupdf as fitz
 
@@ -629,6 +657,8 @@ def _text_ink(path: str) -> list[dict]:
                         box = fitz.Rect(span.get("bbox") or (0, 0, 0, 0))
                         if size <= 0 or box.width < 0.4 or box.height < 0.4:
                             continue
+                        if not _span_is_black(span.get("color")):
+                            continue
                         spans.append((size, box))
             if not spans:
                 continue
@@ -644,10 +674,12 @@ def _text_ink(path: str) -> list[dict]:
                 crop = arr[y0:y1, x0:x1, :4]
                 if crop.size == 0:
                     continue
-                dark = crop[:, :, 3] > 80
-                if int(dark.sum()) < 6:
+                channels = crop[:, :, :3].astype(np.int16)
+                spread = channels.max(axis=2) - channels.min(axis=2)
+                neutral = (spread <= 20) & (crop[:, :, 3] > 70)
+                if int(neutral.sum()) < 6:
                     continue
-                mean = crop[dark].mean(axis=0)
+                mean = crop[neutral].mean(axis=0)
                 found.append({"size": size, "c": float(mean[0]), "m": float(mean[1]), "y": float(mean[2]), "k": float(mean[3])})
         return found
     finally:

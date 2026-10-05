@@ -261,8 +261,67 @@ def test_e9_and_light() -> None:
     shutil.rmtree(folder, ignore_errors=True)
 
 
+def test_canva_trim_decorations_and_blue() -> None:
+    """Canva's extra bleed is the trim. Soft decorations are enlarged. Blue type is not a K-only failure."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    from client_file_audit import audit_pdf, upscale_soft_images
+    from designer_assistant import _size_check
+    from extra_checks import _span_is_black, _text_ink
+    from twenty_five import assess
+
+    folder = tempfile.mkdtemp(prefix="a6-card-")
+    page_w = 152.9 * MM
+    page_h = 110.1 * MM
+    src = os.path.join(folder, "canva.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=page_w, height=page_h)
+    page.insert_text((40, 40), "BLUE", fontsize=16, fontfile=FONT, color=(5 / 255, 95 / 255, 166 / 255))
+    page.insert_text((40, 70), "KONLY", fontsize=12, fontfile=FONT, color=(0, 0, 0))
+    soft = os.path.join(folder, "soft.png")
+    Image.new("RGB", (20, 20), (20, 40, 200)).save(soft)
+    page.insert_image(fitz.Rect(10, 80, 50, 120), filename=soft)
+    doc.save(src)
+    doc.close()
+    order = {"widthMm": 148, "heightMm": 105, "explicitSize": True, "pageCount": 1}
+    row = check_e1(src, order)
+    check("e1-canva-trim", row["status"] == "pass" and "148" in row["detail"] and "scaled" not in row["detail"], row["detail"])
+    size = _size_check(src, 148, 105)
+    check("6d-canva-trim", size["ok"] is True and "does not match" not in size["detail"], size["detail"])
+    check("blue-not-black", _span_is_black(352166) is False and _span_is_black(0) is True)
+    ink = _text_ink(src)
+    check("blue-not-ink", all(item["size"] < 15 for item in ink), str(ink))
+    black = audit_pdf(src)["black"]
+    check("rgb-black-counted", int(black.get("rgbSmallBlack") or 0) > 0 and black.get("needsFix") is False and int(black.get("richSmallText") or 0) == 0, str(black))
+    fixed = os.path.join(folder, "konly.pdf")
+    from client_file_audit import _page_streams, apply_vector_fixes
+    import pikepdf
+    apply_vector_fixes(src, fixed)
+    held = pikepdf.open(fixed)
+    raw = b"\n".join(_page_streams(held, held.pages[0]))
+    held.close()
+    check("rgb-black-k-only", b"0.0000 0.0000 0.0000 1.0000 k" in raw and b".0196" in raw, raw[:240])
+    before = audit_pdf(src, 148, 105)
+    decorative = before["resolution"].get("decorative") or []
+    check("soft-not-worst", before["resolution"]["worst"] is None and decorative and float(decorative[0]["ppi"]) < 75, str(before["resolution"]))
+    points = {item["num"]: item for item in assess(src, 148, 105)["checks"]}
+    check("decor-auto", points["3"]["status"] == "auto" and points["3b"]["status"] == "auto", points["3"]["detail"])
+    copied = os.path.join(folder, "copy.pdf")
+    shutil.copyfile(src, copied)
+    enlarged = upscale_soft_images(copied)
+    after = audit_pdf(copied, 148, 105)
+    check(
+        "decor-upscaled",
+        enlarged["changed"] >= 1 and enlarged["skippedLow"] == 0 and (after["resolution"]["worst"] is None or after["resolution"]["worst"] >= 75),
+        str(enlarged) + str(after["resolution"]),
+    )
+    shutil.rmtree(folder, ignore_errors=True)
+
+
 def main() -> None:
     test_order_and_e1()
+    test_canva_trim_decorations_and_blue()
     test_e2_e5()
     test_e3_and_nuclear()
     test_e6_e7_e8()

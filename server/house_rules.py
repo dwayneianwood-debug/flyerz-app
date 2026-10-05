@@ -264,6 +264,24 @@ def connect() -> sqlite3.Connection:
     return db
 
 
+def _plain_sentence(rule_key: str, text: str) -> str:
+    """Code fragments are spoken as rules. The stored text is left unchanged."""
+    key = str(rule_key or "")
+    if key.startswith("doc-dashboard-copy"):
+        return (
+            "When type sits in the safe zone, copy the picture, shrink it by 30 pixels on each side, "
+            "add those 30 pixels of bleed back, and run the bleed again so the sheet still has a full halo."
+        )
+    if key.startswith("doc-safe-zone"):
+        return (
+            "Keep type 3 mm inside the trim. If it is closer, copy the picture first, shrink it by 30 pixels "
+            "on each side with area sampling, and add 30 pixels of bleed."
+        )
+    if key.startswith("doc-ocr-critical"):
+        return "Transcribe the lettering exactly. Do not fix spelling, do not invent letters, and skip shapes that have no letters."
+    return text
+
+
 def list_rules(client: str = "") -> list[dict]:
     db = connect()
     try:
@@ -280,7 +298,7 @@ def list_rules(client: str = "") -> list[dict]:
         out.append({
             "id": int(row["id"]),
             "rule_key": row["rule_key"],
-            "text": row["text"],
+            "text": _plain_sentence(row["rule_key"], row["text"]),
             "scope": row["scope"],
             "client": row["client"],
             "locked": bool(row["locked"]),

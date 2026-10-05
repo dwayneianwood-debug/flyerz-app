@@ -4300,6 +4300,28 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
     }
   });
 
+  function catRows(quick: Record<string, unknown>): any[] {
+    const rows = [
+      ...(Array.isArray(quick.prepressChecks) ? quick.prepressChecks : []),
+      ...(Array.isArray(quick.extraChecks) ? quick.extraChecks : []),
+    ];
+    const checklist = Array.isArray(quick.checklist) ? quick.checklist : [];
+    for (const item of checklist) {
+      const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      if (row.passed === true) continue;
+      const detail = String(row.detail || row.label || "");
+      if (!detail) continue;
+      rows.push({
+        num: "",
+        name: String(row.label || "Press check"),
+        status: "warning",
+        pass: false,
+        detail,
+      });
+    }
+    return rows;
+  }
+
   const glitchyChecklistCache = new Map<string, { checks: { label: string; pass: boolean }[] }>();
 
   app.get('/api/glitchy-checklist/:jobId', async (req, res) => {
@@ -4315,6 +4337,27 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       if (!job || !job.auditResults) return res.json({ checks: [] });
 
       const storedOrder = ((job.auditResults as any)?.order || {}) as Record<string, unknown>;
+      const quick = ((job.auditResults as any)?.quickPrint || {}) as Record<string, unknown>;
+      const storedRows = catRows(quick);
+      if (storedRows.length) {
+        const checks = storedRows.map((item: any) => {
+          const status = String(item?.status || "");
+          const detail = String(item?.detail || item?.message || "");
+          const num = String(item?.num || "");
+          const name = String(item?.name || "");
+          return {
+            num,
+            name,
+            label: String(item?.label || (num ? `${num}. ${name}: ${detail}` : detail)),
+            pass: item?.pass === true || status === "passed" || status === "pass" || status === "auto" || status === "fixed",
+            status,
+            detail,
+          };
+        });
+        const body = { checks };
+        glitchyChecklistCache.set(cacheKey, body);
+        return res.json(body);
+      }
       const trimW = Number(job.productWidthMm || storedOrder.widthMm || 0);
       const trimH = Number(job.productHeightMm || storedOrder.heightMm || 0);
       const explicit = trimW > 0 && trimH > 0;
@@ -4418,13 +4461,21 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
         });
       }
       const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
-      const trimW = Number(saved.targetWidth || saved.trimW || 0);
-      const trimH = Number(saved.targetHeight || saved.trimH || 0);
+      const storedOrder = ((job.auditResults as any)?.order || {}) as Record<string, unknown>;
+      const trimW = Number(job.productWidthMm || storedOrder.widthMm || saved.targetWidth || saved.trimW || 0);
+      const trimH = Number(job.productHeightMm || storedOrder.heightMm || saved.targetHeight || saved.trimH || 0);
+      const quick = ((job.auditResults as any)?.quickPrint || {}) as Record<string, unknown>;
+      const storedRows = catRows(quick);
       const source = job.correctedPath && fsSync.existsSync(job.correctedPath) ? job.correctedPath : job.originalPath;
       const output = path.join(path.dirname(job.originalPath), `designer-${job.id}.pdf`);
       const previewDir = path.join(process.cwd(), "uploads", "glitchy", String(job.id));
       fsSync.mkdirSync(previewDir, { recursive: true });
       const args = [script, "--input", source, "--message", text, "--output", output, "--job-id", String(job.id), "--preview-dir", previewDir];
+      if (storedRows.length) {
+        const storedPath = path.join(previewDir, "stored-checks.json");
+        fsSync.writeFileSync(storedPath, JSON.stringify({ checks: storedRows }));
+        args.push("--stored", storedPath);
+      }
       if (action) args.push("--action", String(action));
       if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
       const result = execPythonCapture(args, "GlitchyDesigner", 90_000);

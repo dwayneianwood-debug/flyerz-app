@@ -53,7 +53,9 @@ def _row(num: str, name: str, status: str, detail: str) -> dict:
 def _page_count(path: str) -> int:
     if not os.path.isfile(path):
         return 0
-    if not str(path).lower().endswith(".pdf"):
+    from extra_checks import looks_like_pdf
+
+    if not looks_like_pdf(path):
         return 1
     import pikepdf
 
@@ -69,21 +71,28 @@ def _render(path: str):
     import cv2
     import numpy as np
 
+    from extra_checks import looks_like_pdf
+
     ext = os.path.splitext(path)[1].lower()
     if ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"):
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         return image, 72
-    if ext != ".pdf":
+    if not looks_like_pdf(path):
         return None, 0
     import pymupdf as fitz
 
-    doc = fitz.open(path)
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return None, 0
     try:
         if doc.page_count < 1:
             return None, 0
         pix = doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csRGB)
         rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), 72
+    except Exception:
+        return None, 0
     finally:
         doc.close()
 
@@ -168,7 +177,11 @@ def assess(path: str, trim_w: float | None = None, trim_h: float | None = None) 
         put("2b", "passed", "Black was checked. Text under 18 pt is not rich black, and total ink is within 300%.")
 
     worst = resolution.get("worst")
-    if not resolution.get("checked") or worst is None:
+    decorations = resolution.get("decorative") or []
+    if decorations and (worst is None or float(worst) >= 300):
+        put("3", "auto", "Minor decorations were enlarged with Lanczos, up to 4×. A main photo under 75 ppi would still be flagged.")
+        put("3b", "auto", "Soft decorations were enlarged. A main photo under 75 ppi is left for a person.")
+    elif not resolution.get("checked") or worst is None:
         put("3", "passed", "No picture large enough to judge. Vector artwork is treated as sharp.")
         put("3b", "passed", "No upscale is needed.")
     else:
@@ -501,7 +514,9 @@ def run_checklist(path: str, trim_w: float | None = None, trim_h: float | None =
     before = assess(path, trim_w, trim_h)
     checks = before["checks"]
     fixed_path = ""
-    if apply and os.path.isfile(path) and str(path).lower().endswith(".pdf"):
+    from extra_checks import looks_like_pdf
+
+    if apply and os.path.isfile(path) and looks_like_pdf(path):
         folder = tempfile.mkdtemp(prefix="points-")
         fixed_path = os.path.join(folder, "fixed.pdf")
         shutil.copyfile(path, fixed_path)

@@ -28,7 +28,7 @@ RICH = (0.40, 0.30, 0.30, 1.0)
 MIN_IMAGE_AREA = 0.02
 FONT_ASK = "Please export with fonts embedded or outlined."
 _TOKEN = re.compile(
-    r"(-?\d+\.?\d*(?:[eE][+-]?\d+)?)"
+    r"(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)"
     r"|(/[^\s\[\]<>()]+)"
     r"|([A-Za-z*'\"]+)"
     r"|(\[)"
@@ -179,6 +179,7 @@ def _process_tokens(
         "registration": False,
         "peakTac": 0.0,
         "richSmallText": 0,
+        "rgbSmallBlack": 0,
         "largeKOnly": False,
         "blackFixes": 0,
     }
@@ -327,6 +328,8 @@ def _process_tokens(
                     else:
                         gray = float(vals[0])
                         near = gray <= 0.12
+                    if near and small_text:
+                        found["rgbSmallBlack"] += 1
                     if rewrite and near:
                         k_op = "k" if op in ("rg", "g") else "K"
                         prefix = stack[:-need]
@@ -381,9 +384,12 @@ def _page_streams(pdf, page) -> list[bytes]:
         parts = []
         for ref in contents:
             try:
-                parts.append(pdf.get_object(ref).read_bytes())
+                parts.append(ref.read_bytes())
             except Exception:
-                continue
+                try:
+                    parts.append(pdf.get_object(ref).read_bytes())
+                except Exception:
+                    continue
         return parts
     try:
         return [contents.read_bytes()]
@@ -781,6 +787,49 @@ def font_report(path: str) -> dict:
     return {"checked": checked, "problems": problems, "type3": type3, "embedded": embedded}
 
 
+def _mask_opaque_fraction(doc, xref: int) -> float | None:
+    """Share of a soft mask that is actually visible. None when the image has no mask."""
+    import numpy as np
+
+    try:
+        kind, value = doc.xref_get_key(int(xref), "SMask")
+    except Exception:
+        return None
+    if kind == "null" or not value:
+        return None
+    parts = str(value).split()
+    if not parts or not parts[0].isdigit():
+        return None
+    mask_xref = int(parts[0])
+    if mask_xref <= 0:
+        return None
+    try:
+        import pymupdf as fitz
+
+        pix = fitz.Pixmap(doc, mask_xref)
+        samples = np.frombuffer(pix.samples, dtype=np.uint8)
+    except Exception:
+        return None
+    if samples.size == 0:
+        return None
+    return float(np.mean(samples > 10))
+
+
+def _is_decoration(area_ratio: float, opaque: float | None) -> bool:
+    """A small placement, or a soft graphic that is mostly transparent, is not a main photo."""
+    if opaque is not None and opaque < 0.45:
+        return True
+    visible = area_ratio if opaque is None else area_ratio * opaque
+    return visible < 0.08
+
+
+def decorative_xrefs(path: str) -> set[int]:
+    try:
+        return {int(row["xref"]) for row in _image_rows(path) if row.get("decorative") and row.get("xref")}
+    except Exception:
+        return set()
+
+
 def _image_rows(path: str) -> list[dict]:
     import pymupdf as fitz
 
@@ -809,7 +858,8 @@ def _image_rows(path: str) -> list[dict]:
                 if not bbox or len(bbox) < 4:
                     continue
                 area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
-                if area / page_area < MIN_IMAGE_AREA:
+                area_ratio = area / page_area
+                if area_ratio < MIN_IMAGE_AREA and not _is_decoration(area_ratio, _mask_opaque_fraction(doc, xref) if xref else None):
                     continue
                 width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
                 height_in = max(0.01, (float(bbox[3]) - float(bbox[1])) / 72.0)
@@ -817,13 +867,18 @@ def _image_rows(path: str) -> list[dict]:
                 px_h = float(image.get("height") or 0)
                 if px_w < 2 or px_h < 2:
                     continue
+                opaque = _mask_opaque_fraction(doc, xref) if xref else None
+                decorative = _is_decoration(area_ratio, opaque)
+                if area_ratio < MIN_IMAGE_AREA and not decorative:
+                    continue
                 ppi = min(px_w / width_in, px_h / height_in)
                 rows.append({
                     "name": labels.get(xref) or f"image {xref or len(rows) + 1}",
                     "ppi": round(ppi, 1),
                     "page": index + 1,
                     "xref": xref,
-                    "area": area / page_area,
+                    "area": area_ratio,
+                    "decorative": decorative,
                 })
     finally:
         doc.close()
@@ -838,6 +893,7 @@ def _vector_black(path: str) -> dict:
         "registration": False,
         "peakTac": 0.0,
         "richSmallText": 0,
+        "rgbSmallBlack": 0,
         "largeKOnly": False,
         "hairlines": 0,
         "minStroke": None,
@@ -857,6 +913,7 @@ def _vector_black(path: str) -> dict:
             summary["registration"] = summary["registration"] or found["registration"]
             summary["peakTac"] = max(summary["peakTac"], found["peakTac"])
             summary["richSmallText"] += found["richSmallText"]
+            summary["rgbSmallBlack"] += int(found.get("rgbSmallBlack") or 0)
             summary["largeKOnly"] = summary["largeKOnly"] or found["largeKOnly"]
             summary["hairlines"] += found["hairlines"]
             if found["minStroke"] is not None:
@@ -881,12 +938,15 @@ def _resolution(path: str, trim_w: float | None, trim_h: float | None) -> dict:
         rows = _image_rows(path)
     except Exception:
         return {"checked": False, "worst": None, "images": [], "amber": False, "severe": False}
-    low = [row for row in rows if row["ppi"] + 1 < 300]
-    worst = min((row["ppi"] for row in rows), default=None)
+    photos = [row for row in rows if not row.get("decorative")]
+    decorative = [row for row in rows if row.get("decorative") and row["ppi"] + 1 < 300]
+    low = [row for row in photos if row["ppi"] + 1 < 300]
+    worst = min((row["ppi"] for row in photos), default=None)
     return {
         "checked": True,
         "worst": worst,
         "images": low,
+        "decorative": decorative,
         "amber": bool(low) and (worst or 0) >= DPI_FLOOR,
         "severe": worst is not None and worst < DPI_FLOOR and bool(low),
     }
@@ -1189,8 +1249,54 @@ def _repair_array(arr, dpi: float) -> bool:
     return changed
 
 
+def _smask_xref(doc, xref: int) -> int:
+    try:
+        kind, value = doc.xref_get_key(int(xref), "SMask")
+    except Exception:
+        return 0
+    if kind == "null" or not value:
+        return 0
+    parts = str(value).split()
+    if not parts or not parts[0].isdigit():
+        return 0
+    return int(parts[0])
+
+
+def _upscale_smask(doc, page, xref: int, factor: float, max_scale: float) -> None:
+    """Keep the soft mask the same size as the picture it belongs to."""
+    import io
+
+    import numpy as np
+    import pymupdf as fitz
+    from PIL import Image
+
+    mask_xref = _smask_xref(doc, xref)
+    if mask_xref <= 0:
+        return
+    pix = fitz.Pixmap(doc, mask_xref)
+    if pix.w < 2 or pix.h < 2:
+        return
+    new_w = max(1, int(round(pix.w * factor)))
+    new_h = max(1, int(round(pix.h * factor)))
+    if max(new_w / pix.w, new_h / pix.h) > float(max_scale) + 0.01:
+        return
+    samples = np.frombuffer(pix.samples, dtype=np.uint8)
+    channels = max(1, int(pix.n))
+    arr = samples.reshape(pix.h, pix.w, channels)[:, :, 0]
+    image = Image.fromarray(arr, mode="L")
+    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    payload = io.BytesIO()
+    image.save(payload, format="PNG")
+    page.replace_image(mask_xref, stream=payload.getvalue())
+
+
 def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.85) -> dict:
-    """Enlarge embedded pictures of 75–299 ppi by at most 4×. Under 75 ppi is left alone. A full-page plate is left alone so a kept bleed is not resampled."""
+    """Enlarge soft pictures by at most 4× with Lanczos.
+
+    A main photo under 75 ppi is left alone. A small placement or a mostly
+    transparent decoration is enlarged even under 75 ppi. A full-page plate
+    is left alone so a kept bleed is not resampled.
+    """
     import pymupdf as fitz
     from PIL import Image
     import io
@@ -1214,7 +1320,10 @@ def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.
                 if len(bbox) < 4:
                     continue
                 area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
-                if area / page_area >= full_page:
+                area_ratio = area / page_area
+                opaque = _mask_opaque_fraction(doc, xref)
+                decorative = _is_decoration(area_ratio, opaque)
+                if area_ratio >= full_page and not decorative:
                     result["skippedFull"] += 1
                     continue
                 width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
@@ -1226,7 +1335,7 @@ def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.
                 ppi = min(px_w / width_in, px_h / height_in)
                 if ppi >= 299:
                     continue
-                if ppi < DPI_FLOOR:
+                if ppi < DPI_FLOOR and not decorative:
                     result["skippedLow"] += 1
                     continue
                 factor = min(float(max_scale), 300.0 / max(ppi, 1.0))
@@ -1256,6 +1365,7 @@ def upscale_soft_images(path: str, max_scale: float = 4.0, full_page: float = 0.
                     payload = io.BytesIO()
                     image.save(payload, format="PNG")
                     page.replace_image(xref, stream=payload.getvalue())
+                    _upscale_smask(doc, page, xref, factor, max_scale)
                     result["changed"] += 1
                     replaced = True
                 except Exception:

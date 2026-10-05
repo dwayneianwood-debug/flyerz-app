@@ -72,6 +72,17 @@ def inferred_side_bleed(
         }
     return None
 
+
+def detected_trim_mm(page_w_mm: float, page_h_mm: float, order_w_mm: float, order_h_mm: float) -> tuple[float, float]:
+    """Trim the file is actually using. Canva's page is often the trim plus the bleed already there."""
+    bleed = inferred_side_bleed(page_w_mm, page_h_mm, order_w_mm, order_h_mm)
+    if bleed and bleed.get("kind") == "existing":
+        return (
+            float(page_w_mm) - float(bleed["left"]) - float(bleed["right"]),
+            float(page_h_mm) - float(bleed["top"]) - float(bleed["bottom"]),
+        )
+    return float(page_w_mm), float(page_h_mm)
+
 SIDES = ("top", "bottom", "left", "right")
 CHAIN = {
     "flat": ("colour", "replicate", "stretch"),
@@ -1567,6 +1578,48 @@ def _fringe_depth(strip: np.ndarray) -> int:
     return int(depth)
 
 
+def _clear_pixel_keyline(plate: np.ndarray) -> np.ndarray:
+    """Replace a 1–2 px lighter rim with the ink under it, one pixel at a time.
+
+    The rim can be a white keyline or a paler anti-aliased edge. It has to be
+    short, lighter than the ink, and the ink behind it has to stay the same
+    colour. A border that continues, and a dark shape that reaches the edge,
+    stay. A partial rim is cleared even when the rest of that edge is already ink.
+    """
+    if plate.ndim < 3 or plate.shape[0] < 6 or plate.shape[1] < 6:
+        return plate
+    out = np.array(plate, copy=True)
+
+    def clear_rows(view: np.ndarray) -> None:
+        if view.shape[1] < 4:
+            return
+        tone = view.astype(np.float32).mean(axis=2)
+        color = view.astype(np.int16)
+        rows = np.arange(view.shape[0])
+        step01 = np.abs(color[:, 0] - color[:, 1]).sum(axis=1)
+        step12 = np.abs(color[:, 1] - color[:, 2]).sum(axis=1)
+        step23 = np.abs(color[:, 2] - color[:, 3]).sum(axis=1)
+        one = (tone[:, 0] > tone[:, 1] + 18.0) & (step01 > 45) & (step12 < 36)
+        if np.any(one):
+            view[one, 0] = view[one, 1]
+            tone = view.astype(np.float32).mean(axis=2)
+            color = view.astype(np.int16)
+        two = (
+            (tone[:, 0] > tone[:, 2] + 18.0)
+            & (tone[:, 1] > tone[:, 2] + 18.0)
+            & (np.abs(color[:, 0] - color[:, 2]).sum(axis=1) > 45)
+            & (step23 < 36)
+        )
+        if np.any(two):
+            view[two, :2] = view[rows[two], 2][:, None]
+
+    clear_rows(out)
+    clear_rows(out[:, ::-1])
+    clear_rows(np.transpose(out, (1, 0, 2)))
+    clear_rows(np.transpose(out[::-1], (1, 0, 2)))
+    return out
+
+
 def _content_fringe(content: np.ndarray) -> tuple:
     """Light hairline on each side: left, top, right, bottom. Zero when the edge is ink."""
     if content.ndim < 3 or content.shape[0] < 4 or content.shape[1] < 4:
@@ -1601,14 +1654,235 @@ def _shear_repeat(anchor: np.ndarray, shift: np.ndarray, count: int) -> np.ndarr
     return anchor[sample]
 
 
-def _extend_gs_rgb(rgb: np.ndarray, box) -> np.ndarray:
-    """Fill the margin from the Ghostscript pixels beside the seam.
+def _true_edge_colors(strip: np.ndarray) -> np.ndarray:
+    """The pixel on the trim edge. A matching neighbour one pixel in can steady a halftone dot.
 
-    The first eight pixels are the six the 2 mm window reads, plus the two it
-    skips, laid outward in reverse. Past that, the edge continues on its slope
-    instead of copying artwork from deeper in the page. A short light hairline
-    is replaced by the ink under it. Flat ink and a vertical column are copied
-    straight out.
+    A hard step is not averaged in, so a diagonal keeps the colour that actually
+    touches the edge.
+    """
+    if strip.size == 0:
+        return np.zeros((0, 3), np.float32)
+    if strip.ndim == 2:
+        strip = strip[:, :, None]
+    edge = strip[:, 0].astype(np.float32)
+    if strip.shape[1] < 2:
+        return edge
+    nxt = strip[:, 1].astype(np.float32)
+    close = np.abs(edge - nxt).sum(axis=1) < 36.0
+    colors = np.array(edge, copy=True)
+    colors[close] = (edge[close] + nxt[close]) * 0.5
+    return colors
+
+
+def _limit_edge_shift(colors: np.ndarray, shift: np.ndarray, margin: int) -> np.ndarray:
+    """Stop a diagonal before it steps into a different colour.
+
+    The sample stays on the edge colour. Flat ink is copied straight out.
+    """
+    count = int(np.shape(colors)[0])
+    limited = np.array(shift, dtype=np.float32, copy=True).reshape(-1)
+    if count < 2 or margin < 2 or limited.size != count:
+        return limited
+    span = float(margin - 1)
+    origin = np.asarray(colors, np.float32)
+    for index in range(count):
+        move = float(limited[index])
+        if abs(move) < 0.3:
+            continue
+        step = 1 if move > 0.0 else -1
+        reached = None
+        for hop in range(1, count):
+            sample = index + step * hop
+            if sample < 0 or sample >= count:
+                reached = max(0, hop - 1)
+                break
+            # Stop before the next hard colour, so the strip stays the edge colour.
+            if float(np.abs(origin[sample] - origin[index]).sum()) > 40.0:
+                reached = max(0, hop - 1)
+                break
+        if reached is None:
+            continue
+        if reached <= 0:
+            limited[index] = np.float32(0.0)
+            continue
+        cap = float(reached) / span
+        if abs(move) > cap:
+            limited[index] = np.float32(cap if move > 0.0 else -cap)
+    return limited
+
+
+def _place_edge(canvas: np.ndarray, plate: np.ndarray, side: str, box) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Paint one margin from the true edge colour.
+
+    The strip uses the limited shift, so it cannot step into the next colour.
+    The raw shift is kept for the corner, which has to follow the slope far
+    enough to meet the other strip.
+    """
+    x0, y0, x1, y1 = box
+    height, width = canvas.shape[:2]
+    ch, cw = plate.shape[:2]
+    depth = min(48, ch if side in ("top", "bottom") else cw)
+
+    def placed(view: np.ndarray, margin: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        colors = _true_edge_colors(view)
+        raw = _outward_row_shift(view)
+        shift = _limit_edge_shift(colors, raw, max(margin, 1))
+        return colors, shift, raw
+
+    if side == "left":
+        colors, shift, raw = placed(plate[:, : min(depth, cw)], x0)
+        if x0 > 0:
+            canvas[y0:y1, :x0] = _paint_outward(colors, shift, x0)
+        return colors, shift, raw
+    if side == "right":
+        margin = width - x1
+        colors, shift, raw = placed(plate[:, ::-1][:, : min(depth, cw)], margin)
+        if margin > 0:
+            canvas[y0:y1, x1:] = _paint_outward(colors, shift, margin)[:, ::-1]
+        return colors, shift, raw
+    if side == "top":
+        colors, shift, raw = placed(np.transpose(plate[: min(depth, ch)], (1, 0, 2)), y0)
+        if y0 > 0:
+            block = _paint_outward(colors, shift, y0)
+            canvas[:y0, x0:x1] = np.transpose(block, (1, 0, 2))
+        return colors, shift, raw
+    margin = height - y1
+    colors, shift, raw = placed(np.transpose(plate[::-1][: min(depth, ch)], (1, 0, 2)), margin)
+    if margin > 0:
+        block = _paint_outward(colors, shift, margin)
+        canvas[y1:, x0:x1] = np.transpose(block, (1, 0, 2))[::-1]
+    return colors, shift, raw
+
+
+def _hold_edge_sample(colors: np.ndarray, origin: float, at: float) -> np.ndarray:
+    """Sample along an edge, and stay on the first hard colour the diagonal enters."""
+    count = int(colors.shape[0])
+    if count < 1:
+        return np.zeros(3, np.float32)
+    origin = float(np.clip(origin, 0, count - 1))
+    at = float(np.clip(at, 0, count - 1))
+    direction = 1 if at >= origin else -1
+    index = int(np.floor(origin))
+    held = None
+    while (index + direction) >= 0 and (index + direction) < count and (index - at) * direction < 0:
+        nxt = index + direction
+        if held is None and float(np.abs(colors[nxt] - colors[index]).sum()) > 80.0:
+            held = colors[nxt]
+        elif held is not None and float(np.abs(colors[nxt] - held).sum()) > 80.0:
+            return held
+        index = nxt
+    if held is not None:
+        return held
+    low = int(np.floor(at))
+    high = min(count - 1, low + 1)
+    mix = at - low
+    return colors[low] * (1.0 - mix) + colors[high] * mix
+
+
+def _continue_into_corner(colors: np.ndarray, shift: np.ndarray, length: int, at_end: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Edge colours for `length` pixels past one end. Index 0 touches the trim."""
+    colors = np.asarray(colors, np.float32)
+    shift = np.asarray(shift, np.float32).reshape(-1)
+    count = int(colors.shape[0])
+    extra = np.zeros((max(length, 0), 3), np.float32)
+    extra_shift = np.zeros(max(length, 0), np.float32)
+    if count < 1 or length < 1:
+        return extra, extra_shift
+    origin = float(count - 1 if at_end else 0)
+    slope = float(shift[-1] if at_end else shift[0]) if shift.size == count else 0.0
+    # The end of a hard diagonal often sits a few pixels in from the corner.
+    if shift.size == count:
+        window = shift[-24:] if at_end else shift[:24]
+        strong = window[np.abs(window) > 0.3]
+        if strong.size >= 3:
+            slope = float(np.median(strong))
+    for index in range(length):
+        distance = float(index + 1)
+        # Shift is already signed: positive samples further along the edge.
+        at = origin + slope * distance
+        extra[index] = _hold_edge_sample(colors, origin, at)
+        extra_shift[index] = slope
+    return extra, extra_shift
+
+
+def _fill_corner(canvas: np.ndarray, y0: int, y1: int, x0: int, x1: int, side_block: np.ndarray, edge_block: np.ndarray, side_at_low: bool, edge_at_low: bool) -> None:
+    """Fill a corner from the two strips that meet it. The nearer strip supplies the colour.
+
+    side_block continues the left or right strip. edge_block continues the top or
+    bottom strip. Both are already in canvas orientation. The row and column that
+    touch those strips stay pinned, so the corner grows no third colour.
+    """
+    ch = int(y1 - y0)
+    cw = int(x1 - x0)
+    if ch < 1 or cw < 1 or side_block.shape[:2] != (ch, cw) or edge_block.shape[:2] != (ch, cw):
+        return
+    rows = np.arange(ch)[:, None]
+    cols = np.arange(cw)[None, :]
+    dist_side = rows if side_at_low else (ch - 1 - rows)
+    dist_edge = cols if edge_at_low else (cw - 1 - cols)
+    mixed = np.where((dist_side <= dist_edge)[..., None], side_block, edge_block)
+    # Two pixels, so the 2 px seam window sits on the strip colour and not the blend.
+    if side_at_low:
+        mixed[0, :] = side_block[0, :]
+        if ch > 1:
+            mixed[1, :] = side_block[0, :]
+    else:
+        mixed[-1, :] = side_block[-1, :]
+        if ch > 1:
+            mixed[-2, :] = side_block[-1, :]
+    if edge_at_low:
+        mixed[:, 0] = edge_block[:, 0]
+        if cw > 1:
+            mixed[:, 1] = edge_block[:, 0]
+    else:
+        mixed[:, -1] = edge_block[:, -1]
+        if cw > 1:
+            mixed[:, -2] = edge_block[:, -1]
+    canvas[y0:y1, x0:x1] = np.clip(np.round(mixed), 0, 255).astype(np.uint8)
+
+
+def _side_corner_block(colors: np.ndarray, shift: np.ndarray, height: int, width: int, at_end: bool, outward_low: bool) -> np.ndarray:
+    """Continue a vertical edge into a corner. Result is (height, width) in canvas order.
+
+    Column 0 is the outer side when outward_low is set, otherwise column -1 is outer.
+    Row 0 touches the trim when at_end is false, and row -1 touches it when at_end is set.
+    """
+    extra, extra_shift = _continue_into_corner(colors, shift, height, at_end)
+    if at_end:
+        along, along_shift = extra, extra_shift
+    else:
+        along, along_shift = extra[::-1], extra_shift[::-1]
+    painted = _paint_outward(along, along_shift, width)
+    if outward_low:
+        return painted
+    return painted[:, ::-1]
+
+
+def _edge_corner_block(colors: np.ndarray, shift: np.ndarray, height: int, width: int, at_end: bool, outward_low: bool) -> np.ndarray:
+    """Continue a horizontal edge into a corner. Result is (height, width) in canvas order.
+
+    Row 0 is the outer side when outward_low is set. Column 0 touches the trim when
+    at_end is false, and column -1 touches it when at_end is set.
+    """
+    extra, extra_shift = _continue_into_corner(colors, shift, width, at_end)
+    if at_end:
+        along, along_shift = extra[::-1], extra_shift[::-1]
+    else:
+        along, along_shift = extra, extra_shift
+    painted = _paint_outward(along, along_shift, height)
+    block = np.transpose(painted, (1, 0, 2))[:, ::-1]
+    if outward_low:
+        return block[::-1]
+    return block
+
+
+def _extend_gs_rgb(rgb: np.ndarray, box) -> np.ndarray:
+    """Fill the margin from the true edge pixels in this same render.
+
+    Flat ink is copied straight out. A diagonal keeps moving at the slope it had
+    when it reached the edge, instead of being mirrored back into the bleed.
+    Each corner is filled from the two strips that meet there. A short light
+    hairline is replaced by the ink under it.
     """
     x0, y0, x1, y1 = box
     height, width = rgb.shape[:2]
@@ -1640,78 +1914,39 @@ def _extend_gs_rgb(rgb: np.ndarray, box) -> np.ndarray:
             pin = max(0, ch - 1 - (bottom_fringe + 2))
             plate[pin + 1:] = plate[pin]
         canvas[y0:y1, x0:x1] = plate
-    pin_x = min(2, cw - 1)
-    pin_y = min(2, ch - 1)
-    mirror = _SEAM_MIRROR_PX
-    if x0 > 0:
-        near = min(mirror, x0)
-        distances = np.arange(1, near + 1)
-        columns = np.clip(distances + 1, 0, cw - 1)
-        canvas[y0:y1, x0 - distances] = plate[:, columns]
-        canvas[y0:y1, x0:min(x1, x0 + 2)] = plate[:, pin_x][:, None]
-        extra = x0 - near
-        if extra > 0:
-            anchor = canvas[y0:y1, x0 - near]
-            shift = _outward_row_shift(plate[:, :min(48, cw)])
-            block = np.swapaxes(_shear_repeat(anchor, shift, extra), 0, 1)[:, ::-1]
-            canvas[y0:y1, :extra] = block
-    if x1 < width:
-        margin = width - x1
-        near = min(mirror, margin)
-        distances = np.arange(1, near + 1)
-        columns = np.clip(cw - 2 - distances, 0, cw - 1)
-        canvas[y0:y1, x1 - 1 + distances] = plate[:, columns]
-        canvas[y0:y1, max(x0, x1 - 2):x1] = plate[:, max(0, cw - 1 - pin_x)][:, None]
-        extra = margin - near
-        if extra > 0:
-            anchor = canvas[y0:y1, x1 - 1 + near]
-            shift = _outward_row_shift(plate[:, ::-1][:, :min(48, cw)])
-            block = np.swapaxes(_shear_repeat(anchor, shift, extra), 0, 1)
-            canvas[y0:y1, width - extra:] = block
-    if y0 > 0:
-        near = min(mirror, y0)
-        distances = np.arange(1, near + 1)
-        rows = np.clip(distances + 1, 0, ch - 1)
-        canvas[y0 - distances, x0:x1] = plate[rows]
-        canvas[y0:min(y1, y0 + 2), x0:x1] = plate[pin_y]
-        extra = y0 - near
-        if extra > 0:
-            anchor = canvas[y0 - near, x0:x1]
-            shift = _outward_row_shift(np.transpose(plate[:min(48, ch)], (1, 0, 2)))
-            canvas[:extra, x0:x1] = _shear_repeat(anchor, shift, extra)[::-1]
-    if y1 < height:
-        margin = height - y1
-        near = min(mirror, margin)
-        distances = np.arange(1, near + 1)
-        rows = np.clip(ch - 2 - distances, 0, ch - 1)
-        canvas[y1 - 1 + distances, x0:x1] = plate[rows]
-        canvas[max(y0, y1 - 2):y1, x0:x1] = plate[max(0, ch - 1 - pin_y)]
-        extra = margin - near
-        if extra > 0:
-            anchor = canvas[y1 - 1 + near, x0:x1]
-            shift = _outward_row_shift(np.transpose(plate[::-1][:min(48, ch)], (1, 0, 2)))
-            canvas[height - extra:, x0:x1] = _shear_repeat(anchor, shift, extra)
+    plate = _clear_pixel_keyline(plate)
+    canvas[y0:y1, x0:x1] = plate
+    placed = (x0, y0, x1, y1)
+    left_colors, left_shift, left_raw = _place_edge(canvas, plate, "left", placed)
+    right_colors, right_shift, right_raw = _place_edge(canvas, plate, "right", placed)
+    top_colors, top_shift, top_raw = _place_edge(canvas, plate, "top", placed)
+    bottom_colors, bottom_shift, bottom_raw = _place_edge(canvas, plate, "bottom", placed)
+    # Corners follow the real slope so a diagonal can enter the corner. The
+    # pixels that touch a strip are pinned to that strip.
     if y0 > 0 and x0 > 0:
-        yy = np.clip(np.arange(y0) + 2, 0, ch - 1)
-        xx = np.clip(np.arange(x0) + 2, 0, cw - 1)
-        canvas[:y0, :x0] = plate[yy[::-1]][:, xx[::-1]]
+        side = _side_corner_block(left_colors, left_raw, y0, x0, at_end=False, outward_low=True)
+        edge = _edge_corner_block(top_colors, top_raw, y0, x0, at_end=False, outward_low=False)
+        side[-1] = canvas[y0, :x0]
+        edge[:, -1] = canvas[:y0, x0]
+        _fill_corner(canvas, 0, y0, 0, x0, side, edge, side_at_low=False, edge_at_low=False)
     if y0 > 0 and x1 < width:
-        yy = np.clip(np.arange(y0) + 2, 0, ch - 1)
-        xx = np.clip(cw - 3 - np.arange(width - x1), 0, cw - 1)
-        canvas[:y0, x1:] = plate[yy[::-1]][:, xx]
+        side = _side_corner_block(right_colors, right_raw, y0, width - x1, at_end=False, outward_low=False)
+        edge = _edge_corner_block(top_colors, top_raw, y0, width - x1, at_end=True, outward_low=False)
+        side[-1] = canvas[y0, x1:]
+        edge[:, 0] = canvas[:y0, x1 - 1]
+        _fill_corner(canvas, 0, y0, x1, width, side, edge, side_at_low=False, edge_at_low=True)
     if y1 < height and x0 > 0:
-        yy = np.clip(ch - 3 - np.arange(height - y1), 0, ch - 1)
-        xx = np.clip(np.arange(x0) + 2, 0, cw - 1)
-        canvas[y1:, :x0] = plate[yy][:, xx[::-1]]
+        side = _side_corner_block(left_colors, left_raw, height - y1, x0, at_end=True, outward_low=True)
+        edge = _edge_corner_block(bottom_colors, bottom_raw, height - y1, x0, at_end=False, outward_low=True)
+        side[0] = canvas[y1 - 1, :x0]
+        edge[:, -1] = canvas[y1:, x0]
+        _fill_corner(canvas, y1, height, 0, x0, side, edge, side_at_low=True, edge_at_low=False)
     if y1 < height and x1 < width:
-        yy = np.clip(ch - 3 - np.arange(height - y1), 0, ch - 1)
-        xx = np.clip(cw - 3 - np.arange(width - x1), 0, cw - 1)
-        canvas[y1:, x1:] = plate[yy][:, xx]
-    # A diagonal that has already left the page must not step back in the outer corner.
-    if y1 < height:
-        _stop_edge_fold(canvas[y1:])
-    if y0 > 0:
-        _stop_edge_fold(canvas[:y0][::-1])
+        side = _side_corner_block(right_colors, right_raw, height - y1, width - x1, at_end=True, outward_low=False)
+        edge = _edge_corner_block(bottom_colors, bottom_raw, height - y1, width - x1, at_end=True, outward_low=True)
+        side[0] = canvas[y1 - 1, x1:]
+        edge[:, 0] = canvas[y1:, x1 - 1]
+        _fill_corner(canvas, y1, height, x1, width, side, edge, side_at_low=True, edge_at_low=True)
     return canvas
 
 
@@ -2056,19 +2291,23 @@ def compile_vector_press(
         or (client_audit.get("black") or {}).get("needsFix")
         or (client_audit.get("spots") or {}).get("names")
     )
+    # RGB black under 18 pt is not a card warning. It is still rewritten to K-only
+    # before the CMYK conversion, or the press raster turns it into four colours.
+    force_k = int((client_audit.get("black") or {}).get("rgbSmallBlack") or 0) > 0
     soft_images = [
         row for row in ((client_audit.get("resolution") or {}).get("images") or [])
         if 75 <= float(row.get("ppi") or 0) < 300 and float(row.get("area") or 1) < 0.85
     ]
+    decorations = (client_audit.get("resolution") or {}).get("decorative") or []
     image_upscale = {"changed": 0, "skippedLow": 0, "skippedFull": 0}
-    if client_audit.get("isPdf") and (needs_fix or soft_images):
+    if client_audit.get("isPdf") and (needs_fix or force_k or soft_images or decorations):
         fixed_path = open_path + ".clientfix.pdf"
-        if needs_fix:
+        if needs_fix or force_k:
             apply_vector_fixes(open_path, fixed_path)
             repair_cmyk_images(fixed_path)
         else:
             shutil.copyfile(open_path, fixed_path)
-        if soft_images:
+        if soft_images or decorations:
             image_upscale = upscale_soft_images(fixed_path)
         open_path = fixed_path
     src = fitz.open(open_path)
@@ -2425,11 +2664,13 @@ def edge_seam_delta_e(path: str, seam_x_pt: float, seam_y_pt: float, dpi: float 
             sy = int(round(float(seam_y_pt) * scale))
             sx = min(max(sx, band + 1), width - band - 1)
             sy = min(max(sy, band + 1), height - band - 1)
+            # The strip is the whole added margin. It has to match the true edge
+            # pixel, not a mirror of the artwork a few pixels inside.
             pairs = {
-                "left": ((sy, height - sy, sx - band, sx), (sy, height - sy, sx, sx + band)),
-                "right": ((sy, height - sy, width - sx, width - sx + band), (sy, height - sy, width - sx - band, width - sx)),
-                "top": ((sy - band, sy, sx, width - sx), (sy, sy + band, sx, width - sx)),
-                "bottom": ((height - sy, height - sy + band, sx, width - sx), (height - sy - band, height - sy, sx, width - sx)),
+                "left": ((sy, height - sy, 0, sx), (sy, height - sy, sx, sx + 1)),
+                "right": ((sy, height - sy, width - sx, width), (sy, height - sy, width - sx - 1, width - sx)),
+                "top": ((0, sy, sx, width - sx), (sy, sy + 1, sx, width - sx)),
+                "bottom": ((height - sy, height, sx, width - sx), (height - sy - 1, height - sy, sx, width - sx)),
             }
             # outside, inside. A white hairline sits in the outside band and moves the mean.
             edges = {}
@@ -2448,41 +2689,33 @@ def edge_seam_delta_e(path: str, seam_x_pt: float, seam_y_pt: float, dpi: float 
                 out_mean = _band_mean(rgb, outside)
                 in_mean = _band_mean(rgb, inside)
                 corner_de[name] = None if out_mean is None or in_mean is None else round(_delta_e(out_mean, in_mean), 2)
-            skip = 2
             local_edges = {
-                "left": _window_max_delta_e(
-                    rgb, (sy, height - sy, max(0, sx - band), sx), (sy, height - sy, sx + skip, sx + skip + band), "y",
-                ),
+                "left": _window_max_delta_e(rgb, (sy, height - sy, 0, sx), (sy, height - sy, sx, sx + 1), "y"),
                 "right": _window_max_delta_e(
-                    rgb,
-                    (sy, height - sy, width - sx, min(width, width - sx + band)),
-                    (sy, height - sy, width - sx - skip - band, width - sx - skip),
-                    "y",
+                    rgb, (sy, height - sy, width - sx, width), (sy, height - sy, width - sx - 1, width - sx), "y",
                 ),
-                "top": _window_max_delta_e(
-                    rgb, (max(0, sy - band), sy, sx, width - sx), (sy + skip, sy + skip + band, sx, width - sx), "x",
-                ),
+                "top": _window_max_delta_e(rgb, (0, sy, sx, width - sx), (sy, sy + 1, sx, width - sx), "x"),
                 "bottom": _window_max_delta_e(
-                    rgb,
-                    (height - sy, min(height, height - sy + band), sx, width - sx),
-                    (height - sy - skip - band, height - sy - skip, sx, width - sx),
-                    "x",
+                    rgb, (height - sy, height, sx, width - sx), (height - sy - 1, height - sy, sx, width - sx), "x",
                 ),
             }
-            win = max(4, int(round(2.0 / 25.4 * float(dpi))))
+            # A corner matches when the pixels that touch each strip match that strip.
             local_corners = {
-                "tl": _window_max_delta_e(rgb, (0, sy, 0, sx), (sy + skip, sy + skip + win, sx + skip, sx + skip + win), "y"),
-                "tr": _window_max_delta_e(
-                    rgb, (0, sy, width - sx, width), (sy + skip, sy + skip + win, width - sx - skip - win, width - sx - skip), "y",
+                "tl": max(
+                    _window_max_delta_e(rgb, (sy - 2, sy, 0, sx), (sy, sy + 2, 0, sx), "x") or 0,
+                    _window_max_delta_e(rgb, (0, sy, sx - 2, sx), (0, sy, sx, sx + 2), "y") or 0,
                 ),
-                "bl": _window_max_delta_e(
-                    rgb, (height - sy, height, 0, sx), (height - sy - skip - win, height - sy - skip, sx + skip, sx + skip + win), "y",
+                "tr": max(
+                    _window_max_delta_e(rgb, (sy - 2, sy, width - sx, width), (sy, sy + 2, width - sx, width), "x") or 0,
+                    _window_max_delta_e(rgb, (0, sy, width - sx, width - sx + 2), (0, sy, width - sx - 2, width - sx), "y") or 0,
                 ),
-                "br": _window_max_delta_e(
-                    rgb,
-                    (height - sy, height, width - sx, width),
-                    (height - sy - skip - win, height - sy - skip, width - sx - skip - win, width - sx - skip),
-                    "y",
+                "bl": max(
+                    _window_max_delta_e(rgb, (height - sy, height - sy + 2, 0, sx), (height - sy - 2, height - sy, 0, sx), "x") or 0,
+                    _window_max_delta_e(rgb, (height - sy, height, sx - 2, sx), (height - sy, height, sx, sx + 2), "y") or 0,
+                ),
+                "br": max(
+                    _window_max_delta_e(rgb, (height - sy, height - sy + 2, width - sx, width), (height - sy - 2, height - sy, width - sx, width), "x") or 0,
+                    _window_max_delta_e(rgb, (height - sy, height, width - sx, width - sx + 2), (height - sy, height, width - sx - 2, width - sx), "y") or 0,
                 ),
             }
             rows.append({
