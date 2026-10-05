@@ -246,8 +246,9 @@ def _embedded_image_dpi(path: str) -> float | None:
 def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float | None = None) -> dict | None:
     """Visual bleed from a TrimBox, or from the page size when every box equals the MediaBox.
 
-    A Canva export often has no TrimBox. If the page is the ordered trim plus 2–15 mm
-    on each side, that extra is bleed that is already in the file.
+    A file often has no TrimBox. If the page is the ordered trim plus about 0.4–15 mm
+    on a side, that extra is bleed that is already in the file. A real TrimBox may
+    be uneven, including a side with no bleed.
     """
     try:
         media = page.mediabox
@@ -277,7 +278,7 @@ def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float |
     bottom = (trim.y0 - media.y0) * 25.4 / 72.0
     left = (trim.x0 - media.x0) * 25.4 / 72.0
     right = (media.x1 - trim.x1) * 25.4 / 72.0
-    if min(top, bottom, left, right) < 1.5:
+    if min(top, bottom, left, right) < -0.2 or max(top, bottom, left, right) < 0.4:
         return None
     return {
         "top": float(top),
@@ -483,6 +484,25 @@ def _pdf_exception_suggests_bad_geometry(exc: BaseException) -> bool:
     return any(n in blob for n in needles)
 
 
+def cmyk_raster_bytes(page, matrix, clip) -> tuple[bytes, int, int]:
+    """300 DPI DeviceCMYK pixels. An RGB pixmap cannot tell 100K from rich black."""
+    import io
+
+    import fitz
+    import numpy as np
+    from PIL import Image
+
+    pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False, colorspace=fitz.csCMYK)
+    pix.set_dpi(300, 300)
+    if pix.n < 4 or pix.width < 1 or pix.height < 1:
+        raise RuntimeError("CMYK raster did not produce a 4-channel image")
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    cmyk = np.ascontiguousarray(arr[:, :, :4])
+    buf = io.BytesIO()
+    Image.fromarray(cmyk, mode="CMYK").save(buf, format="TIFF", compression="tiff_adobe_deflate", dpi=(300, 300))
+    return buf.getvalue(), int(pix.width), int(pix.height)
+
+
 def nuclear_rebuild_pdf_visual_mount(
     broken_path: str,
     output_path: str,
@@ -492,9 +512,10 @@ def nuclear_rebuild_pdf_visual_mount(
 ) -> str:
     """
     Nuclear option: **pure raster** rebuild — no vector operators; full pixmap sampling only.
-    Each source page is rendered at 300 DPI via get_pixmap(alpha=False), then mounted on a
+    Each source page is rendered at 300 DPI in DeviceCMYK (not RGB), then mounted on a
     fresh page with trim+bleed dimensions. All page boxes are set to one rectangle before
     insert_image so geometry is ironclad (layer integrity: single raster, no ghost vectors).
+    CMYK keeps K-only text, overprint black and spot-to-K work that an RGB pixmap would undo.
     """
     import fitz
 
@@ -516,21 +537,19 @@ def nuclear_rebuild_pdf_visual_mount(
             raise ValueError("Nuclear rebuild: source PDF has no pages")
         for i in range(n):
             src_pg = broken.load_page(i)
-            pix = src_pg.get_pixmap(matrix=mat, clip=page_raster_clip_rect(src_pg), alpha=False)
-            pix.set_dpi(int(raster_dpi), int(raster_dpi))
-            pw, ph = pix.width, pix.height
+            image_bytes, pw, ph = cmyk_raster_bytes(src_pg, mat, page_raster_clip_rect(src_pg))
 
             target_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
             tw_pt, th_pt = float(target_rect.width), float(target_rect.height)
             clean_page = clean.new_page(width=tw_pt, height=th_pt)
             flush_page_boxes_to_rect(clean_page, target_rect)
             clean_page.insert_image(
-                press_insert_rect_at_origin(tw_pt, th_pt), pixmap=pix, keep_proportion=False
+                press_insert_rect_at_origin(tw_pt, th_pt), stream=image_bytes, keep_proportion=False
             )
-            del pix
+            del image_bytes
 
             sys.stderr.write(
-                f"[COMPILE] Nuclear pure-raster page {i + 1}/{n}: {pw}x{ph}px @ {int(raster_dpi)} DPI → "
+                f"[COMPILE] Nuclear pure-raster page {i + 1}/{n}: {pw}x{ph}px @ {int(raster_dpi)} DPI CMYK → "
                 f"{target_w_pt:.2f}x{target_h_pt:.2f} pt canvas\n"
             )
     finally:
@@ -655,11 +674,7 @@ def _normalize_pdf_geometry(
 
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
-        pix.set_dpi(300, 300)
-        pw_px, ph_px = pix.width, pix.height
-        img_bytes = pix.tobytes("png")
-        pix = None
+        img_bytes, pw_px, ph_px = cmyk_raster_bytes(page, mat, clip)
         gc.collect()
 
         logical_w, logical_h = page_pts_from_px(pw_px, ph_px, FINAL_RASTER_DPI)
@@ -738,10 +753,7 @@ def _apply_creep_shift(input_path: str, output_path: str,
     for i, page in enumerate(src):
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, clip=page_raster_clip_rect(page), alpha=False)
-        pix.set_dpi(300, 300)
-        img_bytes = pix.tobytes("png")
-        pix = None
+        img_bytes, _pw, _ph = cmyk_raster_bytes(page, mat, page_raster_clip_rect(page))
 
         mb = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
         tw, th = float(mb.width), float(mb.height)
@@ -809,14 +821,9 @@ def _enforce_single_layer(
         stats["vectors_purged"] += len(drawings)
         stats["pages_rerasterized"] += 1
 
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(300 / 72.0, 300 / 72.0),
-            clip=page_raster_clip_rect(page),
-            alpha=False,
+        img_bytes, pix_w, pix_h = cmyk_raster_bytes(
+            page, fitz.Matrix(300 / 72.0, 300 / 72.0), page_raster_clip_rect(page)
         )
-        pix.set_dpi(300, 300)
-        img_bytes = pix.tobytes("png")
-        pix_w, pix_h = pix.width, pix.height
         if use_press_target:
             mount_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
         else:
@@ -866,16 +873,15 @@ def _preflatten_for_gs(
     bleed_mm: float = PRESS_DEFAULT_BLEED_MM,
 ) -> str:
     """
-    Pre-flatten the GS handoff file: render each page as a single RGB raster
-    at 300 DPI with alpha=False (white background), inject DPI metadata.
+    Pre-flatten the GS handoff file: render each page as a single CMYK raster
+    at 300 DPI with alpha=False, inject DPI metadata.
     Guarantees Ghostscript receives a clean, flat, alpha-free PDF that
     won't choke under 50 MB memory constraints.
 
-    Normal pages (< PREFLATTEN_LOSSLESS_MAX_PIXELS): lossless PNG — no JPEG softness.
-    Oversized pages: JPEG q95 fallback to keep GS MaxBitmap / RAM safe.
+    The plate is DeviceCMYK TIFF so 100K text stays on the black channel.
+    An RGB pixmap would turn that black into four-colour before Ghostscript runs.
 
-    Uses alpha=False directly in get_pixmap to avoid double-memory from
-    RGBA->RGB conversion. Cleans up prior temp work_path to free /dev/shm space.
+    Cleans up prior temp work_path to free /dev/shm space.
     """
     import fitz
     import gc
@@ -883,67 +889,31 @@ def _preflatten_for_gs(
     sys.stderr.write(f"[PRE-FLATTEN] Flattening GS handoff: {work_path} ({os.path.getsize(work_path) / (1024*1024):.1f} MB)\n")
 
     try:
-        from PIL import Image as _PilImage
         src = fitz.open(work_path)
         dst = fitz.open()
         scale = 300.0 / 72.0
         mat = fitz.Matrix(scale, scale)
 
         for i, page in enumerate(src):
-            pix = page.get_pixmap(matrix=mat, clip=page_raster_clip_rect(page), alpha=False)
-            pix.set_dpi(300, 300)
-            pix_w, pix_h = pix.width, pix.height
+            image_bytes, pix_w, pix_h = cmyk_raster_bytes(page, mat, page_raster_clip_rect(page))
             page_pixels = int(pix_w) * int(pix_h)
-            use_lossless = page_pixels < int(PREFLATTEN_LOSSLESS_MAX_PIXELS)
-
-            pil_img = _PilImage.frombytes("RGB", (pix_w, pix_h), pix.samples)
-            pix = None
-            if pil_img.mode != "RGB":
-                sys.stderr.write(f"[PRE-FLATTEN] Page {i+1}: unexpected mode {pil_img.mode}, converting to RGB\n")
-                pil_img = pil_img.convert("RGB")
-
-            if use_lossless:
-                flat_tmp = tempfile.NamedTemporaryFile(
-                    suffix="_flat.png", delete=False, dir=FAI_TEMP_DIR
-                ).name
-                tmp_chain.append(flat_tmp)
-                try:
-                    pil_img.save(
-                        flat_tmp,
-                        format="PNG",
-                        optimize=True,
-                        dpi=(int(FINAL_RASTER_DPI), int(FINAL_RASTER_DPI)),
-                    )
-                except OSError as save_err:
-                    raise RuntimeError(
-                        f"Pre-flatten PNG save failed for page {i+1} "
-                        f"(mode={pil_img.mode}, size={pix_w}x{pix_h}): {save_err}"
-                    ) from save_err
-                codec_label = "PNG lossless"
-            else:
-                flat_tmp = tempfile.NamedTemporaryFile(
-                    suffix="_flat.jpg", delete=False, dir=FAI_TEMP_DIR
-                ).name
-                tmp_chain.append(flat_tmp)
-                try:
-                    pil_img.save(
-                        flat_tmp,
-                        format="JPEG",
-                        quality=int(PREFLATTEN_JPEG_QUALITY),
-                        optimize=True,
-                        dpi=(int(FINAL_RASTER_DPI), int(FINAL_RASTER_DPI)),
-                    )
-                except OSError as save_err:
-                    raise RuntimeError(
-                        f"Pre-flatten JPEG save failed for page {i+1} "
-                        f"(mode={pil_img.mode}, size={pix_w}x{pix_h}): {save_err}"
-                    ) from save_err
-                codec_label = f"JPEG q{int(PREFLATTEN_JPEG_QUALITY)} (big-page fallback)"
+            flat_tmp = tempfile.NamedTemporaryFile(
+                suffix="_flat.tif", delete=False, dir=FAI_TEMP_DIR
+            ).name
+            tmp_chain.append(flat_tmp)
+            try:
+                with open(flat_tmp, "wb") as handle:
+                    handle.write(image_bytes)
+            except OSError as save_err:
+                raise RuntimeError(
+                    f"Pre-flatten CMYK save failed for page {i+1} "
+                    f"(size={pix_w}x{pix_h}): {save_err}"
+                ) from save_err
+            codec_label = "CMYK TIFF"
+            del image_bytes
 
             if not os.path.exists(flat_tmp) or os.path.getsize(flat_tmp) == 0:
                 raise RuntimeError(f"Pre-flatten save produced empty file for page {i+1}: {flat_tmp}")
-            pil_img.close()
-            pil_img = None
             gc.collect()
 
             mount_rect = press_target_media_rect(trim_w_mm, trim_h_mm, bleed_mm)
@@ -1029,11 +999,7 @@ def _prerasterize_pdf(
     for i, page in enumerate(src):
         meta = page_meta[i]
         clip = page_raster_clip_rect(page)
-        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
-        pix.set_dpi(dpi, dpi)
-        img_bytes = pix.tobytes("png")
-        pix_w, pix_h = pix.width, pix.height
-        pix = None
+        img_bytes, pix_w, pix_h = cmyk_raster_bytes(page, mat, clip)
         gc.collect()
 
         logical_w, logical_h = page_pts_from_px(pix_w, pix_h, float(dpi))
@@ -1356,6 +1322,11 @@ def main():
     print(f"DEBUG: Crop args received: crop_x={args.crop_x}, crop_y={args.crop_y}, crop_w={args.crop_w}, crop_h={args.crop_h}", flush=True)
     print(f"DEBUG: Trim args received: trim_w={args.trim_w}, trim_h={args.trim_h}", flush=True)
     print(f"CRITICAL DEBUG: Starting from ORIGINAL file. Input path = {args.input}", flush=True)
+    from press_ready_engine import plate_exceeds_memory
+
+    _large_sheet = plate_exceeds_memory(float(args.trim_w or 0), float(args.trim_h or 0))
+    if _large_sheet:
+        sys.stderr.write("[COMPILE] Large format: vectors stay live and only the bleed strips are drawn.\n")
     if args.crop_x >= 0:
         print(f"CRITICAL DEBUG: CROPPING ORIGINAL FILE {args.input} AT {args.crop_x},{args.crop_y} size {args.crop_w}x{args.crop_h}", flush=True)
     if args.auto_shifter > 0:
@@ -1485,6 +1456,7 @@ def main():
                     vector_live = True
                     work_path = live["path"]
                     compile_stats["press_engine"] = live.get("report") or {}
+                    compile_stats["client_audit"] = (live.get("report") or {}).get("clientFileAudit") or {}
                     compile_stats["vector_press_live"] = True
                     compile_stats["cmyk_converted"] = True
                     compile_stats["cmyk_verified"] = True
@@ -1497,6 +1469,17 @@ def main():
             except Exception as vector_err:
                 vector_live = False
                 sys.stderr.write(f"[COMPILE] Vector press path failed, using raster bleed: {vector_err}\n")
+
+        if _large_sheet and not vector_live:
+            message = (
+                "This large sheet could not be built as vectors with a bleed edge. "
+                "A full 300 dpi plate was not rendered."
+            )
+            sys.stderr.write(f"[COMPILE] {message}\n")
+            write_status(status_file, "COMPLETE", message)
+            with open(result_file, "w", encoding="utf-8") as handle:
+                json.dump({"success": False, "plateSkipped": True, "error": message}, handle)
+            return
 
         if is_image:
             _prof_img_t0 = time.time()
@@ -1766,6 +1749,25 @@ def main():
             )
             from pdf_geometry_sanitize import aggressive_sanitize_open_document_boxes
 
+            from client_file_audit import apply_vector_fixes, audit_pdf, repair_cmyk_images
+
+            compile_stats["client_audit"] = audit_pdf(input_path, float(args.trim_w), float(args.trim_h))
+            _client = compile_stats["client_audit"]
+            _black = _client.get("black") or {}
+            _force_k = int(_black.get("rgbSmallBlack") or 0) > 0 or int(_black.get("rgbTextBlack") or 0) > 0
+            _needs_client_fix = bool(
+                (_client.get("hairlines") or {}).get("count")
+                or _black.get("needsFix")
+                or (_client.get("spots") or {}).get("names")
+                or _force_k
+            )
+            if _client.get("isPdf") and _needs_client_fix:
+                _fixed_pdf = tempfile.NamedTemporaryFile(suffix="_clientfix.pdf", delete=False, dir=FAI_TEMP_DIR).name
+                _tmp_chain.append(_fixed_pdf)
+                apply_vector_fixes(input_path, _fixed_pdf)
+                repair_cmyk_images(_fixed_pdf)
+                input_path = _fixed_pdf
+                sys.stderr.write("[COMPILE] Vector fixes applied before raster (hairlines, black, spots).\n")
             pdf_try_src = input_path
             _nuclear_pdf_fallback_used = False
             while True:
@@ -2203,15 +2205,9 @@ def main():
                     for _fb_i, _fb_page in enumerate(_fb_src):
                         _fb_scale = 300.0 / 72.0
                         _fb_mat = _fitz_fb.Matrix(_fb_scale, _fb_scale)
-                        _fb_pix = _fb_page.get_pixmap(
-                            matrix=_fb_mat,
-                            clip=page_raster_clip_rect(_fb_page),
-                            alpha=False,
+                        _fb_img, _fb_pxw, _fb_pxh = cmyk_raster_bytes(
+                            _fb_page, _fb_mat, page_raster_clip_rect(_fb_page)
                         )
-                        _fb_pix.set_dpi(300, 300)
-                        _fb_pxw, _fb_pxh = _fb_pix.width, _fb_pix.height
-                        _fb_img = _fb_pix.tobytes("png")
-                        _fb_pix = None
                         _fb_mr = press_target_media_rect(args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
                         _fb_w, _fb_h = float(_fb_mr.width), float(_fb_mr.height)
                         _fb_new = _fb_dst.new_page(width=_fb_w, height=_fb_h)
@@ -2460,15 +2456,9 @@ def main():
                     for _fb2_i, _fb2_page in enumerate(_fb2_src):
                         _fb2_scale = 300.0 / 72.0
                         _fb2_mat = _fitz_fb2.Matrix(_fb2_scale, _fb2_scale)
-                        _fb2_pix = _fb2_page.get_pixmap(
-                            matrix=_fb2_mat,
-                            clip=page_raster_clip_rect(_fb2_page),
-                            alpha=False,
+                        _fb2_img, _fb2_pxw, _fb2_pxh = cmyk_raster_bytes(
+                            _fb2_page, _fb2_mat, page_raster_clip_rect(_fb2_page)
                         )
-                        _fb2_pix.set_dpi(300, 300)
-                        _fb2_pxw, _fb2_pxh = _fb2_pix.width, _fb2_pix.height
-                        _fb2_img = _fb2_pix.tobytes("png")
-                        _fb2_pix = None
                         _fb2_mr = press_target_media_rect(args.trim_w, args.trim_h, PRESS_DEFAULT_BLEED_MM)
                         _fb2_w, _fb2_h = float(_fb2_mr.width), float(_fb2_mr.height)
                         _fb2_new = _fb2_dst.new_page(width=_fb2_w, height=_fb2_h)
@@ -2715,6 +2705,16 @@ def main():
             raise
 
         output_size = os.path.getsize(args.output)
+        if not vector_live:
+            try:
+                from client_file_audit import repair_cmyk_images
+
+                # Always. needsFix used to skip picture files, so black type stayed four-colour.
+                full = bool(((compile_stats.get("client_audit") or {}).get("black") or {}).get("needsFix"))
+                repair_cmyk_images(args.output, text_only=not full)
+                output_size = os.path.getsize(args.output)
+            except Exception as ink_err:
+                sys.stderr.write(f"[COMPILE] CMYK image black repair failed: {ink_err}\n")
         sys.stderr.write(f"[COMPILE] Press-ready PDF complete: {args.output} ({output_size} bytes)\n")
 
         spans_saved = compile_stats["total_spans"]
@@ -2729,7 +2729,7 @@ def main():
             typo_action = f"No vector text detected. Full rasterization at {render_dpi} DPI."
 
         if compile_stats["cmyk_converted"]:
-            ink_action = f"Hazardous RGB neutralized. Converted to CMYK via FOGRA39 ICC profile (verified: {compile_stats['cmyk_verified']}) and clamped to safe total ink limits."
+            ink_action = f"Converted to CMYK via FOGRA39 (verified: {compile_stats['cmyk_verified']})."
             if compile_stats["neutralized_count"] > 0:
                 ink_action += f" {compile_stats['neutralized_count']} near-black colors fixed to K-only overprint."
             if compile_stats.get("fonts_outlined"):
@@ -2779,11 +2779,22 @@ def main():
         if artwork_note:
             res_action = res_action + " " + artwork_note
 
-        if compile_stats["hairlines_fixed"] > 0:
-            hairline_action = f"Hairline strokes detected (below 0.25pt) and bulked to 0.3pt for press stability. {compile_stats['hairlines_fixed']} stroke(s) enforced."
+        client_audit = compile_stats.get("client_audit") or {}
+        hair = client_audit.get("hairlines") or {}
+        if hair.get("checked") and int(hair.get("count") or 0) > 0:
+            hairline_action = (
+                f"Thin lines under 0.25 pt were found on the original file ({int(hair['count'])}). "
+                "They are raised to 0.25 pt."
+            )
+            hairline_auto = True
+        elif hair.get("checked"):
+            hairline_action = "Strokes on the original file were checked. None were under 0.25 pt."
+            hairline_auto = False
+        elif compile_stats["hairlines_fixed"] > 0:
+            hairline_action = f"Hairline strokes under 0.25 pt were raised to 0.25 pt ({compile_stats['hairlines_fixed']})."
             hairline_auto = True
         else:
-            hairline_action = "No hairlines detected; all strokes meet minimum weight requirements."
+            hairline_action = "Hairlines were not checked on a vector source, so none are reported as clear."
             hairline_auto = False
 
         qr_status = compile_stats.get("qr_scan_status", "not_run")

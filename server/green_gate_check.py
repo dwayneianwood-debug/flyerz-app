@@ -159,7 +159,7 @@ def test_bled_pdf_explains_itself() -> None:
     check("bled-not-cmyk", items["cmyk"]["passed"] is False, str(items["cmyk"]))
     check("bled-font", items["fonts"]["passed"] is False, str(items["fonts"]))
     check("bled-safe", items["safe"]["passed"] is True, str(items["safe"]))
-    check("bled-not-red", report["severity"] != "red", str(report["severity"]))
+    check("bled-font-red", report["severity"] == "red" and "Helvetica" in report["clientMessage"], report.get("clientMessage"))
 
 
 def test_blank_and_wrong_shape() -> None:
@@ -297,11 +297,19 @@ def test_picture_text_is_not_green() -> None:
         items["picturetext"]["passed"] is False and items["picturetext"]["detail"] == SMALL_PICTURE_REASON,
         str(items.get("picturetext")),
     )
-    check("picture-small-not-red", report["severity"] != "red", str(report["severity"]))
-    light = decide_light({"compiled": True, "enginePassed": True, "checklist": {"items": report["items"], "severity": report["severity"]}})
     check(
-        "picture-small-amber",
-        light["light"] == "amber" and SMALL_PICTURE_REASON in light["reasons"] and light["clientMessage"] == "",
+        "picture-small-low-res-warning",
+        report["severity"] != "red" and items["resolution"]["passed"] is False and "ppi" in items["resolution"]["detail"],
+        str(items.get("resolution")) + str(report.get("severity")),
+    )
+    light = decide_light({
+        "compiled": True,
+        "enginePassed": True,
+        "checklist": {"items": report["items"], "severity": report["severity"], "clientMessage": report.get("clientMessage")},
+    })
+    check(
+        "picture-small-reasons",
+        light["light"] == "amber" and SMALL_PICTURE_REASON in light["reasons"] and any("ppi" in line for line in light["reasons"]),
         str(light),
     )
 
@@ -387,8 +395,81 @@ def test_esrgan_only_with_token() -> None:
             os.environ["REPLICATE_API_TOKEN"] = saved
 
 
+def test_bleed_strip_does_not_fail_cmyk() -> None:
+    """A DeviceRGB margin strip keeps the edge colour. The artwork must still be CMYK."""
+    import pikepdf
+    from pikepdf import Array, Dictionary, Name
+
+    from green_gate import _colour
+
+    folder = tempfile.mkdtemp(prefix="gate-bleed-rgb-")
+    mm = 72.0 / 25.4
+    bleed = 5 * mm
+    trim_w, trim_h = 148 * mm, 210 * mm
+    width = trim_w + 2 * bleed
+    height = trim_h + 2 * bleed
+
+    def sheet() -> pikepdf.Pdf:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(width, height))
+        page.MediaBox = Array([0, 0, width, height])
+        page.TrimBox = Array([bleed, bleed, bleed + trim_w, bleed + trim_h])
+        page.Resources = Dictionary(XObject=Dictionary())
+        return pdf
+
+    pdf = sheet()
+    page = pdf.pages[0]
+    art = pdf.make_stream(bytes([10, 20, 30, 40] * 16))
+    art.Type = Name("/XObject")
+    art.Subtype = Name("/Image")
+    art.Width = 4
+    art.Height = 4
+    art.ColorSpace = Name("/DeviceCMYK")
+    art.BitsPerComponent = 8
+    edge = pdf.make_stream(bytes([183, 184, 185] * 80))
+    edge.Type = Name("/XObject")
+    edge.Subtype = Name("/Image")
+    edge.Width = 1
+    edge.Height = 80
+    edge.ColorSpace = Name("/DeviceRGB")
+    edge.BitsPerComponent = 8
+    page.Resources.XObject[Name("/Im0")] = art
+    page.Resources.XObject[Name("/Bleed0_0")] = edge
+    page.Contents = pdf.make_stream(
+        (
+            f"q {trim_w:.3f} 0 0 {trim_h:.3f} {bleed:.3f} {bleed:.3f} cm /Im0 Do Q\n"
+            f"q {bleed:.3f} 0 0 40 0 {bleed:.3f} cm /Bleed0_0 Do Q\n"
+        ).encode()
+    )
+    path = os.path.join(folder, "press.pdf")
+    pdf.save(path)
+    pdf.close()
+    cmyk, _ink = _colour(path)
+    check("bleed-strip-ignored", cmyk["passed"] is True, str(cmyk))
+
+    rgb_pdf = sheet()
+    rgb_page = rgb_pdf.pages[0]
+    picture = rgb_pdf.make_stream(bytes([20, 40, 80] * 16))
+    picture.Type = Name("/XObject")
+    picture.Subtype = Name("/Image")
+    picture.Width = 4
+    picture.Height = 4
+    picture.ColorSpace = Name("/DeviceRGB")
+    picture.BitsPerComponent = 8
+    rgb_page.Resources.XObject[Name("/Im0")] = picture
+    rgb_page.Contents = rgb_pdf.make_stream(
+        f"q {trim_w:.3f} 0 0 {trim_h:.3f} {bleed:.3f} {bleed:.3f} cm /Im0 Do Q\n".encode()
+    )
+    rgb_path = os.path.join(folder, "rgb.pdf")
+    rgb_pdf.save(rgb_path)
+    rgb_pdf.close()
+    failed, _ink = _colour(rgb_path)
+    check("artwork-rgb-still-fails", failed["passed"] is False and "not CMYK" in failed["detail"], str(failed))
+
+
 def main() -> None:
     test_messages()
+    test_bleed_strip_does_not_fail_cmyk()
     test_embedded_dpi()
     test_sharpen_keeps_the_hole()
     test_paint_and_ink_colour()

@@ -11,6 +11,7 @@ import { beginJobRun, endJobRun, JobAlreadyRunning } from "./jobRunLock";
 import { runWithJobProgress, writeJobProgress } from "./jobProgress";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
+import { checksAllPassed } from "./checkVerdict";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
 import { isPrintToolType } from "@shared/artwork-types";
 import {
@@ -730,7 +731,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
 
     checks = normalizeChecksAfterPdfGeometryHeal(checks);
 
-    const overallPassed = checks.every((c) => c.passed || (c as any).severity === "WARNING" || (c as any).severity === "MANUAL_REVIEW");
+    const overallPassed = checksAllPassed(checks);
     const fixesApplied = checks.filter((c) => c.autoFixed).length;
     const complianceReport = generateComplianceReport(filename, checks, fixesApplied);
 

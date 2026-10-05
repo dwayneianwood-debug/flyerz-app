@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { useToast } from "@/hooks/use-toast";
+import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
 import type { BleedOptions } from "@shared/schema";
 import { defaultBleedOptions } from "@shared/schema";
 import { FULL_PAGE_CROP_NORMALIZED } from "@shared/crop-box";
@@ -38,7 +39,10 @@ const KNOWN_SIZES: { key: string; label: string; w: number; h: number }[] = [
   { key: "a4", label: "A4", w: 210, h: 297 },
   { key: "a5", label: "A5", w: 148, h: 210 },
   { key: "a6", label: "A6", w: 105, h: 148 },
+  { key: "a7", label: "A7", w: 74, h: 105 },
+  { key: "dl", label: "DL", w: 99, h: 210 },
   { key: "business-card", label: "Card", w: 90, h: 50 },
+  { key: "card55", label: "Card 90 × 55", w: 90, h: 55 },
 ];
 
 function detectFileDimensions(file: globalThis.File): Promise<{ w: number; h: number; pxW: number; pxH: number } | null> {
@@ -615,15 +619,16 @@ export function FileUpload() {
   }, [toast]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
-    const oversized = acceptedFiles.filter(f => f.size > 50 * 1024 * 1024);
+    const oversized = acceptedFiles.filter(f => f.size > UPLOAD_LIMIT_BYTES);
     if (oversized.length > 0) {
+      const biggest = oversized.reduce((left, right) => (left.size > right.size ? left : right));
       toast({
         title: "File too large",
-        description: `${oversized.length} file(s) exceed the 50MB limit.`,
+        description: uploadTooLargeMessage(biggest.size),
         variant: "destructive",
       });
     }
-    const validFiles = acceptedFiles.filter(f => f.size <= 50 * 1024 * 1024);
+    const validFiles = acceptedFiles.filter(f => f.size <= UPLOAD_LIMIT_BYTES);
     if (validFiles.length === 0) return;
 
     if (validFiles.length === 1) {
@@ -1020,7 +1025,10 @@ export function FileUpload() {
                       <Label className="text-xs text-muted-foreground mb-1 block">Preset Sizes</Label>
                       <Select
                         value={
+                          (widthInput === "90" && heightInput === "55") || (widthInput === "55" && heightInput === "90") ? "card55" :
                           (widthInput === "90" && heightInput === "50") || (widthInput === "50" && heightInput === "90") ? "business-card" :
+                          (widthInput === "99" && heightInput === "210") || (widthInput === "210" && heightInput === "99") ? "dl" :
+                          (widthInput === "74" && heightInput === "105") || (widthInput === "105" && heightInput === "74") ? "a7" :
                           (widthInput === "105" && heightInput === "148") || (widthInput === "148" && heightInput === "105") ? "a6" :
                           (widthInput === "148" && heightInput === "210") || (widthInput === "210" && heightInput === "148") ? "a5" :
                           (widthInput === "210" && heightInput === "297") || (widthInput === "297" && heightInput === "210") ? "a4" :
@@ -1033,6 +1041,9 @@ export function FileUpload() {
                         onValueChange={(v) => {
                           const sizes: Record<string, [number, number]> = {
                             "business-card": [90, 50],
+                            "card55": [90, 55],
+                            "dl": [99, 210],
+                            "a7": [74, 105],
                             "a6": [105, 148],
                             "a5": [148, 210],
                             "a4": [210, 297],
@@ -1063,6 +1074,9 @@ export function FileUpload() {
                         <SelectContent>
                           <SelectItem value="custom">Custom Size</SelectItem>
                           <SelectItem value="business-card">Business Card — 90 × 50 mm</SelectItem>
+                          <SelectItem value="card55">Business Card — 90 × 55 mm</SelectItem>
+                          <SelectItem value="dl">DL — 99 × 210 mm</SelectItem>
+                          <SelectItem value="a7">A7 — 74 × 105 mm</SelectItem>
                           <SelectItem value="a6">A6 — 105 × 148 mm</SelectItem>
                           <SelectItem value="a5">A5 — 148 × 210 mm</SelectItem>
                           <SelectItem value="a4">A4 — 210 × 297 mm</SelectItem>
@@ -1412,7 +1426,7 @@ export function FileUpload() {
               </h3>
 
               <p className="text-xs text-muted-foreground max-w-[200px] font-medium" data-testid="text-upload-description">
-                {ARTWORK_TYPE_LABEL} up to 50MB — drop multiple files for batch processing
+                {ARTWORK_TYPE_LABEL} up to 500MB — drop multiple files for batch processing
               </p>
 
               <div className="mt-4 flex flex-wrap justify-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">

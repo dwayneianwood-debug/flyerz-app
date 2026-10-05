@@ -170,9 +170,9 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
         )}
         {activeMethod && activeMethod !== "auto" && (
           <div className={`relative rounded-lg border-2 border-primary/30 overflow-hidden bg-gray-100 dark:bg-gray-800 transition-opacity duration-200 ${loading ? "opacity-50" : ""}`}>
-            {(variantPages?.[activeMethod]?.length || 0) > 1 && (
+            {Math.max(variantPages?.[activeMethod]?.length || 0, pageCount || 0) > 1 && (
               <div className="flex items-center gap-2 flex-wrap p-2" data-testid="style-page-selector">
-                {variantPages?.[activeMethod]?.map((_, index) => (
+                {Array.from({ length: Math.max(variantPages?.[activeMethod]?.length || 0, pageCount || 0) }, (_, index) => (
                   <button
                     key={index}
                     type="button"
@@ -193,7 +193,7 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
                 className="w-full h-full object-contain"
                 data-testid="img-bleed-variant-colourBorder"
               />
-              ) : variants[activeMethod] ? (
+              ) : (variants[activeMethod] || pageCount > 1) ? (
               <img
                 src={`/api/jobs/${jobId}/bleed-variant/${activeMethod}?page=${proofPage || 0}`}
                 alt={activeInfo?.label || activeMethod}

@@ -104,6 +104,9 @@ def decide_light(facts: dict) -> dict:
             "reasons": ["The picture's shape cannot be extended to this print size."],
             "clientMessage": client_message("proportions"),
         }
+    if facts.get("plateSkipped"):
+        reason = str(facts.get("plateReason") or "").strip() or "The press plate was not rendered."
+        return {"light": "amber", "reasons": [reason], "clientMessage": ""}
     if facts.get("missingContent"):
         from green_gate import client_message
 
@@ -141,6 +144,13 @@ def decide_light(facts: dict) -> dict:
             reasons.append(note)
     if facts.get("enginePassed") is False:
         note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
+        if "live text that was already embedded" in note.lower():
+            return {
+                "light": "red",
+                "reasons": [note],
+                "clientMessage": note,
+                "checklistRed": True,
+            }
         if note not in reasons:
             reasons.append(note)
     checklist = facts.get("checklist") if isinstance(facts.get("checklist"), dict) else None
@@ -159,6 +169,23 @@ def decide_light(facts: dict) -> dict:
                 "reasons": reasons or ["This file cannot go to press as it is."],
                 "clientMessage": str(checklist.get("clientMessage") or client_message("cut")),
             }
+    twenty = facts.get("twentyFive") if isinstance(facts.get("twentyFive"), dict) else None
+    extra_checks = facts.get("extraChecks") if isinstance(facts.get("extraChecks"), dict) else None
+    from extra_checks import worse_light
+
+    combined = worse_light(twenty, extra_checks) if (twenty or extra_checks) else None
+    if combined and combined.get("light") == "red":
+        extra = [line for line in (combined.get("reasons") or []) if line not in reasons]
+        return {
+            "light": "red",
+            "reasons": extra + reasons,
+            "clientMessage": str(combined.get("clientMessage") or ""),
+            "checklistRed": True,
+        }
+    if combined and combined.get("light") == "amber":
+        for line in combined.get("reasons") or []:
+            if line and line not in reasons:
+                reasons.append(line)
     if reasons:
         return {"light": "amber", "reasons": reasons, "clientMessage": ""}
     return {"light": "green", "reasons": [], "clientMessage": ""}
@@ -193,6 +220,26 @@ def _read_image(path: str):
     import cv2
 
     return _to_bgr(cv2.imread(path, cv2.IMREAD_UNCHANGED))
+
+
+def _place_large_image(src: str, dest: str, trim_w: float, trim_h: float) -> None:
+    """Place a poster picture on the trim. Cover scale, then the press path adds the bleed strips."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    doc = fitz.open()
+    page = doc.new_page(width=trim_w * MM_TO_PT, height=trim_h * MM_TO_PT)
+    # Cover: the picture fills the trim. Reading the header avoids a full-plate decode.
+    with Image.open(src) as image:
+        src_w, src_h = image.size
+    cover = max(page.rect.width / max(src_w, 1), page.rect.height / max(src_h, 1))
+    width = src_w * cover
+    height = src_h * cover
+    x0 = (page.rect.width - width) / 2.0
+    y0 = (page.rect.height - height) / 2.0
+    page.insert_image(fitz.Rect(x0, y0, x0 + width, y0 + height), filename=src, keep_proportion=False)
+    doc.save(dest)
+    doc.close()
 
 
 def _write_png(img, path: str) -> None:
@@ -250,14 +297,23 @@ def _remember_product(decisions: list, product: dict, trim_w: float, trim_h: flo
 
 
 def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
-    """Best catalog size. An unrotated landscape product wins over turning the portrait one."""
+    """Best catalog size. An unrotated landscape product wins over turning the portrait one.
+
+    Equal bleed on both axes wins over a nearer trim that only explains one axis.
+    A 90 × 50 card with 2.5 mm all round is 95 × 55, which is also close to the
+    90 × 55 card. The even margin is the partial bleed. A real TrimBox is read
+    before this, so an uneven edge is not guessed here.
+    """
     best = None
     for product in _products():
         fit = _fit_page_to_trim(width_mm, height_mm, float(product["widthMm"]), float(product["heightMm"]), tolerance)
         if not fit:
             continue
+        bleed = fit["bleed"]
+        uniform = abs(float(bleed["left"]) - float(bleed["top"]))
         extra = abs(width_mm - fit["trimW"]) + abs(height_mm - fit["trimH"])
-        rank = (1 if fit["rotated"] else 0, extra)
+        kind_rank = 0 if bleed.get("kind") == "trim" else 1
+        rank = (1 if fit["rotated"] else 0, kind_rank, round(uniform, 3), extra)
         if best is None or rank < best[0]:
             best = (rank, product, fit["rotated"])
     if not best:
@@ -1159,7 +1215,7 @@ def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
             capture_output=True,
             text=True,
             timeout=240,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(), "PYTHONUNBUFFERED": "1"},
         )
         payload = {}
         if os.path.exists(result.name):
@@ -1250,11 +1306,17 @@ def make_print_ready(
     detect_size: bool = False,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
+    locale_seen = {}
+    try:
+        from host_paths import pin_c_locale
+
+        locale_seen = pin_c_locale() or {}
+    except Exception:
+        pass
     display = _safe_name(filename or os.path.basename(src_path))
     decisions = [
         "Sales quick mode decided this file on its own. Nobody was asked a question.",
         "Bleed is 5 mm on every side.",
-        "The press file is CMYK, with rich black kept.",
     ]
     product = {"id": product_id, "label": product_label, "widthMm": trim_w, "heightMm": trim_h}
     ext = _ext(src_path, display)
@@ -1315,6 +1377,8 @@ def make_print_ready(
     aspect_extended = False
     aspect_delta = 0.0
     upscale = 1.0
+    dpi_mode = ""
+    dpi_detail = ""
     existing_kept = False
     ocr_low = False
     ocr_doubtful = False
@@ -1325,6 +1389,8 @@ def make_print_ready(
     lettering_note = "The original lettering is kept."
 
     try:
+        from press_ready_engine import plate_exceeds_memory
+
         if ext in (".ai", ".eps"):
             opened, prep_error = _prepare_vector(src_path, ext)
             if prep_error or not opened:
@@ -1382,8 +1448,18 @@ def make_print_ready(
                 decisions.append(
                     "The PDF shape does not match the product. The page was placed whole and the edges were extended. It was not stretched."
                 )
-                raster = _render_pdf_image(work_path)
-                ext = ".png"
+                if plate_exceeds_memory(trim_w, trim_h):
+                    decisions.append("Large format keeps the vectors. Only the bleed edge is drawn.")
+                else:
+                    raster = _render_pdf_image(work_path)
+                    ext = ".png"
+        if plate_exceeds_memory(trim_w, trim_h) and ext in IMAGE_EXT:
+            placed = os.path.join(output_dir, "large-placed.pdf")
+            _place_large_image(work_path, placed, trim_w, trim_h)
+            work_path = placed
+            ext = ".pdf"
+            raster = None
+            decisions.append("Large format keeps the picture as placed. Only the 5 mm bleed edge is added.")
         if ext in IMAGE_EXT or raster is not None:
             if raster is None:
                 raster = _read_image(work_path)
@@ -1509,15 +1585,31 @@ def make_print_ready(
             if not (vector_built and vector_built.get("ok")):
                 _mark("enlarging", lettering_note)
                 upscaled_path = os.path.join(output_dir, "upscaled.png")
+                source_ppi = 300.0 / max(float(upscale), 1e-6)
                 try:
                     from ai_upscale import apply_ai_upscale
 
-                    enlarged = apply_ai_upscale(fitted_path, {
-                        "trim_w_mm": trim_w,
-                        "trim_h_mm": trim_h,
-                        "bleed_mm": 0,
-                        "output_path": upscaled_path,
-                    })
+                    if source_ppi < 75:
+                        dpi_mode = "under"
+                        dpi_detail = f"About {source_ppi:.0f} ppi. Under 75 ppi, so the picture was not enhanced."
+                        enlarged = {"used_original": True, "message": dpi_detail}
+                    else:
+                        enlarged = apply_ai_upscale(fitted_path, {
+                            "trim_w_mm": trim_w,
+                            "trim_h_mm": trim_h,
+                            "bleed_mm": 0,
+                            "output_path": upscaled_path,
+                            "max_scale": 4,
+                            "skip_below_ppi": 75,
+                        })
+                        if enlarged.get("used_original"):
+                            dpi_mode = "under" if source_ppi < 75 else ""
+                        elif float(upscale) > 4:
+                            dpi_mode = "capped"
+                            dpi_detail = f"About {source_ppi:.0f} ppi was enlarged by 4× and is still under 300 ppi."
+                        elif float(upscale) > 1.05:
+                            dpi_mode = "upscaled"
+                            dpi_detail = f"About {source_ppi:.0f} ppi was enlarged toward 300 ppi, and not by more than 4×."
                 except Exception as exc:
                     enlarged = {"used_original": True, "message": str(exc)[:160]}
                 if enlarged.get("enhanced_path") and os.path.exists(str(enlarged.get("enhanced_path"))) and not enlarged.get("used_original"):
@@ -1553,7 +1645,28 @@ def make_print_ready(
 
     press_path = os.path.join(output_dir, "press.pdf")
     _mark("press", lettering_note)
+    ink_report = None
     vector_ok = bool(vector_built and vector_built.get("ok") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
+    plate_ink = ((vector_built or {}).get("qa") or {}).get("plate_ink") if vector_ok else None
+    if vector_ok and isinstance(plate_ink, dict):
+        ink_report = {
+            "images": 1 if plate_ink.get("changed") else 0,
+            "rewritten": 1 if plate_ink.get("changed") else 0,
+            "why": "in-plate" if plate_ink.get("changed") else "in-plate-unchanged",
+            "painted": plate_ink.get("painted"),
+            "dark": plate_ink.get("dark"),
+            "locale": locale_seen,
+        }
+        sys.stderr.write("[INK] " + json.dumps(ink_report) + "\n")
+    elif vector_ok:
+        try:
+            from client_file_audit import repair_cmyk_images
+
+            # The traced page is already the press file. Small black type in that plate has to be K-only.
+            ink_report = repair_cmyk_images(press_path, text_only=True)
+        except Exception as exc:
+            ink_report = {"images": 0, "rewritten": 0, "why": "raised", "error": str(exc)[:300]}
+            sys.stderr.write(f"[INK] rewrite failed: {exc}\n")
     if vector_ok:
         compiled = {
             "success": True,
@@ -1610,18 +1723,89 @@ def make_print_ready(
                 "edge": (vector_built or {}).get("edge") or {},
                 "sourceBgr": vector_source,
                 "placement": (vector_built or {}).get("placement") or {},
+                "sourcePath": src_path,
             })
+            black_row = next((item for item in (checklist.get("items") or []) if item.get("id") == "black"), None)
+            if black_row and black_row.get("passed"):
+                decisions.append("Black ink was checked on the original file.")
+            elif black_row:
+                decisions.append(str(black_row.get("detail") or "Black ink was corrected for press."))
             facts["checklist"] = checklist
         except Exception:
             checklist = None
+    if os.path.isfile(src_path):
+        try:
+            from twenty_five import assess as assess_points
+            from twenty_five import light_from_checks, settle_checks
+
+            raw_points = assess_points(src_path, trim_w, trim_h)
+            point_audit = (engine.get("clientAudit") if isinstance(engine, dict) else None) or {}
+            settled = settle_checks(raw_points.get("checks") or [], {
+                "bleed": bool(press_ok),
+                "cmyk": bool(press_ok),
+                "flattened": bool(press_ok),
+                "black": bool(point_audit.get("black")),
+                "hair": int(point_audit.get("hairlines") or 0) > 0,
+                "spots": bool(point_audit.get("spots")),
+                "dpi": dpi_mode,
+                "dpiDetail": dpi_detail,
+            })
+            if press_ok:
+                try:
+                    from extra_checks import press_ink_facts
+
+                    ink = press_ink_facts(press_path)
+                    if isinstance(ink_report, dict):
+                        ink_report["k_only"] = int(ink.get("k_only") or 0)
+                        ink_report["max_tac"] = round(float(ink.get("max_tac") or 0), 1)
+                        if str(ink_report.get("why") or "").startswith("in-plate") and ink_report["k_only"] <= 0 and not ink.get("small_k"):
+                            ink_report["why"] = "in-plate-not-in-file"
+                    for index, row in enumerate(settled):
+                        if str(row.get("num")) != "2b":
+                            continue
+                        if ink.get("small_rich") or float(ink.get("max_tac") or 0) > 300.5:
+                            detail = (
+                                f"Black text in the press file is still four-colour"
+                                f" and total ink is about {float(ink.get('max_tac') or 0):.0f}%."
+                            )
+                            settled[index] = {**row, "status": "warning", "pass": False, "detail": detail, "label": f"2b. {row.get('name')}: {detail}"}
+                        elif ink.get("small_k") and float(ink.get("max_tac") or 0) <= 300.5:
+                            detail = "Black text under 18 pt in the press file is K-only, and total ink is within 300%."
+                            settled[index] = {**row, "status": "passed", "pass": True, "detail": detail, "label": f"2b. {row.get('name')}: {detail}"}
+                        break
+                except Exception:
+                    pass
+            derived = light_from_checks(settled)
+            facts["twentyFive"] = {**derived, "checks": settled}
+        except Exception:
+            pass
+        try:
+            from extra_checks import assess_extras
+
+            extra_report = assess_extras(
+                src_path,
+                press_path if press_ok else "",
+                {
+                    "widthMm": trim_w,
+                    "heightMm": trim_h,
+                    "explicitSize": True,
+                    "cmykOnly": True,
+                },
+                apply=False,
+            )
+            facts["extraChecks"] = extra_report
+        except Exception:
+            pass
     info = decide_light(facts)
     result = _blank(info, decisions, product, quantity, notes)
     result["checklist"] = list((checklist or {}).get("items") or [])
+    result["prepressChecks"] = list((facts.get("twentyFive") or {}).get("checks") or [])
+    result["extraChecks"] = list((facts.get("extraChecks") or {}).get("checks") or [])
     result["upscale"] = round(upscale, 3)
     result["existingBleedKept"] = existing_kept
     result["enginePassed"] = facts["enginePassed"]
     result["pressEngine"] = engine if isinstance(engine, dict) else None
-    if press_ok and info["light"] != "red":
+    if press_ok and (info["light"] != "red" or info.get("checklistRed")):
         result["pressPath"] = press_path
         try:
             boxes = _boxes_mm(press_path)
@@ -1648,6 +1832,15 @@ def make_print_ready(
     elif not press_ok:
         result["pressPath"] = ""
     result["decisions"] = decisions
+    if ink_report:
+        result["inkRepair"] = {
+            "rewritten": int(ink_report.get("images") or ink_report.get("rewritten") or 0),
+            "why": str(ink_report.get("why") or ink_report.get("error") or ""),
+            "k_only": int(ink_report.get("k_only") or 0),
+            "max_tac": ink_report.get("max_tac"),
+            "skips": ink_report.get("skips") or [],
+            "locale": ink_report.get("locale") or {},
+        }
     result["letteringNote"] = lettering_note
     if vector_built:
         result["vectorText"] = {

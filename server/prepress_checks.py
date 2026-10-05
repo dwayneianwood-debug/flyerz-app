@@ -21,7 +21,7 @@ def _px_to_mm(px_val, dpi):
     return round(px_val * 25.4 / dpi, 2)
 
 
-def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=False):
+def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=False, safe_mm=None):
     """
     Section 2 — Enhanced Safe Zone Validation with severity levels.
     For all foreground content, calculate distance to trim on all sides.
@@ -43,7 +43,8 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
             "auto_fixed": False
         }
 
-    safe_px = _mm_to_px(SAFE_ZONE_MM, dpi)
+    zone_mm = SAFE_ZONE_MM if safe_mm is None else float(safe_mm)
+    safe_px = _mm_to_px(zone_mm, dpi)
 
     trim_region = img_bgr[trim_top:trim_bottom, trim_left:trim_right]
     gray = cv2.cvtColor(trim_region, cv2.COLOR_BGR2GRAY)
@@ -70,7 +71,7 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
                 "page": page_num,
                 "side": side_name,
                 "severity": "PASS",
-                "distance_mm": SAFE_ZONE_MM,
+                "distance_mm": zone_mm,
                 "content_percentage": 0.0
             })
             continue
@@ -105,7 +106,7 @@ def enhanced_safe_zone_analysis(img_bgr, trim_info, dpi, page_num=1, auto_fix=Fa
         if distance_mm <= 0:
             severity = "CRITICAL"
             overall_severity = "CRITICAL"
-        elif distance_mm < SAFE_ZONE_MM:
+        elif distance_mm < zone_mm:
             severity = "WARNING"
             if overall_severity != "CRITICAL":
                 overall_severity = "WARNING"
@@ -643,7 +644,18 @@ def check_pdfx_compliance(doc, input_path):
             except Exception:
                 pass
 
-            if "/Separation" in page_text or "/DeviceN" in page_text:
+            if i == 0 and input_path:
+                try:
+                    from client_file_audit import spot_names
+
+                    names = spot_names(input_path)
+                except Exception:
+                    names = []
+                if names:
+                    results["issues"].append("Spot colours: " + ", ".join(names[:6]))
+                else:
+                    results["passes"].append(f"Page {i+1}: No spot colours")
+            elif "/Separation" in page_text or "/DeviceN" in page_text:
                 results["issues"].append(f"Page {i+1}: Spot colours detected")
             else:
                 results["passes"].append(f"Page {i+1}: No spot colours")
@@ -662,19 +674,23 @@ def check_pdfx_compliance(doc, input_path):
             if i >= 4:
                 break
 
-        fonts = doc.get_page_fonts(0, full=True) if len(doc) > 0 else []
+        font_problems = []
         embedded_count = 0
-        unembedded = []
-        for font in fonts:
-            font_name = font[3] if len(font) > 3 else "Unknown"
-            font_type = font[2] if len(font) > 2 else ""
-            if font_type and "Type3" not in font_type:
-                embedded_count += 1
-            else:
-                unembedded.append(font_name)
+        if input_path:
+            try:
+                from client_file_audit import font_report
 
-        if unembedded:
-            results["issues"].append(f"Unembedded fonts: {', '.join(unembedded[:5])}")
+                report = font_report(input_path)
+                font_problems = [row["name"] for row in report.get("problems") or []]
+                embedded_count = int(report.get("embedded") or 0) + len(report.get("type3") or [])
+            except Exception:
+                font_problems = []
+        if font_problems:
+            results["issues"].append(
+                "Fonts not embedded or substituted: "
+                + ", ".join(font_problems[:5])
+                + ". Please export with fonts embedded or outlined."
+            )
             results["fixable"].append("embed_fonts")
         elif embedded_count > 0:
             results["passes"].append(f"{embedded_count} font(s) properly embedded")
@@ -945,14 +961,14 @@ def build_pdfx_check(doc, input_path, flags=None):
     elif all_fixable:
         return {
             "name": "PDF/X Compliance",
-            "passed": True,
+            "passed": False,
             "message": (
-                f"PDF/X compliance: {pdfx['total_issues']} minor issue(s) auto-resolved "
-                f"(metadata defaults applied). Print-ready."
+                f"PDF/X compliance: {pdfx['total_issues']} issue(s) still need a real fix. "
+                "They were not auto-resolved."
             ),
-            "autoFixed": True,
-            "details": f"Auto-fixed: {issues_str} | Passes: {passes_str}",
-            "severity": "PASS"
+            "autoFixed": False,
+            "details": f"Issues: {issues_str} | Passes: {passes_str}",
+            "severity": "FAIL"
         }
     else:
         return {

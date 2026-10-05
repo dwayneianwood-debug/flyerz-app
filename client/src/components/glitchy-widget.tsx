@@ -1,11 +1,27 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { glitchyPlacement } from "@/lib/glitchy-placement";
+import { glitchyPlacement, keepAskedReply } from "@/lib/glitchy-placement";
 
 type CatMode = "head" | "walking" | "sleeping" | "stretching";
 
 interface CheckItem {
   label: string;
   pass: boolean;
+  status?: string;
+  detail?: string;
+  name?: string;
+  num?: string;
+}
+
+interface ChatAction {
+  id: string;
+  label: string;
+  tone?: string;
+}
+
+function checkText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  return String(value);
 }
 
 function CatAvatar({ mode, dilated }: { mode: CatMode; dilated: boolean }) {
@@ -131,8 +147,19 @@ type ProcessState = "IDLE" | "PROCESSING" | "QUEUED" | "SUCCESS" | "ERROR";
 
 const GLITCHY_SUPPRESS_CROPBOX_ERR = "cropbox not in mediabox";
 
-function textContainsCropBoxMediaBoxUiNoise(text: string): boolean {
-  return text.toLowerCase().includes(GLITCHY_SUPPRESS_CROPBOX_ERR);
+function textContainsCropBoxMediaBoxUiNoise(text: unknown): boolean {
+  return checkText(text).toLowerCase().includes(GLITCHY_SUPPRESS_CROPBOX_ERR);
+}
+
+function normalizeCheck(row: Partial<CheckItem> | null | undefined): CheckItem {
+  const item = row && typeof row === "object" ? row : {};
+  const detail = checkText(item.detail);
+  const name = checkText(item.name);
+  const num = checkText(item.num);
+  const label = checkText(item.label) || (num ? `${num}. ${name}: ${detail}` : detail || name);
+  const status = checkText(item.status);
+  const pass = item.pass === true || status === "passed" || status === "pass" || status === "auto" || status === "fixed";
+  return { label, pass, status, detail, name, num };
 }
 
 export default function GlitchyWidget() {
@@ -147,6 +174,9 @@ export default function GlitchyWidget() {
   const [chatLoading, setChatLoading] = useState(false);
   const [checklist, setChecklist] = useState<CheckItem[]>([]);
   const [responseText, setResponseText] = useState("*Purrs*");
+  const [chatActions, setChatActions] = useState<ChatAction[]>([]);
+  const [previewBefore, setPreviewBefore] = useState("");
+  const [previewAfter, setPreviewAfter] = useState("");
   const [catMode, setCatMode] = useState<CatMode>("head");
   const [uiVisible, setUiVisible] = useState(true);
   const [happyHop, setHappyHop] = useState(false);
@@ -161,6 +191,7 @@ export default function GlitchyWidget() {
   /** ask = invite; reveal = show what we did after click */
   const [achievementPhase, setAchievementPhase] = useState<"ask" | "reveal" | null>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
+  const replyPinned = useRef(false);
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const idleRef = useRef(0);
   const wanderingRef = useRef(false);
@@ -185,7 +216,7 @@ export default function GlitchyWidget() {
     try {
       const res = await fetch(`/api/glitchy-checklist/${jobId}`);
       const data = await res.json();
-      const rows: CheckItem[] = data.checks || [];
+      const rows = Array.isArray(data.checks) ? data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)) : [];
       setChecklist(
         rows.map((c) =>
           textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
@@ -279,7 +310,7 @@ export default function GlitchyWidget() {
           try {
             const res = await fetch(`/api/glitchy-checklist/${jobId}`);
             const data = await res.json();
-            const rows: CheckItem[] = data.checks || [];
+            const rows = Array.isArray(data.checks) ? data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)) : [];
             const cleaned = rows.map((c) =>
               textContainsCropBoxMediaBoxUiNoise(c.label) ? { ...c, pass: true } : c,
             );
@@ -297,6 +328,9 @@ export default function GlitchyWidget() {
         }
         if (items.length === 0) {
           items.push({ label: "Artwork audited and prepared for print", done: true });
+        }
+        if (keepAskedReply(replyPinned.current)) {
+          return;
         }
         setCatMode("head");
         setUiVisible(true);
@@ -330,6 +364,7 @@ export default function GlitchyWidget() {
 
   useEffect(() => {
     const resetGlitchy = () => {
+      replyPinned.current = false;
       setCatMode("head");
       setUiVisible(true);
       setPosX(15);
@@ -340,6 +375,7 @@ export default function GlitchyWidget() {
     };
 
     const offerAchievement = (message: string, items: PreflightItem[]) => {
+      if (keepAskedReply(replyPinned.current)) return;
       resetGlitchy();
       setProcessState("SUCCESS");
       setProcessingMessage(message);
@@ -378,8 +414,20 @@ export default function GlitchyWidget() {
       }
 
       const items: PreflightItem[] = [];
+      const liveChecks = Array.isArray(detail.checks) ? detail.checks : [];
+      if (liveChecks.length) {
+        setChecklist(
+          liveChecks.map((c: Partial<CheckItem>) => {
+            const row = normalizeCheck(c);
+            return textContainsCropBoxMediaBoxUiNoise(row.label) ? { ...row, pass: true } : row;
+          }),
+        );
+        for (const c of liveChecks) {
+          items.push({ label: c.label, done: !!c.pass });
+        }
+      }
       const report = detail.auditReport;
-      if (report) {
+      if (!liveChecks.length && report) {
         if (report.geometry?.action_taken) {
           items.push({ label: `📐 ${report.geometry.action_taken}`, done: true });
         }
@@ -392,19 +440,8 @@ export default function GlitchyWidget() {
         if (report.resolution_and_lenses?.action_taken) {
           items.push({ label: `🔍 ${report.resolution_and_lenses.action_taken}`, done: true });
         }
-      } else {
-        items.push({ label: "Ink Coverage: Clamped to 200% TIC (Press-Safe)", done: true });
-        items.push({ label: "Text Sharpening: Converted to 100% K Overprint", done: true });
-        items.push({ label: "Bleed Status: 5mm TrimBox & BleedBox Embedded", done: true });
-        if (detail.lensesDetected) {
-          items.push({ label: "Lenses Flattened: Supersampled 600→300 DPI", done: !!detail.lensesFlattened });
-        }
-        if (detail.aiEnhanced) {
-          items.push({ label: "AI Resolution Enhancement Applied", done: true });
-        }
-        if (detail.originalTic && detail.finalTic && detail.originalTic > detail.finalTic) {
-          items.push({ label: `TIC Reduced: ${detail.originalTic}% → ${detail.finalTic}%`, done: true });
-        }
+      } else if (!liveChecks.length) {
+        fetchChecklist();
       }
       if (bleedLabel) {
         items.push({ label: `Bleed strategy: ${bleedLabel}`, done: true });
@@ -682,6 +719,7 @@ export default function GlitchyWidget() {
 
     setChatBoxVisible((v) => {
       if (v) {
+        replyPinned.current = false;
         setUserOpened(false);
         setIsInteracting(false);
         setBubbleVisible(false);
@@ -708,12 +746,14 @@ export default function GlitchyWidget() {
     }
   }
 
-  async function askGlitchy() {
-    const val = chatInputRef.current?.value?.trim();
+  async function askGlitchy(actionId?: string) {
+    const id = typeof actionId === "string" ? actionId : "";
+    const val = id || chatInputRef.current?.value?.trim();
     if (!val || chatLoading) return;
-    chatInputRef.current!.value = "";
+    if (!id && chatInputRef.current) chatInputRef.current.value = "";
 
-    setResponseText("...Thinking...");
+    const checking = /artwork|right\?|check this|is this/i.test(val);
+    setResponseText(id ? "Doing that now." : checking ? "Checking this artwork." : "One moment.");
     setChatLoading(true);
 
     try {
@@ -721,12 +761,38 @@ export default function GlitchyWidget() {
       const res = await fetch("/api/glitchy-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: val, jobId }),
+        body: JSON.stringify({ message: val, jobId, action: id }),
       });
       const data = await res.json();
-      setResponseText(data.reply);
+      setResponseText(checkText(data.reply) || "I couldn't read a reply.");
+      replyPinned.current = true;
+      setChatBoxVisible(true);
+      setUserOpened(true);
+      setAchievementPhase(null);
+      setChatActions(
+        Array.isArray(data.actions)
+          ? data.actions.map((action: Partial<ChatAction>) => ({
+              id: checkText(action?.id),
+              label: checkText(action?.label),
+              tone: checkText(action?.tone),
+            }))
+          : [],
+      );
+      if (Array.isArray(data.checks) && data.checks.length) {
+        setChecklist(data.checks.map((row: Partial<CheckItem>) => normalizeCheck(row)));
+      }
+      const stamp = Date.now();
+      setPreviewBefore(data.previewBefore ? `${data.previewBefore}?t=${stamp}` : "");
+      setPreviewAfter(data.previewAfter ? `${data.previewAfter}?t=${stamp}` : "");
     } catch {
-      setResponseText("Meow? (Check your connection!)");
+      setResponseText("I couldn't reach the checker, so I have not run a check.");
+      replyPinned.current = true;
+      setChatBoxVisible(true);
+      setUserOpened(true);
+      setAchievementPhase(null);
+      setChatActions([]);
+      setPreviewBefore("");
+      setPreviewAfter("");
     }
     setChatLoading(false);
   }
@@ -766,7 +832,7 @@ export default function GlitchyWidget() {
   const hasFailedChecks =
     !checklistPassOverride &&
     checklist.some((c) => !c.pass && !textContainsCropBoxMediaBoxUiNoise(c.label));
-  const showChecklist = hasFailedChecks && catMode === "head" && chatBoxVisible;
+  const showChecklist = checklist.length > 0 && catMode === "head" && chatBoxVisible;
 
   const suppressCropBoxErrorBubble =
     processState === "ERROR" && textContainsCropBoxMediaBoxUiNoise(compileErrorMsg);
@@ -1074,16 +1140,22 @@ export default function GlitchyWidget() {
             <p style={{ margin: "0 0 5px 0", fontSize: 10, fontWeight: "bold", color: "#333" }}>
               Checklist:
             </p>
-            <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5 }}>
-              {checklist.map((c, i) => (
-                <li
-                  key={i}
-                  data-testid={`glitchy-check-${i}`}
-                  style={{ color: c.pass ? "#27ae60" : "#e74c3c", fontWeight: "bold" }}
-                >
-                  {c.pass ? "\u2705" : "\u274C"} {c.label}
-                </li>
-              ))}
+            <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 9, lineHeight: 1.5, maxHeight: 220, overflowY: "auto" }}>
+              {checklist.map((c, i) => {
+                const status = c.status || (c.pass ? "passed" : "failed");
+                const color = status === "auto" || status === "fixed" ? "#0f766e" : status === "warning" ? "#d97706" : status === "skipped" ? "#64748b" : c.pass ? "#27ae60" : "#e74c3c";
+                const mark = status === "auto" || status === "fixed" ? "\u2728" : status === "warning" ? "!" : status === "skipped" ? "–" : c.pass ? "\u2705" : "\u274C";
+                return (
+                  <li
+                    key={i}
+                    data-testid={`glitchy-check-${i}`}
+                    data-status={status}
+                    style={{ color, fontWeight: "bold" }}
+                  >
+                    {mark} {c.label}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}
@@ -1161,9 +1233,47 @@ export default function GlitchyWidget() {
               )
             ) : (
               <>
-                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee" }}>
+                <div data-testid="glitchy-response" style={{ fontSize: 10, marginBottom: 5, color: "#eee", whiteSpace: "pre-wrap", maxHeight: 140, overflowY: "auto" }}>
                   {responseText}
                 </div>
+                {(previewBefore || previewAfter) && (
+                  <div data-testid="glitchy-previews" style={{ display: "flex", gap: 4, marginBottom: 5 }}>
+                    {previewBefore && (
+                      <img data-testid="glitchy-preview-before" src={previewBefore} alt="Before" style={{ width: "48%", maxHeight: 90, objectFit: "contain", background: "#111" }} />
+                    )}
+                    {previewAfter && (
+                      <img data-testid="glitchy-preview-after" src={previewAfter} alt="After" style={{ width: "48%", maxHeight: 90, objectFit: "contain", background: "#111" }} />
+                    )}
+                  </div>
+                )}
+                {chatActions.length > 0 && (
+                  <div data-testid="glitchy-actions" style={{ display: "flex", flexDirection: "column", gap: 3, marginBottom: 4 }}>
+                    {chatActions.map((action) => {
+                      const secondary = action.tone === "secondary";
+                      return (
+                      <button
+                        key={action.id}
+                        type="button"
+                        data-testid={`glitchy-action-${action.id}`}
+                        onClick={() => askGlitchy(action.id)}
+                        style={{
+                          background: secondary ? "#333" : "#a3e635",
+                          color: secondary ? "#a3e635" : "#111",
+                          border: "1px solid #555",
+                          borderRadius: 4,
+                          cursor: "pointer",
+                          fontSize: 8,
+                          fontWeight: secondary ? 400 : 700,
+                          padding: 3,
+                          textAlign: "left",
+                        }}
+                      >
+                        {action.label}
+                      </button>
+                      );
+                    })}
+                  </div>
+                )}
                 <input
                   ref={chatInputRef}
                   data-testid="glitchy-chat-input"
@@ -1183,7 +1293,7 @@ export default function GlitchyWidget() {
                   }}
                 />
                 <button
-                  onClick={askGlitchy}
+                  onClick={() => askGlitchy()}
                   data-testid="glitchy-chat-send"
                   style={{
                     width: "100%",

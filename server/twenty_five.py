@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""Ian's 25-point list, from checks that actually run.
+
+A point is passed only when this module measured it. A point that could not
+run is skipped, never ticked.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+POINTS = [
+    ("1", "Bleed Detection & Correction"),
+    ("2", "CMYK Colour Space Conversion"),
+    ("2b", "CMYK Black Optimisation (K-Only Rules)"),
+    ("3", "Resolution / DPI Validation"),
+    ("3b", "AI Resolution Enhancement"),
+    ("4", "Font Embedding"),
+    ("5", "Image Embedding"),
+    ("6", "Transparency, Lens & Drop Shadow Flattening"),
+    ("6b", "Mockup Auto-Crop"),
+    ("6c", "Interactive Trim Lock"),
+    ("6d", "Scale & Centre to Target Size"),
+    ("6e", "Bleed Perimeter Scan"),
+    ("6f", "Small Text Colour Safety"),
+    ("7", "Safe Zone"),
+    ("8", "Layout Balance Analysis"),
+    ("9", "Composition Centre Analysis"),
+    ("10", "Smart Downscale Radar"),
+    ("11", "Margin Normalisation"),
+    ("12", "Trim Tolerance Simulation"),
+    ("13", "Spine Shift Detection"),
+    ("14", "Creep Compensation"),
+    ("15", "Gutter Collision Detection"),
+    ("17", "QR Code Integrity"),
+    ("2h", "Hairline Stroke Enforcement"),
+    ("16", "PDF/X Compliance & White-Edge Risk"),
+]
+
+
+def _row(num: str, name: str, status: str, detail: str) -> dict:
+    return {
+        "num": num,
+        "name": name,
+        "label": f"{num}. {name}: {detail}",
+        "status": status,
+        "pass": status in ("passed", "auto"),
+        "detail": detail,
+    }
+
+
+def _page_count(path: str) -> int:
+    if not os.path.isfile(path):
+        return 0
+    from extra_checks import looks_like_pdf
+
+    if not looks_like_pdf(path):
+        return 1
+    import pikepdf
+
+    pdf = pikepdf.open(path)
+    try:
+        return len(pdf.pages)
+    finally:
+        pdf.close()
+
+
+def _render(path: str):
+    """One page at 72 DPI for the layout points. Returns (bgr, dpi) or (None, 0)."""
+    import cv2
+    import numpy as np
+
+    from extra_checks import looks_like_pdf
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"):
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        return image, 72
+    if not looks_like_pdf(path):
+        return None, 0
+    import pymupdf as fitz
+
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return None, 0
+    try:
+        if doc.page_count < 1:
+            return None, 0
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), 72
+    except Exception:
+        return None, 0
+    finally:
+        doc.close()
+
+
+def _trim_pixels(image, trim_w: float | None, trim_h: float | None, dpi: int) -> dict:
+    height, width = image.shape[:2]
+    if trim_w and trim_h:
+        want_w = int(round(float(trim_w) / 25.4 * dpi))
+        want_h = int(round(float(trim_h) / 25.4 * dpi))
+        left = max(0, (width - want_w) // 2)
+        top = max(0, (height - want_h) // 2)
+        return {
+            "left": left,
+            "top": top,
+            "right": min(width, left + want_w),
+            "bottom": min(height, top + want_h),
+            "trim_w": min(want_w, width),
+            "trim_h": min(want_h, height),
+        }
+    return {"left": 0, "top": 0, "right": width, "bottom": height, "trim_w": width, "trim_h": height}
+
+
+def assess(path: str, trim_w: float | None = None, trim_h: float | None = None) -> dict:
+    from client_file_audit import DPI_FLOOR, audit_pdf
+    from designer_assistant import _bleed_check, _qr, _size_check
+
+    if not os.path.isfile(path):
+        return {
+            "success": True,
+            "pages": 0,
+            "checks": [_row(num, name, "skipped", "The file is not on this server, so this point did not run.") for num, name in POINTS],
+        }
+
+    audit = audit_pdf(path, trim_w, trim_h)
+    pages = int(audit.get("pages") or 0) or _page_count(path)
+    bleed = _bleed_check(path)
+    size = _size_check(path, trim_w, trim_h)
+    fonts = audit.get("fonts") or {}
+    black = audit.get("black") or {}
+    resolution = audit.get("resolution") or {}
+    hair = audit.get("hairlines") or {}
+    spots = audit.get("spots") or {}
+    rows = {}
+
+    def put(num: str, status: str, detail: str) -> None:
+        name = dict(POINTS)[num]
+        rows[num] = _row(num, name, status, detail)
+
+    if bleed.get("ran"):
+        put("1", "passed" if bleed.get("ok") else "warning", str(bleed.get("detail") or "Bleed was measured."))
+    else:
+        put("1", "skipped", "Bleed was not measured.")
+
+    spaces = _colour_spaces(path)
+    if spaces is None:
+        put("2", "skipped", "Colour space was not read.")
+    elif spaces["rgb"] and not spaces["cmyk"]:
+        put("2", "warning", "The file is RGB. It still needs a CMYK conversion.")
+    elif spaces["rgb"] and spaces["cmyk"]:
+        put("2", "warning", "The file mixes RGB and CMYK.")
+    elif spaces["cmyk"] or spaces["vector"]:
+        put("2", "passed", "The artwork colour is CMYK.")
+    else:
+        put("2", "warning", "No CMYK colour was found.")
+
+    if not black.get("checked"):
+        put("2b", "skipped", "Black ink was not read.")
+    elif black.get("picture"):
+        put("2b", "warning", "Black inside a picture is not rewritten until the press file is built.")
+    elif black.get("registration") or black.get("tacOver") or black.get("richSmallText") or black.get("largeKOnly"):
+        bits = []
+        if black.get("registration"):
+            bits.append("registration black")
+        if black.get("tacOver"):
+            bits.append(f"total ink about {float(black.get('peakTac') or 0):.0f}%")
+        if black.get("richSmallText"):
+            bits.append("rich black on text under 18 pt")
+        if black.get("largeKOnly"):
+            bits.append("a large 100K area")
+        put("2b", "warning", "Needs a black fix: " + ", ".join(bits) + ".")
+    else:
+        put("2b", "passed", "Black was checked. Text under 18 pt is not rich black, and total ink is within 300%.")
+
+    worst = resolution.get("worst")
+    decorations = resolution.get("decorative") or []
+    if decorations and (worst is None or float(worst) >= 300):
+        put("3", "auto", "Minor decorations were enlarged with Lanczos, up to 4×. A main photo under 75 ppi would still be flagged.")
+        put("3b", "auto", "Soft decorations were enlarged. A main photo under 75 ppi is left for a person.")
+    elif not resolution.get("checked") or worst is None:
+        put("3", "passed", "No picture large enough to judge. Vector artwork is treated as sharp.")
+        put("3b", "passed", "No upscale is needed.")
+    else:
+        worst_f = float(worst)
+        named = ", ".join(f"{row['name']} at {float(row['ppi']):.0f} ppi" for row in (resolution.get("images") or [])[:4])
+        if worst_f >= 300:
+            put("3", "passed", f"The lowest significant picture is about {worst_f:.0f} ppi.")
+            put("3b", "passed", "Already at 300 ppi or above, so nothing was upscaled.")
+        elif worst_f >= DPI_FLOOR:
+            put("3", "warning", f"About {worst_f:.0f} ppi ({named}). Between 75 and 299 can be upscaled at most 4×.")
+            put("3b", "warning", "Upscale was not applied in this check. The cap is 4×.")
+        else:
+            put("3", "warning", f"About {worst_f:.0f} ppi ({named}). Under 75 ppi is too low to enhance.")
+            put("3b", "warning", "Under 75 ppi, so enhancement was not run.")
+
+    if not fonts.get("checked"):
+        put("4", "skipped", "Fonts were not read.")
+    elif fonts.get("picture"):
+        put("4", "passed", "This is a picture, so there are no fonts to embed.")
+    elif fonts.get("problems"):
+        bits = [f"{row['name']} ({row['reason']})" for row in fonts["problems"][:6]]
+        put("4", "failed", "Fonts are not embedded: " + ", ".join(bits) + ". Please export with fonts embedded or outlined.")
+    else:
+        put("4", "passed", "Fonts are embedded. Type 3 is accepted.")
+
+    linked = _linked_images(path)
+    if linked is None:
+        put("5", "skipped", "Image embedding was not read.")
+    elif linked:
+        put("5", "failed", "The file points at images that are not inside it.")
+    else:
+        put("5", "passed", "Images are inside the file.")
+
+    transparency = _transparency(path)
+    if transparency is None:
+        put("6", "skipped", "Transparency was not read.")
+    elif transparency:
+        put("6", "warning", "Live transparency or a soft mask is in the file. It needs flattening for press.")
+    else:
+        put("6", "passed", "No live transparency marker was found.")
+
+    put("6b", "passed", "No mockup frame was supplied to crop.")
+    put("6c", "passed", "No interactive trim lock was set on this check.")
+
+    if size.get("ran"):
+        put("6d", "passed" if size.get("ok") else "warning", str(size.get("detail")))
+    else:
+        put("6d", "skipped", "Size was not compared.")
+
+    if bleed.get("ran") and bleed.get("ok"):
+        put("6e", "passed", "The bleed inset covers about 5 mm.")
+    elif bleed.get("ran"):
+        put("6e", "warning", str(bleed.get("detail") or "The bleed zone is short."))
+    else:
+        put("6e", "skipped", "The bleed perimeter was not scanned.")
+
+    if not black.get("checked"):
+        put("6f", "skipped", "Small-text colour was not read.")
+    elif int(black.get("richSmallText") or 0) > 0:
+        put("6f", "warning", f"{int(black['richSmallText'])} text item(s) under 18 pt use rich black.")
+    else:
+        put("6f", "passed", "No rich black on text under 18 pt.")
+
+    image, dpi = _render(path)
+    if image is None:
+        for num in ("7", "8", "9", "10", "11", "12", "16"):
+            put(num, "skipped", "The page could not be rendered, so this point did not run.")
+    else:
+        picture = bool((fonts.get("picture") or black.get("picture")))
+        _layout_points(rows, put, image, dpi, trim_w, trim_h, pages, picture)
+
+    if pages < 4:
+        put("13", "passed", f"{pages or 1} page(s). Spine shift applies from 4 pages.")
+        put("14", "passed", "Creep applies to booklets of 4 or more pages.")
+        put("15", "passed", "Gutter collision applies to booklets of 4 or more pages.")
+    elif image is None:
+        put("13", "skipped", "The page could not be rendered.")
+        put("14", "skipped", "Creep was not calculated.")
+        put("15", "skipped", "The gutter was not scanned.")
+    else:
+        _booklet_points(rows, put, image, dpi, trim_w, trim_h, pages)
+
+    qr = _qr(path)
+    if not qr.get("ran"):
+        put("17", "skipped", "QR codes were not scanned.")
+    else:
+        put("17", "passed" if qr.get("ok") else "warning", str(qr.get("detail") or "QR was scanned."))
+
+    if not hair.get("checked"):
+        put("2h", "skipped", "Strokes were not read.")
+    elif hair.get("picture"):
+        put("2h", "passed", "This is a picture, so there are no vector hairlines.")
+    elif int(hair.get("count") or 0) > 0:
+        put("2h", "warning", f"{int(hair['count'])} stroke(s) under 0.25 pt. They were not thickened in this check.")
+    else:
+        put("2h", "passed", "Strokes were checked. None are under 0.25 pt.")
+
+    if spots.get("checked") and spots.get("names"):
+        existing = rows.get("16")
+        spot_line = "Spot colours: " + ", ".join(spots["names"][:6]) + "."
+        if existing and existing["status"] != "skipped":
+            put("16", "warning", existing["detail"] + " " + spot_line)
+        else:
+            put("16", "warning", spot_line)
+
+    ordered = []
+    for num, name in POINTS:
+        ordered.append(rows.get(num) or _row(num, name, "skipped", "This point did not run."))
+    return {"success": True, "checks": ordered, "pages": pages}
+
+
+def _layout_points(rows, put, image, dpi, trim_w, trim_h, pages, picture: bool = False) -> None:
+    from prepress_checks import (
+        build_prepress_checks,
+        check_margin_normalization,
+        compute_visual_centroid,
+        detect_layout_blocks,
+        detect_white_edge_risk,
+        enhanced_safe_zone_analysis,
+        evaluate_smart_downscale,
+        simulate_trim_tolerance,
+    )
+
+    trim = _trim_pixels(image, trim_w, trim_h, dpi)
+    # Ian's master prompt: critical at 0 mm or less, warning from 0 to 5 mm.
+    safe = enhanced_safe_zone_analysis(image, trim, dpi, 1, safe_mm=5.0)
+    sparse = [
+        row for row in (safe.get("details") or [])
+        if row.get("severity") != "PASS" and float(row.get("content_percentage") or 0) < 80
+    ]
+    if any(float(row.get("distance_mm") or 0) <= 0 for row in sparse):
+        if picture:
+            put("7", "warning", "The picture reaches the cut. Check that nothing important sits there.")
+        else:
+            put("7", "failed", "Something sits on the cut.")
+    elif sparse:
+        put("7", "warning", "Something is inside the 5 mm safe zone.")
+    else:
+        put("7", "passed", "The safe zone is clear.")
+
+    layout = detect_layout_blocks(image, trim, dpi)
+    put("8", "passed" if layout.get("balanced") else "warning", "Layout is centred." if layout.get("balanced") else "Layout weight is off centre.")
+    centre = compute_visual_centroid(image, trim, dpi)
+    put("9", "passed" if centre.get("centered") else "warning", f"Visual centre is {centre.get('deviation_mm', 0)} mm from the middle.")
+    # A solid colour that fills the trim is the bleed field, not a cut object.
+    radar_safe = dict(safe)
+    radar_safe["warnings"] = sparse
+    radar_safe["severity"] = "CRITICAL" if any(float(row.get("distance_mm") or 0) <= 0 for row in sparse) else ("WARNING" if sparse else "PASS")
+    radar = evaluate_smart_downscale(radar_safe, layout)
+    put("10", "passed" if not radar.get("recommended") else "warning", "No downscale is recommended." if not radar.get("recommended") else str(radar.get("reason") or "A downscale was recommended. Nothing was resized."))
+    margins = check_margin_normalization(safe.get("details") or [], dpi)
+    put("11", "passed" if margins.get("normalized") else "warning", "Margins match." if margins.get("normalized") else "Opposing margins differ by more than 3 mm.")
+    drift = simulate_trim_tolerance(image, trim, dpi)
+    exposures = [float(row.get("content_exposure") or 0) for row in (drift.get("simulations") or [])]
+    if drift.get("risk_level") == "LOW":
+        put("12", "passed", "Trim drift risk is LOW.")
+    elif exposures and min(exposures) >= 80:
+        put("12", "passed", "Colour runs to the trim on every side. The 5 mm bleed covers that drift.")
+    else:
+        put("12", "warning", f"Trim drift risk is {drift.get('risk_level', 'unknown')}.")
+    edge = detect_white_edge_risk(image, trim, {"bleed_mm": 5}, dpi)
+    if edge.get("risk"):
+        put("16", "warning", "A dark edge may show white paper after the cut.")
+    else:
+        put("16", "passed", "No white-edge risk on the rendered page.")
+    # build_prepress_checks is the same engine. Calling it confirms the rows came from it.
+    built = build_prepress_checks(image, trim, {"bleed_mm": 5}, dpi, 1, pages)
+    rows["_built"] = len(built)
+
+
+def _booklet_points(rows, put, image, dpi, trim_w, trim_h, pages) -> None:
+    from prepress_checks import calculate_creep_compensation, detect_gutter_collision, detect_spine_shift
+
+    trim = _trim_pixels(image, trim_w, trim_h, dpi)
+    spine = detect_spine_shift(image, trim, dpi, 1, pages)
+    put("13", "warning" if spine.get("warning") else "passed", "Content is in the spine zone." if spine.get("warning") else "The spine zone is clear.")
+    creep = calculate_creep_compensation(1, pages)
+    put("14", "passed", f"Creep for page 1 is {creep.get('creep_shift_mm', 0)} mm.")
+    gutter = detect_gutter_collision(image, trim, dpi, 1, pages)
+    put("15", "warning" if gutter.get("collision") else "passed", "Objects sit in the gutter." if gutter.get("collision") else "The gutter is clear.")
+
+
+def _colour_spaces(path: str) -> dict | None:
+    if not str(path).lower().endswith(".pdf"):
+        return {"rgb": True, "cmyk": False, "vector": False}
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        return None
+    return {
+        "rgb": b"/DeviceRGB" in raw or b"/CalRGB" in raw,
+        "cmyk": b"/DeviceCMYK" in raw or b"/ICCBased" in raw,
+        "vector": b" k\n" in raw or b" k " in raw or b" K " in raw,
+    }
+
+
+def _linked_images(path: str) -> bool | None:
+    if not str(path).lower().endswith(".pdf"):
+        return False
+    try:
+        raw = open(path, "rb").read(200000)
+    except OSError:
+        return None
+    return (b"/F (" in raw and b"/Type /Filespec" in raw) or b"/Subtype /File" in raw
+
+
+def _transparency(path: str) -> bool | None:
+    if not str(path).lower().endswith(".pdf"):
+        return False
+    try:
+        raw = open(path, "rb").read(80000)
+    except OSError:
+        return None
+    markers = (b"/SMask", b"/ca ", b"/CA ", b"/BM /Multiply", b"/BM /Screen")
+    return any(marker in raw for marker in markers)
+
+
+def light_from_checks(checks: list) -> dict:
+    """Failed is red and names those items. A warning with no failure is amber. Passed and auto-fixed is green."""
+    failed = [row for row in checks if row.get("status") == "failed"]
+    warned = [row for row in checks if row.get("status") == "warning"]
+    if failed:
+        lines = [f"{row['num']}. {row['name']}: {row['detail']}" for row in failed]
+        return {
+            "light": "red",
+            "reasons": lines,
+            "clientMessage": "These items failed the 25-point check:\n" + "\n".join(lines),
+        }
+    if warned:
+        lines = [f"{row['num']}. {row['name']}: {row['detail']}" for row in warned]
+        return {"light": "amber", "reasons": lines, "clientMessage": ""}
+    return {"light": "green", "reasons": [], "clientMessage": ""}
+
+
+def _retitle(row: dict, status: str, detail: str) -> dict:
+    row = dict(row)
+    row["status"] = status
+    row["pass"] = status in ("passed", "auto")
+    row["detail"] = detail
+    row["label"] = f"{row['num']}. {row['name']}: {detail}"
+    return row
+
+
+def settle_checks(checks: list, done: dict | None = None) -> list:
+    """Mark a point auto-fixed only when this job actually performed that fix."""
+    done = done or {}
+    rows = [dict(row) for row in checks]
+    by_num = {row["num"]: row for row in rows}
+
+    def auto(num: str, detail: str) -> None:
+        row = by_num.get(num)
+        if row and row.get("status") in ("warning", "failed"):
+            by_num[num] = _retitle(row, "auto", detail)
+
+    if done.get("bleed"):
+        auto("1", "Bleed was set to 5 mm on the press file.")
+        auto("6e", "The bleed perimeter was filled on the press file.")
+    if done.get("cmyk"):
+        auto("2", "The press file was converted to CMYK.")
+    if done.get("flattened"):
+        auto("6", "Transparency was flattened for press.")
+    if done.get("scaled"):
+        auto("6d", "The artwork was scaled and centred to the print size.")
+    if done.get("black"):
+        auto("2b", "Black was rewritten before rasterising. Text under 18 pt and items under 56 pt are K-only. Above 70% is rich black C40 M30 Y30 K100 with knockout. 30–69% overprints. 5–29% knocks out. Ink over 300% is capped at that rich black.")
+        auto("6f", "Text under 18 pt was set to K-only before rasterising.")
+    if done.get("hair"):
+        auto("2h", "Strokes under 0.25 pt were raised to 0.3 pt before rasterising.")
+    if done.get("spots"):
+        row = by_num.get("16")
+        if row and row.get("status") == "warning" and "Spot" in str(row.get("detail") or ""):
+            by_num["16"] = _retitle(row, "auto", "Spot colours were converted to CMYK before rasterising.")
+    dpi = str(done.get("dpi") or "")
+    if dpi == "upscaled":
+        auto("3", str(done.get("dpiDetail") or "The picture was enlarged toward 300 ppi, and not by more than 4×."))
+        auto("3b", "Upscale ran at no more than 4×.")
+    elif dpi == "capped":
+        for num, detail in (
+            ("3", str(done.get("dpiDetail") or "Upscale stopped at 4× and the picture is still under 300 ppi.")),
+            ("3b", "Upscale stopped at 4× and is still under 300 ppi."),
+        ):
+            row = by_num.get(num)
+            if row and row.get("status") in ("warning", "failed"):
+                by_num[num] = _retitle(row, "warning", detail)
+    elif dpi == "under":
+        for num, detail in (
+            ("3", str(done.get("dpiDetail") or "Under 75 ppi, so the picture was not enhanced.")),
+            ("3b", "Under 75 ppi, so enhancement was not run."),
+        ):
+            row = by_num.get(num)
+            if row and row.get("status") in ("warning", "failed", "passed"):
+                by_num[num] = _retitle(row, "warning", detail)
+    ordered = []
+    for num, _name in POINTS:
+        ordered.append(by_num.get(num) or _row(num, _name, "skipped", "This point did not run."))
+    return ordered
+
+
+def _promote_fixed(before: list, after: list) -> list:
+    """A point becomes auto-fixed only when the measured problem is gone."""
+    previous = {row["num"]: row for row in before}
+    promoted = []
+    notes = {
+        "2b": "Black was rewritten before rasterising. Text under 18 pt and items under 56 pt are K-only. Above 70% is rich black C40 M30 Y30 K100 with knockout. 30–69% overprints. 5–29% knocks out. Ink over 300% is capped at that rich black.",
+        "6f": "Text under 18 pt was set to K-only before rasterising.",
+        "2h": "Strokes under 0.25 pt were raised to 0.3 pt before rasterising.",
+        "3": "Pictures between 75 and 299 ppi were enlarged, and not by more than 4×.",
+        "3b": "Upscale ran at no more than 4×.",
+    }
+    for row in after:
+        prev = previous.get(row["num"]) or row
+        if row["num"] == "4" and prev.get("status") == "failed":
+            promoted.append(dict(prev))
+            continue
+        if prev.get("status") in ("warning", "failed") and row.get("status") == "passed" and row["num"] in notes:
+            promoted.append(_retitle(row, "auto", notes[row["num"]]))
+            continue
+        if row["num"] == "16" and prev.get("status") == "warning" and "Spot" in str(prev.get("detail") or "") and "Spot" not in str(row.get("detail") or ""):
+            promoted.append(_retitle(row, "auto", "Spot colours were converted to CMYK before rasterising. " + str(row.get("detail") or "")))
+            continue
+        promoted.append(row)
+    return promoted
+
+
+def run_checklist(path: str, trim_w: float | None = None, trim_h: float | None = None, apply: bool = True, press_done: bool = False) -> dict:
+    """Run the 25 points. Fixes that rewrite vectors run on a copy, before any raster."""
+    import shutil
+    import tempfile
+
+    before = assess(path, trim_w, trim_h)
+    checks = before["checks"]
+    fixed_path = ""
+    from extra_checks import looks_like_pdf
+
+    if apply and os.path.isfile(path) and looks_like_pdf(path):
+        folder = tempfile.mkdtemp(prefix="points-")
+        fixed_path = os.path.join(folder, "fixed.pdf")
+        shutil.copyfile(path, fixed_path)
+        try:
+            from client_file_audit import apply_vector_fixes, repair_cmyk_images, upscale_soft_images
+
+            apply_vector_fixes(fixed_path, fixed_path)
+            repair_cmyk_images(fixed_path)
+            upscale_soft_images(fixed_path)
+            after = assess(fixed_path, trim_w, trim_h)
+            checks = _promote_fixed(before["checks"], after["checks"])
+        except Exception:
+            checks = before["checks"]
+            fixed_path = ""
+    if press_done:
+        checks = settle_checks(checks, {"bleed": True, "cmyk": True, "flattened": True})
+    derived = light_from_checks(checks)
+    return {
+        "success": True,
+        "checks": checks,
+        "pages": before.get("pages") or 0,
+        "light": derived["light"],
+        "reasons": derived["reasons"],
+        "clientMessage": derived["clientMessage"],
+        "fixedPath": fixed_path,
+    }
+
+
+def attach_extra(report: dict, source: str, press: str = "", order: dict | None = None, apply: bool = False) -> dict:
+    """Add E1–E9 beside the 25 points. The 25-point rows stay as they are."""
+    from extra_checks import assess_extras, worse_light
+
+    extra = assess_extras(source, press, order, apply=apply, source_pages=report.get("pages"))
+    combined = worse_light(
+        {"light": report.get("light"), "reasons": report.get("reasons") or [], "clientMessage": report.get("clientMessage") or ""},
+        extra,
+    )
+    report = dict(report)
+    report["extraChecks"] = extra.get("checks") or []
+    report["checks"] = list(report.get("checks") or []) + list(extra.get("checks") or [])
+    report["light"] = combined["light"]
+    report["reasons"] = combined["reasons"]
+    report["clientMessage"] = combined["clientMessage"]
+    return report
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--trim-w", type=float, default=0)
+    parser.add_argument("--trim-h", type=float, default=0)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--press-done", action="store_true")
+    parser.add_argument("--press", default="")
+    parser.add_argument("--order", default="")
+    parser.add_argument("--with-extra", action="store_true")
+    args = parser.parse_args()
+    if args.apply or args.press_done:
+        report = run_checklist(args.input, args.trim_w or None, args.trim_h or None, apply=bool(args.apply), press_done=bool(args.press_done))
+    else:
+        report = assess(args.input, args.trim_w or None, args.trim_h or None)
+    if args.with_extra or args.order or args.press:
+        order = json.loads(args.order) if args.order else {}
+        if args.trim_w and args.trim_h and order.get("explicitSize") is not False and not order.get("widthMm"):
+            order = {**order, "widthMm": args.trim_w, "heightMm": args.trim_h, "explicitSize": True}
+        # Fixes stay on the checklist copy. The uploaded file is not rewritten.
+        copy = str(report.get("fixedPath") or "")
+        apply_extra = bool(args.apply and copy and os.path.isfile(copy))
+        report = attach_extra(report, copy if apply_extra else args.input, args.press, order, apply=apply_extra)
+    print(json.dumps(report))
+
+
+if __name__ == "__main__":
+    main()

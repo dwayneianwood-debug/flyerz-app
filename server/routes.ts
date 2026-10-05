@@ -1,6 +1,7 @@
 import "./loadEnv";
 import type { Express } from "express";
 import type { Server } from "http";
+import { checksAllPassed } from "./checkVerdict";
 import { storage, coerceSavedBleedOptionsFromDb } from "./storage";
 import { api, buildUrl } from "@shared/routes";
 import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
@@ -11,6 +12,7 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 import multer from "multer";
+import { diskUpload, rejectOversizedUpload, uploadTooLargeMessage } from "./uploadLimit";
 import path from "path";
 import fs from "fs/promises";
 import {
@@ -24,7 +26,7 @@ import {
   clientSafeQuickCheckError,
   isOfficeUpload,
 } from "./fileProcessor";
-import { execSync, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import fsSync from "fs";
 import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
@@ -665,17 +667,13 @@ function sanitizeBleedOptions(parsed: any) {
   return result;
 }
 
-// Configure multer for file uploads
+// Configure multer for file uploads. Bytes stream to disk, up to 500 MB.
 const uploadDir = path.join(process.cwd(), "uploads");
-const upload = multer({
-  dest: uploadDir,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
-  fileFilter: (req, file, cb) => {
-    if (isAllowedUpload(file.originalname, file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(INVALID_UPLOAD_MESSAGE));
-    }
+const upload = diskUpload(uploadDir, (req, file, cb) => {
+  if (isAllowedUpload(file.originalname, file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(INVALID_UPLOAD_MESSAGE));
   }
 });
 
@@ -726,6 +724,7 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   await ensureUploadDir();
+  app.use(rejectOversizedUpload);
 
   startJanitor(60 * 60 * 1000);
   registerJobCleanupRoutes(app);
@@ -901,14 +900,32 @@ export async function registerRoutes(
         severity: c.severity,
       }));
 
+      const chosen = customerTrimFromUploadBody(req.body);
+      const sidesRaw = String(req.body?.sides || "").trim().toLowerCase();
+      const sides = sidesRaw === "single" || sidesRaw === "double" || sidesRaw === "booklet" ? sidesRaw : "";
+      const orderedPages = Number(req.body?.pageCount ?? req.body?.orderedPageCount);
+      const finishRaw = req.body?.finishes;
+      const finishes = Array.isArray(finishRaw)
+        ? finishRaw.map((item: unknown) => String(item)).filter(Boolean)
+        : String(finishRaw || "").split(",").map((item) => item.trim()).filter(Boolean);
+      const headToFoot = req.body?.headToFoot === true || req.body?.headToFoot === "1" || req.body?.headToFoot === "true";
       const auditResults: AuditResults = {
         checks,
-        overallPassed: checks.every((c: any) => c.passed || c.severity === "WARNING" || c.severity === "MANUAL_REVIEW"),
+        overallPassed: checksAllPassed(checks),
         fixesApplied: 0,
         complianceReport: `Quick check completed. ${checks.filter(c => c.passed).length}/${checks.length} checks passed.`,
         artworkSize: quickCheckResult.artworkSize,
         savedBleedOptions: bleedOptions,
         pageCount: quickCheckResult.pageCount ?? ingested.pageCount,
+        order: {
+          widthMm: chosen?.width ?? null,
+          heightMm: chosen?.height ?? null,
+          explicitSize: Boolean(chosen),
+          sides: sides || null,
+          pageCount: Number.isFinite(orderedPages) && orderedPages > 0 ? orderedPages : null,
+          finishes,
+          headToFoot,
+        },
         ...(isIllustratorType(normalizedType) ? { sourceFormat: normalizedType as "ai" | "eps" } : {}),
       };
 
@@ -916,6 +933,12 @@ export async function registerRoutes(
         status: 'complete',
         auditResults,
         completedAt: new Date(),
+        productWidthMm: chosen?.width ?? null,
+        productHeightMm: chosen?.height ?? null,
+        sides: sides || null,
+        orderedPageCount: Number.isFinite(orderedPages) && orderedPages > 0 ? orderedPages : null,
+        finishes: finishes.length ? JSON.stringify(finishes) : null,
+        headToFoot,
       });
 
       res.status(201).json({
@@ -925,13 +948,10 @@ export async function registerRoutes(
       });
     } catch (error) {
       console.error('Error uploading file:', error);
-      if (error instanceof multer.MulterError) {
-        if (error.code === 'LIMIT_FILE_SIZE') {
-          return res.status(413).json({
-            message: 'File too large. Maximum size is 50MB.',
-            code: 'FILE_TOO_LARGE'
-          });
-        }
+      if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+        const length = Number(req.headers["content-length"]);
+        const bytes = Number.isFinite(length) && length > 0 ? length : 500 * 1024 * 1024 + 1;
+        return res.status(413).type("text/plain; charset=utf-8").send(uploadTooLargeMessage(bytes));
       }
       res.status(500).json({ message: 'Failed to upload file' });
     }
@@ -1503,60 +1523,67 @@ export async function registerRoutes(
         }
       }
 
-      if (proofPaths.length === 0) {
-        const artworkFile = job.correctedPath || job.originalPath;
-        if (artworkFile) {
-          try {
-            await fs.access(artworkFile);
-            const ext = path.extname(artworkFile).toLowerCase();
-            if (isRasterExtension(ext)) {
-              proofPaths = [artworkFile];
-            } else if (isVectorExtension(ext)) {
-              const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + '_proof.png');
-              try {
-                const escapedInput = artworkFile.replace(/'/g, "'\\''");
-                const escapedOutput = proofBase.replace(/'/g, "'\\''");
-                execSync(
-                  `${PYTHON_BIN} -c "import sys; sys.path.insert(0, 'server'); from smart_bleed import generate_visual_proof; generate_visual_proof('${escapedInput}', '${escapedOutput}')"`,
-                  { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), stdio: ['pipe', 'pipe', 'inherit'] }
-                );
+      if (pageIndex < 0) {
+        return res.status(404).json({ message: `Page ${pageIndex} not found` });
+      }
 
-                try {
-                  const stat = fsSync.statSync(proofBase);
-                  if (stat.size > 0) {
-                    proofPaths = [proofBase];
-                    console.log(`[FAI] Visual proof regenerated on-the-fly: ${proofBase}`);
-                  }
-                } catch {
-                  const multiPages: string[] = [];
-                  const proofStem = proofBase.replace(/\.png$/, '');
-                  for (let pg = 1; pg <= 20; pg++) {
-                    const pgPath = `${proofStem}${pg}.png`;
-                    try {
-                      const stat = fsSync.statSync(pgPath);
-                      if (stat.size > 0) multiPages.push(pgPath);
-                      else break;
-                    } catch { break; }
-                  }
-                  if (multiPages.length > 0) {
-                    proofPaths = multiPages;
-                    console.log(`[FAI] Visual proof regenerated on-the-fly: ${multiPages.length} page(s)`);
-                  }
-                }
-              } catch (genErr: any) {
-                console.warn('[FAI] Proof regeneration failed:', genErr.message || genErr);
-              }
-            }
-          } catch {}
+      let proofPageCount = proofPaths.length;
+      const artworkFile = job.correctedPath || job.originalPath;
+      const pageReady = (candidate: string | undefined) => {
+        if (!candidate) return false;
+        try {
+          return fsSync.statSync(candidate).size > 0;
+        } catch {
+          return false;
         }
+      };
+      if (artworkFile && isVectorExtension(path.extname(artworkFile).toLowerCase()) && !pageReady(proofPaths[pageIndex])) {
+        const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + "_proof.png");
+        const numbered = proofBase.replace(/\.png$/, `${pageIndex + 1}.png`);
+        if (!pageReady(pageIndex === 0 ? proofBase : "") && !pageReady(numbered)) {
+          try {
+            const proofScript = path.join(process.cwd(), "server", "screen_proof.py");
+            const proofProc = spawnSync(
+              PYTHON_BIN,
+              [proofScript, artworkFile, proofBase, String(pageIndex + 1)],
+              { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), encoding: "utf-8" },
+            );
+            if (proofProc.stderr) console.log(String(proofProc.stderr).trim());
+            const proofOut = `${proofProc.stdout || ""}\n${proofProc.stderr || ""}`;
+            const pagesLine = proofOut.split("\n").find((line) => line.startsWith("PAGES "));
+            const fileLine = proofOut.split("\n").find((line) => line.startsWith("FILE "));
+            const reported = pagesLine ? Number(pagesLine.slice(6)) || 0 : 0;
+            const written = fileLine ? fileLine.slice(5).trim() : numbered;
+            if (pageReady(written)) {
+              proofPageCount = Math.max(proofPageCount, reported, pageIndex + 1);
+              const slots = new Array(proofPageCount).fill("");
+              proofPaths.forEach((existing, index) => {
+                if (index < slots.length) slots[index] = existing;
+              });
+              slots[pageIndex] = written;
+              proofPaths = slots;
+              console.log(`[FAI] Visual proof page ${pageIndex + 1} rendered on the fly: ${written}`);
+            }
+          } catch (genErr: any) {
+            console.warn("[FAI] Proof regeneration failed:", genErr.message || genErr);
+          }
+        } else if (pageReady(numbered) || (pageIndex === 0 && pageReady(proofBase))) {
+          const written = pageReady(numbered) ? numbered : proofBase;
+          proofPageCount = Math.max(proofPageCount, pageIndex + 1);
+          const slots = new Array(proofPageCount).fill("");
+          proofPaths.forEach((existing, index) => {
+            if (index < slots.length) slots[index] = existing;
+          });
+          slots[pageIndex] = written;
+          proofPaths = slots;
+        }
+      } else if (proofPaths.length === 0 && artworkFile && isRasterExtension(path.extname(artworkFile).toLowerCase())) {
+        proofPaths = [artworkFile];
+        proofPageCount = 1;
       }
 
-      if (proofPaths.length === 0) {
-        return res.status(404).json({ message: 'Visual proof not available' });
-      }
-
-      if (pageIndex < 0 || pageIndex >= proofPaths.length) {
-        return res.status(404).json({ message: `Page ${pageIndex} not found. Available pages: 0-${proofPaths.length - 1}` });
+      if (!pageReady(proofPaths[pageIndex])) {
+        return res.status(404).json({ message: "Visual proof not available" });
       }
 
       const targetPath = proofPaths[pageIndex];
@@ -1571,7 +1598,7 @@ export async function registerRoutes(
 
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('X-Proof-Page-Count', String(proofPaths.length));
+      res.setHeader('X-Proof-Page-Count', String(Math.max(proofPageCount, proofPaths.length)));
       const { createReadStream } = await import('fs');
       createReadStream(targetPath).pipe(res);
     } catch (error) {
@@ -2003,13 +2030,32 @@ export async function registerRoutes(
       const auditResults = job.auditResults as AuditResults | null;
       const pageIndex = Math.max(0, parseInt(req.query.page as string) || 0);
       const pageList = (auditResults as { bleedVariantPages?: Record<string, string[]> } | null)?.bleedVariantPages?.[method];
-      const variantPath = Array.isArray(pageList) && pageList[pageIndex]
+      let variantPath = Array.isArray(pageList) && pageList[pageIndex]
         ? pageList[pageIndex]
         : (pageIndex === 0 ? auditResults?.bleedVariants?.[method as keyof NonNullable<AuditResults["bleedVariants"]>] : null);
+      if (!variantPath && pageIndex > 0) {
+        const artwork = String(job.originalPath || "");
+        if (artwork && isPathSafe(artwork) && fsSync.existsSync(artwork)) {
+          const outPath = path.join(path.dirname(artwork), `style-${method}-page${pageIndex}.png`);
+          try {
+            if (!fsSync.existsSync(outPath)) {
+              const script = path.join(process.cwd(), "server", "smart_bleed.py");
+              execPythonCapture(
+                [script, "--one-style", artwork, method, String(pageIndex), outPath],
+                "BleedStylePage",
+                90_000,
+              );
+            }
+            if (fsSync.existsSync(outPath) && isPathSafe(outPath)) variantPath = outPath;
+          } catch (styleErr) {
+            console.error("[FAI] On-demand bleed page failed:", styleErr);
+          }
+        }
+      }
       if (!variantPath) {
         return res.status(404).json({ message: `No variant found for method: ${method}` });
       }
-      res.setHeader("X-Proof-Page-Count", String(Array.isArray(pageList) && pageList.length ? pageList.length : 1));
+      res.setHeader("X-Proof-Page-Count", String(Math.max(Array.isArray(pageList) ? pageList.length : 1, pageIndex + 1)));
 
       if (!isPathSafe(variantPath)) {
         return res.status(403).json({ message: "Invalid variant file path" });
@@ -2024,7 +2070,7 @@ export async function registerRoutes(
       const ext = path.extname(variantPath).toLowerCase();
       const mimeMap: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf" };
       res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
-      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Cache-Control", "private, no-store");
       const { createReadStream } = await import("fs");
       createReadStream(variantPath).pipe(res);
     } catch (error) {
@@ -4275,6 +4321,30 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
     }
   });
 
+  function catRows(quick: Record<string, unknown>): any[] {
+    const rows = [
+      ...(Array.isArray(quick.prepressChecks) ? quick.prepressChecks : []),
+      ...(Array.isArray(quick.extraChecks) ? quick.extraChecks : []),
+    ];
+    const checklist = Array.isArray(quick.checklist) ? quick.checklist : [];
+    for (const item of checklist) {
+      const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      if (row.passed === true) continue;
+      const detail = String(row.detail || row.label || "");
+      if (!detail) continue;
+      const name = String(row.name || row.label || "Press check");
+      rows.push({
+        num: "",
+        name,
+        status: "warning",
+        pass: false,
+        detail,
+        label: String(row.label || detail || name),
+      });
+    }
+    return rows;
+  }
+
   const glitchyChecklistCache = new Map<string, { checks: { label: string; pass: boolean }[] }>();
 
   app.get('/api/glitchy-checklist/:jobId', async (req, res) => {
@@ -4289,28 +4359,53 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       const job = await storage.getJob(jobId);
       if (!job || !job.auditResults) return res.json({ checks: [] });
 
-      const auditChecks = stripCropBoxNotInMediaBoxFromChecks(job.auditResults.checks || []);
-      const overallPassed = job.auditResults.overallPassed === true;
-      const checks: { label: string; pass: boolean }[] = [];
-
-      const dpiCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-      if (dpiCheck) checks.push({ label: "High Res (300 DPI)", pass: dpiCheck.passed });
-
-      const bleedCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-      if (bleedCheck) checks.push({ label: "Bleed Ready", pass: bleedCheck.passed });
-
-      const cmykCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-      if (cmykCheck) checks.push({ label: "CMYK Colors", pass: cmykCheck.passed });
-
-      const sizeCheck = auditChecks.find((c: any) => c.name?.toLowerCase().includes("size") || c.name?.toLowerCase().includes("dimension"));
-      if (sizeCheck) checks.push({ label: "Correct Size", pass: sizeCheck.passed });
-
-      if (overallPassed) {
-        for (const row of checks) {
-          row.pass = true;
-        }
+      const storedOrder = ((job.auditResults as any)?.order || {}) as Record<string, unknown>;
+      const quick = ((job.auditResults as any)?.quickPrint || {}) as Record<string, unknown>;
+      const storedRows = catRows(quick);
+      if (storedRows.length) {
+        const checks = storedRows.map((item: any) => {
+          const status = String(item?.status || "");
+          const detail = String(item?.detail || item?.message || "");
+          const num = String(item?.num || "");
+          const name = String(item?.name || "");
+          return {
+            num,
+            name,
+            label: String(item?.label || (num ? `${num}. ${name}: ${detail}` : detail)),
+            pass: item?.pass === true || status === "passed" || status === "pass" || status === "auto" || status === "fixed",
+            status,
+            detail,
+          };
+        });
+        const body = { checks };
+        glitchyChecklistCache.set(cacheKey, body);
+        return res.json(body);
       }
-
+      const trimW = Number(job.productWidthMm || storedOrder.widthMm || 0);
+      const trimH = Number(job.productHeightMm || storedOrder.heightMm || 0);
+      const explicit = trimW > 0 && trimH > 0;
+      const file = job.originalPath || job.correctedPath;
+      if (!file) return res.json({ checks: [] });
+      const script = path.join(process.cwd(), "server", "twenty_five.py");
+      const args = [script, "--input", file, "--apply", "--with-extra"];
+      if (job.correctedPath && fsSync.existsSync(job.correctedPath)) {
+        args.push("--press-done", "--press", job.correctedPath);
+      }
+      const finishSource = storedOrder.finishes ?? job.finishes;
+      const order = {
+        widthMm: explicit ? trimW : null,
+        heightMm: explicit ? trimH : null,
+        explicitSize: explicit,
+        sides: job.sides || storedOrder.sides || "",
+        pageCount: job.orderedPageCount || storedOrder.pageCount || null,
+        finishes: finishSource || [],
+        headToFoot: Boolean(job.headToFoot || storedOrder.headToFoot),
+        cmykOnly: true,
+      };
+      args.push("--order", JSON.stringify(order));
+      if (explicit) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
+      const result = execPythonCapture(args, "TwentyFive", 60_000);
+      const checks = Array.isArray(result?.checks) ? result.checks : [];
       const body = { checks };
       glitchyChecklistCache.set(cacheKey, body);
       if (glitchyChecklistCache.size > 200) {
@@ -4323,119 +4418,129 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
     }
   });
 
+  app.get("/api/glitchy-preview/:jobId/:side", (req, res) => {
+    const jobId = String(req.params.jobId || "");
+    const side = String(req.params.side || "");
+    if (!/^\d+$/.test(jobId) || (side !== "before" && side !== "after")) {
+      return res.status(404).end();
+    }
+    const root = path.resolve(process.cwd(), "uploads", "glitchy", jobId);
+    const file = path.resolve(root, `${side}.png`);
+    if (!file.startsWith(root + path.sep) || !fsSync.existsSync(file)) {
+      return res.status(404).end();
+    }
+    res.type("png");
+    return res.sendFile(file);
+  });
+
   app.post('/api/glitchy-chat', async (req, res) => {
     try {
-      const { message, jobId } = req.body;
-      const msg = (message || '').toLowerCase();
-      let response = "";
-
-      let artworkState: any = null;
-      const warnings: string[] = [];
-      if (jobId) {
-        try {
-          const job = await storage.getJob(jobId);
-          if (job) {
-            const checks = stripCropBoxNotInMediaBoxFromChecks(job.auditResults?.checks || []);
-            artworkState = {
-              filename: job.filename,
-              status: job.status,
-              checks,
-              overallPassed: job.auditResults?.overallPassed,
-              aiEnhanced: job.auditResults?.aiEnhanced,
-              bleedMethod: job.auditResults?.selectedBleedMethod || job.auditResults?.recommendedBleedMethod,
-              hasBleed: checks.some((c: any) => c.name?.toLowerCase().includes("bleed") && c.passed),
-              currentSize: (() => {
-                const sizeCheck = checks.find((c: any) => c.name?.toLowerCase().includes("size") || c.name?.toLowerCase().includes("dimension"));
-                return sizeCheck?.message || "processed";
-              })(),
-            };
-            const dpiCheck = checks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-            if (dpiCheck && !dpiCheck.passed) warnings.push("low_res");
-            const bleedCheck = checks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-            if (bleedCheck && !bleedCheck.passed) warnings.push("no_bleed");
-            const cmykCheck = checks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-            if (cmykCheck && !cmykCheck.passed) warnings.push("wrong_color");
-          }
-        } catch { }
+      const { message, jobId, action } = req.body || {};
+      const text = String(message || "").trim();
+      const greeting = /^(hi|hello|hey)\b/i.test(text) && !action;
+      const script = path.join(process.cwd(), "server", "designer_assistant.py");
+      const replyJson = (result: any, extras: Record<string, unknown> = {}) => res.json({
+        reply: result?.reply || "I couldn't read a result from the check.",
+        actions: Array.isArray(result?.actions)
+          ? result.actions.map((action: any) => ({
+              id: String(action?.id || ""),
+              label: String(action?.label || ""),
+              tone: String(action?.tone || ""),
+            }))
+          : [],
+        checks: Array.isArray(result?.checks)
+          ? result.checks.map((row: any) => {
+              const detail = String(row?.detail || "");
+              const name = String(row?.name || "");
+              const num = String(row?.num || "");
+              return {
+                ...row,
+                num,
+                name,
+                detail,
+                label: String(row?.label || (num ? `${num}. ${name}: ${detail}` : detail || name)),
+              };
+            })
+          : [],
+        provider: result?.provider || "rules",
+        ok: result?.ok !== false,
+        previewBefore: "",
+        previewAfter: "",
+        downloadUrl: "",
+        ...extras,
+      });
+      if (!jobId) {
+        if (greeting) {
+          return res.json({
+            reply: "Hello. Upload a file, then ask if the artwork is right. I only talk about checks I have run.",
+            actions: [],
+            provider: "rules",
+          });
+        }
+        const ruled = execPythonCapture([script, "--message", text], "GlitchyDesigner", 30_000);
+        if (ruled?.handled) return replyJson(ruled);
+        return res.json({
+          reply: "Upload a file first. I won't guess about artwork I haven't seen.",
+          actions: [],
+          provider: "rules",
+        });
       }
-
-      if (warnings.length > 0 && (msg.includes("next") || msg.includes("step") || msg.includes("what now"))) {
-        if (warnings.includes("low_res")) {
-          response = "Wait! Your DPI is too low. It might look blurry when printed! Can we fix that before the next step? 🔍";
-        } else if (warnings.includes("no_bleed")) {
-          response = "Hold on! I don't see proper bleed. Your edges might get cut off during trimming! 📏";
-        } else if (warnings.includes("wrong_color")) {
-          response = "Careful! The colors aren't in CMYK yet. They might shift when printed! 🎨";
-        }
-      } else if (msg.includes("hello") || msg.includes("hi") || msg.includes("hey")) {
-        response = "Hiya! I'm Glitchy, your tiny print-shop assistant! ✨";
-      } else if (msg.includes("day") || msg.includes("how are")) {
-        const silly = [
-          "I'm feeling 100% fluffy today!",
-          "Just eating some leftover pixels!",
-          "Optimizing my cuteness... standby!",
-        ];
-        response = silly[Math.floor(Math.random() * silly.length)];
-      } else if (msg.includes("bleed")) {
-        if (artworkState) {
-          if (artworkState.hasBleed) {
-            const bleedCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("bleed"));
-            response = bleedCheck
-              ? `Yup! ${bleedCheck.message}. Method: ${artworkState.bleedMethod || "auto"}. You're safe! ✨`
-              : "Bleed is added. Your edges are safe! ✨";
-          } else {
-            response = "I don't see proper bleed yet. The system will add it during processing! 🤔";
-          }
-        } else {
-          response = "Bleed adds extra space so nothing gets cut off during printing. Upload a file to get started! 📏";
-        }
-      } else if (msg.includes("dpi") || msg.includes("resolution") || msg.includes("resize") || msg.includes("size")) {
-        if (artworkState) {
-          const dpiCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("dpi"));
-          response = dpiCheck
-            ? `I've crunched the numbers: ${dpiCheck.message}. ${artworkState.aiEnhanced ? "AI enhancement was applied! 🤖" : "Looking sharp!"}`
-            : "DPI looks good on this file!";
-        } else {
-          response = "For print, you need at least 300 DPI. Upload your artwork and I'll check it for you! 🔍";
-        }
-      } else if (msg.includes("next") || msg.includes("what now") || msg.includes("step")) {
-        if (artworkState) {
-          if (artworkState.status === "complete" && artworkState.overallPassed) {
-            response = "Everything looks green! Your next step is to download the corrected file or share the report. 🚀";
-          } else if (artworkState.status === "complete") {
-            response = "Some checks need attention. Review the failed items and re-upload a corrected version! 🔧";
-          } else {
-            response = "Your file is still processing. Hang tight! ⏳";
-          }
-        } else {
-          response = "Upload your artwork first, then I'll guide you through each step! 🚀";
-        }
-      } else if (msg.includes("warning") || msg.includes("issue") || msg.includes("problem")) {
-        if (warnings.length > 0) {
-          const issues = warnings.map(w => w === "low_res" ? "low DPI" : w === "no_bleed" ? "missing bleed" : w === "wrong_color" ? "not CMYK" : w);
-          response = `I spotted ${issues.length} issue${issues.length > 1 ? "s" : ""}: ${issues.join(", ")}. Want me to explain any of these? ⚠️`;
-        } else if (artworkState) {
-          response = "No issues detected! Everything looks good on this file. 🎉";
-        } else {
-          response = "Upload a file first and I'll check it for issues! 🔍";
-        }
-      } else if (msg.includes("help") || msg.includes("what can")) {
-        response = "I can help with: bleed, DPI/resolution, colors, warnings, and next steps. Just ask! 🌟";
-      } else if (msg.includes("cmyk") || msg.includes("color") || msg.includes("colour")) {
-        if (artworkState) {
-          const cmykCheck = artworkState.checks.find((c: any) => c.name?.toLowerCase().includes("cmyk") || c.name?.toLowerCase().includes("color"));
-          response = cmykCheck ? `Color check says: ${cmykCheck.message} 🎨` : "Colors are looking good! 🎨";
-        } else {
-          response = "For litho printing, artwork needs to be in CMYK color mode. Upload your file and I'll convert it! 🎨";
-        }
-      } else {
-        response = "I'm not sure, but I'm tiny and learning! Ask me about your bleed, DPI, colors, or next steps. 🤔";
+      if (greeting) {
+        return res.json({
+          reply: "Hello. Ask me if this artwork is right and I will run the press checks on this file.",
+          actions: [],
+          provider: "rules",
+        });
       }
-
-      res.json({ reply: response });
+      const job = await storage.getJob(Number(jobId));
+      if (!job?.originalPath) {
+        const ruled = execPythonCapture([script, "--message", text, "--job-id", String(jobId)], "GlitchyDesigner", 30_000);
+        if (ruled?.handled) return replyJson(ruled);
+        return res.json({
+          reply: "I can't see an uploaded file on this job, so I have not run any checks.",
+          actions: [],
+          provider: "rules",
+        });
+      }
+      const saved = ((job.auditResults as any)?.savedBleedOptions || {}) as Record<string, unknown>;
+      const storedOrder = ((job.auditResults as any)?.order || {}) as Record<string, unknown>;
+      const trimW = Number(job.productWidthMm || storedOrder.widthMm || saved.targetWidth || saved.trimW || 0);
+      const trimH = Number(job.productHeightMm || storedOrder.heightMm || saved.targetHeight || saved.trimH || 0);
+      const quick = ((job.auditResults as any)?.quickPrint || {}) as Record<string, unknown>;
+      const storedRows = catRows(quick);
+      const source = job.correctedPath && fsSync.existsSync(job.correctedPath) ? job.correctedPath : job.originalPath;
+      const output = path.join(path.dirname(job.originalPath), `designer-${job.id}.pdf`);
+      const previewDir = path.join(process.cwd(), "uploads", "glitchy", String(job.id));
+      fsSync.mkdirSync(previewDir, { recursive: true });
+      const args = [script, "--input", source, "--message", text, "--output", output, "--job-id", String(job.id), "--preview-dir", previewDir];
+      if (storedRows.length) {
+        const storedPath = path.join(previewDir, "stored-checks.json");
+        fsSync.writeFileSync(storedPath, JSON.stringify({ checks: storedRows }));
+        args.push("--stored", storedPath);
+      }
+      if (action) args.push("--action", String(action));
+      if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
+      const result = execPythonCapture(args, "GlitchyDesigner", 90_000);
+      let downloadUrl = "";
+      if (result?.path && result.ok && fsSync.existsSync(result.path)) {
+        const prior = (job.auditResults || { checks: [], overallPassed: false, fixesApplied: 0, complianceReport: "" }) as AuditResults;
+        const auditResults = { ...prior, compiledPdfPath: result.path };
+        await storage.updateJob(job.id, { correctedPath: result.path, auditResults });
+        downloadUrl = `/api/jobs/${job.id}/download/press-ready`;
+      }
+      const sides = Array.isArray(result?.previewSides) ? result.previewSides : [];
+      return replyJson(result, {
+        downloadUrl,
+        previewBefore: sides.includes("before") ? `/api/glitchy-preview/${job.id}/before` : "",
+        previewAfter: sides.includes("after") ? `/api/glitchy-preview/${job.id}/after` : "",
+      });
     } catch (error: any) {
-      console.error('[Glitchy] Chat error:', error);
-      res.json({ reply: "Oops, my brain glitched! Try again? 🤯" });
+      console.error("[Glitchy] Chat error:", error);
+      res.json({
+        reply: "I couldn't finish that. I have not run a check, so I won't say the file is fine.",
+        actions: [],
+        provider: "rules",
+      });
     }
   });
 

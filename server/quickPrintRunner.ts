@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import type { AuditResults, FileType } from "@shared/schema";
+import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
 import { quickPrintProduct, QUICK_PRINT_PRODUCTS } from "@shared/quickPrint";
 import { pythonChildEnv } from "./pythonChildEnv";
 import { storage } from "./storage";
@@ -59,6 +59,8 @@ export interface QuickRunResult {
   rebuildPdf?: string;
   rebuildBefore?: string;
   rebuildAfter?: string;
+  extraChecks?: { id?: string; num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string; message?: string; autoFixed?: boolean }[];
+  prepressChecks?: { num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string }[];
 }
 
 function asResult(raw: Record<string, unknown>): QuickRunResult {
@@ -101,6 +103,36 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     rebuildPdf: raw.rebuildPdf ? String(raw.rebuildPdf) : "",
     rebuildBefore: raw.rebuildBefore ? String(raw.rebuildBefore) : "",
     rebuildAfter: raw.rebuildAfter ? String(raw.rebuildAfter) : "",
+    extraChecks: Array.isArray(raw.extraChecks)
+      ? raw.extraChecks.map((item) => {
+          const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          return {
+            id: String(row.id || ""),
+            name: String(row.name || ""),
+            status: String(row.status || ""),
+            pass: row.pass === true,
+            detail: String(row.detail || row.message || ""),
+            message: String(row.message || row.detail || ""),
+            autoFixed: row.autoFixed === true || row.status === "fixed",
+            num: String(row.num || ""),
+            label: String(row.label || ""),
+          };
+        })
+      : [],
+    prepressChecks: Array.isArray(raw.prepressChecks)
+      ? raw.prepressChecks.map((item) => {
+          const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          const status = String(row.status || "");
+          return {
+            num: String(row.num || ""),
+            name: String(row.name || ""),
+            label: String(row.label || ""),
+            status,
+            pass: row.pass === true || status === "passed" || status === "auto" || status === "fixed",
+            detail: String(row.detail || ""),
+          };
+        })
+      : [],
   };
 }
 
@@ -217,7 +249,7 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
 
 export async function saveQuickResult(jobId: number, result: QuickRunResult): Promise<void> {
   const enginePassed = result.pressEngine?.passed === true;
-  const checks = result.decisions.map((message) => ({
+  const checks: AuditCheck[] = result.decisions.map((message) => ({
     name: "Quick print",
     passed: result.light !== "red",
     message,
@@ -228,6 +260,16 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
   }
   if (result.light === "red" && result.clientMessage) {
     checks.push({ name: "Quick print", passed: false, message: result.clientMessage, autoFixed: false });
+  }
+  for (const extra of result.extraChecks || []) {
+    checks.push({
+      name: extra.name || extra.id || "Extra check",
+      passed: extra.pass === true,
+      message: extra.message || extra.detail || "",
+      autoFixed: extra.autoFixed === true,
+      id: extra.id,
+      status: extra.status,
+    });
   }
   const { pressEngine, ...quickPrint } = result;
   const reused = publishQuickReuse(jobId, result);
@@ -243,6 +285,15 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     proofPageCount: result.pageCount || undefined,
     quickPrint: { ...quickPrint, approved: false },
     pressEngine,
+    order: {
+      widthMm: result.trimWidthMm || null,
+      heightMm: result.trimHeightMm || null,
+      explicitSize: Boolean(result.trimWidthMm && result.trimHeightMm),
+      sides: null,
+      pageCount: result.pageCount || null,
+      finishes: [],
+      headToFoot: false,
+    },
     ...reused,
   } as AuditResults;
   await storage.updateJob(jobId, {
@@ -250,6 +301,9 @@ export async function saveQuickResult(jobId: number, result: QuickRunResult): Pr
     correctedPath: result.pressPath || undefined,
     completedAt: new Date(),
     auditResults: audit,
+    productWidthMm: result.trimWidthMm || null,
+    productHeightMm: result.trimHeightMm || null,
+    orderedPageCount: result.pageCount || null,
   });
 }
 

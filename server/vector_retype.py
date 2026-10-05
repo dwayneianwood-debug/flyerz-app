@@ -2021,19 +2021,10 @@ def paint_retyped(page, items: list, sx: float, sy: float) -> None:
 
 
 def fonts_embedded(path: str) -> bool:
-    """True when every face on the page is embedded. No faces is not a failure."""
-    import pymupdf as fitz
+    """True when every face on the original file is embedded. Type 3 is allowed. No faces is not a failure."""
+    from client_file_audit import font_report
 
-    doc = fitz.open(path)
-    try:
-        fonts = doc[0].get_fonts() or []
-    finally:
-        doc.close()
-    if not fonts:
+    report = font_report(path)
+    if not report.get("checked"):
         return True
-    for font in fonts:
-        ext = str(font[1] if len(font) > 1 else "")
-        base = str(font[3] if len(font) > 3 else "")
-        if ext.lower() in ("", "n/a") and "+" not in base:
-            return False
-    return True
+    return not report.get("problems")

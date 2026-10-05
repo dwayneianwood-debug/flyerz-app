@@ -918,7 +918,10 @@ export default function JobDetails() {
       }
       const data = await res.json();
       setBleedPreview(data);
-      setProofPage(0);
+      setProofPage((current) => {
+        const count = Array.isArray(data.previewUrls) ? data.previewUrls.length : 1;
+        return current >= 0 && current < count ? current : 0;
+      });
     } catch (err: any) {
       setBleedPreviewError(err.message);
     } finally {

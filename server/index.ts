@@ -1,6 +1,7 @@
 import "./loadEnv";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
+import { uploadLimitError } from "./uploadLimit";
 import { serveStatic } from "./static";
 import { compressResponses } from "./httpCompression";
 import { createServer } from "http";
@@ -235,7 +236,10 @@ const listenHost = flyerzResolveListenHost();
 (async () => {
   await registerRoutes(httpServer, app);
 
-  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    if (err && err.code === "LIMIT_FILE_SIZE") {
+      return uploadLimitError(err, req, res, next);
+    }
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 

@@ -4,6 +4,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { useToast } from "@/hooks/use-toast";
+import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
 import { Crop, Download, Loader2, RotateCcw, Upload } from "lucide-react";
 import {
   CROP_RATIOS,
@@ -83,8 +84,8 @@ export default function PureCrop() {
       toast({ title: "Unsupported file", description: "Use a JPG, PNG, or PDF.", variant: "destructive" });
       return;
     }
-    if (file.size > 50 * 1024 * 1024) {
-      toast({ title: "File too large", description: "Maximum size is 50MB.", variant: "destructive" });
+    if (file.size > UPLOAD_LIMIT_BYTES) {
+      toast({ title: "File too large", description: uploadTooLargeMessage(file.size), variant: "destructive" });
       return;
     }
     setOpening(true);

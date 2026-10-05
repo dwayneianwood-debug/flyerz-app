@@ -133,6 +133,28 @@ def bundled_sans(bold: bool = True) -> str:
     return os.path.join(FONT_DIR, name)
 
 
+def pin_c_locale() -> dict:
+    """Pin this process to a dot decimal before any float formatting or Ghostscript spawn.
+
+    Ian's laptop locale uses a comma. LC_ALL hides LC_NUMERIC from child processes,
+    so the parent locale is recorded and then cleared.
+    """
+    import locale
+
+    seen = {
+        "LC_ALL": os.environ.get("LC_ALL") or "",
+        "LC_NUMERIC": os.environ.get("LC_NUMERIC") or "",
+    }
+    os.environ.pop("LC_ALL", None)
+    os.environ["LC_NUMERIC"] = "C"
+    try:
+        locale.setlocale(locale.LC_NUMERIC, "C")
+        seen["pinned"] = locale.setlocale(locale.LC_NUMERIC)
+    except locale.Error as exc:
+        seen["pinned"] = f"failed:{exc}"
+    return seen
+
+
 def c_numeric_env(base: dict | None = None) -> dict:
     """Environment for potrace and Ghostscript.
 

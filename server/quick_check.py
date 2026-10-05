@@ -627,21 +627,15 @@ def check_print_readiness(doc, img_bgr, dpi, file_type, input_path):
             pass
 
         if not _illustrator_source(file_type):
-            fonts = doc.get_page_fonts(0, full=True)
-            embedded_count = 0
-            not_embedded = []
-            for font in fonts:
-                font_name = font[3] if len(font) > 3 else "Unknown"
-                font_file = font[4] if len(font) > 4 else ""
-                if font_file:
-                    embedded_count += 1
-                else:
-                    not_embedded.append(font_name)
+            from client_file_audit import font_report
 
-            if not_embedded:
-                issues.append(f"{len(not_embedded)} font(s) not embedded: {', '.join(not_embedded[:3])}")
-            elif fonts:
-                info.append(f"{embedded_count} font(s) embedded")
+            report = font_report(input_path) if input_path else {"problems": [], "embedded": 0, "type3": []}
+            problems = report.get("problems") or []
+            if problems:
+                names = ", ".join(row["name"] for row in problems[:3])
+                issues.append(f"{len(problems)} font(s) not embedded or substituted: {names}. Please export with fonts embedded or outlined.")
+            elif report.get("embedded") or report.get("type3"):
+                info.append(f"{int(report.get('embedded') or 0) + len(report.get('type3') or [])} font(s) embedded")
 
         page_count = len(doc)
         if page_count > 1:
