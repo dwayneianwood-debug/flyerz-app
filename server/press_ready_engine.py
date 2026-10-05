@@ -2256,40 +2256,96 @@ def _split_pad(total: int, start_share: float) -> tuple[int, int]:
     return start, int(total) - start
 
 
+def _chroma_lum(line: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    px = line.astype(np.float32) / 255.0
+    cyan, magenta, yellow, black = px[..., 0], px[..., 1], px[..., 2], px[..., 3]
+    red = (1.0 - cyan) * (1.0 - black)
+    green = (1.0 - magenta) * (1.0 - black)
+    blue = (1.0 - yellow) * (1.0 - black)
+    lum = 0.3 * red + 0.59 * green + 0.11 * blue
+    high = np.maximum(np.maximum(red, green), blue)
+    low = np.minimum(np.minimum(red, green), blue)
+    return high - low, lum
+
+
+def _flat_run(line: np.ndarray) -> np.ndarray:
+    """Pixels that share one colour with a neighbour along the edge."""
+    count = int(line.shape[0])
+    flat = np.zeros(count, dtype=bool)
+    if count < 2:
+        return flat
+    step = np.max(np.abs(line[1:].astype(np.int16) - line[:-1].astype(np.int16)), axis=-1)
+    close = step <= 12
+    flat[1:] |= close
+    flat[:-1] |= close
+    return flat
+
+
+def _outlier_mask(line: np.ndarray, inner: np.ndarray) -> np.ndarray:
+    """A flat edge line, or a single corner pixel, that is a different colour from inside.
+
+    The mean of four channels hides a red rule: magenta and yellow can jump while the
+    average stays under 40. A smooth gradient of a few levels per pixel stays put.
+    """
+    jump = np.max(np.abs(line.astype(np.int16) - inner.astype(np.int16)), axis=-1)
+    chroma_edge, lum_edge = _chroma_lum(line)
+    chroma_inner, lum_inner = _chroma_lum(inner)
+    vivid = (jump >= 22) & ((chroma_edge > chroma_inner + 0.12) | (lum_edge > lum_inner + 0.08))
+    strong = jump > 40
+    eligible = _flat_run(line)
+    if int(line.shape[0]) > 0:
+        eligible[0] = True
+        eligible[-1] = True
+    return (strong | vivid) & eligible
+
+
+def _quiet_line(arr: np.ndarray, axis: int, at: int, inner_at: int, second_at: int | None) -> None:
+    if axis == 0:
+        line = arr[at]
+        inner = arr[inner_at]
+        second = None if second_at is None else arr[second_at]
+    else:
+        line = arr[:, at]
+        inner = arr[:, inner_at]
+        second = None if second_at is None else arr[:, second_at]
+    replace = _outlier_mask(line, inner)
+    if not bool(replace.any()):
+        return
+    old = np.array(line, copy=True)
+    if axis == 0:
+        arr[at, replace] = inner[replace]
+    else:
+        arr[replace, at] = inner[replace]
+    if second is None:
+        return
+    # A two-pixel rule would still show just inside the seam after the outer pixel is quieted.
+    matches = np.max(np.abs(second.astype(np.int16) - old.astype(np.int16)), axis=-1) <= 12
+    still = _outlier_mask(second, inner)
+    thin = replace & matches & still
+    if not bool(thin.any()):
+        return
+    if axis == 0:
+        arr[second_at, thin] = inner[thin]
+    else:
+        arr[thin, second_at] = inner[thin]
+
+
 def _quiet_outlier_edge(arr: np.ndarray) -> np.ndarray:
     """Drop a one-pixel fringe that is a different colour from a few pixels inside.
 
-    A symmetric mirror repeats that pixel, so a light last row becomes a hairline on both
-    sides of the seam. A smooth edge changes by much less than this over four pixels.
+    A symmetric mirror repeats that pixel, so a light last row or a red corner pixel
+    becomes a hairline or a cross on the seam. A smooth edge changes by much less
+    than this over four pixels.
     """
     arr = np.ascontiguousarray(arr).copy()
     height, width = int(arr.shape[0]), int(arr.shape[1])
     inset = 4
-
-    def far(edge: np.ndarray, inner: np.ndarray) -> bool:
-        return float(np.mean(np.abs(edge.astype(np.int16) - inner.astype(np.int16)))) > 40.0
-
     if height > inset * 2:
-        if far(arr[0], arr[inset]):
-            arr[0] = arr[inset]
-        if far(arr[-1], arr[-1 - inset]):
-            arr[-1] = arr[-1 - inset]
+        _quiet_line(arr, 0, 0, inset, 1)
+        _quiet_line(arr, 0, -1, -1 - inset, -2)
     if width > inset * 2:
-        if far(arr[:, 0], arr[:, inset]):
-            arr[:, 0] = arr[:, inset]
-        if far(arr[:, -1], arr[:, -1 - inset]):
-            arr[:, -1] = arr[:, -1 - inset]
-    # A single hot corner pixel mirrors into a cross even when the rest of the row is even.
-    if height > inset * 2 and width > inset * 2:
-        corners = (
-            (0, inset, 0, inset),
-            (0, inset, -1, -1 - inset),
-            (-1, -1 - inset, 0, inset),
-            (-1, -1 - inset, -1, -1 - inset),
-        )
-        for y, inner_y, x, inner_x in corners:
-            if far(arr[y, x], arr[inner_y, inner_x]):
-                arr[y, x] = arr[inner_y, inner_x]
+        _quiet_line(arr, 1, 0, inset, 1)
+        _quiet_line(arr, 1, -1, -1 - inset, -2)
     return arr
 
 

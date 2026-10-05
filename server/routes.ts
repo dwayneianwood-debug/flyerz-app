@@ -25,7 +25,7 @@ import {
   clientSafeQuickCheckError,
   isOfficeUpload,
 } from "./fileProcessor";
-import { execSync, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import fsSync from "fs";
 import os from "os";
 import { getFlyerzTempRoot } from "./envPaths";
@@ -1528,60 +1528,67 @@ export async function registerRoutes(
         }
       }
 
-      if (proofPaths.length === 0) {
-        const artworkFile = job.correctedPath || job.originalPath;
-        if (artworkFile) {
-          try {
-            await fs.access(artworkFile);
-            const ext = path.extname(artworkFile).toLowerCase();
-            if (isRasterExtension(ext)) {
-              proofPaths = [artworkFile];
-            } else if (isVectorExtension(ext)) {
-              const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + '_proof.png');
-              try {
-                const escapedInput = artworkFile.replace(/'/g, "'\\''");
-                const escapedOutput = proofBase.replace(/'/g, "'\\''");
-                execSync(
-                  `${PYTHON_BIN} -c "import sys; sys.path.insert(0, 'server'); from smart_bleed import generate_visual_proof; generate_visual_proof('${escapedInput}', '${escapedOutput}')"`,
-                  { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), stdio: ['pipe', 'pipe', 'inherit'] }
-                );
+      if (pageIndex < 0) {
+        return res.status(404).json({ message: `Page ${pageIndex} not found` });
+      }
 
-                try {
-                  const stat = fsSync.statSync(proofBase);
-                  if (stat.size > 0) {
-                    proofPaths = [proofBase];
-                    console.log(`[FAI] Visual proof regenerated on-the-fly: ${proofBase}`);
-                  }
-                } catch {
-                  const multiPages: string[] = [];
-                  const proofStem = proofBase.replace(/\.png$/, '');
-                  for (let pg = 1; pg <= 20; pg++) {
-                    const pgPath = `${proofStem}${pg}.png`;
-                    try {
-                      const stat = fsSync.statSync(pgPath);
-                      if (stat.size > 0) multiPages.push(pgPath);
-                      else break;
-                    } catch { break; }
-                  }
-                  if (multiPages.length > 0) {
-                    proofPaths = multiPages;
-                    console.log(`[FAI] Visual proof regenerated on-the-fly: ${multiPages.length} page(s)`);
-                  }
-                }
-              } catch (genErr: any) {
-                console.warn('[FAI] Proof regeneration failed:', genErr.message || genErr);
-              }
-            }
-          } catch {}
+      let proofPageCount = proofPaths.length;
+      const artworkFile = job.correctedPath || job.originalPath;
+      const pageReady = (candidate: string | undefined) => {
+        if (!candidate) return false;
+        try {
+          return fsSync.statSync(candidate).size > 0;
+        } catch {
+          return false;
         }
+      };
+      if (artworkFile && isVectorExtension(path.extname(artworkFile).toLowerCase()) && !pageReady(proofPaths[pageIndex])) {
+        const proofBase = path.join(path.dirname(artworkFile), path.basename(artworkFile, path.extname(artworkFile)) + "_proof.png");
+        const numbered = proofBase.replace(/\.png$/, `${pageIndex + 1}.png`);
+        if (!pageReady(pageIndex === 0 ? proofBase : "") && !pageReady(numbered)) {
+          try {
+            const proofScript = path.join(process.cwd(), "server", "screen_proof.py");
+            const proofProc = spawnSync(
+              PYTHON_BIN,
+              [proofScript, artworkFile, proofBase, String(pageIndex + 1)],
+              { timeout: 30000, cwd: process.cwd(), env: pythonChildEnv(), encoding: "utf-8" },
+            );
+            if (proofProc.stderr) console.log(String(proofProc.stderr).trim());
+            const proofOut = `${proofProc.stdout || ""}\n${proofProc.stderr || ""}`;
+            const pagesLine = proofOut.split("\n").find((line) => line.startsWith("PAGES "));
+            const fileLine = proofOut.split("\n").find((line) => line.startsWith("FILE "));
+            const reported = pagesLine ? Number(pagesLine.slice(6)) || 0 : 0;
+            const written = fileLine ? fileLine.slice(5).trim() : numbered;
+            if (pageReady(written)) {
+              proofPageCount = Math.max(proofPageCount, reported, pageIndex + 1);
+              const slots = new Array(proofPageCount).fill("");
+              proofPaths.forEach((existing, index) => {
+                if (index < slots.length) slots[index] = existing;
+              });
+              slots[pageIndex] = written;
+              proofPaths = slots;
+              console.log(`[FAI] Visual proof page ${pageIndex + 1} rendered on the fly: ${written}`);
+            }
+          } catch (genErr: any) {
+            console.warn("[FAI] Proof regeneration failed:", genErr.message || genErr);
+          }
+        } else if (pageReady(numbered) || (pageIndex === 0 && pageReady(proofBase))) {
+          const written = pageReady(numbered) ? numbered : proofBase;
+          proofPageCount = Math.max(proofPageCount, pageIndex + 1);
+          const slots = new Array(proofPageCount).fill("");
+          proofPaths.forEach((existing, index) => {
+            if (index < slots.length) slots[index] = existing;
+          });
+          slots[pageIndex] = written;
+          proofPaths = slots;
+        }
+      } else if (proofPaths.length === 0 && artworkFile && isRasterExtension(path.extname(artworkFile).toLowerCase())) {
+        proofPaths = [artworkFile];
+        proofPageCount = 1;
       }
 
-      if (proofPaths.length === 0) {
-        return res.status(404).json({ message: 'Visual proof not available' });
-      }
-
-      if (pageIndex < 0 || pageIndex >= proofPaths.length) {
-        return res.status(404).json({ message: `Page ${pageIndex} not found. Available pages: 0-${proofPaths.length - 1}` });
+      if (!pageReady(proofPaths[pageIndex])) {
+        return res.status(404).json({ message: "Visual proof not available" });
       }
 
       const targetPath = proofPaths[pageIndex];
@@ -1596,7 +1603,7 @@ export async function registerRoutes(
 
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('Cache-Control', 'public, max-age=3600');
-      res.setHeader('X-Proof-Page-Count', String(proofPaths.length));
+      res.setHeader('X-Proof-Page-Count', String(Math.max(proofPageCount, proofPaths.length)));
       const { createReadStream } = await import('fs');
       createReadStream(targetPath).pipe(res);
     } catch (error) {

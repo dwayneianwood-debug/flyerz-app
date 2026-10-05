@@ -1406,6 +1406,22 @@ def generate_visual_proof(pdf_path: str, output_png_path: str) -> dict:
     if total_pages == 0:
         return {"success": False, "error": "PDF has no pages"}
 
+    try:
+        from screen_proof import write_screen_proof
+
+        fast = write_screen_proof(pdf_path, output_png_path, dpi=144)
+        if fast.get("success"):
+            fast["originalDpi"] = real_asset_dpi
+            fast["showLowDpiWarning"] = is_low_res_asset
+            fast["isBlank"] = any(_is_proof_blank(path) for path in (fast.get("proofPaths") or []))
+            sys.stderr.write(
+                f"[FAI] Visual proof: {len(fast.get('proofPaths') or [])} page(s) rendered at 144 DPI via PyMuPDF.\n"
+            )
+            return fast
+        sys.stderr.write(f"[PROOF] fast path declined: {fast.get('error')}\n")
+    except Exception as exc:
+        sys.stderr.write(f"[PROOF] fast path failed: {exc}\n")
+
     base, ext = os.path.splitext(output_png_path)
 
     def render_single_page(page_num):

@@ -258,6 +258,44 @@ def test_mirror_drops_fringe() -> None:
     cross[-1, -1] = (20, 220, 220, 0)
     quiet_cross = _quiet_outlier_edge(cross)
     check("corner-cross", int(quiet_cross[-1, -1, 1]) < 100, str(int(quiet_cross[-1, -1, 1])))
+    pale = np.full((48, 64, 4), 2, np.uint8)
+    pale[-1, -1] = (8, 8, 8, 2)
+    quiet_pale = _quiet_outlier_edge(pale)
+    check("pale-corner-kept", int(quiet_pale[-1, -1, 0]) == 8, str(quiet_pale[-1, -1].tolist()))
+    # A short red rule whose channel average stays under 40. The mirror used to double it into a cross.
+    darker = np.array([20, 80, 70, 40], np.uint8)
+    red = np.array([5, 115, 105, 25], np.uint8)
+    rule = np.full((48, 64, 4), darker, np.uint8)
+    rule[-1, -10:] = red
+    rule[-10:, -1] = red
+    rule[-2, -1] = red
+    mean_gap = float(np.mean(np.abs(red.astype(np.int16) - darker.astype(np.int16))))
+    quiet_rule = _quiet_outlier_edge(rule)
+    corner = quiet_rule[-1, -1]
+    arm = quiet_rule[-1, -4]
+    stem = quiet_rule[-4, -1]
+    kept = quiet_rule[-6, -8]
+    # A two-pixel rule is the anti-aliased edge. Both pixels have to go or the mirror still draws it.
+    thick = np.full((48, 64, 4), darker, np.uint8)
+    thick[-2:, -12:] = red
+    thick[-12:, -2:] = red
+    quiet_thick = _quiet_outlier_edge(thick)
+    padded, _pads = _mirror_pad(rule, 80, 64, 2, 2, 2, 2)
+    mirrored = padded[-8:, -8:]
+    still_red = int(np.min(np.max(np.abs(mirrored.astype(np.int16) - red.astype(np.int16)), axis=-1)))
+    check(
+        "red-cross-corner",
+        mean_gap < 40
+        and int(np.max(np.abs(corner.astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(arm.astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(stem.astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(kept.astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(quiet_thick[-1, -1].astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(quiet_thick[-2, -2].astype(int) - darker.astype(int)))) < 5
+        and int(np.max(np.abs(quiet_thick[-6, -8].astype(int) - darker.astype(int)))) < 5
+        and still_red > 20,
+        f"mean {mean_gap:.1f} corner {corner.tolist()} mirror-gap {still_red}",
+    )
 
 
 def test_plate_buffer_is_the_image() -> None:
@@ -278,6 +316,39 @@ def test_locale_pin() -> None:
     os.environ["LC_NUMERIC"] = "en_ZA.UTF-8"
     seen = pin_c_locale()
     check("locale-c", "LC_ALL" not in os.environ and os.environ.get("LC_NUMERIC") == "C", str(seen))
+
+
+def test_screen_proof_is_direct() -> None:
+    """The before picture is a PyMuPDF render, not an OpenCV import."""
+    import subprocess
+    import sys
+
+    import pymupdf as fitz
+
+    folder = tempfile.mkdtemp(prefix="screen-proof-")
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=200)
+    page.draw_rect(fitz.Rect(40, 40, 120, 100), color=(0.8, 0.1, 0.1), fill=(0.8, 0.1, 0.1))
+    src = os.path.join(folder, "job.pdf")
+    doc.save(src)
+    doc.close()
+    out = os.path.join(folder, "job_proof.png")
+    script = os.path.join(os.path.dirname(__file__), "screen_proof.py")
+    started = time.perf_counter()
+    proc = subprocess.run([sys.executable, script, src, out, "1"], capture_output=True, text=True, timeout=20)
+    elapsed = time.perf_counter() - started
+    written = os.path.join(folder, "job_proof1.png")
+    from PIL import Image
+
+    white = False
+    if os.path.exists(written):
+        corner = Image.open(written).convert("RGB").getpixel((2, 2))
+        white = min(corner) > 240
+    check(
+        "screen-proof-direct",
+        proc.returncode == 0 and elapsed < 3 and white and "PAGES 1" in proc.stdout and "cv2" not in (proc.stderr or ""),
+        f"{elapsed:.2f}s rc {proc.returncode} white {white} {proc.stderr[-200:]}",
+    )
 
 
 def test_screen_proof_is_fast() -> None:
@@ -308,6 +379,7 @@ def main() -> None:
     test_plate_buffer_is_the_image()
     test_mirror_drops_fringe()
     test_locale_pin()
+    test_screen_proof_is_direct()
     test_screen_proof_is_fast()
     test_mirror_plate()
     test_mask_skip()
