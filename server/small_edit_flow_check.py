@@ -50,6 +50,22 @@ def _text(path: str) -> str:
         doc.close()
 
 
+def _visual(src: str, preview: str, key: str) -> tuple[str, list[str]]:
+    """Pixel, region, and page gates. A case fails when any one of them fails."""
+    from artwork_edits import _load, gate_line, visual_gates
+
+    prop = (_load(key).get("proposal") or {})
+    staged = os.path.join(preview, "staged.pdf")
+    problems = visual_gates(
+        src,
+        staged,
+        prop.get("guardBox") or prop.get("editBox"),
+        str(prop.get("shownOld") or prop.get("old") or ""),
+        str(prop.get("shownNew") or prop.get("new") or ""),
+    )
+    return gate_line(problems), problems
+
+
 def _live(path: str, line: str) -> None:
     import pymupdf as fitz
 
@@ -94,8 +110,10 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
         os.makedirs(ART, exist_ok=True)
         shutil.copyfile(before, os.path.join(ART, f"{name}-before.png"))
         shutil.copyfile(after, os.path.join(ART, f"{name}-after.png"))
+    gate, gate_problems = _visual(src, preview, name)
+    problems.extend(gate_problems)
     if problems:
-        _record(name, False, "; ".join(problems))
+        _record(name, False, "; ".join(problems) + " " + gate)
         return
     done = confirm(name, dest)
     TRANSCRIPT.append(f"yes -> {done.get('reply')}\n")
@@ -109,7 +127,7 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
     TRANSCRIPT.append(f"undo -> {undone.get('reply')}\n")
     if not undone.get("ok") or absent not in _text(dest) or expect in _text(dest):
         problems.append("undo " + _text(dest).replace("\n", " ")[:80])
-    _record(name, not problems, "; ".join(problems) or expect)
+    _record(name, not problems, "; ".join(problems) or f"{expect} {gate}")
 
 
 def _full_font() -> None:
@@ -228,7 +246,9 @@ def _subset_gap() -> None:
         full = [name for name in names if "Anton" in name and "+" not in name]
         if not full or any(name == "Helvetica" for name in names):
             problems.append("font " + ", ".join(names))
-    _record("subset-gap", not problems, "; ".join(problems) or "full Anton, 100% K")
+    gate, gate_problems = _visual(src, preview, "subset-gap")
+    problems.extend(gate_problems)
+    _record("subset-gap", not problems, "; ".join(problems) or f"full Anton, 100% K {gate}")
 
 
 def _subset_closest() -> None:
@@ -256,7 +276,9 @@ def _subset_closest() -> None:
             doc.close()
         if any(name == "Helvetica" for name in names) or not any("+" not in name and "Xylophone" not in name for name in names):
             problems.append("font " + ", ".join(names))
-    _record("subset-closest", not problems, "; ".join(problems) or "amber closest")
+    gate, gate_problems = _visual(src, preview, "subset-closest")
+    problems.extend(gate_problems)
+    _record("subset-closest", not problems, "; ".join(problems) or f"amber closest {gate}")
 
 
 def _subset_font() -> None:
@@ -337,12 +359,19 @@ def _raster_date() -> None:
     TRANSCRIPT.append(f"## raster-date\n{reply}\n")
     staged = os.path.join(preview, "staged.pdf")
     text = _text(staged) if os.path.isfile(staged) else ""
-    ok = asked and asked.get("pending") and "Monday 12 October" in text and "Saturday" not in text and "not applied" in reply.lower()
-    if ok:
+    gate, gate_problems = _visual(src, preview, "raster-date")
+    ok = (
+        asked and asked.get("pending") and "Monday 12 October" in text and "Saturday" not in text
+        and "not applied" in reply.lower() and not gate_problems
+    )
+    if os.path.isfile(os.path.join(preview, "before.png")):
         os.makedirs(ART, exist_ok=True)
         shutil.copyfile(os.path.join(preview, "before.png"), os.path.join(ART, "raster-date-before.png"))
         shutil.copyfile(os.path.join(preview, "after.png"), os.path.join(ART, "raster-date-after.png"))
-    _record("raster-saturday", bool(ok), text.replace("\n", " ")[:80] or reply[:80])
+    detail = text.replace("\n", " ")[:80] or reply[:80]
+    if gate_problems:
+        detail = "; ".join(gate_problems)
+    _record("raster-saturday", bool(ok), f"{detail} {gate}")
 
 
 def _cat_yes() -> None:
@@ -369,6 +398,8 @@ def _cat_yes() -> None:
 
     asked = ask("change the date to 12 October 2026")
     problems = []
+    gate, gate_problems = _visual(src, preview, "ian-date")
+    problems.extend(gate_problems)
     if "Monday 12 October" not in (asked.get("reply") or "") or "not applied" not in (asked.get("reply") or "").lower():
         problems.append((asked.get("reply") or "no reply")[:160])
     if os.path.isfile(dest):
@@ -386,7 +417,105 @@ def _cat_yes() -> None:
         problems.append("undo " + _text(dest).replace("\n", " ")[:80])
     if "25-point" not in (undone.get("reply") or ""):
         problems.append("undo checks")
-    _record("cat-yes-undo", not problems, "; ".join(problems) or "Monday 12 October, then back")
+    _record("cat-yes-undo", not problems, "; ".join(problems) or f"Monday 12 October, then back {gate}")
+
+
+def _overlap_time() -> None:
+    """Stacked Anton lines share em-boxes. Replacing the time must leave both neighbours."""
+    import pymupdf as fitz
+    from artwork_edits import propose
+
+    anton = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts", "Anton-Regular.ttf"))
+    src = os.path.join(ROOT, "overlap-time.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=340, height=180)
+    page.insert_font(fontname="ANTON", fontfile=anton)
+    face = fitz.Font(fontfile=anton)
+    page.insert_text((24, 48), "SUNDAY", fontsize=26, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    page.insert_text((16, 68), "MORNING WORSHIP ", fontsize=13, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    time_x = 16 + face.text_length("MORNING WORSHIP ", fontsize=13)
+    page.insert_text((time_x, 68), "10:00AM", fontsize=13, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    page.insert_text((16, 82), "EVENING WORSHIP 5:00PM", fontsize=13, fontname="ANTON", fontfile=anton, color=(0, 0, 0))
+    doc.save(src)
+    doc.close()
+    doc = fitz.open(src)
+    boxes = []
+    try:
+        for block in doc[0].get_text("dict")["blocks"]:
+            for line in block.get("lines") or []:
+                for span in line.get("spans") or []:
+                    boxes.append((span.get("text") or "", fitz.Rect(span["bbox"])))
+    finally:
+        doc.close()
+    problems = []
+    time_box = next((box for text, box in boxes if "10:00AM" in text), None)
+    sunday = next((box for text, box in boxes if "SUNDAY" in text), fitz.Rect())
+    evening = next((box for text, box in boxes if "EVENING" in text), fitz.Rect())
+    if time_box is None or (time_box & sunday).is_empty or (time_box & evening).is_empty:
+        problems.append("fixture em-boxes do not overlap")
+    preview = os.path.join(ROOT, "preview-overlap-time")
+    asked = propose(src, "change the time to 7:30 pm", "overlap-time", preview)
+    reply = (asked or {}).get("reply") or ""
+    TRANSCRIPT.append(f"## overlap-time\n{reply}\n")
+    staged = os.path.join(preview, "staged.pdf")
+    text = _text(staged) if os.path.isfile(staged) else ""
+    if "7:30PM" not in text or "10:00" in text:
+        problems.append(text.replace("\n", " ")[:140] or "time not replaced")
+    if "SUNDAY" not in text or "EVENING WORSHIP 5:00PM" not in text:
+        problems.append("neighbour lost " + text.replace("\n", " ")[:140])
+    if os.path.isfile(staged):
+        import pymupdf as fitz
+        doc = fitz.open(staged)
+        try:
+            words = [item[4] for item in doc[0].get_text("words")]
+        finally:
+            doc.close()
+        if "1" in words:
+            problems.append("leftover 1")
+    gate, gate_problems = _visual(src, preview, "overlap-time")
+    problems.extend(gate_problems)
+    if os.path.isfile(os.path.join(preview, "after.png")):
+        os.makedirs(ART, exist_ok=True)
+        shutil.copyfile(os.path.join(preview, "before.png"), os.path.join(ART, "overlap-time-before.png"))
+        shutil.copyfile(os.path.join(preview, "after.png"), os.path.join(ART, "overlap-time-after.png"))
+    _record("time-overlap", not problems, "; ".join(problems) or f"neighbours kept {gate}")
+
+
+def _shrink_venue() -> None:
+    """A longer venue that would leave a narrow column is set smaller, and the reply says so."""
+    import pymupdf as fitz
+    from artwork_edits import _load, propose
+
+    src = os.path.join(ROOT, "shrink-venue.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    page.draw_rect(fitz.Rect(18, 28, 148, 110), color=(0.9, 0.9, 0.9), fill=(0.9, 0.9, 0.9), width=0)
+    page.insert_font(fontname="DEJAVU", fontfile=FONT)
+    page.insert_text((26, 78), "CITY HALL", fontsize=16, fontname="DEJAVU", fontfile=FONT, color=(0, 0, 0))
+    page.insert_text((220, 78), "Keep me", fontsize=14, fontname="DEJAVU", fontfile=FONT, color=(0, 0, 0))
+    doc.save(src)
+    doc.close()
+    preview = os.path.join(ROOT, "preview-shrink-venue")
+    asked = propose(src, "change the venue to Community Centre", "shrink-venue", preview)
+    reply = (asked or {}).get("reply") or ""
+    TRANSCRIPT.append(f"## shrink-venue\n{reply}\n")
+    prop = (_load("shrink-venue").get("proposal") or {})
+    staged = os.path.join(preview, "staged.pdf")
+    text = _text(staged) if os.path.isfile(staged) else ""
+    problems = []
+    if "smaller" not in reply.lower() or "column" not in reply.lower():
+        problems.append(reply[:180] or "no shrink note")
+    if not prop.get("shrunk") or float(prop.get("size") or 16) >= 16:
+        problems.append(f"size {prop.get('size')}")
+    if "COMMUNITY CENTRE" not in text or "CITY HALL" in text or "Keep me" not in text:
+        problems.append(text.replace("\n", " ")[:140] or "text")
+    gate, gate_problems = _visual(src, preview, "shrink-venue")
+    problems.extend(gate_problems)
+    if os.path.isfile(os.path.join(preview, "after.png")):
+        os.makedirs(ART, exist_ok=True)
+        shutil.copyfile(os.path.join(preview, "before.png"), os.path.join(ART, "shrink-venue-before.png"))
+        shutil.copyfile(os.path.join(preview, "after.png"), os.path.join(ART, "shrink-venue-after.png"))
+    _record("venue-shrink", not problems and bool(asked), "; ".join(problems) or f"shrunk to fit {gate}")
 
 
 def _write() -> None:
@@ -429,6 +558,8 @@ def run() -> list[str]:
     _flow("venue-caps", "CITY HALL", venue, "COMMUNITY CENTRE", "CITY HALL")
     _flow("venue-lower", "community hall", venue, "community centre", "community hall")
     _raster_date()
+    _overlap_time()
+    _shrink_venue()
     _cat_yes()
     _write()
     return list(FAILURES)

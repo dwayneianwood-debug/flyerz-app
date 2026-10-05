@@ -121,6 +121,43 @@ def _ask(src: str, message: str, job: str, preview: str, dest: str, width: float
     return payload
 
 
+def _save_zoom(src: str, staged: str, stem: str, box) -> None:
+    if not box or len(box) < 4:
+        return
+    import pymupdf as fitz
+
+    os.makedirs(ART, exist_ok=True)
+    pad = 28
+    for label, path in (("before", src), ("after", staged)):
+        if not os.path.isfile(path):
+            continue
+        doc = fitz.open(path)
+        try:
+            page = doc[0]
+            clip = fitz.Rect(float(box[0]) - pad, float(box[1]) - pad, float(box[2]) + pad, float(box[3]) + pad) & page.rect
+            pix = page.get_pixmap(matrix=fitz.Matrix(5, 5), clip=clip, alpha=False, colorspace=fitz.csRGB)
+            pix.save(os.path.join(ART, f"{stem}-zoom-{label}.png"))
+        finally:
+            doc.close()
+
+
+def _visual(src: str, preview: str, job: str) -> tuple[str, list[str]]:
+    from artwork_edits import _load, gate_line, visual_gates
+
+    prop = (_load(job).get("proposal") or {})
+    box = prop.get("guardBox") or prop.get("editBox")
+    staged = os.path.join(preview, "staged.pdf")
+    problems = visual_gates(
+        src,
+        staged,
+        box,
+        str(prop.get("shownOld") or prop.get("old") or ""),
+        str(prop.get("shownNew") or prop.get("new") or ""),
+    )
+    _save_zoom(src, staged, job, box)
+    return gate_line(problems), problems
+
+
 def _keep_previews(preview: str, stem: str) -> None:
     os.makedirs(ART, exist_ok=True)
     for side in ("before", "after"):
@@ -153,6 +190,10 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
     asked = _ask(src, f"change the phone number to {NEW_PHONE}", name, preview, dest, width, height)
     _keep_previews(preview, name)
     problems = []
+    gate, gate_problems = ("a=fail b=fail c=fail", ["no proposal"])
+    if asked.get("pending") is True:
+        gate, gate_problems = _visual(src, preview, name)
+        problems.extend(gate_problems)
     reply = asked.get("reply") or ""
     if asked.get("pending") is not True or "not applied" not in reply.lower():
         problems.append(reply[:160] or asked.get("_err") or "no proposal")
@@ -175,10 +216,10 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
     if "()" in reply or "®" in reply:
         problems.append("stray brackets " + reply[:120])
     if not apply:
-        _record(name, not problems, "; ".join(problems) or "preview only, not applied")
+        _record(name, not problems, "; ".join(problems) or f"preview only, not applied {gate}")
         return
     if problems:
-        _record(name, False, "; ".join(problems))
+        _record(name, False, "; ".join(problems) + " " + gate)
         return
     done = _ask(src, "yes", name, preview, dest, width, height)
     problems.extend([] if done.get("ok") and os.path.isfile(dest) and "0821234567" in _phone_digits(_text(dest)) else ["confirm failed " + (done.get("reply") or "")[:120]])
@@ -195,7 +236,7 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
             undo_note = _checks_ran(undone)
             if undo_note:
                 problems.append("undo " + undo_note)
-    _record(name, not problems, "; ".join(problems) or f"{width:.0f}x{height:.0f} " + ("confirmed, undone" if undo else "confirmed"))
+    _record(name, not problems, "; ".join(problems) or f"{width:.0f}x{height:.0f} " + ("confirmed, undone" if undo else "confirmed") + " " + gate)
 
 
 def _heading_and_logo(width: float, height: float, stem: str) -> None:
@@ -290,7 +331,11 @@ def _real_field(src: str, stem: str, message: str, expect_new: str, expect_old: 
     asked = _ask(src, message, job, preview, dest, 148, 105)
     _keep_previews(preview, stem)
     problems = []
+    gate = ""
     reply = asked.get("reply") or ""
+    if asked.get("pending") is True:
+        gate, gate_problems = _visual(src, preview, job)
+        problems.extend(gate_problems)
     if asked.get("pending") is not True or "not applied" not in reply.lower():
         problems.append(reply[:200] or asked.get("_err") or "no proposal")
     if os.path.isfile(dest) or _sha(src) != original:
@@ -318,7 +363,7 @@ def _real_field(src: str, stem: str, message: str, expect_new: str, expect_old: 
             problems.append("undo " + note)
         if _sha(src) != original:
             problems.append("source changed")
-    _record(stem, not problems, "; ".join(problems) or expect_new)
+    _record(stem, not problems, "; ".join(problems) or f"{expect_new} {gate}".strip())
 
 
 def _real_a6() -> None:

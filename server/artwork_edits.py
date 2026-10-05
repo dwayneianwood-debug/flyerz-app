@@ -5,7 +5,7 @@ Live text stays in its own font when that face has the new letters. A Canva
 subset usually does not: the full face is taken from the bundled font folder
 (or C:\\Windows\\Fonts on a laptop) by the name after the subset tag. If that
 face is not there, the closest bundled font is used and the reply says amber.
-A picture gets the old words painted out and new vector text in the closest font.
+A picture gets only those word pixels inpainted from the background, then new vector text in the closest font.
 """
 
 from __future__ import annotations
@@ -620,30 +620,50 @@ def _line_groups(words: list[dict]) -> list[list[dict]]:
 
 
 def _closest_font(crop, text: str) -> tuple[str, float]:
+    """The bundled face whose ink overlaps the word. Lower score is closer.
+
+    A flat colour difference lets a script face win on a pale crop. The overlap
+    of the dark (or light) strokes follows the letters.
+    """
     import cv2
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont
 
     paths = _candidate_fonts()
-    if crop is None or crop.size == 0:
+    if crop is None or getattr(crop, "size", 0) == 0:
         path = next((item for item in paths if os.path.isfile(item)), "")
         return path, 999.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    # The letters are the minority: darker on a light ground, or lighter on a dark one.
+    if float(gray.mean()) > 140:
+        mask = gray < 160
+    else:
+        mask = gray > 140
     best_path = ""
-    best_score = 1e9
-    height = max(12, crop.shape[0])
+    best_iou = -1.0
+    draw_h = max(48, int(mask.shape[0]))
     for path in paths:
         if not os.path.isfile(path):
             continue
-        font = ImageFont.truetype(path, max(10, height - 2))
-        canvas = Image.new("RGB", (max(crop.shape[1], 8), max(height, 8)), (255, 255, 255))
-        ImageDraw.Draw(canvas).text((0, 0), text, font=font, fill=(0, 0, 0))
-        plate = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
-        plate = cv2.resize(plate, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA)
-        score = float(np.mean(np.abs(plate.astype(np.float32) - crop.astype(np.float32))))
-        if score < best_score:
-            best_score = score
+        font = ImageFont.truetype(path, draw_h)
+        canvas = Image.new("L", (draw_h * max(8, len(text) + 1), draw_h + 8), 255)
+        ImageDraw.Draw(canvas).text((0, 2), text, font=font, fill=0)
+        plate = np.array(canvas)
+        cols = np.where(plate.min(axis=0) < 200)[0]
+        rows = np.where(plate.min(axis=1) < 200)[0]
+        if len(cols) == 0 or len(rows) == 0:
+            continue
+        glyph = plate[rows.min(): rows.max() + 1, cols.min(): cols.max() + 1]
+        glyph = cv2.resize(glyph, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_AREA)
+        ink = glyph < 170
+        union = int(np.logical_or(mask, ink).sum()) or 1
+        iou = float(np.logical_and(mask, ink).sum()) / float(union)
+        if iou > best_iou:
+            best_iou = iou
             best_path = path
-    return best_path, best_score
+    # Callers treat a high score as a poor match. 0 would be a perfect overlap.
+    score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
+    return best_path, score
 
 
 def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
@@ -765,7 +785,10 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
         font_note = " The letters stay in the file's own font."
     else:
         font_note = ""
-    reply = _preview_sentence(proposal) + font_note + amber + " Here is the before and after. I have not applied it yet."
+    fit_note = ""
+    if proposal.get("shrunk"):
+        fit_note = " I made the words smaller so they stay inside the column."
+    reply = _preview_sentence(proposal) + font_note + amber + fit_note + " Here is the before and after. I have not applied it yet."
     return {
         "ok": True,
         "reply": reply,
@@ -775,6 +798,7 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
         ],
         "previewSides": ["before", "after"],
         "pending": True,
+        "editBox": proposal.get("guardBox") or proposal.get("editBox"),
     }
 
 
@@ -1210,25 +1234,276 @@ def _place_font_text(page, point, text: str, size: float, rgb, fontfile: str) ->
         _recolor_new_text(page, before, operator)
 
 
+def _union_rect(rects: list):
+    import pymupdf as fitz
+
+    box = None
+    for rect in rects:
+        item = fitz.Rect(rect)
+        if item.is_empty or item.width < 0.05 or item.height < 0.05:
+            continue
+        if box is None:
+            box = item
+        else:
+            box = fitz.Rect(min(box.x0, item.x0), min(box.y0, item.y0), max(box.x1, item.x1), max(box.y1, item.y1))
+    return box
+
+
+def _trace_chars(page, old_text: str, loose) -> list:
+    """Character quads for this line. One visual line can be several texttrace runs."""
+    import pymupdf as fitz
+
+    wanted = " ".join(str(old_text or "").split())
+    if not wanted:
+        return []
+    loose_rect = fitz.Rect(loose) if loose else None
+    exact = None
+    partial = []
+    for item in page.get_texttrace() or []:
+        chars = [char for char in (item.get("chars") or []) if char]
+        if not chars:
+            continue
+        text = "".join(chr(char[0]) for char in chars)
+        norm = " ".join(text.split())
+        if not norm:
+            continue
+        box = fitz.Rect(item.get("bbox") or chars[0][3])
+        if loose_rect:
+            center = fitz.Point((box.x0 + box.x1) / 2.0, (box.y0 + box.y1) / 2.0)
+            if not loose_rect.contains(center):
+                continue
+        if norm == wanted:
+            if exact is None or len(chars) > len(exact):
+                exact = chars
+            continue
+        if norm in wanted:
+            partial.append((box.x0, box.y0, box, chars))
+    if exact:
+        return exact
+    def _inside(outer, inner) -> bool:
+        return (
+            outer.x0 <= inner.x0 + 0.2
+            and outer.y0 <= inner.y0 + 0.2
+            and outer.x1 >= inner.x1 - 0.2
+            and outer.y1 >= inner.y1 - 0.2
+            and (outer.width > inner.width + 0.4 or outer.height > inner.height + 0.4)
+        )
+
+    partial.sort(key=lambda item: len(item[3]), reverse=True)
+    kept = []
+    for _x, _y, box, group in partial:
+        if any(_inside(other, box) for other, _chars in kept):
+            continue
+        kept.append((box, group))
+    kept.sort(key=lambda item: (item[0].y0, item[0].x0))
+    chars = []
+    for _box, group in kept:
+        chars.extend(group)
+    return chars
+
+
+def _other_span_rects(page, old_text: str) -> list:
+    import pymupdf as fitz
+
+    wanted = " ".join(str(old_text or "").split())
+    boxes = []
+    for block in (page.get_text("dict") or {}).get("blocks") or []:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines") or []:
+            for span in line.get("spans") or []:
+                text = " ".join(str(span.get("text") or "").split())
+                if not text or text == wanted:
+                    continue
+                boxes.append(fitz.Rect(span["bbox"]))
+    return boxes
+
+
+def _clear_of(rect, others, gap: float = 0.5):
+    """Pull a box off every neighbouring line. A touch deletes that whole glyph.
+
+    A line above or below is cut on the vertical edge. Its em-box is often
+    wider than the words and sits to one side, and a sideways cut then misses
+    the first glyph of the line being replaced.
+    """
+    import pymupdf as fitz
+
+    if rect is None:
+        return None
+    current = fitz.Rect(rect)
+    for _ in range(8):
+        hit = False
+        for other in others:
+            overlap = current & other
+            if overlap.is_empty or overlap.width < 0.05 or overlap.height < 0.05:
+                continue
+            other_y = (other.y0 + other.y1) / 2.0
+            other_x = (other.x0 + other.x1) / 2.0
+            own_x = (current.x0 + current.x1) / 2.0
+            if other.y1 <= current.y0 + 0.2 or other_y < current.y0:
+                current.y0 = other.y1 + gap
+            elif other.y0 >= current.y1 - 0.2 or other_y > current.y1:
+                current.y1 = other.y0 - gap
+            elif other_x < own_x:
+                current.x0 = other.x1 + gap
+            else:
+                current.x1 = other.x0 - gap
+            hit = True
+            if current.y1 - current.y0 < 0.35 or current.x1 - current.x0 < 0.25:
+                return None
+        if not hit:
+            break
+    if current.y1 - current.y0 < 0.35 or current.x1 - current.x0 < 0.25:
+        return None
+    return current
+
+
+def _redact_hits(pieces, quad) -> bool:
+    import pymupdf as fitz
+
+    box = fitz.Rect(quad)
+    for piece in pieces or []:
+        hit = fitz.Rect(piece) & box
+        if hit.width > 0.12 and hit.height > 0.12:
+            return True
+    return False
+
+
+def _ink_and_redact(page, old_text: str, loose):
+    """The drawn word box, and a slightly smaller box that does not touch other lines."""
+    import pymupdf as fitz
+
+    chars = _trace_chars(page, old_text, loose)
+    quads = []
+    origin = None
+    for char in chars:
+        if chr(char[0]).isspace():
+            continue
+        quads.append(fitz.Rect(char[3]))
+        if origin is None:
+            origin = (float(char[2][0]), float(char[2][1]))
+    ink = _union_rect(quads)
+    if ink is None and loose:
+        ink = fitz.Rect(loose)
+    if ink is None:
+        return None, None, origin
+    others = _other_span_rects(page, old_text)
+    inset = 0.35
+    shrunk = fitz.Rect(ink.x0 + inset, ink.y0 + inset, ink.x1 - inset, ink.y1 - inset)
+    if shrunk.width < 0.4 or shrunk.height < 0.4:
+        shrunk = fitz.Rect(ink)
+    redact = _clear_of(shrunk, others, 0.5)
+    pieces = []
+    if isinstance(redact, list):
+        pieces.extend(redact)
+    elif redact is not None:
+        pieces.append(redact)
+    # Every old glyph still has to meet a redaction box, or that letter stays.
+    for quad in quads:
+        if _redact_hits(pieces, quad):
+            continue
+        piece = fitz.Rect(quad.x0 + 0.15, quad.y0 + 0.15, quad.x1 - 0.15, quad.y1 - 0.15)
+        if piece.width < 0.2 or piece.height < 0.2:
+            piece = fitz.Rect(quad)
+        cleared = _clear_of(piece, others, 0.35)
+        if cleared is not None and _redact_hits([cleared], quad):
+            pieces.append(cleared)
+    return ink, (pieces or None), origin
+
+
+def _column_rect(page, word):
+    """The panel that holds the words. A full-page wash is not a column."""
+    import pymupdf as fitz
+
+    if word is None:
+        return fitz.Rect(page.rect)
+    cx = (word.x0 + word.x1) / 2.0
+    cy = (word.y0 + word.y1) / 2.0
+    best = None
+    page_box = fitz.Rect(page.rect)
+    for drawing in page.get_drawings() or []:
+        if not drawing.get("fill"):
+            continue
+        rect = fitz.Rect(drawing.get("rect") or page_box)
+        if rect.width < 8 or rect.height < 8:
+            continue
+        if rect.width > page_box.width * 0.92 and rect.height > page_box.height * 0.92:
+            continue
+        if rect.x0 - 1 <= cx <= rect.x1 + 1 and rect.y0 - 1 <= cy <= rect.y1 + 1:
+            if best is None or rect.width < best.width:
+                best = rect
+    return best or page_box
+
+
+def _fit_on_line(page, text: str, old_text: str, size: float, fontfile: str, align: str, origin, ink) -> tuple:
+    """Keep the baseline. A longer line that would leave its column is set smaller."""
+    import pymupdf as fitz
+
+    if fontfile in ("helv", "times", "cour"):
+        face = fitz.Font(fontfile)
+    elif fontfile:
+        face = fitz.Font(fontfile=fontfile)
+    else:
+        face = fitz.Font("helv")
+    size = float(size or 12)
+    width = float(face.text_length(text, fontsize=size))
+    old_width = float(face.text_length(old_text or text, fontsize=size))
+    column = _column_rect(page, ink or fitz.Rect(page.rect))
+    pad = 3.0
+    origin_x = float(origin[0])
+    origin_y = float(origin[1])
+    if align == "center" and ink is not None:
+        room = max(4.0, column.width - 2 * pad)
+    else:
+        room = max(4.0, (column.x1 - pad) - origin_x)
+    shrunk = False
+    if width > old_width + 0.4 and width > room:
+        size = max(4.0, size * (room / width) * 0.98)
+        width = float(face.text_length(text, fontsize=size))
+        shrunk = True
+    if align == "center" and ink is not None:
+        center = (ink.x0 + ink.x1) / 2.0
+        origin_x = center - width / 2.0
+    return (origin_x, origin_y), size, shrunk, width
+
+
 def _replace_span(page, proposal: dict) -> None:
     import pymupdf as fitz
 
-    raw = fitz.Rect(proposal["bbox"])
-    box = fitz.Rect(raw.x0 - 0.3, raw.y0 - 0.3, raw.x1 + 0.3, raw.y1 + 0.3) & page.rect
-    page.add_redact_annot(box, fill=_nearby_fill(page, raw))
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-    origin = proposal.get("origin") or (box.x0, box.y1 - 1)
+    old_text = str(proposal.get("old") or "")
+    loose = proposal.get("bbox")
+    ink, redact, trace_origin = _ink_and_redact(page, old_text, loose)
+    if ink is None and loose:
+        ink = fitz.Rect(loose)
+    origin = trace_origin or proposal.get("origin") or (ink.x0 if ink else 0, ink.y1 if ink else 0)
     size = float(proposal.get("size") or 12)
     text = str(proposal.get("new") or "")
     rgb = proposal.get("rgb")
     if not rgb or len(rgb) < 3:
         rgb = list(_color_tuple(int(proposal.get("color") or 0)))
     fontfile = proposal.get("fontfile") or ""
-    if proposal.get("align") == "center" and fontfile:
-        face = fitz.Font(fontfile) if fontfile in ("helv", "times", "cour") else fitz.Font(fontfile=fontfile)
-        width = float(face.text_length(text, fontsize=size))
-        center = (raw.x0 + raw.x1) / 2.0
-        origin = (center - width / 2.0, float(origin[1]))
+    origin, size, shrunk, width = _fit_on_line(
+        page, text, old_text, size, fontfile, str(proposal.get("align") or ""), origin, ink,
+    )
+    proposal["shrunk"] = bool(proposal.get("shrunk") or shrunk)
+    proposal["size"] = size
+    if ink is not None:
+        placed = fitz.Rect(origin[0], ink.y0, origin[0] + width, ink.y1)
+        guard = fitz.Rect(min(ink.x0, placed.x0), ink.y0, max(ink.x1, placed.x1), ink.y1)
+        proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
+        proposal["guardBox"] = [guard.x0, guard.y0, guard.x1, guard.y1]
+    if isinstance(redact, list):
+        for piece in redact:
+            page.add_redact_annot(piece)
+    elif redact is not None:
+        page.add_redact_annot(redact)
+    else:
+        return
+    # No fill. Images and line art stay, so a coloured panel is not painted over.
+    page.apply_redactions(
+        images=fitz.PDF_REDACT_IMAGE_NONE,
+        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+    )
     _place_font_text(page, origin, text, size, rgb, fontfile)
 
 
@@ -1251,7 +1526,59 @@ def _resize_logo(doc, page, proposal: dict) -> None:
     page.draw_rect(fitz.Rect(proposal["grown"]), color=(0, 0, 0), fill=(0, 0, 0), width=0)
 
 
+def _raster_ink(image, left: int, top: int, width: int, height: int):
+    """The strokes of this word, grown from the reader box to the whole glyph."""
+    import cv2
+    import numpy as np
+
+    height_px, width_px = image.shape[:2]
+    grow_y = max(4, int(round(height * 1.5)))
+    grow_x = max(2, int(round(width * 0.04)))
+    win_y0, win_y1 = max(0, top - grow_y), min(height_px, top + height + grow_y)
+    win_x0, win_x1 = max(0, left - grow_x), min(width_px, left + width + grow_x)
+    window = image[win_y0:win_y1, win_x0:win_x1]
+    if window.size == 0:
+        return None
+    frame = max(2, min(grow_y, 6))
+    ring = np.concatenate([
+        window[:frame].reshape(-1, 3),
+        window[-frame:].reshape(-1, 3),
+    ]).astype(np.float32)
+    background = np.median(ring, axis=0)
+    distance = np.linalg.norm(window.astype(np.float32) - background, axis=2)
+    foreground = (distance > 48.0).astype(np.uint8)
+    count, labels = cv2.connectedComponents(foreground)
+    keep = np.zeros(foreground.shape, np.uint8)
+    box_x0, box_y0 = left - win_x0, top - win_y0
+    box_x1, box_y1 = box_x0 + width, box_y0 + height
+    for index in range(1, count):
+        ys, xs = np.where(labels == index)
+        if ys.size < 4:
+            continue
+        if xs.max() < box_x0 or xs.min() >= box_x1 or ys.max() < box_y0 or ys.min() >= box_y1:
+            continue
+        center_y = float(ys.mean())
+        if center_y < box_y0 - height * 0.35 or center_y > box_y1 + height * 0.35:
+            continue
+        keep[ys, xs] = 255
+    if int(keep.sum()) < 255:
+        keep[box_y0:box_y1, box_x0:box_x1] = 255
+    mask = cv2.dilate(keep, np.ones((3, 3), np.uint8), iterations=1)
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return None
+    return {
+        "window": window,
+        "mask": mask,
+        "win": (win_x0, win_y0, win_x1, win_y1),
+        "bounds": (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
+        "background": background,
+        "color": np.median(window[keep > 0].astype(np.float32), axis=0) if np.any(keep) else background,
+    }
+
+
 def _paint_raster_text(doc, page, proposal: dict) -> None:
+    """Inpaint only the word's strokes, then set the new words on that background."""
     import cv2
     import numpy as np
     import pymupdf as fitz
@@ -1260,23 +1587,43 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
     left, top, width, height = [int(item) for item in proposal["pixelBox"]]
-    y0, y1 = max(0, top), min(image.shape[0], top + height)
-    x0, x1 = max(0, left), min(image.shape[1], left + width)
-    border = np.concatenate([
-        image[max(0, y0 - 2): y0, x0:x1].reshape(-1, 3),
-        image[y1: min(image.shape[0], y1 + 2), x0:x1].reshape(-1, 3),
-    ]) if y1 > y0 and x1 > x0 else np.zeros((1, 3), np.uint8)
-    fill = np.median(border.astype(np.float32), axis=0) if len(border) else np.array([255, 255, 255])
-    image[y0:y1, x0:x1] = np.clip(np.round(fill), 0, 255).astype(np.uint8)
-    painted = fitz.Pixmap(fitz.csRGB, pix.w, pix.h, image.tobytes(), 0)
-    page.clean_contents()
-    # Cover the page image with the painted pixels, then set the new words as live text.
-    page.insert_image(page.rect, pixmap=painted, overlay=True)
-    origin_x = left / scale
-    origin_y = (top + height * 0.85) / scale
-    size = max(8.0, (height / scale) * 0.8) * float(proposal.get("sizeFactor") or 1.0)
+    found = _raster_ink(image, left, top, width, height)
+    if found is None:
+        return
+    window = found["window"]
+    painted = cv2.inpaint(window, found["mask"], 3, cv2.INPAINT_TELEA)
+    x0, y0, x1, y1 = found["bounds"]
+    patch = painted[y0:y1, x0:x1]
+    win_x0, win_y0, _win_x1, _win_y1 = found["win"]
+    overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
+    clip = fitz.Rect((win_x0 + x0) / scale, (win_y0 + y0) / scale, (win_x0 + x1) / scale, (win_y0 + y1) / scale)
+    page.insert_image(clip, pixmap=overlay, overlay=True)
+    ink = fitz.Rect(clip)
     fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
-    _place_font_text(page, (origin_x, origin_y), str(proposal.get("new") or ""), size, (0, 0, 0), fontfile)
+    size = max(5.0, ink.height * 0.92) * float(proposal.get("sizeFactor") or 1.0)
+    origin_y = ink.y1 - ink.height * 0.12
+    center_x = (ink.x0 + ink.x1) / 2.0
+    page_mid = (page.rect.x0 + page.rect.x1) / 2.0
+    align = "center" if abs(center_x - page_mid) <= 14 else "left"
+    origin, size, shrunk, text_width = _fit_on_line(
+        page,
+        str(proposal.get("new") or ""),
+        str(proposal.get("old") or ""),
+        size,
+        fontfile,
+        align,
+        (ink.x0, origin_y),
+        ink,
+    )
+    proposal["shrunk"] = bool(shrunk)
+    proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
+    placed = fitz.Rect(origin[0], ink.y0, origin[0] + text_width, ink.y1)
+    guard = fitz.Rect(min(ink.x0, placed.x0), ink.y0, max(ink.x1, placed.x1), ink.y1)
+    proposal["guardBox"] = [guard.x0, guard.y0, guard.x1, guard.y1]
+    # The reply uses the guard, which includes a longer replacement on the same line.
+    color = found["color"]
+    rgb = (float(color[0]) / 255.0, float(color[1]) / 255.0, float(color[2]) / 255.0)
+    _place_font_text(page, origin, str(proposal.get("new") or ""), size, rgb, fontfile)
 
 
 def confirm(key: str, dest: str) -> dict:
@@ -1310,6 +1657,151 @@ def cancel(key: str) -> dict:
     state["proposal"] = {}
     _save(key, state)
     return {"ok": True, "reply": "Left the file as it was. Nothing was applied.", "actions": []}
+
+
+def _compact_ocr(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def _render_rgb(path: str, scale: float = 2.5):
+    import pymupdf as fitz
+    import numpy as np
+
+    doc = fitz.open(path)
+    try:
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+        return image
+    finally:
+        doc.close()
+
+
+def _tesseract(image, psm: str, tsv: bool) -> str:
+    import cv2
+
+    folder = tempfile.mkdtemp(prefix="edit-gate-")
+    path = os.path.join(folder, "page.png")
+    cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    cmd = ["tesseract", path, "stdout", "--psm", psm]
+    if tsv:
+        cmd.append("tsv")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout or ""
+
+
+def _tsv_words(image) -> list[tuple[int, int, int, int, str]]:
+    """Each word with its box. Sparse mode, so one edited line does not reshuffle the page."""
+    words = []
+    for line in _tesseract(image, "11", True).splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) < 12 or not parts[11].strip():
+            continue
+        try:
+            words.append((int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9]), parts[11].strip()))
+        except ValueError:
+            continue
+    return words
+
+
+def _read_as(text: str, digits: bool) -> str:
+    compact = _compact_ocr(text)
+    if digits:
+        compact = compact.replace("O", "0").replace("I", "1").replace("L", "1")
+    return compact
+
+
+def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_text: str) -> list[str]:
+    """Three gates. A neighbour deleted, a flat block, or a missing new word fails the case.
+
+    (a) Outside a small margin of the old word box, the page pixels stay put.
+    (b) OCR of that region reads the new words.
+    (c) OCR of the whole page changes only by those words.
+    """
+    import numpy as np
+    from collections import Counter
+
+    problems = []
+    if not edit_box or len(edit_box) < 4:
+        return ["no word box"]
+    if not os.path.isfile(before_pdf) or not os.path.isfile(after_pdf):
+        return ["missing preview pdf"]
+    scale = 2.5
+    before = _render_rgb(before_pdf, scale)
+    after = _render_rgb(after_pdf, scale)
+    if before.shape != after.shape:
+        return ["page size changed"]
+    margin = 1.25 * scale
+    x0 = max(0, int(np.floor(float(edit_box[0]) * scale - margin)))
+    y0 = max(0, int(np.floor(float(edit_box[1]) * scale - margin)))
+    x1 = min(before.shape[1], int(np.ceil(float(edit_box[2]) * scale + margin)))
+    y1 = min(before.shape[0], int(np.ceil(float(edit_box[3]) * scale + margin)))
+    delta = np.abs(before.astype(np.int16) - after.astype(np.int16)).max(axis=2)
+    outside = delta.copy()
+    outside[y0:y1, x0:x1] = 0
+    changed = int((outside > 12).sum())
+    if changed > 40:
+        problems.append(f"pixels outside the word {changed}")
+    pad = int(round(3 * scale))
+    crop = after[max(0, y0 - pad): min(after.shape[0], y1 + pad), max(0, x0 - pad): min(after.shape[1], x1 + pad)]
+    digits = sum(ch.isdigit() for ch in (new_text or "")) >= max(1, int(0.6 * len(re.sub(r"\s", "", new_text or "x"))))
+    wanted = _read_as(new_text, digits)
+    old_compact = _read_as(old_text, digits)
+    before_words = _tsv_words(before)
+    after_words = _tsv_words(after)
+    readings = []
+    if crop.size:
+        import cv2
+        bigger = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        readings.append(" ".join(item[4] for item in _tsv_words(bigger)))
+        readings.append(_tesseract(bigger, "6", False))
+        readings.append(_tesseract(bigger, "7", False))
+    inside = []
+    for left, top, width, height, text in after_words:
+        cx = left + width / 2.0
+        cy = top + height / 2.0
+        if x0 - 4 <= cx <= x1 + 4 and y0 - 4 <= cy <= y1 + 4:
+            inside.append(text)
+    readings.append(" ".join(inside))
+    compacts = [_read_as(text, digits) for text in readings if text and text.strip()]
+    if wanted and not any(wanted in item for item in compacts):
+        problems.append("region OCR missed " + (new_text or "")[:40])
+    if old_compact and old_compact != wanted and any(old_compact in item for item in compacts):
+        problems.append("region OCR still has the old words")
+
+    def outside(words) -> list[str]:
+        found = []
+        for left, top, width, height, text in words:
+            cx = left + width / 2.0
+            cy = top + height / 2.0
+            if x0 - 4 <= cx <= x1 + 4 and y0 - 4 <= cy <= y1 + 4:
+                continue
+            token = _compact_ocr(text)
+            if token:
+                found.append(token)
+        return found
+
+    before_out = Counter(outside(before_words))
+    after_out = Counter(outside(after_words))
+    if before_out != after_out:
+        problems.append("page OCR changed more than the words")
+    return problems
+
+
+def gate_line(problems: list[str]) -> str:
+    """Pass or fail for the pixel gate, the region read, and the rest of the page."""
+    blob = " ".join(problems or [])
+    structural = "no word box" in blob or "missing preview" in blob
+    pixel = structural or "pixels outside" in blob or "page size changed" in blob
+    region = structural or "region OCR" in blob
+    page = structural or "page OCR" in blob or "page size changed" in blob
+    return "a={0} b={1} c={2}".format(
+        "fail" if pixel else "pass",
+        "fail" if region else "pass",
+        "fail" if page else "pass",
+    )
 
 
 def undo(key: str, dest: str) -> dict:
