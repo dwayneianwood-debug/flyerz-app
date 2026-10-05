@@ -112,6 +112,61 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
     _record(name, not problems, "; ".join(problems) or expect)
 
 
+def _subset_font() -> None:
+    """A Canva subset tag (ABCDEF+Anton-Regular) is still the Anton file."""
+    import pymupdf as fitz
+    import pikepdf
+    from artwork_edits import _embedded_font
+
+    src = os.path.join(ROOT, "subset-anton.pdf")
+    font = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "fonts", "Anton-Regular.ttf"))
+    doc = fitz.open()
+    page = doc.new_page(width=320, height=120)
+    page.insert_font(fontname="ANTON", fontfile=font)
+    page.insert_text((16, 70), "Call 067 1345 937", fontsize=16, fontname="ANTON", fontfile=font)
+    doc.save(src)
+    doc.close()
+    pdf = pikepdf.open(src, allow_overwriting_input=True)
+    for face in pdf.pages[0].Resources.Font.values():
+        face["/BaseFont"] = pikepdf.Name("/ABCDEF+Anton-Regular")
+    pdf.save(src)
+    pdf.close()
+    doc = fitz.open(src)
+    try:
+        found = _embedded_font(doc, doc[0], "Anton-Regular")
+    finally:
+        doc.close()
+    _record("subset-font", bool(found), found or "subset tag hid Anton")
+
+
+def _phone_icon() -> None:
+    """A phone icon read as empty brackets is not part of the number."""
+    from artwork_edits import _select_hit
+    from edit_style import swap_text
+
+    words = [
+        {"text": "®)", "left": 10, "top": 40, "width": 20, "height": 18},
+        {"text": "073", "left": 40, "top": 40, "width": 30, "height": 18},
+        {"text": "703", "left": 80, "top": 40, "width": 30, "height": 18},
+        {"text": "0766", "left": 120, "top": 40, "width": 40, "height": 18},
+    ]
+    hit = _select_hit(words, {"kind": "phone", "new": "082 123 4567"})
+    problems = []
+    text = (hit or {}).get("text") or ""
+    if text != "073 703 0766" or "®" in text or "()" in text:
+        problems.append("boxes " + repr(text))
+    found, styled, full = swap_text("() 073 703 0766", "phone", "082 123 4567")
+    if styled != "082 123 4567" or "()" in (full or "") or "()" in (found or ""):
+        problems.append(f"empty {found!r} {styled!r} {full!r}")
+    _found, _styled, call = swap_text("Call () 073 703 0766", "phone", "082 123 4567")
+    if "()" in (call or "") or "082 123 4567" not in (call or ""):
+        problems.append(f"call {call!r}")
+    _found, kept, _full = swap_text("(073) 703 0766", "phone", "082 123 4567")
+    if kept != "(082) 123 4567":
+        problems.append(f"real brackets {kept!r}")
+    _record("phone-icon", not problems, "; ".join(problems) or "073 703 0766")
+
+
 def _raster_date() -> None:
     import pymupdf as fitz
     from PIL import Image, ImageDraw, ImageFont
@@ -210,6 +265,9 @@ def run() -> list[str]:
     _flow("date-mdy", "October 5, 2025", date, "October 12, 2026", "October 5")
     phone = "change the phone number to 082 123 4567"
     _flow("phone-spaces", "Call 073 703 0766", phone, "082 123 4567", "073 703 0766")
+    _flow("phone-empty", "Call () 073 703 0766", phone, "082 123 4567", "()")
+    _phone_icon()
+    _subset_font()
     _flow("phone-hyphen", "Call 072-971-4247", phone, "082-123-4567", "072-971-4247")
     _flow("phone-parens", "Call (073) 703 0766", phone, "(082) 123 4567", "073")
     time = "change the time to 7:30 pm"

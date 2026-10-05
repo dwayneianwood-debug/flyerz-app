@@ -752,8 +752,16 @@ def _press_matrix(page):
     if images:
         width, height = _image_pixels(page, int(images[0][0]))
         if width >= 8 and height >= 8 and page.rect.width > 1 and page.rect.height > 1:
-            return fitz.Matrix(width / page.rect.width, height / page.rect.height)
-    return fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+            matrix = fitz.Matrix(width / page.rect.width, height / page.rect.height)
+        else:
+            matrix = fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+    else:
+        matrix = fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+    long_mm = max(page.rect.width, page.rect.height) * 25.4 / 72.0
+    if long_mm > 430.0:
+        cap = 150.0 / 72.0
+        matrix = fitz.Matrix(min(abs(matrix.a), cap), min(abs(matrix.d), cap))
+    return matrix
 
 
 def _page_rgb(path: str, zoom: float):

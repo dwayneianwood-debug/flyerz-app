@@ -466,8 +466,6 @@ def test_heavy(folder: str) -> None:
     import pymupdf as fitz
     from PIL import Image
     from extra_checks import assess_extras
-    from press_ready_engine import PLATE_SKIP_REASON
-
     # A1 page with a real 300 dpi photo placed at 100 mm, not a full-sheet bitmap.
     photo = os.path.join(folder, "photo.jpg")
     side = int(round(100 / 25.4 * 300))
@@ -488,17 +486,22 @@ def test_heavy(folder: str) -> None:
     if result.get("productId") != "a1":
         problems.append(f"product {result.get('productId')}")
     blob = " ".join(result.get("reasons") or []) + " " + " ".join(result.get("decisions") or [])
-    if PLATE_SKIP_REASON not in blob:
-        problems.append(blob[:140])
-    if result.get("light") != "amber":
-        problems.append(f"light {result.get('light')}")
-    if elapsed > 25:
+    press = result.get("pressPath") or ""
+    if not press or not os.path.exists(press):
+        problems.append("no press file " + blob[:100])
+    else:
+        got_w, got_h = _press_mm(press)
+        if abs(got_w - 604) > 2 or abs(got_h - 851) > 2:
+            problems.append(f"press {got_w:.1f}x{got_h:.1f}")
+    if result.get("light") == "red":
+        problems.append(f"red {blob[:100]}")
+    if elapsed > 45:
         problems.append(f"time {elapsed:.1f}s")
     if _by_id(extras)["extra_E1"]["status"] != "pass":
         problems.append("E1 " + _by_id(extras)["extra_E1"]["detail"][:80])
     if "traceback" in blob.lower():
         problems.append("traceback")
-    _record("heavy-a1-poster", not problems, "; ".join(problems) or f"amber {elapsed:.1f}s")
+    _record("heavy-a1-poster", not problems, "; ".join(problems) or f"press {elapsed:.1f}s")
 
     bulky = os.path.join(folder, "bulky.pdf")
     _save(_page(148, 210, "BULK"), bulky)

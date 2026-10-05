@@ -170,6 +170,8 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
         problems.append("staged text " + (staged_text[:80] or "missing"))
     if "BISHOP" in reply or "Waterbok" in reply:
         problems.append("replaced more than the number")
+    if "()" in reply or "®" in reply:
+        problems.append("stray brackets " + reply[:120])
     if not apply:
         _record(name, not problems, "; ".join(problems) or "preview only, not applied")
         return

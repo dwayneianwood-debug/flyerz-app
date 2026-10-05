@@ -270,8 +270,8 @@ def _case_pdf(name: str, spec: dict) -> None:
 
 def test_every_product() -> None:
     for product in _products():
-        # A2 and larger are detected in the size matrix. A 300 dpi plate of A0
-        # is about 14000 × 10000 and does not belong in this press compile.
+        # A2 and larger are press-compiled in the size matrix. This loop is the
+        # small-sheet customer path. A full 300 dpi plate is not built for them.
         if max(float(product["widthMm"]), float(product["heightMm"])) > 430:
             continue
         _case_pdf(f"size-{product['id']}", {

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Every product, both orientations, and the bleed and size cases Ian listed.
 
-A press file is built when the sheet's long side is at most 430 mm. A0–A2 are
-detected the same way, and the 300 dpi plate is not rendered: that bitmap is
-larger than the memory leash this process is built for.
+A press file is built for every product. A0–A2 keep their vectors and only the
+5 mm bleed is drawn as strips, so a full 300 dpi plate is not allocated.
 """
 
 from __future__ import annotations
@@ -227,6 +226,128 @@ def _press_size(path: str) -> tuple[float, float]:
         doc.close()
 
 
+def _page_text(path: str) -> str:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        return doc[0].get_text("text") or ""
+    finally:
+        doc.close()
+
+
+def _full_plate(path: str) -> bool:
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        for info in page.get_image_info() or []:
+            box = info.get("bbox") or (0, 0, 0, 0)
+            if (box[2] - box[0]) > page.rect.width * 0.5 and (box[3] - box[1]) > page.rect.height * 0.5:
+                return True
+        return False
+    finally:
+        doc.close()
+
+
+def _child_peak_mb() -> str:
+    """High-water RSS of this process.
+
+    Linux keeps ru_maxrss across exec, so a child would otherwise report the
+    parent's peak. VmHWM is this process only.
+    """
+    return (
+        "def _peak_mb():\n"
+        "    try:\n"
+        "        for line in open('/proc/self/status', encoding='ascii'):\n"
+        "            if line.startswith('VmHWM:'):\n"
+        "                return round(int(line.split()[1]) / 1024.0, 1)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)\n"
+    )
+
+
+def _compile_measured(src: str, out: str, trim_w: float, trim_h: float) -> dict:
+    """Compile in a child process so the peak RSS is this sheet, not the suite."""
+    import json
+    import subprocess
+
+    code = (
+        "import json, resource, time\n"
+        "from press_ready_engine import compile_vector_press\n"
+        + _child_peak_mb()
+        + f"t0 = time.perf_counter()\n"
+        f"result = compile_vector_press({src!r}, {out!r}, {trim_w}, {trim_h}, 5)\n"
+        "peak = _peak_mb()\n"
+        "report = result.get('report') or {}\n"
+        "print(json.dumps({\n"
+        "  'used': bool(result.get('used')),\n"
+        "  'seconds': round(time.perf_counter() - t0, 2),\n"
+        "  'peakMb': peak,\n"
+        "  'existing': bool(report.get('existingBleed')),\n"
+        "  'large': bool(report.get('largeFormat')),\n"
+        "  'reason': str(report.get('reason') or '')[:120],\n"
+        "}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.path.dirname(__file__),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    payload = {}
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith("{"):
+            payload = json.loads(line)
+            break
+    if not payload:
+        payload = {"used": False, "seconds": 0, "peakMb": 0, "reason": (proc.stderr or "")[-180:]}
+    return payload
+
+
+def _compile_large(product: dict, folder: str, kind: str) -> None:
+    from press_ready_engine import press_window_seam
+
+    pid = product["id"]
+    trim_w = float(product["widthMm"])
+    trim_h = float(product["heightMm"])
+    src = os.path.join(folder, f"{pid}-{kind}.pdf")
+    if not os.path.exists(src):
+        _write_pdf(src, trim_w, trim_h, kind)
+    out = os.path.join(folder, f"{pid}-{kind}-press.pdf")
+    measured = _compile_measured(src, out, trim_w, trim_h)
+    problems = []
+    if not measured.get("used") or not os.path.exists(out):
+        problems.append(measured.get("reason") or "no press file")
+    else:
+        width, height = _press_size(out)
+        if abs(width - (trim_w + 10)) > 1.5 or abs(height - (trim_h + 10)) > 1.5:
+            problems.append(f"press {width:.1f}x{height:.1f}")
+        if "P1" not in _page_text(out):
+            problems.append("vector text lost")
+        if _full_plate(out):
+            problems.append("full plate")
+        if not measured.get("large"):
+            problems.append("not large-format")
+        if float(measured.get("peakMb") or 0) > 450:
+            problems.append(f"peak {measured.get('peakMb')}MB")
+        if float(measured.get("seconds") or 0) > 60:
+            problems.append(f"time {measured.get('seconds')}s")
+        if kind == "canva":
+            if not measured.get("existing"):
+                problems.append("existing bleed not kept")
+            seams = press_window_seam(src, out) or []
+            worst = max((float(row.get("page_max") or 0) for row in seams), default=99)
+            if not seams or worst >= 5:
+                problems.append(f"seam {worst:.2f}")
+    detail = "; ".join(problems) or f"{measured.get('seconds')}s peak {measured.get('peakMb')}MB"
+    _record(pid, f"press-{kind}", not problems, detail)
+
+
 def _compile_case(product: dict, folder: str, kind: str) -> None:
     from press_ready_engine import compile_vector_press, press_window_seam
 
@@ -367,7 +488,8 @@ def run() -> list[str]:
     for product in products:
         long_side = max(float(product["widthMm"]), float(product["heightMm"]))
         if long_side > PRESS_LIMIT_MM:
-            _record(product["id"], "press-canva", True, "detected only; plate is over the memory leash")
+            _compile_large(product, folder, "noleed")
+            _compile_large(product, folder, "canva")
             continue
         if product["id"] not in compile_ids and not str(product["id"]).startswith("card"):
             # Every remaining sheet at or under A3 still gets the partial-bleed compile.

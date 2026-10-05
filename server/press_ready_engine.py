@@ -26,12 +26,14 @@ import numpy as np
 
 from http_headers import external_headers
 
-# A 300 dpi plate longer than this does not fit the memory leash (A2 and above).
+# A full 300 dpi plate longer than this does not fit the memory leash (A2 and above).
+# Those sheets stay vector. Only the 5 mm bleed strips are rasterized.
 PLATE_LIMIT_MM = 430.0
 PLATE_SKIP_REASON = (
     "This sheet is larger than the press line can hold in memory, so the plate was not rendered. "
     "The size was read and the file was not damaged."
 )
+LARGE_BLEED_DPI = 300.0
 SAFE_ZONE_MM = 3.0
 SAFE_ZONE_SHRINK_MIN = 0.01
 SAFE_ZONE_SHRINK_CAP = 0.03
@@ -42,7 +44,11 @@ MM_TO_PT = 72.0 / 25.4
 
 
 def plate_exceeds_memory(trim_w_mm: float, trim_h_mm: float) -> bool:
-    """True when a 300 dpi plate of this trim would exceed the memory leash."""
+    """True when a full 300 dpi plate of this trim would exceed the memory leash.
+
+    The press file is still built. Vectors stay live and only the bleed strips
+    are drawn, so Ghostscript's 50MB caps are unchanged.
+    """
     return max(float(trim_w_mm or 0), float(trim_h_mm or 0)) > PLATE_LIMIT_MM
 
 
@@ -1245,7 +1251,7 @@ def _insert_cmyk(page, cmyk, rect) -> None:
     Image.fromarray(np.ascontiguousarray(cmyk), mode="CMYK").save(
         buf, format="TIFF", compression="raw", dpi=(300, 300),
     )
-    page.insert_image(rect, stream=buf.getvalue())
+    page.insert_image(rect, stream=buf.getvalue(), keep_proportion=False)
 
 
 # A 1–2 px light line sits on the page edge. Read a few pixels past it.
@@ -2752,6 +2758,28 @@ def _overlay_live_text(dest, src, pads: tuple[int, int, int, int]) -> None:
     _rewrite_text_to_cmyk(dest, clip)
 
 
+def _paint_large_strips(path: str, placements: list) -> None:
+    """Draw only the 5 mm bleed. A poster is not flattened to one 300 dpi plate."""
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    tmp = path + ".strips.pdf"
+    painted = False
+    try:
+        for index, page in enumerate(doc):
+            placement = placements[index] if index < len(placements) else None
+            if not placement:
+                continue
+            _paint_cmyk_edge(page, fitz.Rect(*placement))
+            painted = True
+        if painted:
+            doc.save(tmp, deflate=True, garbage=4)
+    finally:
+        doc.close()
+    if painted and os.path.isfile(tmp):
+        os.replace(tmp, path)
+
+
 def _place_mirrored_bleed(dest, src, short_l: float, short_r: float, short_t: float, short_b: float) -> None:
     """Extend a partial bleed to 5 mm as one mirrored CMYK image, with the type on top."""
     target_w, target_h = _probe_page_pixels(float(dest.rect.width), float(dest.rect.height))
@@ -2763,13 +2791,32 @@ def _place_mirrored_bleed(dest, src, short_l: float, short_r: float, short_t: fl
     _overlay_live_text(dest, src, pads)
 
 
-def press_window_seam(src_pdf: str, press_pdf: str) -> list[dict]:
+def _seam_dpi(path: str) -> int:
+    """300 dpi on a normal sheet.
+
+    A poster is compared on a render whose long side stays near 1400 px.
+    Template matching a full 72 dpi A0 page allocates hundreds of megabytes.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        rect = doc[0].rect
+        long_mm = max(float(rect.width), float(rect.height)) * 25.4 / 72.0
+    finally:
+        doc.close()
+    if long_mm > PLATE_LIMIT_MM:
+        return max(18, int(1400 * 25.4 / long_mm))
+    return 300
+
+
+def press_window_seam(src_pdf: str, press_pdf: str, dpi: int | None = None) -> list[dict]:
     """seam.py on the press PDF: the added strip against an inner band of the same width."""
     import pymupdf as fitz
 
     if not src_pdf or not press_pdf or not os.path.isfile(src_pdf) or not os.path.isfile(press_pdf):
         return []
-    dpi = 300
+    dpi = int(dpi or _seam_dpi(press_pdf))
     px = dpi / 25.4
 
     def render(path: str, index: int) -> np.ndarray:
@@ -2795,7 +2842,8 @@ def press_window_seam(src_pdf: str, press_pdf: str) -> list[dict]:
     for index in range(count):
         source = render(src_pdf, index)
         output = render(press_pdf, index)
-        margin = 30
+        # 2.5 mm. At 300 dpi that is the same 30 px the small-sheet check used.
+        margin = max(4, int(round(2.5 * px)))
         template = source[margin:-margin, margin:-margin]
         if template.size == 0 or output.shape[0] < template.shape[0] or output.shape[1] < template.shape[1]:
             rows.append({"page": index + 1, "page_max": 99.0, "edges": {}, "corners": {}})
@@ -3038,11 +3086,20 @@ def compile_vector_press(
             short_t = max(0.0, bleed_pt - existing["top"] * MM_TO_PT)
             short_b = max(0.0, bleed_pt - existing["bottom"] * MM_TO_PT)
             if max(short_l, short_r, short_t, short_b) >= 0.4:
-                # One CMYK plate. The shortfall is a mirror of the outermost pixels, not a separate strip.
-                extended = True
-                _place_mirrored_bleed(new_page, src_page, short_l, short_r, short_t, short_b)
-                page_mirrored.append(True)
-                edge_placements.append(None)
+                if plate_exceeds_memory(trim_w_mm, trim_h_mm):
+                    # Keep the page as vectors. The shortfall is a strip, not a full plate.
+                    placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
+                    new_page.show_pdf_page(placed, src, index, clip=clip)
+                    kept = True
+                    extended = True
+                    page_mirrored.append(False)
+                    edge_placements.append((placed.x0, placed.y0, placed.x1, placed.y1))
+                else:
+                    # One CMYK plate. The shortfall is a mirror of the outermost pixels, not a separate strip.
+                    extended = True
+                    _place_mirrored_bleed(new_page, src_page, short_l, short_r, short_t, short_b)
+                    page_mirrored.append(True)
+                    edge_placements.append(None)
             else:
                 placed = fitz.Rect(short_l, short_t, short_l + clip.width, short_t + clip.height)
                 new_page.show_pdf_page(placed, src, index, clip=clip)
@@ -3133,7 +3190,10 @@ def compile_vector_press(
         boxed = out_path + ".box.pdf"
         fixed.save(boxed, deflate=True, garbage=4)
         fixed.close()
-        _paint_bleed_matching(boxed, edge_placements)
+        if plate_exceeds_memory(trim_w_mm, trim_h_mm):
+            _paint_large_strips(boxed, edge_placements)
+        else:
+            _paint_bleed_matching(boxed, edge_placements)
         os.replace(boxed, out_path)
 
     full_keep = kept and not extended
@@ -3147,6 +3207,10 @@ def compile_vector_press(
     report["contentKind"] = kind
     report["analysis"]["contentKind"] = kind
     report["existingBleed"] = bool(kept or extended)
+    report["largeFormat"] = plate_exceeds_memory(trim_w_mm, trim_h_mm)
+    if report["largeFormat"]:
+        report["bleedDpi"] = LARGE_BLEED_DPI
+        rescue["note"] = "Text and vectors were kept live. Only the 5 mm bleed edge was drawn."
     report["fullBleedKept"] = full_keep
     report["rescue"] = rescue
     report["pageCount"] = page_count

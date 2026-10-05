@@ -119,13 +119,19 @@ def _missing_glyphs(fontfile: str, text: str) -> list[str]:
     return missing
 
 
+def _font_token(name: str) -> str:
+    """Family name without a PDF subset tag. ABCDEF+Anton-Regular is Anton."""
+    tail = str(name or "").split("+")[-1]
+    return re.sub(r"[^a-z0-9]", "", tail.lower())
+
+
 def _embedded_font(doc, page, fontname: str) -> str | None:
     import pymupdf as fitz
 
-    wanted = re.sub(r"[^a-z0-9]", "", ((fontname or "").split("+")[-1]).lower())
+    wanted = _font_token(fontname)
     for item in page.get_fonts() or []:
         xref = int(item[0])
-        names = [re.sub(r"[^a-z0-9]", "", str(part).lower()) for part in item[3:]]
+        names = [_font_token(part) for part in item[3:]]
         names = [name for name in names if name]
         if wanted and not any(wanted == name or name.startswith(wanted) or wanted.startswith(name) for name in names):
             continue
@@ -591,6 +597,32 @@ def _move_proposal(page, spans: list[dict]) -> dict:
     return {"mode": "move", "moves": moves, "count": len(moves), "amber": False}
 
 
+def _phone_run(group: list[dict]) -> dict | None:
+    """The digit boxes of a phone number, without an icon read as empty brackets."""
+    ordered = sorted(group, key=lambda item: item["left"])
+    digit_at = [index for index, item in enumerate(ordered) if re.search(r"\d", str(item.get("text") or ""))]
+    if not digit_at:
+        return None
+    chosen = []
+    for item in ordered[digit_at[0]:digit_at[-1] + 1]:
+        text = str(item.get("text") or "")
+        if re.search(r"\d", text):
+            chosen.append(item)
+            continue
+        if re.fullmatch(r"[\s().+\-]*", text) and not re.fullmatch(r"\(\s*\)", text.strip()):
+            chosen.append(item)
+    if not chosen:
+        return None
+    joined = " ".join(str(item.get("text") or "") for item in chosen)
+    return {
+        "text": joined,
+        "left": chosen[0]["left"],
+        "top": min(item["top"] for item in chosen),
+        "width": max(item["left"] + item["width"] for item in chosen) - chosen[0]["left"],
+        "height": max(item["top"] + item["height"] for item in chosen) - min(item["top"] for item in chosen),
+    }
+
+
 def _select_hit(words: list[dict], parsed: dict) -> dict | None:
     def boxed(group: list[dict], joined: str) -> dict:
         group.sort(key=lambda item: item["left"])
@@ -607,8 +639,9 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
         if singles:
             # The number's own box, not a neighbouring line that happens to share its height.
             word = min(singles, key=lambda item: (len(item["text"]), item["width"] * item["height"]))
+            text = fragment(word.get("text") or "", parsed["kind"]) or word["text"]
             return {
-                "text": word["text"],
+                "text": text,
                 "left": word["left"],
                 "top": word["top"],
                 "width": word["width"],
@@ -628,10 +661,15 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
     if pattern is None:
         return None
     for group in _line_groups(words):
-        joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
-        if not pattern.search(joined):
-            continue
-        candidate = boxed(group, joined)
+        if parsed["kind"] == "phone":
+            candidate = _phone_run(group)
+            if candidate is None or not fragment(candidate["text"], "phone"):
+                continue
+        else:
+            joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
+            if not pattern.search(joined):
+                continue
+            candidate = boxed(group, joined)
         if hit is None or len(candidate["text"]) > len(hit["text"]):
             hit = candidate
     return hit

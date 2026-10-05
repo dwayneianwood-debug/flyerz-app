@@ -49,12 +49,27 @@ for _index in range(1, 13):
 _MONTH_NUMBER["sept"] = 9
 
 
+# An icon beside a phone number is often read as "()" or "®)". It is not part of the number.
+_STRAY_PHONE = re.compile(r"(?:[®©™]\s*\)|\(\s*\))")
+
+
+def _clean_phone(text: str) -> str:
+    cleaned = _STRAY_PHONE.sub(" ", text or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
 def fragment(text: str, kind: str) -> str:
     pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(kind)
     if pattern is None:
         return ""
     match = pattern.search(text or "")
-    return match.group(0) if match else ""
+    if not match:
+        return ""
+    found = match.group(0)
+    if kind == "phone":
+        return _clean_phone(found)
+    return found
 
 
 def restyle(kind: str, original: str, requested: str) -> str:
@@ -71,13 +86,22 @@ def restyle(kind: str, original: str, requested: str) -> str:
 
 def swap_text(text: str, kind: str, requested: str) -> tuple[str, str, str] | None:
     """Return the found words, the styled replacement, and the full line."""
-    found = fragment(text, kind)
-    if not found:
+    pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(kind)
+    match = pattern.search(text or "") if pattern is not None else None
+    if not match:
         return None
+    raw = match.group(0)
+    found = _clean_phone(raw) if kind == "phone" else raw
     styled = restyle(kind, found, requested)
     if not styled:
         return None
-    return found, styled, text.replace(found, styled, 1)
+    if kind == "phone":
+        styled = _clean_phone(styled)
+        leftover = text.replace(raw, " ", 1)
+        if not re.search(r"[A-Za-z0-9]", leftover):
+            return found, styled, styled
+        return found, styled, _clean_phone(text.replace(raw, styled, 1))
+    return found, styled, text.replace(raw, styled, 1)
 
 
 def _like(sample: str, word: str) -> str:
@@ -202,6 +226,7 @@ def _weekday(year: int, month: int, day: int, sample: str) -> str:
 
 
 def _restyle_phone(original: str, requested: str) -> str:
+    original = _clean_phone(original)
     old_digits = re.sub(r"\D", "", original)
     new_digits = re.sub(r"\D", "", requested)
     if not new_digits:

@@ -215,6 +215,26 @@ def _read_image(path: str):
     return _to_bgr(cv2.imread(path, cv2.IMREAD_UNCHANGED))
 
 
+def _place_large_image(src: str, dest: str, trim_w: float, trim_h: float) -> None:
+    """Place a poster picture on the trim. Cover scale, then the press path adds the bleed strips."""
+    import pymupdf as fitz
+    from PIL import Image
+
+    doc = fitz.open()
+    page = doc.new_page(width=trim_w * MM_TO_PT, height=trim_h * MM_TO_PT)
+    # Cover: the picture fills the trim. Reading the header avoids a full-plate decode.
+    with Image.open(src) as image:
+        src_w, src_h = image.size
+    cover = max(page.rect.width / max(src_w, 1), page.rect.height / max(src_h, 1))
+    width = src_w * cover
+    height = src_h * cover
+    x0 = (page.rect.width - width) / 2.0
+    y0 = (page.rect.height - height) / 2.0
+    page.insert_image(fitz.Rect(x0, y0, x0 + width, y0 + height), filename=src, keep_proportion=False)
+    doc.save(dest)
+    doc.close()
+
+
 def _write_png(img, path: str) -> None:
     import cv2
     from PIL import Image
@@ -1362,7 +1382,7 @@ def make_print_ready(
     lettering_note = "The original lettering is kept."
 
     try:
-        from press_ready_engine import PLATE_SKIP_REASON, plate_exceeds_memory
+        from press_ready_engine import plate_exceeds_memory
 
         if ext in (".ai", ".eps"):
             opened, prep_error = _prepare_vector(src_path, ext)
@@ -1422,15 +1442,17 @@ def make_print_ready(
                     "The PDF shape does not match the product. The page was placed whole and the edges were extended. It was not stretched."
                 )
                 if plate_exceeds_memory(trim_w, trim_h):
-                    decisions.append(PLATE_SKIP_REASON)
-                    info = decide_light({"plateSkipped": True, "plateReason": PLATE_SKIP_REASON})
-                    return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
-                raster = _render_pdf_image(work_path)
-                ext = ".png"
-        if plate_exceeds_memory(trim_w, trim_h):
-            decisions.append(PLATE_SKIP_REASON)
-            info = decide_light({"plateSkipped": True, "plateReason": PLATE_SKIP_REASON})
-            return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
+                    decisions.append("Large format keeps the vectors. Only the bleed edge is drawn.")
+                else:
+                    raster = _render_pdf_image(work_path)
+                    ext = ".png"
+        if plate_exceeds_memory(trim_w, trim_h) and ext in IMAGE_EXT:
+            placed = os.path.join(output_dir, "large-placed.pdf")
+            _place_large_image(work_path, placed, trim_w, trim_h)
+            work_path = placed
+            ext = ".pdf"
+            raster = None
+            decisions.append("Large format keeps the picture as placed. Only the 5 mm bleed edge is added.")
         if ext in IMAGE_EXT or raster is not None:
             if raster is None:
                 raster = _read_image(work_path)
