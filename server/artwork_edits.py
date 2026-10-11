@@ -916,30 +916,6 @@ def _line_groups(words: list[dict]) -> list[list[dict]]:
     return [group["words"] for group in groups]
 
 
-def _face_would_shrink(fontfile: str, old: str, new: str, hit: dict, scale: float) -> bool:
-    """A much heavier face set in the same box comes out smaller. That is not a match."""
-    if not fontfile or not os.path.isfile(fontfile):
-        return False
-    import pymupdf as fitz
-
-    box_w = max(1.0, float(hit.get("width") or 1) / max(float(scale or 1), 0.1))
-    box_h = max(1.0, float(hit.get("height") or 1) / max(float(scale or 1), 0.1))
-    try:
-        face = fitz.Font(fontfile=fontfile)
-        size = max(5.0, min(box_h, box_w) * 0.92)
-        width = float(face.text_length(new or old, fontsize=size))
-    except (OSError, ValueError, RuntimeError):
-        return False
-    if width <= box_w + 0.4:
-        return False
-    old_len = max(1, len(re.sub(r"\s", "", old or "")))
-    new_len = len(re.sub(r"\s", "", new or ""))
-    if new_len > old_len * 1.45:
-        return False
-    shrunk = size * (box_w / max(width, 0.1)) * 0.98
-    return shrunk < box_h * 0.72
-
-
 def _closest_font(crop, text: str) -> tuple[str, float]:
     """The bundled face whose ink overlaps the word. Lower score is closer.
 
@@ -1527,7 +1503,7 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
             return {"ok": False, "reply": f"I read the picture and could not find a {label}, so I have not changed anything.", "actions": []}
         shown_old, shown_new, new_text = swapped
     fontfile, score = _closest_font(crop, hit["text"])
-    if score < 0 or (fontfile and _face_would_shrink(fontfile, shown_old, shown_new, hit, scale)):
+    if score < 0:
         return {
             "ok": False,
             "reply": (
