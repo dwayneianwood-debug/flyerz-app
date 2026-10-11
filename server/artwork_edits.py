@@ -2667,10 +2667,15 @@ def _ink_cut(distance) -> float:
     hist, edges = np.histogram(flat, bins=30, range=(0.0, hi))
     smooth = np.convolve(hist.astype(np.float64), np.array([1.0, 2.0, 1.0]) / 4.0, mode="same")
     last_peak = len(smooth) - 1
-    for index in range(len(smooth) - 2, max(2, len(smooth) // 3), -1):
-        if smooth[index] >= smooth[index - 1] and smooth[index] >= smooth[index + 1]:
-            last_peak = index
-            break
+    # White type on a person is the last bin, standing above the bin beside it.
+    # The shoulder is an earlier bump. Walking inward and stopping on that bump
+    # used to throw the cut away and paint the person as if it were the letters.
+    endpoint_is_peak = len(smooth) < 2 or smooth[-1] >= smooth[-2]
+    if not endpoint_is_peak:
+        for index in range(len(smooth) - 2, max(2, len(smooth) // 3), -1):
+            if smooth[index] >= smooth[index - 1] and smooth[index] >= smooth[index + 1]:
+                last_peak = index
+                break
     left_peak = int(np.argmax(smooth[:max(1, last_peak)]))
     if last_peak <= left_peak + 1:
         return 48.0

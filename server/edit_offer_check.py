@@ -339,6 +339,30 @@ def _raster_venue() -> None:
     _record("raster-venue", ok, detail + " pending " + str(asked.get("pending")))
 
 
+def _church_letter_fill(src: str) -> tuple[float, float]:
+    """Plane residual and mask share for the 11 OCT box on the scale-2 page.
+
+    The laptop render of this poster put that date at pixel box 498,654,103,87.
+    """
+    import numpy as np
+    import pymupdf as fitz
+    from artwork_edits import _paint_plane, _raster_ink
+
+    doc = fitz.open(src)
+    try:
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
+    finally:
+        doc.close()
+    found = _raster_ink(image, 498, 654, 103, 87)
+    if not found:
+        return 0.0, 1.0
+    _painted, spread = _paint_plane(found["window"], found["mask"])
+    share = float((found["mask"] > 0).mean())
+    return float(spread), share
+
+
 def _church() -> None:
     import pymupdf as fitz
     from artwork_edits import SAFE_EDIT, _closest_font
@@ -361,6 +385,9 @@ def _church() -> None:
     path, score = _closest_font(crop, "11 OCT")
     again, score2 = _closest_font(crop, "11 OCT")
     face = os.path.basename(path)
+    spread, share = _church_letter_fill(src)
+    # The white date sits on a person. The mask has to be those strokes, and a
+    # colour plane fitted around them has to miss (the clean limit is 18).
     refused = (
         eleven.get("pending") is not True
         and (eleven.get("reply") or "").strip() == SAFE_EDIT
@@ -370,11 +397,13 @@ def _church() -> None:
         and _sha(src) == before
         and face == os.path.basename(again)
         and abs(score - score2) < 0.01
+        and share < 0.45
+        and spread > 18.0
     )
     _record(
         "church-poster",
         refused,
-        f"11 {(eleven.get('reply') or '')[:80]} | 9 {(nine.get('reply') or '')[:80]} | font {face} {score:.1f}",
+        f"11 {(eleven.get('reply') or '')[:80]} | 9 {(nine.get('reply') or '')[:80]} | font {face} {score:.1f} | letter share {share:.2f} plane {spread:.1f}",
     )
 
 
