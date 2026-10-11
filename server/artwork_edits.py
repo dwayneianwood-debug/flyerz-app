@@ -1469,29 +1469,46 @@ def _move_proposal(page, spans: list[dict]) -> dict:
 
 
 def _phone_run(group: list[dict]) -> dict | None:
-    """The digit boxes of a phone number, without an icon read as empty brackets."""
+    """The digit boxes of a phone number, without an icon read as empty brackets.
+
+    A street number on the same baseline, such as "7640 EXT 11", is not part of the phone.
+    """
     ordered = sorted(group, key=lambda item: item["left"])
-    digit_at = [index for index, item in enumerate(ordered) if re.search(r"\d", str(item.get("text") or ""))]
-    if not digit_at:
-        return None
-    chosen = []
-    for item in ordered[digit_at[0]:digit_at[-1] + 1]:
+    runs: list[list[dict]] = []
+    current: list[dict] = []
+    for item in ordered:
         text = str(item.get("text") or "")
-        if re.search(r"\d", text):
-            chosen.append(item)
+        letters = bool(re.search(r"[A-Za-z]", text))
+        digits = bool(re.search(r"\d", text))
+        separators = bool(re.fullmatch(r"[\s().+\-]*", text)) and not re.fullmatch(r"\(\s*\)", text.strip())
+        if letters or not (digits or separators):
+            if current:
+                runs.append(current)
+                current = []
             continue
-        if re.fullmatch(r"[\s().+\-]*", text) and not re.fullmatch(r"\(\s*\)", text.strip()):
-            chosen.append(item)
-    if not chosen:
-        return None
-    joined = " ".join(str(item.get("text") or "") for item in chosen)
-    return {
-        "text": joined,
-        "left": chosen[0]["left"],
-        "top": min(item["top"] for item in chosen),
-        "width": max(item["left"] + item["width"] for item in chosen) - chosen[0]["left"],
-        "height": max(item["top"] + item["height"] for item in chosen) - min(item["top"] for item in chosen),
-    }
+        current.append(item)
+    if current:
+        runs.append(current)
+    best = None
+    best_digits = 0
+    for run in runs:
+        chosen = [item for item in run if re.search(r"\d", str(item.get("text") or ""))]
+        if not chosen:
+            continue
+        joined = " ".join(str(item.get("text") or "") for item in chosen)
+        phone = fragment(joined, "phone")
+        count = len(re.sub(r"\D", "", phone))
+        if count < 6 or count <= best_digits:
+            continue
+        best_digits = count
+        best = {
+            "text": phone,
+            "left": chosen[0]["left"],
+            "top": min(item["top"] for item in chosen),
+            "width": max(item["left"] + item["width"] for item in chosen) - chosen[0]["left"],
+            "height": max(item["top"] + item["height"] for item in chosen) - min(item["top"] for item in chosen),
+        }
+    return best
 
 
 def _stack_day_and_month(words: list[dict]) -> list[dict]:
