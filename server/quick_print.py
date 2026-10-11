@@ -329,12 +329,14 @@ def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
 def _render_pdf_image(path: str):
     import numpy as np
     import pymupdf as fitz
+    from large_job import file_bytes, is_large_job
 
     doc = fitz.open(path)
     try:
         page = doc[0]
         long_pt = max(page.rect.width, page.rect.height, 1)
-        zoom = min(300.0 / 72.0, 4500.0 / long_pt)
+        cap = 1200.0 if is_large_job(file_bytes(path)) else 4500.0
+        zoom = min(300.0 / 72.0, cap / long_pt)
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
         return arr[:, :, :3][:, :, ::-1].copy()
@@ -1260,7 +1262,10 @@ def _write_proof(press_path: str, png_path: str, pdf_path: str, caption: str) ->
                 color=(0.15, 0.15, 0.15),
             )
             page_png = png_path if index == 0 else f"{stem}-{index + 1}{ext}"
-            pix = out.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+            from large_job import file_bytes, proof_zoom
+
+            zoom = proof_zoom(max(page.rect.width, page.rect.height), file_bytes(press_path))
+            pix = out.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             pix.save(page_png)
             paths.append(page_png)
         proof.save(pdf_path, deflate=True, garbage=4)
@@ -1451,7 +1456,14 @@ def make_print_ready(
                 if plate_exceeds_memory(trim_w, trim_h):
                     decisions.append("Large format keeps the vectors. Only the bleed edge is drawn.")
                 else:
-                    raster = _render_pdf_image(work_path)
+                    from large_job import file_bytes, is_large_job
+
+                    if is_large_job(file_bytes(work_path)):
+                        decisions.append(
+                            "This file is large, so it goes to the press plate as it is. The picture is not drawn again at full size."
+                        )
+                    else:
+                        raster = _render_pdf_image(work_path)
                     ext = ".png"
         if plate_exceeds_memory(trim_w, trim_h) and ext in IMAGE_EXT:
             placed = os.path.join(output_dir, "large-placed.pdf")

@@ -761,6 +761,15 @@ def _press_matrix(page):
     if long_mm > 430.0:
         cap = 150.0 / 72.0
         matrix = fitz.Matrix(min(abs(matrix.a), cap), min(abs(matrix.d), cap))
+    try:
+        from large_job import file_bytes, is_large_job, proof_zoom
+
+        source = str(getattr(page.parent, "name", "") or "")
+        if source and is_large_job(file_bytes(source)):
+            zoom = proof_zoom(max(page.rect.width, page.rect.height), file_bytes(source))
+            matrix = fitz.Matrix(min(abs(matrix.a), zoom), min(abs(matrix.d), zoom))
+    except Exception:
+        pass
     return matrix
 
 

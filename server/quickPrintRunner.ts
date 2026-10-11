@@ -20,7 +20,14 @@ export function pressLogLines(stderr: string): string[] {
   }
   return lines;
 }
-const SCRIPT = path.join(process.cwd(), "server", "quick_print.py");
+function quickPrintScript(): string {
+  return process.env.QUICK_PRINT_SCRIPT || path.join(process.cwd(), "server", "quick_print.py");
+}
+
+function quickPrintKillMs(): number {
+  const parsed = Number(process.env.QUICK_PRINT_KILL_MS || 300_000);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 300_000;
+}
 
 export interface QuickRunOptions {
   productId: string;
@@ -61,6 +68,30 @@ export interface QuickRunResult {
   rebuildAfter?: string;
   extraChecks?: { id?: string; num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string; message?: string; autoFixed?: boolean }[];
   prepressChecks?: { num?: string; name?: string; label?: string; status?: string; pass?: boolean; detail?: string }[];
+}
+
+export function tooLongMessage(bytes: number): string {
+  const mb = Math.max(1, Math.round(Number(bytes) / (1024 * 1024)));
+  return `This file took too long to process (${mb} MB); we're checking it manually`;
+}
+
+export function deadChildResult(timedOut: boolean, bytes: number): QuickRunResult {
+  if (timedOut) {
+    return asResult({
+      light: "red",
+      reasons: ["The file took too long."],
+      decisions: ["Quick mode stopped because the file was still running."],
+      clientMessage: tooLongMessage(bytes),
+      pressEngine: null,
+    });
+  }
+  return asResult({
+    light: "red",
+    reasons: ["The file could not be read."],
+    decisions: ["Quick mode could not finish."],
+    clientMessage: "We could not open this file. Please send it again as a PDF, JPG, or PNG.",
+    pressEngine: null,
+  });
 }
 
 function asResult(raw: Record<string, unknown>): QuickRunResult {
@@ -176,7 +207,7 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
       : resolveQuickProduct(options.productId);
   fs.mkdirSync(outputDir, { recursive: true });
   const args = [
-    SCRIPT,
+    quickPrintScript(),
     "--input", inputPath,
     "--output-dir", outputDir,
     "--trim-w", String(product.widthMm),
@@ -204,9 +235,11 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGTERM");
-    }, 300_000);
+    }, quickPrintKillMs());
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -229,13 +262,9 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
         try { parsed = JSON.parse(fs.readFileSync(filePayload, "utf8")); } catch { parsed = null; }
       }
       if (!parsed) {
-        resolve(asResult({
-          light: "red",
-          reasons: ["The file could not be read."],
-          decisions: ["Quick mode could not finish."],
-          clientMessage: "We could not open this file. Please send it again as a PDF, JPG, or PNG.",
-          pressEngine: null,
-        }));
+        let bytes = 0;
+        try { bytes = fs.statSync(inputPath).size; } catch { bytes = 0; }
+        resolve(deadChildResult(timedOut, bytes));
         if (stderr.trim()) console.error(`[QUICK-PRINT] ${stderr.trim().slice(0, 500)}`);
         return;
       }

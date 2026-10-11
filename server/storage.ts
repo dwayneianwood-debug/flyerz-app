@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
-import { backupDatabaseFile } from "./jobCleanup";
+import { backupDatabaseFile, parseStoredTime } from "./jobCleanup";
 import type { FileJobResponse, CreateFileJobRequest, UpdateFileJobRequest, JobListItem, JobListPage, JobStatus } from "@shared/schema";
 
 export interface IStorage {
@@ -194,6 +194,16 @@ function parseAuditResultsColumn(raw: unknown): FileJobResponse["auditResults"] 
   }
 }
 
+/** SQLite stores UTC without a zone. Read that string as UTC before it becomes a Date. */
+export function storedInstant(value: string | null | undefined): Date {
+  if (!value) return new Date(NaN);
+  return parseStoredTime(String(value));
+}
+
+export function rememberStoredUpload(id: number, uploadedAt: string): void {
+  sqlite.prepare("UPDATE file_jobs SET uploaded_at = ?, status = 'complete' WHERE id = ?").run(uploadedAt, id);
+}
+
 function mapRowToResponse(row: JobRow): FileJobResponse {
   return {
     id: row.id,
@@ -201,8 +211,8 @@ function mapRowToResponse(row: JobRow): FileJobResponse {
     originalPath: row.original_path,
     correctedPath: row.corrected_path,
     status: row.status as FileJobResponse["status"],
-    uploadedAt: new Date(row.uploaded_at),
-    completedAt: row.completed_at ? new Date(row.completed_at) : null,
+    uploadedAt: storedInstant(row.uploaded_at),
+    completedAt: row.completed_at ? storedInstant(row.completed_at) : null,
     fileSize: row.file_size,
     fileType: row.file_type as FileJobResponse["fileType"],
     auditResults: parseAuditResultsColumn(row.audit_results as unknown),
@@ -275,7 +285,7 @@ export class DatabaseStorage implements IStorage {
     const jobs: JobListItem[] = rows.map((row) => {
       const overallPassed = passedFlag(row.overall_passed);
       const pressPassed = passedFlag(row.press_passed);
-      const uploaded = new Date(row.uploaded_at);
+      const uploaded = storedInstant(row.uploaded_at);
       const quickLight = row.quick_light === "green" || row.quick_light === "amber" || row.quick_light === "red"
         ? row.quick_light
         : null;

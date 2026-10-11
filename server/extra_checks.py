@@ -800,15 +800,38 @@ def press_ink_facts(path: str) -> dict:
     return dict(facts)
 
 
+def _sampled_ink(page, zoom: float, facts: dict) -> None:
+    """Ink on a small render of the plate. The full picture is not decoded."""
+    import numpy as np
+    import pymupdf as fitz
+
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csCMYK)
+    if pix is None or pix.n < 4 or pix.w < 2 or pix.h < 2:
+        return
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].astype(np.int16)
+    facts["max_tac"] = max(facts["max_tac"], float(arr.sum(axis=-1).max()) / 2.55)
+    black = arr[:, :, 3] >= 230
+    cmy = arr[:, :, :3].sum(axis=-1)
+    facts["k90"] += int(black.sum())
+    facts["k_only"] += int((black & (cmy <= 13)).sum())
+
+
 def _press_ink_facts_read(path: str) -> dict:
     import numpy as np
+
+    from large_job import file_bytes, is_large_job, proof_zoom
 
     doc = _open_pdf(path)
     facts = {"max_tac": 0.0, "k90": 0, "k_only": 0, "small_rich": False, "small_k": False}
     if doc is None:
         return facts
+    large = is_large_job(file_bytes(path))
     try:
         for page in doc:
+            if large:
+                zoom = proof_zoom(max(page.rect.width, page.rect.height), file_bytes(path))
+                _sampled_ink(page, zoom, facts)
+                continue
             for item in page.get_images(full=True) or []:
                 pix = pymupdf_pixmap(doc, int(item[0]))
                 if pix is None or pix.n < 4 or pix.w < 2:

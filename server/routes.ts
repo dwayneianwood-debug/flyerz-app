@@ -38,6 +38,7 @@ import { spawn } from "child_process";
 import { ensureFullPageCropBox, hasValidCropBox } from "@shared/crop-box";
 import { normalizeBleedMm } from "@shared/bleed-size";
 import { pythonChildEnv } from "./pythonChildEnv";
+import { execPythonAsync } from "./pythonCapture";
 import { choosePressInput } from "./aiRebuildPolicy";
 import { JobAlreadyRunning, duplicateRun } from "./jobRunLock";
 import { readJobProgress } from "./jobProgress";
@@ -4477,7 +4478,7 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
             provider: "rules",
           });
         }
-        const ruled = execPythonCapture([script, "--message", text], "GlitchyDesigner", 30_000);
+        const ruled = await execPythonAsync([script, "--message", text], "GlitchyDesigner", 30_000);
         if (ruled?.handled) return replyJson(ruled);
         return res.json({
           reply: "Upload a file first. I won't guess about artwork I haven't seen.",
@@ -4494,7 +4495,7 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       }
       const job = await storage.getJob(Number(jobId));
       if (!job?.originalPath) {
-        const ruled = execPythonCapture([script, "--message", text, "--job-id", String(jobId)], "GlitchyDesigner", 30_000);
+        const ruled = await execPythonAsync([script, "--message", text, "--job-id", String(jobId)], "GlitchyDesigner", 30_000);
         if (ruled?.handled) return replyJson(ruled);
         return res.json({
           reply: "I can't see an uploaded file on this job, so I have not run any checks.",
@@ -4520,7 +4521,7 @@ print(f'{w},{h},{page_count},{page_index},{w_mm:.2f},{h_mm:.2f}')
       }
       if (action) args.push("--action", String(action));
       if (trimW > 0 && trimH > 0) args.push("--trim-w", String(trimW), "--trim-h", String(trimH));
-      const result = execPythonCapture(args, "GlitchyDesigner", 90_000);
+      const result = await execPythonAsync(args, "GlitchyDesigner", 90_000);
       let downloadUrl = "";
       if (result?.path && result.ok && fsSync.existsSync(result.path)) {
         const prior = (job.auditResults || { checks: [], overallPassed: false, fixesApplied: 0, complianceReport: "" }) as AuditResults;
