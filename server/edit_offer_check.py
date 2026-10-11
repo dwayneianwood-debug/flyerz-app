@@ -386,14 +386,12 @@ def _church() -> None:
     again, score2 = _closest_font(crop, "11 OCT")
     face = os.path.basename(path)
     spread, share = _church_letter_fill(src)
-    # The white date sits on a person. The mask has to be those strokes, and a
+    # 11 OCT sits on a person. The mask has to be the white strokes, and a
     # colour plane fitted around them has to miss (the clean limit is 18).
-    refused = (
+    eleven_reply = (eleven.get("reply") or "").strip()
+    eleven_ok = (
         eleven.get("pending") is not True
-        and (eleven.get("reply") or "").strip() == SAFE_EDIT
-        and nine.get("pending") is not True
-        and "isn't on the artwork" not in (nine.get("reply") or "").lower()
-        and "oct 6" not in (nine.get("reply") or "").lower()
+        and eleven_reply == SAFE_EDIT
         and _sha(src) == before
         and face == os.path.basename(again)
         and abs(score - score2) < 0.01
@@ -401,10 +399,37 @@ def _church() -> None:
         and spread > 18.0
     )
     _record(
-        "church-poster",
-        refused,
-        f"11 {(eleven.get('reply') or '')[:80]} | 9 {(nine.get('reply') or '')[:80]} | font {face} {score:.1f} | letter share {share:.2f} plane {spread:.1f}",
+        "church-11",
+        eleven_ok,
+        f"{eleven_reply} | font {face} {score:.1f} | letter share {share:.2f} plane {spread:.1f}",
     )
+    # 9 OCT is on the pink ground beside that person. Offer it only when the
+    # same checks the Apply button will run have already passed.
+    import shutil
+    from artwork_edits import confirm, undo
+
+    nine_reply = nine.get("reply") or ""
+    nine_clean, nine_detail = _offered_clean(nine, src, "church-9")
+    staged = os.path.join(nine.get("_preview") or "", "staged.pdf")
+    body = " ".join(span.get("text") or "" for span in _spans(staged)) if os.path.isfile(staged) else ""
+    dest = os.path.join(ROOT, "church-out.pdf")
+    shutil.copyfile(src, dest)
+    original = _sha(dest)
+    done = confirm("church-9", dest) if nine.get("pending") is True else {"ok": False}
+    back = undo("church-9", dest) if done.get("ok") else {"ok": False}
+    nine_ok = (
+        nine.get("pending") is True
+        and nine_clean
+        and "isn't on the artwork" not in nine_reply.lower()
+        and "oct 6" not in nine_reply.lower()
+        and "12" in body
+        and "OCT" in body
+        and done.get("ok") is True
+        and back.get("ok") is True
+        and _sha(dest) == original
+        and _sha(src) == before
+    )
+    _record("church-9", nine_ok, f"{nine_detail} undo {back.get('ok')} | {nine_reply[:140]}")
 
 
 def main() -> None:
