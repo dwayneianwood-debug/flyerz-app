@@ -997,10 +997,11 @@ def _missing_named_date() -> None:
     box = (_load("flat-11").get("proposal") or {}).get("editBox")
     outside = _outside_pixels(flat, staged, box) if asked.get("pending") and box else 999999
     face = str((_load("flat-11").get("proposal") or {}).get("faceLabel") or (_load("flat-11").get("proposal") or {}).get("fontfile") or "")
+    flat_body = " ".join(body.split())
     clean = (
         asked.get("pending") is True
-        and "12 OCT" in body
-        and "11 OCT" not in body
+        and "12 OCT" in flat_body
+        and "11 OCT" not in flat_body
         and outside == 0
         and "jokerman" not in face.lower()
         and "could not read" not in (asked.get("reply") or "").lower()

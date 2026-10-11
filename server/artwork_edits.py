@@ -290,6 +290,9 @@ def _font_index() -> list[dict]:
             continue
         seen.add(real)
         family, style = _face_names(use)
+        base = os.path.basename(use).lower()
+        if any(os.path.basename(row["path"]).lower() == base for row in rows):
+            continue
         rows.append({"path": use, "kind": "bundled", "family": family, "style": style})
     rows.sort(key=lambda row: (row["family"], row["style"], os.path.basename(row["path"]).lower()))
     _FONT_INDEX = rows
@@ -1062,13 +1065,11 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     paths = _candidate_fonts()
     if crop is None or getattr(crop, "size", 0) == 0:
         path = _plain_text_face(paths, text) or next((item for item in paths if os.path.isfile(item)), "")
+        _closest_font.weight_ratio = 1.0
         return path, 999.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    # The letters are the minority: darker on a light ground, or lighter on a dark one.
-    if float(gray.mean()) > 140:
-        mask = gray < 160
-    else:
-        mask = gray > 140
+    # The letters are the minority class, including white type on a pink ground.
+    mask = _letter_bits(gray)
     best_path = ""
     best_iou = -1.0
     # Compare the letter strokes, not the empty margin around the reader box.
@@ -1076,35 +1077,36 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     ink_y, ink_x = np.where(mask)
     if len(ink_x) == 0:
         path = _plain_text_face(paths, text) or next((item for item in paths if os.path.isfile(item)), "")
+        _closest_font.weight_ratio = 1.0
         return path, 999.0
     mask = mask[int(ink_y.min()): int(ink_y.max()) + 1, int(ink_x.min()): int(ink_x.max()) + 1]
-    # Compare at a fixed height. A church-poster crop is hundreds of megapixels at full size.
-    draw_h = _COMPARE_PX
+    tokens = [part for part in (text or "").split() if part][:4]
+    bands = _horizontal_bands(mask)
+    stacked = len(bands) >= 2 and len(tokens) >= 2
+    # Compare at a fixed height. A church-poster crop is hundreds of pixels tall,
+    # and a day stacked on its month has to keep the gap between the two lines.
+    draw_h = 180 if stacked else _COMPARE_PX
     if int(mask.shape[0]) > draw_h:
         new_w = max(8, int(round(mask.shape[1] * draw_h / float(mask.shape[0]))))
         mask = cv2.resize(mask.astype(np.uint8) * 255, (new_w, draw_h), interpolation=cv2.INTER_AREA) > 127
+        bands = _horizontal_bands(mask) if stacked else bands
+        stacked = len(bands) >= 2 and len(tokens) >= 2
     sample = (text or "")[:80]
-    canvas_w = min(1024, draw_h * max(2, len(sample) + 1))
-    canvas_h = draw_h + 8
+    canvas_w = min(1024, _COMPARE_PX * max(2, len(sample) + 1))
     src_share = float(mask.mean()) if mask.size else 0.0
     ranked: list[tuple[float, float, float, str, str]] = []
     for path in paths:
         if not os.path.isfile(path):
             continue
         try:
-            font = ImageFont.truetype(path, draw_h)
-            canvas = Image.new("L", (canvas_w, canvas_h), 255)
-            ImageDraw.Draw(canvas).text((0, 2), sample, font=font, fill=0)
+            if stacked:
+                ink = _stacked_ink(path, mask, bands, tokens)
+            else:
+                ink = _line_ink(path, sample, mask, canvas_w)
         except (OSError, ValueError):
             continue
-        plate = np.array(canvas)
-        cols = np.where(plate.min(axis=0) < 200)[0]
-        rows = np.where(plate.min(axis=1) < 200)[0]
-        if len(cols) == 0 or len(rows) == 0:
+        if ink is None:
             continue
-        glyph = plate[rows.min(): rows.max() + 1, cols.min(): cols.max() + 1]
-        glyph = cv2.resize(glyph, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_AREA)
-        ink = glyph < 170
         union = int(np.logical_or(mask, ink).sum()) or 1
         iou = float(np.logical_and(mask, ink).sum()) / float(union)
         share = float(ink.mean()) if ink.size else 0.0
@@ -1116,6 +1118,7 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
             penalty = min(0.45, (ratio - 1.15) * 0.55)
         ranked.append((iou - penalty, iou, ratio, path, _style_of(path)))
     if not ranked:
+        _closest_font.weight_ratio = 1.0
         score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
         return best_path, score
     wanted = _wanted_style(ranked)
@@ -1125,20 +1128,129 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
         pool = [item for item in ranked if item[4] == wanted]
     if not pool:
         # A sans stand-in, or a novelty face such as Jokerman, is not this lettering.
+        _closest_font.weight_ratio = 1.0
         return "", -1.0
-    pool.sort(key=lambda item: (-item[0], os.path.basename(item[3]).lower()))
+    pool.sort(key=lambda item: (-round(item[0], 3), round(abs(1.0 - item[2]), 3), os.path.basename(item[3]).lower()))
     _adjusted, best_iou, best_ratio, best_path, _style = pool[0]
     if src_share >= 0.02 and best_ratio > 1.45:
         lighter = [item for item in pool if item[2] <= 1.25 and item[1] >= best_iou - 0.18]
         if lighter:
-            lighter.sort(key=lambda item: (-item[1], os.path.basename(item[3]).lower()))
-            _adjusted, best_iou, _ratio, best_path, _style = lighter[0]
+            lighter.sort(key=lambda item: (-round(item[1], 3), round(abs(1.0 - item[2]), 3), os.path.basename(item[3]).lower()))
+            _adjusted, best_iou, best_ratio, best_path, _style = lighter[0]
         else:
             # No face is close to this weight. Applying a much heavier one would be wrong.
+            _closest_font.weight_ratio = float(best_ratio)
             return "", -1.0
+    _closest_font.weight_ratio = float(best_ratio)
     # Callers treat a high score as a poor match. 0 would be a perfect overlap.
     score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
     return best_path, score
+
+
+def _horizontal_bands(mask) -> list[tuple[int, int]]:
+    """Rows of letter ink, split where a poster puts the day above the month.
+
+    A bright speck on a photograph is not a line of type. Bands much shorter
+    than the letters are dropped so the day and the month stay the two lines.
+    """
+    import numpy as np
+
+    if mask is None or getattr(mask, "size", 0) == 0:
+        return []
+    row = mask.mean(axis=1) > 0.04
+    spans = []
+    start = None
+    for index, on in enumerate(row.tolist()):
+        if on and start is None:
+            start = index
+        elif not on and start is not None:
+            if index - start > 6:
+                spans.append((start, index))
+            start = None
+    if start is not None and len(row) - start > 6:
+        spans.append((start, len(row)))
+    if not spans:
+        return []
+    tall = max(bottom - top for top, bottom in spans)
+    floor = max(8.0, tall * 0.4)
+    return [(top, bottom) for top, bottom in spans if (bottom - top) >= floor]
+
+
+def _letter_bits(gray):
+    """The letter pixels. White type on a mid pink is the light minority.
+
+    A mean above 140 used to treat that pink as a light page and the letters
+    as the dark pixels, which selected the background and missed the type.
+    """
+    import cv2
+    import numpy as np
+
+    if gray is None or getattr(gray, "size", 0) == 0:
+        return gray
+    _level, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    light = binary > 0
+    letters = light if float(light.mean()) <= 0.5 else ~light
+    share = float(letters.mean()) if letters.size else 0.0
+    if share < 0.008 or share > 0.72:
+        if float(gray.mean()) > 140:
+            letters = gray < 160
+        else:
+            letters = gray > 140
+        if float(letters.mean()) > 0.5:
+            letters = ~letters
+    return letters
+
+
+def _line_ink(path: str, sample: str, mask, canvas_w: int):
+    """One line of type, resized onto the letter box."""
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    draw_h = _COMPARE_PX
+    font = ImageFont.truetype(path, draw_h)
+    canvas = Image.new("L", (canvas_w, draw_h + 8), 255)
+    ImageDraw.Draw(canvas).text((0, 2), sample, font=font, fill=0)
+    plate = np.array(canvas)
+    cols = np.where(plate.min(axis=0) < 200)[0]
+    rows = np.where(plate.min(axis=1) < 200)[0]
+    if len(cols) == 0 or len(rows) == 0:
+        return None
+    glyph = plate[rows.min(): rows.max() + 1, cols.min(): cols.max() + 1]
+    glyph = cv2.resize(glyph, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_AREA)
+    return glyph < 170
+
+
+def _stacked_ink(path: str, mask, bands, tokens):
+    """Draw the day on the top band and the month on the bottom band."""
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    if len(bands) < 2 or len(tokens) < 2:
+        return None
+    use = [(bands[0], tokens[0]), (bands[-1], tokens[-1])]
+    plate = np.zeros(mask.shape, dtype=bool)
+    for (y0, y1), token in use:
+        height = max(12, y1 - y0)
+        font = ImageFont.truetype(path, height)
+        canvas = Image.new("L", (max(32, mask.shape[1] * 2), height + 8), 0)
+        ImageDraw.Draw(canvas).text((0, 0), token, font=font, fill=255)
+        arr = np.array(canvas)
+        cols = np.where(arr.max(axis=0) > 40)[0]
+        rows = np.where(arr.max(axis=1) > 40)[0]
+        if len(cols) == 0 or len(rows) == 0:
+            return None
+        glyph = arr[rows.min(): rows.max() + 1, cols.min(): cols.max() + 1]
+        band = mask[y0:y1]
+        used = np.where(band.any(axis=0))[0]
+        if len(used) == 0:
+            return None
+        width = max(1, int(used.max() - used.min() + 1))
+        glyph = cv2.resize(glyph, (width, max(1, y1 - y0)), interpolation=cv2.INTER_AREA)
+        x0 = int(used.min())
+        plate[y0:y1, x0:x0 + width] |= glyph > 140
+    return plate
 
 
 def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
@@ -1277,6 +1389,10 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     if proposal.get("refuse"):
         _save(key, {"proposal": {}, "undo": "", "current": src})
         return {"ok": False, "reply": str(proposal.get("refuse") or SAFE_EDIT), "actions": [], "pending": False}
+    blocked_offer = _offer_block(src, staged, proposal)
+    if blocked_offer:
+        _save(key, {"proposal": {}, "undo": "", "current": src})
+        return {"ok": False, "reply": blocked_offer, "actions": [], "pending": False}
     _render_page(staged, after)
     proposal["staged"] = staged
     blocked = _preview_block(src, staged, proposal)
@@ -1477,12 +1593,126 @@ def _phone_run(group: list[dict]) -> dict | None:
     return best
 
 
+_MONTH_TOKEN = re.compile(
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?",
+    re.I,
+)
+_MONTH_ONLY = re.compile(
+    r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)$",
+    re.I,
+)
+_TIME_TOKEN = re.compile(r"^\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)$", re.I)
+_DAY_TOKEN = re.compile(r"^\d{1,2}$")
+# A raster face further than this from the letters is not offered.
+_FONT_SCORE_LIMIT = 70.0
+# Digit height may move this far and still be the same size.
+_SIZE_TOLERANCE = 0.18
+# Stroke thickness versus the original. Heavier or lighter than this is refused.
+_WEIGHT_TOLERANCE = 0.35
+
+
+def _is_time_token(text: str) -> bool:
+    return bool(_TIME_TOKEN.match(" ".join(str(text or "").split())))
+
+
+def _month_run(text: str) -> list[str]:
+    """'OCT OCT' is two months. A sentence that merely contains a month is not."""
+    raw = " ".join(str(text or "").split())
+    found = list(_MONTH_TOKEN.finditer(raw))
+    if len(found) < 2:
+        return []
+    leftover = _MONTH_TOKEN.sub("", raw)
+    if re.sub(r"[\s,./+-]+", "", leftover):
+        return []
+    return [item.group(0) for item in found]
+
+
+def _split_merged_months(words: list[dict]) -> tuple[list[dict], bool]:
+    """Split one box that holds two month words, using the day numbers above it.
+
+    The reader sometimes returns 'OCT OCT' as a single 700 px box. Each day
+    then gets the slice of that box that sits underneath it.
+    """
+    merged = False
+    days = [
+        word for word in words
+        if _DAY_TOKEN.match(str(word.get("text") or "").strip()) and not _is_time_token(word.get("text"))
+    ]
+    out = []
+    for word in words:
+        tokens = _month_run(word.get("text") or "")
+        if len(tokens) < 2:
+            out.append(word)
+            continue
+        merged = True
+        left = int(word["left"])
+        top = int(word["top"])
+        width = max(1, int(word["width"]))
+        height = max(1, int(word["height"]))
+        right = left + width
+        count = len(tokens)
+        inside = []
+        for day in days:
+            mid = day["left"] + day["width"] / 2.0
+            slack = day["width"] * 0.35
+            if mid < left - slack or mid > right + slack:
+                continue
+            if day["top"] > top + height * 0.45:
+                continue
+            inside.append(day)
+        inside.sort(key=lambda item: int(item["left"]))
+        if len(inside) > count:
+            center = left + width / 2.0
+            inside = sorted(inside, key=lambda item: abs((item["left"] + item["width"] / 2.0) - center))[:count]
+            inside.sort(key=lambda item: int(item["left"]))
+        if len(inside) == count:
+            mids = [item["left"] + item["width"] / 2.0 for item in inside]
+            edges = [left]
+            for left_mid, right_mid in zip(mids, mids[1:]):
+                edges.append(int(round((left_mid + right_mid) / 2.0)))
+            edges.append(right)
+        else:
+            step = width / float(count)
+            edges = [int(round(left + step * index)) for index in range(count)] + [right]
+        for index, token in enumerate(tokens):
+            x0 = int(edges[index])
+            x1 = max(x0 + 1, int(edges[index + 1]))
+            out.append({
+                "text": token,
+                "left": x0,
+                "top": top,
+                "width": x1 - x0,
+                "height": height,
+                "line": ("month", str(top)),
+            })
+    return out, merged
+
+
+def _day_sits_above_month(piece: str, covered: list[dict]) -> bool:
+    """'OCT 9' built by reading across a stacked poster is not a second date."""
+    match = DATE_IN_TEXT.search(piece or "")
+    if not match or not match.group("d2"):
+        return False
+    day_words = [word for word in covered if _DAY_TOKEN.match(str(word.get("text") or "").strip())]
+    month_words = [word for word in covered if _MONTH_ONLY.match(str(word.get("text") or "").strip())]
+    if not day_words or not month_words:
+        return False
+    return min(int(word["top"]) for word in day_words) + 4 < min(int(word["top"]) for word in month_words)
+
+
+def _unreadable_reply() -> dict:
+    """The reader was not sure. Do not invent a list of dates that are not there."""
+    return {
+        "ok": False,
+        "reply": "I can't read that clearly. Nothing was changed.",
+        "actions": [],
+        "pending": False,
+    }
+
+
 def _stack_day_and_month(words: list[dict]) -> list[dict]:
     """A poster often paints the day above the month. Read that pair as one date."""
-    month = re.compile(
-        r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)$",
-        re.I,
-    )
+    month = _MONTH_ONLY
     days = [word for word in words if re.fullmatch(r"\d{1,2}", str(word.get("text") or "").strip())]
     months = [word for word in words if month.match(str(word.get("text") or "").strip())]
     stacked = []
@@ -1564,15 +1794,19 @@ def _collapse_same(kind: str, hits: list[dict]) -> list[dict]:
     return kept
 
 
-def _collect_hits(words: list[dict], kind: str) -> list[dict]:
+def _collect_hits(words: list[dict], kind: str) -> tuple[list[dict], bool]:
     """Every value of this kind, including a day painted above its month.
 
     A line that holds two dates keeps a separate box for each. Painting "11 OCT"
-    must not cover "10 OCT" beside it.
+    must not cover "10 OCT" beside it. A merged month box is split first.
+    The second value is true when a month box had to be split, so a miss
+    after that is an unclear read rather than a date that is not on the page.
     """
+    merged = False
     pool = list(words)
     if kind == "date":
-        pool = pool + _stack_day_and_month(words)
+        pool, merged = _split_merged_months(words)
+        pool = pool + _stack_day_and_month(pool)
     hits = []
 
     def add(text: str, left: int, top: int, width: int, height: int) -> None:
@@ -1587,13 +1821,15 @@ def _collect_hits(words: list[dict], kind: str) -> list[dict]:
 
     for word in pool:
         add(word.get("text") or "", word["left"], word["top"], word["width"], word["height"])
-    for group in _line_groups(words):
+    for group in _line_groups(pool if kind == "date" else words):
         if kind == "phone":
             candidate = _phone_run(group)
             if candidate:
                 add(candidate["text"], candidate["left"], candidate["top"], candidate["width"], candidate["height"])
             continue
         ordered = sorted(group, key=lambda item: item["left"])
+        if kind == "date":
+            ordered = [word for word in ordered if not _is_time_token(word.get("text"))]
         if not ordered:
             continue
         cursor = 0
@@ -1614,6 +1850,8 @@ def _collect_hits(words: list[dict], kind: str) -> list[dict]:
             covered = [word for start, stop, word in spans if stop > at and start < end]
             if not covered:
                 continue
+            if kind == "date" and _day_sits_above_month(piece, covered):
+                continue
             left, top, width, height = _union_box(covered)
             hits.append({
                 "text": piece,
@@ -1622,7 +1860,7 @@ def _collect_hits(words: list[dict], kind: str) -> list[dict]:
                 "width": width,
                 "height": height,
             })
-    return _collapse_same(kind, _dedupe_hits(kind, hits))
+    return _collapse_same(kind, _dedupe_hits(kind, hits)), merged
 
 
 def _select_hit(words: list[dict], parsed: dict) -> dict | None:
@@ -1637,11 +1875,13 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
         }
 
     if parsed["kind"] in ("phone", "date", "time", "venue"):
-        hits = _collect_hits(words, parsed["kind"])
+        hits, merged = _collect_hits(words, parsed["kind"])
         hint = str(parsed.get("oldHint") or "")
         if hint:
             matched = [word for word in hits if _hint_matches(parsed["kind"], hint, word.get("text") or "")]
             if not matched:
+                if merged:
+                    return {"unreadable": True}
                 return {
                     "missing": True,
                     "named": hint,
@@ -1660,6 +1900,8 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
                 "width": word["width"],
                 "height": word["height"],
             }
+        if merged:
+            return {"unreadable": True}
         return None
     hit = None
     if parsed["kind"] == "heading":
@@ -1715,8 +1957,8 @@ def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
     if image is None:
         return None
     hit = _select_hit(_ocr_words(path), parsed)
-    if not hit or hit.get("ambiguous") or hit.get("missing"):
-        return hit if hit and (hit.get("ambiguous") or hit.get("missing")) else None
+    if not hit or hit.get("ambiguous") or hit.get("missing") or hit.get("unreadable"):
+        return hit if hit and (hit.get("ambiguous") or hit.get("missing") or hit.get("unreadable")) else None
     height, width = image.shape[:2]
     box = info["bbox"]
     sx = (box[2] - box[0]) / float(width or 1)
@@ -1762,6 +2004,8 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
         hit = _select_hit(_ocr_words(png), parsed)
         image = cv2.imread(png)
         crop = None if hit is None or image is None or hit.get("ambiguous") or hit.get("missing") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    if hit and hit.get("unreadable"):
+        return _unreadable_reply()
     if hit and hit.get("missing"):
         return _missing_named_reply(parsed["kind"], str(hit.get("named") or parsed.get("oldHint") or ""), hit.get("found") or [])
     if hit and hit.get("ambiguous"):
@@ -1788,13 +2032,18 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
             return {"ok": False, "reply": f"I read the picture and could not find a {label}, so I have not changed anything.", "actions": []}
         shown_old, shown_new, new_text = swapped
     fontfile, score = _closest_font(crop, hit["text"])
-    if score < 0:
-        return {
-            "ok": False,
-            "reply": (
+    proposal["weightRatio"] = float(getattr(_closest_font, "weight_ratio", 1.0) or 1.0)
+    if score < 0 or score > _FONT_SCORE_LIMIT:
+        if score > _FONT_SCORE_LIMIT:
+            reply = SAFE_EDIT
+        else:
+            reply = (
                 "I could not match the original font, weight, and size closely enough, "
                 "so nothing was changed. Please send the editable file if this has to stay in that exact face."
-            ),
+            )
+        return {
+            "ok": False,
+            "reply": reply,
             "actions": [],
             "pending": False,
         }
@@ -2368,6 +2617,38 @@ def _resize_logo(doc, page, proposal: dict) -> None:
     page.draw_rect(fitz.Rect(proposal["grown"]), color=(0, 0, 0), fill=(0, 0, 0), width=0)
 
 
+def _ink_cut(distance) -> float:
+    """How far from the border a pixel has to be before it counts as a letter.
+
+    On a flat page the letters sit well clear of the paper, and 48 is enough.
+    On a photograph the same cut swallows the person, because skin is also far
+    from a pink border. The letters are the separate peak at the far end of
+    the distance histogram, and the cut is the valley in front of that peak.
+    """
+    import numpy as np
+
+    flat = np.asarray(distance, dtype=np.float32).ravel()
+    if flat.size < 30:
+        return 48.0
+    hi = float(np.percentile(flat, 99.7))
+    if hi < 36.0:
+        return 48.0
+    hist, edges = np.histogram(flat, bins=30, range=(0.0, hi))
+    smooth = np.convolve(hist.astype(np.float64), np.array([1.0, 2.0, 1.0]) / 4.0, mode="same")
+    last_peak = len(smooth) - 1
+    for index in range(len(smooth) - 2, max(2, len(smooth) // 3), -1):
+        if smooth[index] >= smooth[index - 1] and smooth[index] >= smooth[index + 1]:
+            last_peak = index
+            break
+    left_peak = int(np.argmax(smooth[:max(1, last_peak)]))
+    if last_peak <= left_peak + 1:
+        return 48.0
+    valley = left_peak + int(np.argmin(smooth[left_peak:last_peak + 1]))
+    if smooth[valley] > smooth[last_peak] * 0.55:
+        return 48.0
+    return float(edges[min(valley + 1, len(edges) - 1)])
+
+
 def _raster_ink(image, left: int, top: int, width: int, height: int):
     """The strokes of this word, grown from the reader box to the whole glyph."""
     import cv2
@@ -2393,7 +2674,7 @@ def _raster_ink(image, left: int, top: int, width: int, height: int):
     ]).astype(np.float32)
     background = np.median(ring, axis=0)
     distance = np.linalg.norm(window.astype(np.float32) - background, axis=2)
-    foreground = (distance > 48.0).astype(np.uint8)
+    foreground = (distance > _ink_cut(distance)).astype(np.uint8)
     count, labels = cv2.connectedComponents(foreground)
     keep = np.zeros(foreground.shape, np.uint8)
     box_x0, box_y0 = left - win_x0, top - win_y0
@@ -2421,44 +2702,74 @@ def _raster_ink(image, left: int, top: int, width: int, height: int):
         "win": (win_x0, win_y0, win_x1, win_y1),
         "bounds": (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
         "background": background,
-        "color": np.median(window[keep > 0].astype(np.float32), axis=0) if np.any(keep) else background,
+        "color": _ink_color(window, keep, distance, background),
     }
 
 
-def _fill_is_clean(window, mask, painted) -> bool:
-    """The hole has to match the colour just outside the letters.
+def _ink_color(window, keep, distance, background):
+    """The letter colour, not the shadow sitting next to a light face.
 
-    A photograph or a coloured smear does not. That case is refused instead of
-    painting a blurred patch over the words beside it.
+    White type on a pink ground is the pixels furthest from that ground.
+    A median of every dark and light pixel comes out mauve.
+    """
+    import numpy as np
+
+    if not np.any(keep):
+        return background
+    chosen = window[keep > 0].astype(np.float32)
+    dist = distance[keep > 0]
+    if dist.size < 8:
+        return np.median(chosen, axis=0)
+    cut = float(np.percentile(dist, 75))
+    strong = chosen[dist >= cut]
+    if strong.shape[0] < 8:
+        strong = chosen
+    return np.median(strong, axis=0)
+
+
+def _paint_plane(window, mask):
+    """Fill the letters with a colour plane fitted to the pixels around them.
+
+    A flat panel and a smooth gradient both fit. A photograph does not, and
+    that residual is what the cleanliness check uses.
     """
     import cv2
     import numpy as np
 
-    if window is None or mask is None or painted is None:
-        return False
-    core = (mask > 0).astype(np.uint8)
+    if window is None or mask is None:
+        return None, 99.0
+    core = mask > 0
     if int(core.sum()) < 8:
-        return False
-    ring_reach = cv2.dilate(core, np.ones((7, 7), np.uint8), iterations=1)
-    ring = (ring_reach > 0) & (core == 0)
-    samples = window[ring]
-    if samples.shape[0] < 8:
-        return False
-    ring_f = samples.astype(np.float32)
-    background = np.median(ring_f, axis=0)
-    near = np.linalg.norm(ring_f - background, axis=1) <= 22.0
-    local = ring_f[near] if int(near.sum()) >= 8 else ring_f
-    ground = np.median(local, axis=0)
-    spread = float(np.std(local, axis=0).mean()) if local.size else 99.0
-    filled = painted[core > 0].astype(np.float32)
-    if filled.shape[0] < 8:
-        return False
-    shift = float(np.linalg.norm(np.median(filled, axis=0) - ground))
-    blot = float(np.std(filled, axis=0).mean())
-    # Flat panel: the fill stays on that colour. A photo smear does not.
-    if spread <= 16.0 and shift <= 20.0 and blot <= 14.0:
-        return True
-    return shift <= 12.0 and blot <= 8.0
+        return None, 99.0
+    ring_reach = cv2.dilate(core.astype(np.uint8), np.ones((9, 9), np.uint8), iterations=1)
+    ring = (ring_reach > 0) & ~core
+    ys, xs = np.where(ring)
+    if len(xs) < 24:
+        return None, 99.0
+    colors = window[ys, xs].astype(np.float64)
+    design = np.stack([np.ones(len(xs)), xs.astype(np.float64), ys.astype(np.float64)], 1)
+    coef, *_ = np.linalg.lstsq(design, colors, rcond=None)
+    residual = np.linalg.norm(colors - (design @ coef), axis=1)
+    keep = residual <= np.percentile(residual, 80)
+    if int(keep.sum()) >= 24:
+        coef, *_ = np.linalg.lstsq(design[keep], colors[keep], rcond=None)
+        residual = np.linalg.norm(colors[keep] - (design[keep] @ coef), axis=1)
+    spread = float(np.median(residual))
+    painted = window.copy()
+    fy, fx = np.where(core)
+    hole = np.stack([np.ones(len(fx)), fx.astype(np.float64), fy.astype(np.float64)], 1)
+    painted[fy, fx] = np.clip(hole @ coef, 0, 255).astype(np.uint8)
+    return painted, spread
+
+
+def _fill_is_clean(window, mask, painted=None) -> bool:
+    """The hole follows the colour around the letters.
+
+    A flat panel and a smooth gradient pass. A photograph's ring does not
+    lie on one plane, so that edit is refused.
+    """
+    filled, spread = _paint_plane(window, mask)
+    return filled is not None and spread <= 18.0
 
 
 def _glyph_height(mask) -> float:
@@ -2502,6 +2813,39 @@ def _asc_desc(fontfile: str) -> tuple[float, float]:
     return asc, desc
 
 
+_DIGIT_METRICS: dict[str, tuple[float, float]] = {}
+
+
+def _digit_metrics(fontfile: str) -> tuple[float, float]:
+    """Digit ink height and the baseline offset, both as fractions of the em.
+
+    A phone number is sized by the height of an '8', not by the font's
+    ascender-plus-descender box. That box is taller than the digits, and
+    dividing by it set a 6 pt number at under 5 pt.
+    """
+    cached = _DIGIT_METRICS.get(fontfile or "")
+    if cached:
+        return cached
+    from PIL import ImageFont
+
+    size = 200
+    try:
+        font = ImageFont.truetype(fontfile, size) if fontfile and os.path.isfile(fontfile) else None
+    except (OSError, ValueError):
+        font = None
+    if font is None:
+        _DIGIT_METRICS[fontfile or ""] = (0.7, 0.7)
+        return 0.7, 0.7
+    bbox = font.getbbox("8")
+    ascent, _descent = font.getmetrics()
+    ink_h = max(1, int(bbox[3] - bbox[1]))
+    top_from_baseline = max(1, int(ascent - int(bbox[1])))
+    height_ratio = min(0.95, max(0.35, ink_h / float(size)))
+    base_ratio = min(1.15, max(0.35, top_from_baseline / float(size)))
+    _DIGIT_METRICS[fontfile or ""] = (height_ratio, base_ratio)
+    return height_ratio, base_ratio
+
+
 def _em_for_ink(fontfile: str, ink_height: float) -> float:
     """Point size whose letters are as tall as the ink already on the page."""
     import pymupdf as fitz
@@ -2520,6 +2864,94 @@ def _em_for_ink(fontfile: str, ink_height: float) -> float:
     return height / cap
 
 
+def _shape_metrics(fontfile: str, sample: str) -> tuple[float, float]:
+    """Ink height and baseline offset of this sample, as fractions of the em."""
+    key = (fontfile or "") + "\n" + sample
+    cached = _DIGIT_METRICS.get(key)
+    if cached:
+        return cached
+    from PIL import ImageFont
+
+    size = 200
+    try:
+        font = ImageFont.truetype(fontfile, size) if fontfile and os.path.isfile(fontfile) else None
+    except (OSError, ValueError):
+        font = None
+    if font is None:
+        _DIGIT_METRICS[key] = (0.7, 0.7)
+        return 0.7, 0.7
+    bbox = font.getbbox(sample)
+    ascent, _descent = font.getmetrics()
+    ink_h = max(1, int(bbox[3] - bbox[1]))
+    top_from_baseline = max(1, int(ascent - int(bbox[1])))
+    height_ratio = min(0.95, max(0.35, ink_h / float(size)))
+    base_ratio = min(1.15, max(0.35, top_from_baseline / float(size)))
+    _DIGIT_METRICS[key] = (height_ratio, base_ratio)
+    return height_ratio, base_ratio
+
+
+def _stacked_lines(found, scale: float, fontfile: str, text: str):
+    """A day painted above its month stays two lines, each at its own height.
+
+    '12' is wider than '11'. It is sized to the day height and may use the
+    width of the whole date column. It is not shrunk to the narrower day.
+    """
+    import numpy as np
+    import pymupdf as fitz
+
+    tokens = [part for part in str(text or "").split() if part]
+    mask = found["mask"] > 0
+    bands = _horizontal_bands(mask)
+    if len(bands) < 2 or len(tokens) < 2 or not fontfile:
+        return None
+    face = fitz.Font(fontfile=fontfile)
+    win_x0, win_y0, win_x1, win_y1 = found["win"]
+    column = np.zeros(mask.shape[1], dtype=bool)
+    for y0, y1 in (bands[0], bands[-1]):
+        column |= mask[y0:y1].any(axis=0)
+    xs = np.where(column)[0]
+    if len(xs) == 0:
+        return None
+    col_left, col_right = int(xs.min()), int(xs.max()) + 1
+    col_width = (col_right - col_left) / float(scale)
+    placed = []
+    for (y0, y1), token in ((bands[0], tokens[0]), (bands[-1], tokens[-1])):
+        band = mask[y0:y1]
+        band_xs = np.where(band.any(axis=0))[0]
+        if len(band_xs) == 0:
+            return None
+        rect_top = (win_y0 + y0) / scale
+        rect_bottom = (win_y0 + y1) / scale
+        letter_pt = float(rect_bottom - rect_top)
+        if letter_pt < 1:
+            return None
+        sample = "8" if any(ch.isdigit() for ch in token) else "H"
+        height_ratio, base_ratio = _shape_metrics(fontfile, sample)
+        size = letter_pt / height_ratio
+        width = float(face.text_length(token, fontsize=size))
+        # The column is the room the date already occupies. A wider digit may
+        # use it. Past that, shrinking the face would no longer match.
+        if width > col_width + 0.4:
+            size = max(4.0, size * ((col_width / max(width, 0.1)) * 0.98))
+            width = float(face.text_length(token, fontsize=size))
+        shift = abs(size * height_ratio - letter_pt) / letter_pt
+        if shift > _SIZE_TOLERANCE:
+            return "refuse"
+        shrunk = shift > 0.08
+        origin_x = (win_x0 + col_left) / scale + max(0.0, (col_width - width) / 2.0)
+        if origin_x < (win_x0 / scale) - 0.6 or origin_x + width > (win_x1 / scale) + 0.6:
+            return "refuse"
+        placed.append({
+            "origin": (origin_x, rect_top + size * base_ratio),
+            "text": token,
+            "size": size,
+            "shrunk": shrunk,
+            "letter": letter_pt,
+            "digit": size * height_ratio,
+        })
+    return placed
+
+
 def _paint_raster_text(doc, page, proposal: dict) -> None:
     """Inpaint only the word's strokes, then set the new words on that background."""
     import cv2
@@ -2535,8 +2967,8 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         proposal["refuse"] = SAFE_EDIT
         return
     window = found["window"]
-    painted = cv2.inpaint(window, found["mask"], 3, cv2.INPAINT_TELEA)
-    if not _fill_is_clean(window, found["mask"], painted):
+    painted, spread = _paint_plane(window, found["mask"])
+    if painted is None or spread > 18.0:
         proposal["refuse"] = SAFE_EDIT
         return
     x0, y0, x1, y1 = found["bounds"]
@@ -2545,15 +2977,29 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     clip = fitz.Rect((win_x0 + x0) / scale, (win_y0 + y0) / scale, (win_x0 + x1) / scale, (win_y0 + y1) / scale)
     ink = fitz.Rect(clip)
     fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
+    stacked = _stacked_lines(found, scale, fontfile, str(proposal.get("new") or ""))
+    if stacked == "refuse":
+        proposal["refuse"] = SAFE_EDIT
+        return
+    if stacked:
+        overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
+        page.insert_image(clip, pixmap=overlay, overlay=True)
+        color = found["color"]
+        rgb = (float(color[0]) / 255.0, float(color[1]) / 255.0, float(color[2]) / 255.0)
+        for line in stacked:
+            _place_font_text(page, line["origin"], line["text"], line["size"], rgb, fontfile)
+        proposal["glyphPt"] = float(stacked[0]["letter"])
+        proposal["digitPt"] = float(stacked[0]["digit"])
+        proposal["shrunk"] = any(line["shrunk"] for line in stacked)
+        proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
+        proposal["guardBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
+        return
     letter_px = _glyph_height(found["mask"])
     bounds_px = max(1.0, float(y1 - y0))
     letter_pt = ink.height * (letter_px / bounds_px) if letter_px >= 4 else ink.height
-    asc, desc = _asc_desc(fontfile)
-    natural = _em_for_ink(fontfile, letter_pt) * float(proposal.get("sizeFactor") or 1.0)
-    # The whole glyph has to stay inside the old letters. A taller em paints the line above them.
-    if natural * (asc - desc) > letter_pt and letter_pt > 1:
-        natural = letter_pt / (asc - desc)
-    origin_y = ink.y0 + natural * asc
+    height_ratio, base_ratio = _digit_metrics(fontfile)
+    natural = (letter_pt / height_ratio) * float(proposal.get("sizeFactor") or 1.0)
+    origin_y = ink.y0 + natural * base_ratio
     center_x = (ink.x0 + ink.x1) / 2.0
     page_mid = (page.rect.x0 + page.rect.x1) / 2.0
     align = "center" if abs(center_x - page_mid) <= 14 else "fit"
@@ -2567,17 +3013,16 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         (ink.x0, origin_y),
         ink,
     )
-    # E5 warns under 7 pt and fails under 5 pt. A phone that started larger must not land there.
-    if str(proposal.get("kind") or "") == "phone" and natural >= 7.0 and float(size) < 7.0:
-        proposal["refuse"] = (
-            "I could not keep the original size in a matching font, so nothing was changed. "
-            "Please send the editable file if this has to stay that size."
-        )
+    # E5 fails under 5 pt. A number that started at a readable size must not land there.
+    if str(proposal.get("kind") or "") == "phone" and letter_pt >= 7.0 and float(size) * height_ratio < 7.0:
+        proposal["refuse"] = SAFE_EDIT
         return
     overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
     page.insert_image(clip, pixmap=overlay, overlay=True)
-    # Sit the baseline so the letters stay inside the old word, including a day stacked on its month.
-    origin = (origin[0], ink.y0 + size * asc)
+    # The baseline puts the digit ink on the old digit ink, not the font's descender box.
+    origin = (origin[0], ink.y0 + size * base_ratio)
+    proposal["glyphPt"] = float(letter_pt)
+    proposal["digitPt"] = float(size) * float(height_ratio)
     proposal["shrunk"] = bool(shrunk)
     proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
     proposal["guardBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
@@ -2819,6 +3264,64 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
     if problems:
         return ["glyph did not render"]
     return []
+
+
+def _span_points(path: str, text: str) -> float:
+    """The point size of the new words, or 0 when they are not in the file."""
+    import pymupdf as fitz
+
+    if not path or not os.path.isfile(path):
+        return 0.0
+    wanted = _hint_key(text)
+    if not wanted:
+        return 0.0
+    size = 0.0
+    doc = fitz.open(path)
+    try:
+        for block in (doc[0].get_text("dict") or {}).get("blocks") or []:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines") or []:
+                for span in line.get("spans") or []:
+                    if wanted not in _hint_key(span.get("text") or ""):
+                        continue
+                    size = max(size, float(span.get("size") or 0))
+    finally:
+        doc.close()
+    return size
+
+
+def _offer_block(src: str, staged: str, proposal: dict) -> str:
+    """Do not offer Apply when the result would fail the checks.
+
+    Font, size, and weight have to stay near the original, the new words have
+    to clear the 5 pt minimum, and a file that passed E5 must still pass it.
+    """
+    if proposal.get("kind") not in ("phone", "date", "time", "venue"):
+        return ""
+    if proposal.get("mode") not in ("live-text", "raster-text"):
+        return ""
+    new = str(proposal.get("shownNew") or proposal.get("new") or "")
+    points = _span_points(staged, new)
+    if 0 < points < 5.0:
+        return SAFE_EDIT
+    glyph = float(proposal.get("glyphPt") or 0)
+    final = float(proposal.get("digitPt") or 0)
+    if glyph > 1.0 and final > 0 and abs(final - glyph) / glyph > _SIZE_TOLERANCE:
+        return SAFE_EDIT
+    weight = float(proposal.get("weightRatio") or 1.0)
+    if weight > 1.0 + _WEIGHT_TOLERANCE or (0 < weight < 1.0 - _WEIGHT_TOLERANCE):
+        return SAFE_EDIT
+    try:
+        from extra_checks import check_e5
+
+        after = check_e5(staged)
+        before = check_e5(src) if src and os.path.isfile(src) else {}
+    except Exception:
+        return ""
+    if after.get("status") == "failed" and before.get("status") != "failed":
+        return SAFE_EDIT
+    return ""
 
 
 def _preview_block(before_pdf: str, after_pdf: str, proposal: dict) -> str:

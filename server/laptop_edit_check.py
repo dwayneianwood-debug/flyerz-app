@@ -314,7 +314,7 @@ def _church_date_clean(asked: dict, job: str) -> bool:
     reply = asked.get("reply") or ""
     if "could not read" in reply.lower() or not os.path.isfile(staged):
         return False
-    body = _text(staged)
+    body = " ".join(_text(staged).split())
     if "12 OCT" not in body or "9 OCT" in body:
         return False
     box = _proposal_box(job)
