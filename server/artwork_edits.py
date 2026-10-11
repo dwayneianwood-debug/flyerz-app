@@ -23,6 +23,7 @@ from edit_style import (
     TIME_IN_TEXT,
     VENUE_IN_TEXT,
     _parse_date,
+    _venue_region,
     fragment,
     phone_with_icon,
     swap_text,
@@ -775,6 +776,12 @@ def _pieces(text: str, kind: str) -> list[str]:
             if not inside:
                 found.append(match.group(0))
         return found
+    if kind == "venue":
+        bounds = _venue_region(text or "")
+        if bounds:
+            venue = (text or "")[bounds[0]:bounds[1]].strip()
+            if venue:
+                return [venue]
     one = fragment(text or "", kind)
     return [one] if one else []
 

@@ -332,33 +332,111 @@ def _church_date_clean(asked: dict, job: str) -> bool:
     return _sha(dest) == original and _sha(CHURCH) == original
 
 
+def _refused_cleanly(asked: dict, src: str, before: str) -> bool:
+    """A photograph or an unmatched face is refused, and the file bytes stay put."""
+    from artwork_edits import SAFE_EDIT
+
+    reply = (asked.get("reply") or "").strip()
+    allowed = (
+        reply == SAFE_EDIT
+        or reply.startswith("I could not keep the original size")
+        or reply.startswith("I could not match the original font")
+    )
+    return asked.get("pending") is not True and allowed and _sha(src) == before
+
+
+def _raster_phone_ok(asked: dict, src: str, before: str, require_serif: bool) -> tuple[bool, str]:
+    """A painted phone keeps a matching face at 7 pt or more. A textured ground is refused."""
+    import pymupdf as fitz
+    from extra_checks import check_e5
+
+    reply = asked.get("reply") or ""
+    if asked.get("pending") is not True:
+        ok = _refused_cleanly(asked, src, before) and "bahnschrift" not in reply.lower() and "jokerman" not in reply.lower()
+        return ok, reply[:160]
+    staged = os.path.join(asked.get("_preview") or "", "staged.pdf")
+    if not os.path.isfile(staged):
+        return False, "no staged pdf"
+    size = 0.0
+    font = ""
+    doc = fitz.open(staged)
+    try:
+        for block in (doc[0].get_text("dict") or {}).get("blocks") or []:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines") or []:
+                for span in line.get("spans") or []:
+                    if "082" in str(span.get("text") or ""):
+                        size = float(span.get("size") or 0)
+                        font = str(span.get("font") or "")
+    finally:
+        doc.close()
+    row = check_e5(staged)
+    low = font.lower()
+    ok = (
+        size >= 7.0
+        and row.get("status") != "failed"
+        and "5.9" not in str(row.get("detail") or "")
+        and "bahnschrift" not in low
+        and "jokerman" not in low
+        and (not require_serif or any(mark in low for mark in ("serif", "times", "georgia", "garamond", "playfair", "cambria", "palatino")))
+        and "OSError" not in reply
+    )
+    return ok, f"{font} {size:.1f}pt e5={row.get('status')} {reply[:80]}"
+
+
+def _named_date_ok(asked: dict, job: str, src: str) -> tuple[bool, str]:
+    """9 OCT on this poster is edited cleanly, or refused when the ground is a photograph."""
+    from artwork_edits import SAFE_EDIT
+
+    reply = asked.get("reply") or ""
+    if "from 11 oct" in reply.lower() or "jokerman" in reply.lower():
+        return False, reply[:160]
+    if asked.get("pending") is True:
+        clean = "9 OCT" in reply and "72-97" not in reply and _church_date_clean(asked, job)
+        return clean, (reply[:120] + (f" outside {asked.get('_outside')}" if asked.get("_outside") is not None else ""))[:180]
+    refused = reply.strip() == SAFE_EDIT and _sha(src) == asked.get("_srcsha")
+    return refused, reply[:160]
+
+
 def _pictures() -> None:
     if os.path.isfile(FLYER):
+        before = _sha(FLYER)
         asked = _ask(FLYER, "change the phone number to 082 123 4567", "medella-flyer", 148, 210)
-        reply = asked.get("reply") or asked.get("_err") or ""
-        ok = asked.get("pending") is True and "couldn't finish" not in reply.lower() and "OSError" not in reply
+        asked["_srcsha"] = before
+        ok, detail = _raster_phone_ok(asked, FLYER, before, True)
+        if _sha(FLYER) != before:
+            ok = False
         staged = os.path.join(asked["_preview"], "staged.pdf")
-        _zoom(FLYER, staged, "medella-flyer", _proposal_box("medella-flyer"))
-        _record("medella-flyer-phone", ok, reply[:160])
+        if os.path.isfile(staged):
+            _zoom(FLYER, staged, "medella-flyer", _proposal_box("medella-flyer"))
+        _record("medella-flyer-phone", ok, detail)
     else:
         _record("medella-flyer-phone", False, "missing flyer pdf")
     if os.path.isfile(CHURCH):
+        church_sha = _sha(CHURCH)
         phone = _ask(CHURCH, "change the phone number to 082 123 4567", "church-phone", 420, 420)
         date = _ask(CHURCH, "change the date from 9 OCT to 12 October 2026", "church-date", 420, 420)
+        date["_srcsha"] = church_sha
         bare = _ask(CHURCH, "change the date to 12 October 2026", "church-date-many", 420, 420)
         short = _ask(CHURCH, "change 9 OCT to 12 OCT", "church-date-bare", 420, 420)
-        phone_ok = phone.get("pending") is True and "072" in (phone.get("reply") or "")
-        date_reply = date.get("reply") or ""
-        date_ok = date.get("pending") is True and "9 OCT" in date_reply and "72-97" not in date_reply
-        date_ok = date_ok and _church_date_clean(date, "church-date")
+        short["_srcsha"] = church_sha
+        phone_ok, phone_detail = _raster_phone_ok(phone, CHURCH, church_sha, False)
+        if phone.get("pending") is True and "072" not in (phone.get("reply") or ""):
+            phone_ok = False
+        date_ok, date_detail = _named_date_ok(date, "church-date", CHURCH)
         bare_reply = (bare.get("reply") or "").lower()
         bare_ok = bare.get("pending") is not True and "more than one" in bare_reply and "safely change" in bare_reply
-        short_ok = short.get("pending") is True and _church_date_clean(short, "church-date-bare")
-        _zoom(CHURCH, os.path.join(phone["_preview"], "staged.pdf"), "church-phone", _proposal_box("church-phone"))
-        _record("church-phone", phone_ok, (phone.get("reply") or "")[:140])
-        _record("church-date", date_ok, (date_reply[:120] + (f" outside {date.get('_outside')}" if date.get("_outside") is not None else ""))[:180])
+        short_ok, short_detail = _named_date_ok(short, "church-date-bare", CHURCH)
+        phone_staged = os.path.join(phone["_preview"], "staged.pdf")
+        if os.path.isfile(phone_staged):
+            _zoom(CHURCH, phone_staged, "church-phone", _proposal_box("church-phone"))
+        if _sha(CHURCH) != church_sha:
+            date_ok = short_ok = phone_ok = False
+        _record("church-phone", phone_ok, phone_detail[:140])
+        _record("church-date", date_ok, date_detail[:180])
         _record("church-date-many", bare_ok, (bare.get("reply") or "")[:160])
-        _record("church-date-bare", short_ok, ((short.get("reply") or short.get("_err") or "")[:120] + (f" outside {short.get('_outside')}" if short.get("_outside") is not None else ""))[:180])
+        _record("church-date-bare", short_ok, short_detail[:180])
     else:
         _record("church-phone", False, "missing church pdf")
         _record("church-date", False, "missing church pdf")
