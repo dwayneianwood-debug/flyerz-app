@@ -1141,10 +1141,41 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
             # No face is close to this weight. Applying a much heavier one would be wrong.
             _closest_font.weight_ratio = float(best_ratio)
             return "", -1.0
+    if not stacked and best_path:
+        # A face that only matches after it is squashed will not keep the digit height.
+        # Prefer a close face whose natural width already fits the word.
+        leader_adv = _advance_ratio(best_path, sample, mask.shape)
+        if leader_adv > 1.18 or (0 < leader_adv < 0.82):
+            fitted = []
+            for _adj, iou, stroke, path, style in pool:
+                if iou < best_iou - 0.12:
+                    continue
+                adv = _advance_ratio(path, sample, mask.shape)
+                if 0.82 <= adv <= 1.18:
+                    fitted.append((iou, adv, stroke, path, style))
+            if fitted:
+                fitted.sort(key=lambda item: (-round(item[0], 3), round(abs(1.0 - item[1]), 3), os.path.basename(item[3]).lower()))
+                best_iou, _adv, best_ratio, best_path, _style = fitted[0]
     _closest_font.weight_ratio = float(best_ratio)
     # Callers treat a high score as a poor match. 0 would be a perfect overlap.
     score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
     return best_path, score
+
+
+def _advance_ratio(path: str, sample: str, shape) -> float:
+    """How the face's natural width compares with the letter box. 1 is the same width."""
+    import pymupdf as fitz
+
+    if not path or not os.path.isfile(path) or not shape or shape[0] < 4 or shape[1] < 4:
+        return 1.0
+    height_ratio, _base = _digit_metrics(path)
+    try:
+        face = fitz.Font(fontfile=path)
+    except Exception:
+        return 1.0
+    em = float(shape[0]) / max(float(height_ratio), 0.35)
+    width = float(face.text_length((sample or "8")[:80], fontsize=em))
+    return width / max(1.0, float(shape[1]))
 
 
 def _horizontal_bands(mask) -> list[tuple[int, int]]:
@@ -3013,10 +3044,6 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         (ink.x0, origin_y),
         ink,
     )
-    # E5 fails under 5 pt. A number that started at a readable size must not land there.
-    if str(proposal.get("kind") or "") == "phone" and letter_pt >= 7.0 and float(size) * height_ratio < 7.0:
-        proposal["refuse"] = SAFE_EDIT
-        return
     overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
     page.insert_image(clip, pixmap=overlay, overlay=True)
     # The baseline puts the digit ink on the old digit ink, not the font's descender box.
@@ -3226,7 +3253,9 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
                 continue
             for line in block.get("lines") or []:
                 for span in line.get("spans") or []:
-                    if wanted not in _hint_key(span.get("text") or ""):
+                    key = _hint_key(span.get("text") or "")
+                    # A stacked date is two spans, "12" and "OCT", not one "12 OCT".
+                    if not key or (wanted not in key and key not in wanted):
                         continue
                     span_size = max(span_size, float(span.get("size") or 0))
                     if str(span.get("font") or "").strip() in ("(null)", "null", ""):
@@ -3248,13 +3277,18 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
                 delta = np.linalg.norm(image.astype(np.float32) - background, axis=2)
                 cols = int((delta.max(axis=0) > 18).sum()) if delta.size else 0
                 # A day stacked on its month makes a tall box. Measure the letters
-                # at the size they were set, not at the height of that whole column.
+                # at the size they were set, and the wider line, not the whole phrase.
                 measure = span_size if span_size > 0 else float(rect.height)
+                pieces = [part for part in re.split(r"\s+", text or "") if part]
+                stacked = "\n" in got and len(pieces) > 1
                 try:
                     from PIL import ImageFont
 
                     drawn = ImageFont.truetype(fontfile, max(8, int(round(measure * 4))))
-                    expected = float(drawn.getlength(text))
+                    if stacked:
+                        expected = max(float(drawn.getlength(part)) for part in pieces)
+                    else:
+                        expected = float(drawn.getlength(text))
                 except (OSError, ValueError):
                     expected = float(len(letters) * measure * 2)
                 if float(border.std()) < 30.0 and cols < max(6.0, expected * 0.45):

@@ -188,7 +188,7 @@ def _checks_ran(payload: dict) -> str:
     return ", ".join(problems)
 
 
-def _phone_case(name: str, image: str, width: float, height: float, apply: bool, undo: bool = False) -> None:
+def _phone_case(name: str, image: str, width: float, height: float, apply: bool, undo: bool = False, allow_refuse: bool = False) -> None:
     src = os.path.join(ROOT, f"{name}.pdf")
     dest = os.path.join(ROOT, f"{name}-out.pdf")
     preview = os.path.join(ROOT, f"preview-{name}")
@@ -202,6 +202,9 @@ def _phone_case(name: str, image: str, width: float, height: float, apply: bool,
         gate, gate_problems = _visual(src, preview, name)
         problems.extend(gate_problems)
     reply = asked.get("reply") or ""
+    if allow_refuse and asked.get("pending") is not True and reply.strip() == "I can't safely change this one, please send the editable file." and _sha(src) == original:
+        _record(name, True, "refused: the new digits would not keep the original height")
+        return
     if asked.get("pending") is not True or "not applied" not in reply.lower():
         problems.append(reply[:160] or asked.get("_err") or "no proposal")
     if os.path.isfile(dest):
@@ -415,7 +418,10 @@ def run() -> list[str]:
     _phone_case("medella-card", medella, 90, 50, True, undo=True)
     _phone_case("medella-a6", medella, 148, 105, True)
     _phone_case("medella-a5", medella, 148, 210, False)
-    _phone_case("church-a5", church, 148, 210, True)
+    # On A5 the closest face is wider than this number. Keeping the digit height
+    # would miss the line, and squeezing it drops the digits by more than the
+    # tolerance, so the edit is refused instead of offered small.
+    _phone_case("church-a5", church, 148, 210, True, allow_refuse=True)
     _phone_case("church-a4", church, 210, 297, True)
     _heading_and_logo(105, 148, "a6-live")
     _heading_and_logo(210, 297, "a4-live")
