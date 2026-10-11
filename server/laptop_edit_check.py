@@ -2,7 +2,7 @@
 """Laptop findings for the small-edit chat: venue, stray pixels, from/to, fonts, gates.
 
 Each case goes through designer_assistant.py, the same process the page runs.
-PIL is used for the font match, and a Windows font folder is on the search path.
+A Windows font folder is planted and then ignored. Matching uses bundled faces.
 """
 
 from __future__ import annotations
@@ -274,16 +274,17 @@ def _phrases() -> None:
 
 def _fonts() -> None:
     import numpy as np
-    from artwork_edits import _closest_font, _windows_font_dirs
+    from artwork_edits import _closest_font
 
-    dirs = _windows_font_dirs()
-    _record("windows-fonts", any(path.endswith("Fonts") for path in dirs), " ".join(dirs)[:120])
+    bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
+    _record("windows-fonts", True, "machine font folders are not searched")
     crop = np.full((4000, 500, 3), 230, dtype=np.uint8)
     started = time.perf_counter()
     try:
         path, _score = _closest_font(crop, "082 123 4567")
         elapsed = time.perf_counter() - started
-        _record("font-cap", bool(path) and elapsed < 10, f"{elapsed:.2f}s {os.path.basename(path)}")
+        inside = os.path.abspath(path).startswith(bundled) and "/usr/share/fonts" not in os.path.abspath(path)
+        _record("font-cap", bool(path) and inside and elapsed < 10, f"{elapsed:.2f}s {os.path.basename(path)}")
     except Exception as exc:
         _record("font-cap", False, type(exc).__name__ + " " + str(exc)[:80])
 
@@ -379,7 +380,10 @@ def _raster_phone_ok(asked: dict, src: str, before: str, require_serif: bool) ->
         and "5.9" not in str(row.get("detail") or "")
         and "bahnschrift" not in low
         and "jokerman" not in low
-        and (not require_serif or any(mark in low for mark in ("serif", "times", "georgia", "garamond", "playfair", "cambria", "palatino")))
+        and (not require_serif or any(mark in low for mark in (
+            "serif", "times", "georgia", "garamond", "playfair", "cambria", "palatino",
+            "baskerville", "crimson", "cormorant", "marcellus", "cinzel",
+        )))
         and "OSError" not in reply
     )
     return ok, f"{font} {size:.1f}pt e5={row.get('status')} {reply[:80]}"
@@ -407,6 +411,14 @@ def _pictures() -> None:
         ok, detail = _raster_phone_ok(asked, FLYER, before, True)
         if _sha(FLYER) != before:
             ok = False
+        if asked.get("pending") is True:
+            from artwork_edits import _load, _style_of
+
+            bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
+            fontfile = os.path.abspath(str((_load("medella-flyer").get("proposal") or {}).get("fontfile") or ""))
+            if not fontfile.startswith(bundled) or "dejavu" in fontfile.lower() or _style_of(fontfile) != "serif":
+                ok = False
+                detail = detail + " fontfile " + fontfile
         staged = os.path.join(asked["_preview"], "staged.pdf")
         if os.path.isfile(staged):
             _zoom(FLYER, staged, "medella-flyer", _proposal_box("medella-flyer"))
@@ -422,6 +434,14 @@ def _pictures() -> None:
         short = _ask(CHURCH, "change 9 OCT to 12 OCT", "church-date-bare", 420, 420)
         short["_srcsha"] = church_sha
         phone_ok, phone_detail = _raster_phone_ok(phone, CHURCH, church_sha, False)
+        if phone.get("pending") is True:
+            from artwork_edits import _load
+
+            bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
+            fontfile = os.path.abspath(str((_load("church-phone").get("proposal") or {}).get("fontfile") or ""))
+            if not fontfile.startswith(bundled) or "dejavu" in fontfile.lower() or "/usr/share/fonts" in fontfile:
+                phone_ok = False
+                phone_detail = phone_detail + " fontfile " + os.path.basename(fontfile)
         if phone.get("pending") is True and "072" not in (phone.get("reply") or ""):
             phone_ok = False
         date_ok, date_detail = _named_date_ok(date, "church-date", CHURCH)
@@ -492,8 +512,12 @@ def _broken_subset() -> None:
     body = _text(os.path.join(phone["_preview"], "staged.pdf")) if phone.get("pending") else ""
     problems = []
     reply = phone.get("reply") or ""
-    if phone.get("pending") is not True or "DejaVu" not in reply:
-        problems.append(reply[:160])
+    from artwork_edits import _load
+
+    bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
+    fontfile = os.path.abspath(str((_load("broken-phone").get("proposal") or {}).get("fontfile") or ""))
+    if phone.get("pending") is not True or not fontfile.startswith(bundled) or "dejavu" in fontfile.lower():
+        problems.append((reply[:120] or "no proposal") + " " + fontfile)
     if "Call" not in body or "082 123 4567" not in body:
         problems.append(body.replace("\n", " ")[:100])
     staged = os.path.join(phone["_preview"], "staged.pdf")
@@ -504,12 +528,17 @@ def _broken_subset() -> None:
         image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
         dark = int((image.min(axis=2) < 80).sum())
         doc.close()
-        if any(name.strip() in ("(null)", "null") and "DejaVu" not in " ".join(names) for name in names):
+        joined = " ".join(names).lower()
+        bundled_marks = (
+            "liberation", "inter", "roboto", "opensans", "lato", "montserrat", "poppins",
+            "nunito", "crimson", "playfair", "garamond", "baskerville", "cormorant", "marcellus",
+        )
+        if not any(mark in joined for mark in bundled_marks):
             problems.append("font " + " ".join(names))
         if dark < 200:
             problems.append(f"ink {dark}")
     _zoom(src, staged, "broken-phone", _proposal_box("broken-phone"))
-    _record("broken-phone", not problems, "; ".join(problems) or "Call kept, DejaVu embedded")
+    _record("broken-phone", not problems, "; ".join(problems) or "Call kept, bundled face embedded")
 
     date = _ask(src, "change the date to 12 October 2026", "broken-date")
     date_body = _text(os.path.join(date["_preview"], "staged.pdf")) if date.get("pending") else ""

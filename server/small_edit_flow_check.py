@@ -134,10 +134,10 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
 
 
 def _full_font() -> None:
-    """A subset tag resolves to the bundled face, and Windows fonts are on the search path."""
+    """A subset tag resolves to the face shipped with the app."""
     from fontTools.ttLib import TTFont
 
-    from artwork_edits import _glyphs_present, _named_font, _windows_font_dirs
+    from artwork_edits import _glyphs_present, _named_font
 
     wanted = (
         "PWSYDC+Anton-Regular",
@@ -169,12 +169,9 @@ def _full_font() -> None:
             weight = int(TTFont(path)["OS/2"].usWeightClass)
             if weight != 400:
                 problems.append(f"{name} weight {weight}")
-    windows = any(
-        folder.endswith(os.path.join("Windows", "Fonts")) or folder.endswith("\\Fonts")
-        for folder in _windows_font_dirs()
-    )
-    if not windows:
-        problems.append("windows fonts path")
+    bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
+    if anton and not os.path.abspath(anton).startswith(bundled):
+        problems.append("anton not bundled")
     _record("full-font", not problems, "; ".join(problems) or "15 families, regular weight")
 
 
@@ -532,8 +529,11 @@ def _shrink_venue() -> None:
 
 
 def _windows_font_paths() -> None:
-    """Bundled faces come first. The two Windows folders are resolved with os.path."""
+    """A font that exists only on this computer is not used. The bundled Anton is."""
     from pathlib import Path
+
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
 
     import artwork_edits as edits
 
@@ -544,37 +544,63 @@ def _windows_font_paths() -> None:
     user = os.path.join(local, "Microsoft", "Windows", "Fonts")
     os.makedirs(system)
     os.makedirs(user)
-    bundled_face = os.path.join(os.path.dirname(edits.__file__), "fonts", "Anton-Regular.ttf")
-    shutil.copyfile(bundled_face, os.path.join(system, "Arial.ttf"))
+    bundled_root = os.path.join(os.path.dirname(edits.__file__), "fonts")
+    shutil.copyfile(os.path.join(bundled_root, "Anton-Regular.ttf"), os.path.join(system, "Bahnschrift.ttf"))
     shutil.copyfile(FONT, os.path.join(user, "UserFace.ttf"))
+    conf = os.path.join(folder, "fonts.conf")
+    with open(conf, "w", encoding="utf-8") as handle:
+        handle.write('<?xml version="1.0"?><fontconfig><dir>/no/such/fonts</dir></fontconfig>\n')
     old_win = os.environ.get("WINDIR")
     old_local = os.environ.get("LOCALAPPDATA")
+    old_fc = os.environ.get("FONTCONFIG_FILE")
+    old_fc_path = os.environ.get("FONTCONFIG_PATH")
     old_index = edits._FONT_INDEX
     problems = []
     try:
         os.environ["WINDIR"] = windir
         os.environ["LOCALAPPDATA"] = local
+        os.environ["FONTCONFIG_FILE"] = conf
+        os.environ["FONTCONFIG_PATH"] = folder
         edits._FONT_INDEX = None
         dirs = edits._font_search_dirs()
-        windows = edits._windows_font_dirs()
-        bundled = os.path.normpath(str(Path(edits.__file__).resolve().parent / "fonts"))
-        system_path = os.path.normpath(os.path.abspath(system))
-        user_path = os.path.normpath(os.path.abspath(user))
-        if not dirs or os.path.normpath(dirs[0]) != bundled:
-            problems.append("bundled not first " + repr(dirs[:1]))
-        if system_path not in windows or user_path not in windows:
-            problems.append("windows dirs " + repr(windows))
-        if system_path not in dirs or user_path not in dirs:
-            problems.append("search dirs " + repr(dirs))
-        elif dirs.index(system_path) == 0 or dirs.index(user_path) == 0:
-            problems.append("windows ranked above bundled")
+        bundled = os.path.normpath(bundled_root)
+        if dirs != [bundled]:
+            problems.append("search " + repr(dirs))
+        if edits._windows_font_dirs():
+            problems.append("windows dirs were searched")
         rows = edits._font_index()
-        folders = {os.path.normpath(os.path.dirname(os.path.abspath(row["path"]))) for row in rows if row["kind"] == "windows"}
-        if system_path not in folders or user_path not in folders:
-            problems.append("indexed " + repr(sorted(folders)))
+        paths = [os.path.abspath(row["path"]) for row in rows]
+        if any(path.startswith(os.path.abspath(folder)) for path in paths):
+            problems.append("machine font indexed")
+        if any("/usr/share/fonts" in path for path in paths):
+            problems.append("system font indexed")
+        if any("dejavu" in os.path.basename(path).lower() for path in paths):
+            problems.append("dejavu indexed")
+        if not any("crimson" in os.path.basename(path).lower() for path in paths):
+            problems.append("v2 serif missing")
+        if any(row["kind"] != "bundled" for row in rows):
+            problems.append("kind " + ",".join(sorted({row["kind"] for row in rows})))
         named = edits._named_font("PWSYDC+Anton-Regular")
-        if not named or os.path.normpath(os.path.dirname(os.path.abspath(named))) != bundled:
+        if not named or not os.path.abspath(named).startswith(bundled):
             problems.append("named " + str(named))
+        serif_file = os.path.join(bundled_root, "v2", "CrimsonText-Regular.ttf")
+        if not os.path.isfile(serif_file):
+            problems.append("no bundled serif")
+        else:
+            face = ImageFont.truetype(serif_file, 48)
+            plate = Image.new("RGB", (520, 90), (255, 255, 255))
+            ImageDraw.Draw(plate).text((6, 8), "082 123 4567", font=face, fill=(20, 20, 20))
+            crop = np.array(plate)[:, :, ::-1]
+            first, first_score = edits._closest_font(crop, "082 123 4567")
+            second, second_score = edits._closest_font(crop, "082 123 4567")
+            if first != second or first_score != second_score:
+                problems.append(f"unstable {first} {second}")
+            if not os.path.abspath(first).startswith(bundled):
+                problems.append("closest " + str(first))
+            if edits._style_of(first) != "serif":
+                problems.append("style " + edits._style_of(first) + " " + os.path.basename(first))
+            if os.path.basename(first) != "CrimsonText-Regular.ttf":
+                problems.append("face " + os.path.basename(first))
     finally:
         if old_win is None:
             os.environ.pop("WINDIR", None)
@@ -584,9 +610,17 @@ def _windows_font_paths() -> None:
             os.environ.pop("LOCALAPPDATA", None)
         else:
             os.environ["LOCALAPPDATA"] = old_local
+        if old_fc is None:
+            os.environ.pop("FONTCONFIG_FILE", None)
+        else:
+            os.environ["FONTCONFIG_FILE"] = old_fc
+        if old_fc_path is None:
+            os.environ.pop("FONTCONFIG_PATH", None)
+        else:
+            os.environ["FONTCONFIG_PATH"] = old_fc_path
         edits._FONT_INDEX = old_index
         shutil.rmtree(folder, ignore_errors=True)
-    _record("windows-font-paths", not problems, "; ".join(problems) or "bundled, then both Windows folders")
+    _record("bundled-fonts-only", not problems, "; ".join(problems) or "system fonts hidden, same bundled face twice")
 
 
 def _windows_ocr_shape() -> None:
@@ -834,14 +868,14 @@ def _font_weight() -> None:
     crop = np.array(canvas)[:, :, ::-1]
     previous = edits._FONT_INDEX
     edits._FONT_INDEX = [
-        {"path": regular_path, "kind": "windows", "family": "arial", "style": "regular"},
-        {"path": heavy_path, "kind": "windows", "family": "cooper", "style": "black"},
+        {"path": regular_path, "kind": "bundled", "family": "arial", "style": "regular"},
+        {"path": heavy_path, "kind": "bundled", "family": "cooper", "style": "black"},
     ]
     try:
         path, score = edits._closest_font(crop, "082 123 4567")
         both = os.path.basename(path).lower().startswith("arial") and score >= 0
         edits._FONT_INDEX = [
-            {"path": heavy_path, "kind": "windows", "family": "cooper", "style": "black"},
+            {"path": heavy_path, "kind": "bundled", "family": "cooper", "style": "black"},
         ]
         refused, refused_score = edits._closest_font(crop, "082 123 4567")
         only = refused == "" and refused_score < 0
@@ -855,8 +889,8 @@ def _font_weight() -> None:
         ImageDraw.Draw(serif_plate).text((6, 8), "082 123 4567", font=serif_face, fill=(20, 20, 20))
         serif_crop = np.array(serif_plate)[:, :, ::-1]
         edits._FONT_INDEX = [
-            {"path": sans_path, "kind": "windows", "family": "bahnschrift", "style": "regular"},
-            {"path": serif_path, "kind": "windows", "family": "timesnewroman", "style": "regular"},
+            {"path": sans_path, "kind": "bundled", "family": "bahnschrift", "style": "regular"},
+            {"path": serif_path, "kind": "bundled", "family": "timesnewroman", "style": "regular"},
         ]
         chosen, chosen_score = edits._closest_font(serif_crop, "082 123 4567")
         serif_won = os.path.basename(chosen).lower().startswith("times") and chosen_score >= 0
@@ -977,10 +1011,10 @@ def _serif_phone_keeps_size() -> None:
     """A serif phone stays a serif, and a number that started large does not fall under 7 pt."""
     import pymupdf as fitz
     from PIL import Image, ImageDraw, ImageFont
-    from artwork_edits import propose
+    from artwork_edits import _load, _style_of, propose
     from extra_checks import check_e5
 
-    serif = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+    serif = os.path.join(os.path.dirname(__file__), "fonts", "v2", "CrimsonText-Regular.ttf")
     face = ImageFont.truetype(serif, 48)
     plate = Image.new("RGB", (980, 240), (255, 255, 255))
     ImageDraw.Draw(plate).text((48, 80), "073 703 0766", font=face, fill=(12, 12, 12))
@@ -1005,11 +1039,14 @@ def _serif_phone_keeps_size() -> None:
             doc.close()
     row = check_e5(staged) if os.path.isfile(staged) else {}
     reply = asked.get("reply") or ""
+    fontfile = str((_load("serif-phone").get("proposal") or {}).get("fontfile") or "")
     ok = (
         asked.get("pending") is True
         and size >= 7.0
-        and "serif" in font.lower()
-        and "bahnschrift" not in font.lower()
+        and _style_of(fontfile) == "serif"
+        and fontfile.startswith(os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts")))
+        and "bahnschrift" not in fontfile.lower()
+        and "/usr/share/fonts" not in fontfile
         and row.get("status") != "failed"
         and "5.9" not in str(row.get("detail") or "")
     )

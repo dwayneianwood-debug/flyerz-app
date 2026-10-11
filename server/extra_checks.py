@@ -181,12 +181,11 @@ def _image_pixels(path: str) -> tuple[int, int] | None:
 
 
 def _font_dirs() -> list[str]:
+    """Exact-face lookup uses the fonts shipped with the app. Not the host's font folder."""
     here = os.path.dirname(os.path.abspath(__file__))
     return [
         os.path.join(here, "fonts"),
         os.path.join(here, "fonts", "v2"),
-        "/usr/share/fonts/truetype/dejavu",
-        "/usr/share/fonts/truetype/liberation",
     ]
 
 

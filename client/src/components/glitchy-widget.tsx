@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { glitchyPlacement, keepAskedReply } from "@/lib/glitchy-placement";
+import { chatPanelLayout, speechBubbleMaxWidth } from "@/lib/viewport-layout";
 
 type CatMode = "head" | "walking" | "sleeping" | "stretching";
 
@@ -201,6 +202,7 @@ export default function GlitchyWidget() {
   const [userOpened, setUserOpened] = useState(false);
   const [obstacleTops, setObstacleTops] = useState<number[]>([]);
   const [viewportHeight, setViewportHeight] = useState(800);
+  const [viewportWidth, setViewportWidth] = useState(1280);
 
   function getJobIdFromUrl(): number | null {
     const match = window.location.pathname.match(/\/job\/(\d+)/);
@@ -600,6 +602,7 @@ export default function GlitchyWidget() {
     const apply = () => {
       setNarrow(media.matches);
       setViewportHeight(window.innerHeight);
+      setViewportWidth(window.innerWidth);
     };
     apply();
     media.addEventListener("change", apply);
@@ -857,6 +860,8 @@ export default function GlitchyWidget() {
     obstacleTops,
   });
   const showPanels = !placement.collapsed;
+  const panel = chatPanelLayout(viewportWidth);
+  const bubbleMax = speechBubbleMaxWidth(viewportWidth);
 
   const showBubble =
     (bubbleVisible && processState === "IDLE" && !chatBoxVisible) ||
@@ -1041,16 +1046,18 @@ export default function GlitchyWidget() {
           box-shadow: 0 8px 25px rgba(0,0,0,0.3);
           text-align: center;
           position: relative;
-          max-width: 240px;
-          min-width: 140px;
+          max-width: var(--glitchy-bubble-max, 240px);
+          min-width: 0;
+          box-sizing: border-box;
         }
         .glitchy-chat-expanded {
-          width: 330px;
-          max-width: 330px;
-          min-width: 210px;
+          width: var(--glitchy-panel-width, 330px);
+          max-width: var(--glitchy-panel-width, 330px);
+          min-width: 0;
           padding: 15px 20px;
           font-size: 13px;
-          margin-left: -105px;
+          margin-left: var(--glitchy-panel-shift, -105px);
+          box-sizing: border-box;
         }
         .glitchy-speech-bubble::after {
           content: '';
@@ -1088,17 +1095,6 @@ export default function GlitchyWidget() {
           background-color: #ff5277;
           transform: scale(1.01);
         }
-        @media (max-width: 768px) {
-          .glitchy-chat-expanded {
-            width: min(240px, calc(100vw - 24px));
-            max-width: calc(100vw - 24px);
-            min-width: 0;
-            margin-left: 0;
-          }
-          .glitchy-speech-bubble {
-            max-width: min(220px, calc(100vw - 32px));
-          }
-        }
         .error-text {
           color: #ff4b4b;
           font-weight: bold;
@@ -1110,7 +1106,7 @@ export default function GlitchyWidget() {
         data-collapsed={placement.collapsed ? "true" : "false"}
         style={{
           position: "fixed",
-          bottom: isVisible ? placement.bottom : -100,
+          bottom: isVisible ? `calc(${placement.bottom}px + env(safe-area-inset-bottom, 0px))` : -100,
           right: placement.collapsed || narrow || !wanderingRef.current ? 12 : undefined,
           left: !placement.collapsed && !narrow && wanderingRef.current ? posX : undefined,
           width: placement.collapsed ? 44 : 120,
@@ -1120,7 +1116,10 @@ export default function GlitchyWidget() {
           overflow: "visible",
           zIndex: 30,
           pointerEvents: "none",
-          fontFamily: "sans-serif",
+          fontFamily: "Flyerz Sans, sans-serif",
+          ["--glitchy-panel-width" as string]: `${panel.width}px`,
+          ["--glitchy-panel-shift" as string]: `${panel.marginLeft}px`,
+          ["--glitchy-bubble-max" as string]: `${bubbleMax}px`,
           transformOrigin: "bottom right",
           transition: "bottom 0.25s ease-in-out, left 2s linear",
         }}

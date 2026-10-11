@@ -96,14 +96,14 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
       <div className="orb orb-2" aria-hidden="true" />
       <div className="orb orb-3" aria-hidden="true" />
       <header className="sticky top-0 z-50 w-full glow-header">
-        <div className="max-w-7xl mx-auto flex h-16 items-center px-4 sm:px-6 lg:px-8 justify-between">
-          <div className="flex items-center gap-3" data-testid="header-brand">
+        <div className="max-w-7xl mx-auto flex h-16 items-center px-4 sm:px-6 lg:px-8 justify-between gap-2 min-w-0">
+          <div className="flex items-center gap-3 shrink-0" data-testid="header-brand">
             <Link href="/" className="flex items-center gap-2 hover:opacity-90 transition-opacity">
               <img src={logoPath} alt="Flyerz.co.za" className="h-10 sm:h-12 w-auto" data-testid="img-logo" />
             </Link>
           </div>
           
-          <nav className="flex items-center gap-1 sm:gap-2">
+          <nav className="flex items-center gap-1 sm:gap-2 min-w-0 overflow-x-auto">
             {canInstall && (
               <Button
                 onClick={install}
@@ -152,7 +152,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
               </Button>
 
               {toolsOpen && (
-                <div className="absolute right-0 mt-2 w-64 bg-background border border-border/60 rounded-xl shadow-xl shadow-black/10 overflow-hidden z-50" data-testid="tools-dropdown">
+                <div className="absolute right-0 mt-2 w-64 max-w-[calc(100vw-1.5rem)] bg-background border border-border/60 rounded-xl shadow-xl shadow-black/10 overflow-hidden z-50" data-testid="tools-dropdown">
                   <div className="p-1.5">
                     <Link href="/crop" onClick={() => setToolsOpen(false)}>
                       <div className="flex items-center gap-3 p-3 rounded-lg cursor-pointer hover:bg-muted/60 transition-colors group" data-testid="tool-link-crop">
@@ -207,7 +207,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 <Settings className="w-4 h-4" />
               </Button>
               {settingsOpen && (
-                <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
+                <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1.5rem)] rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
                   <div className="flex items-start gap-3 p-3" data-testid="setting-clear-old-jobs">
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-semibold text-foreground leading-tight">Clear old jobs overnight</p>
@@ -276,7 +276,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 <HelpCircle className="w-4 h-4" />
               </Button>
               {helpOpen && (
-                <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
+                <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1.5rem)] rounded-xl border bg-popover/95 backdrop-blur-md shadow-lg p-2 z-50">
                   <Link
                     href="/dashboard/rules"
                     className="flex items-center gap-3 p-3 rounded-lg hover:bg-muted/60 transition-colors group"

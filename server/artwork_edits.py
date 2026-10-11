@@ -2,9 +2,10 @@
 """One small edit at a time, with a preview and an undo.
 
 Live text stays in its own font when that face has the new letters. A Canva
-subset usually does not: the full face is taken from the bundled font folder
-(or C:\\Windows\\Fonts on a laptop) by the name after the subset tag. If that
-face is not there, the closest bundled font is used and the reply says amber.
+subset usually does not: the full face is taken from the fonts shipped with
+the app, by the name after the subset tag. Machine font folders are not
+searched, so Linux and Windows produce the same letters. If that face is not
+in the bundle, the closest bundled font is used and the reply says amber.
 A picture gets only those word pixels inpainted from the background, then new vector text in the closest font.
 """
 
@@ -60,12 +61,6 @@ SAFE_EDIT = "I can't safely change this one, please send the editable file."
 
 _BUNDLED_FONTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _FIXTURE_FONTS = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "fonts"))
-_FALLBACK_FONTS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-)
 _WEIGHT_WORDS = (
     "extralight", "extrabold", "semibold", "demibold", "regular",
     "italic", "medium", "black", "bold", "light", "thin", "book",
@@ -167,50 +162,44 @@ def _weight_hint(name: str) -> str:
 
 
 def _windows_font_dirs() -> list[str]:
-    """The two Windows font folders, after the bundled faces.
+    """Machine font folders are not searched.
 
-    Paths are built with pathlib and normalised with os.path so a laptop and
-    this container resolve the same way. A missing folder is simply skipped.
+    A Windows laptop and this Linux host do not have the same faces. Edits use
+    the fonts shipped with the app, or a font embedded in the artwork.
     """
-    from pathlib import Path
-
-    windir = Path(os.environ.get("WINDIR") or os.path.join("C:\\", "Windows"))
-    local_root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    folders = (
-        windir / "Fonts",
-        Path(local_root) / "Microsoft" / "Windows" / "Fonts",
-    )
-    return [os.path.normpath(os.path.abspath(str(folder))) for folder in folders]
+    return []
 
 
 def _font_search_dirs() -> list[str]:
-    """Bundled fonts first, then the Windows folders."""
-    from pathlib import Path
-
-    bundled = Path(__file__).resolve().parent / "fonts"
-    return [os.path.normpath(str(bundled))] + _windows_font_dirs()
+    """Only the fonts shipped in server/fonts. The same list on every computer."""
+    return [os.path.normpath(_BUNDLED_FONTS)]
 
 
 def _bundled_font_files() -> list[str]:
+    """Every face shipped with the app, including server/fonts/v2.
+
+    Walk order is sorted, so the same computer and a different one build the
+    same list. A font that exists only on Linux or only on Windows is not here.
+    """
     found = []
     seen = set()
-    for folder in (_BUNDLED_FONTS, _FIXTURE_FONTS):
+    folders = [_BUNDLED_FONTS]
+    if os.path.isdir(_FIXTURE_FONTS):
+        folders.append(_FIXTURE_FONTS)
+    for folder in folders:
         if not os.path.isdir(folder):
             continue
-        for name in sorted(os.listdir(folder)):
-            if not name.lower().endswith((".ttf", ".otf")):
-                continue
-            path = os.path.join(folder, name)
-            real = os.path.abspath(path)
-            if real in seen:
-                continue
-            seen.add(real)
-            found.append(path)
-    for path in _FALLBACK_FONTS:
-        real = os.path.abspath(path)
-        if os.path.isfile(path) and real not in seen:
-            seen.add(real)
-            found.append(path)
+        for dirpath, dirnames, files in os.walk(folder):
+            dirnames.sort()
+            for name in sorted(files):
+                if not name.lower().endswith((".ttf", ".otf")):
+                    continue
+                path = os.path.join(dirpath, name)
+                real = os.path.abspath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
+                found.append(path)
     return found
 
 
@@ -301,27 +290,14 @@ def _font_index() -> list[dict]:
             continue
         seen.add(real)
         family, style = _face_names(use)
-        kind = "system" if os.path.abspath(path).startswith("/usr/share/fonts") else "bundled"
-        rows.append({"path": use, "kind": kind, "family": family, "style": style})
-    for folder in _windows_font_dirs():
-        if not os.path.isdir(folder):
-            continue
-        for name in sorted(os.listdir(folder)):
-            if not name.lower().endswith((".ttf", ".otf", ".ttc")):
-                continue
-            path = os.path.join(folder, name)
-            real = os.path.abspath(path)
-            if real in seen or not os.path.isfile(path):
-                continue
-            seen.add(real)
-            family, style = _face_names(path)
-            rows.append({"path": path, "kind": "windows", "family": family, "style": style})
+        rows.append({"path": use, "kind": "bundled", "family": family, "style": style})
+    rows.sort(key=lambda row: (row["family"], row["style"], os.path.basename(row["path"]).lower()))
     _FONT_INDEX = rows
     return rows
 
 
 def _candidate_fonts() -> list[str]:
-    return [row["path"] for row in _font_index() if row["kind"] in ("bundled", "windows", "system")]
+    return [row["path"] for row in _font_index() if row["kind"] == "bundled"]
 
 
 def _named_font(fontname: str) -> str | None:
@@ -336,8 +312,7 @@ def _named_font(fontname: str) -> str | None:
         if row["family"] != wanted:
             continue
         style_rank = 0 if row["style"] == hint or (hint == "regular" and row["style"] in ("regular", "book")) else 1
-        kind_rank = 0 if row["kind"] == "bundled" else 1 if row["kind"] == "windows" else 2
-        key = (style_rank, kind_rank)
+        key = (style_rank, os.path.basename(row["path"]).lower())
         if key < best_key:
             best_key = key
             best = row["path"]
@@ -421,7 +396,10 @@ def _closest_among(crop, text: str, paths: list[str]) -> tuple[str, float]:
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont
 
-    usable = [path for path in paths if os.path.isfile(path)]
+    usable = sorted(
+        (path for path in paths if os.path.isfile(path)),
+        key=lambda item: os.path.basename(item).lower(),
+    )
     if not usable:
         return "", 999.0
     if crop is None or getattr(crop, "size", 0) == 0:
@@ -487,7 +465,7 @@ def _plain_text_face(paths: list[str], text: str) -> str:
         if any(word in token for word in ("script", "vibes", "handwrit", "brush", "calligraphy", "signature", "cursive")):
             continue
         rank = 9
-        for index, name in enumerate(("dejavusans", "liberationsans", "arial", "calibri", "carlito", "anton", "roboto", "notosans")):
+        for index, name in enumerate(("liberationsans", "inter", "roboto", "opensans", "lato", "montserrat", "poppins")):
             if name in token and "bold" not in token and "italic" not in token:
                 rank = index
                 break
@@ -512,7 +490,7 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
     paths = [
         row["path"]
         for row in _font_index()
-        if row["kind"] in ("bundled", "windows", "system") and _glyphs_present(row["path"], text)
+        if row["kind"] == "bundled" and _glyphs_present(row["path"], text)
     ]
     if not paths:
         missing = _missing_glyphs(embedded, text) if embedded and embedded not in ("helv", "times", "cour") else [
@@ -525,7 +503,7 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
             "fontSource": "none",
             "reply": (
                 f"The font {fontname or 'on the page'} has no glyph for {shown}, "
-                "and none of the installed fonts do either. Nothing was changed."
+                "and none of the fonts shipped with the app do either. Nothing was changed."
             ),
         }
     crop = _span_crop(page, bbox) if bbox else None
@@ -552,7 +530,7 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
             "fontSource": "none",
             "reply": (
                 f"The font {fontname or 'on the page'} has no glyph for {shown}, "
-                "and none of the installed fonts do either. Nothing was changed."
+                "and none of the fonts shipped with the app do either. Nothing was changed."
             ),
         }
     return {
@@ -1027,11 +1005,13 @@ def _line_groups(words: list[dict]) -> list[list[dict]]:
 _SERIF_MARKS = (
     "serif", "times", "georgia", "garamond", "palatino", "cambria", "playfair",
     "baskerville", "constantia", "bookantiqua", "century", "merriweather",
+    "crimson", "cormorant", "marcellus", "cinzel",
 )
 _DISPLAY_MARKS = (
     "jokerman", "chiller", "freestyle", "viner", "mistral", "blackadder", "curlz",
     "papyrus", "comic", "handwriting", "calligraphy", "greatvibes", "brushscript",
     "rage", "pristina", "harlow", "ravie", "snapitc", "juice", "cooper",
+    "parisienne", "pinyon", "allura", "script",
 )
 
 
@@ -1050,37 +1030,18 @@ def _style_of(path: str) -> str:
     return "sans"
 
 
-def _reference_font(style: str) -> str:
-    preferred = {
-        "serif": ("dejavuserif", "playfair", "times", "georgia", "liberationserif"),
-        "sans": ("dejavusans", "liberationsans", "arial", "calibri"),
-    }.get(style, ())
-    for mark in preferred:
-        for row in _font_index():
-            if mark in (row.get("family") or "") and _style_of(row["path"]) == style:
-                return row["path"]
-    for row in _font_index():
-        if _style_of(row["path"]) == style:
-            return row["path"]
-    return ""
-
-
 def _wanted_style(ranked: list) -> str:
-    """Serif artwork stays with a serif. A plain sans is not a substitute for it."""
-    sans_path = _reference_font("sans")
-    serif_path = _reference_font("serif")
+    """Serif artwork stays with a serif. A plain sans is not a substitute for it.
 
-    def iou_for(path: str) -> float:
-        if not path:
-            return -1.0
-        wanted = os.path.abspath(path)
-        for item in ranked:
-            if os.path.abspath(item[3]) == wanted:
-                return float(item[1])
-        return -1.0
+    The class is the best overlap in that class. One reference file can lose
+    even when another face in the same class is the real match.
+    """
+    def best(style: str) -> float:
+        scores = [float(item[1]) for item in ranked if item[4] == style]
+        return max(scores) if scores else -1.0
 
-    sans_iou = iou_for(sans_path)
-    serif_iou = iou_for(serif_path)
+    sans_iou = best("sans")
+    serif_iou = best("serif")
     if serif_iou >= 0 and serif_iou >= sans_iou + 0.03:
         return "serif"
     if sans_iou >= 0 and sans_iou >= serif_iou + 0.03:
@@ -1165,12 +1126,12 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     if not pool:
         # A sans stand-in, or a novelty face such as Jokerman, is not this lettering.
         return "", -1.0
-    pool.sort(key=lambda item: item[0], reverse=True)
+    pool.sort(key=lambda item: (-item[0], os.path.basename(item[3]).lower()))
     _adjusted, best_iou, best_ratio, best_path, _style = pool[0]
     if src_share >= 0.02 and best_ratio > 1.45:
         lighter = [item for item in pool if item[2] <= 1.25 and item[1] >= best_iou - 0.18]
         if lighter:
-            lighter.sort(key=lambda item: item[1], reverse=True)
+            lighter.sort(key=lambda item: (-item[1], os.path.basename(item[3]).lower()))
             _adjusted, best_iou, _ratio, best_path, _style = lighter[0]
         else:
             # No face is close to this weight. Applying a much heavier one would be wrong.
@@ -2520,6 +2481,27 @@ def _glyph_height(mask) -> float:
     return heights[len(heights) // 2]
 
 
+def _asc_desc(fontfile: str) -> tuple[float, float]:
+    """Ascender and descender as fractions of the em. Both stay inside the old word."""
+    import pymupdf as fitz
+
+    try:
+        face = fitz.Font(fontfile=fontfile) if fontfile and os.path.isfile(fontfile) else fitz.Font("helv")
+        asc = float(face.ascender or 0.8)
+        desc = float(face.descender or -0.2)
+    except Exception:
+        asc, desc = 0.8, -0.2
+    if abs(asc) > 2:
+        asc = asc / 1000.0
+    if abs(desc) > 2:
+        desc = desc / 1000.0
+    if asc < 0.2:
+        asc = 0.8
+    if desc > -0.01:
+        desc = -0.2
+    return asc, desc
+
+
 def _em_for_ink(fontfile: str, ink_height: float) -> float:
     """Point size whose letters are as tall as the ink already on the page."""
     import pymupdf as fitz
@@ -2566,8 +2548,12 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     letter_px = _glyph_height(found["mask"])
     bounds_px = max(1.0, float(y1 - y0))
     letter_pt = ink.height * (letter_px / bounds_px) if letter_px >= 4 else ink.height
+    asc, desc = _asc_desc(fontfile)
     natural = _em_for_ink(fontfile, letter_pt) * float(proposal.get("sizeFactor") or 1.0)
-    origin_y = ink.y1 - max(2.0, ink.height * 0.12)
+    # The whole glyph has to stay inside the old letters. A taller em paints the line above them.
+    if natural * (asc - desc) > letter_pt and letter_pt > 1:
+        natural = letter_pt / (asc - desc)
+    origin_y = ink.y0 + natural * asc
     center_x = (ink.x0 + ink.x1) / 2.0
     page_mid = (page.rect.x0 + page.rect.x1) / 2.0
     align = "center" if abs(center_x - page_mid) <= 14 else "fit"
@@ -2590,9 +2576,8 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         return
     overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
     page.insert_image(clip, pixmap=overlay, overlay=True)
-    # A stacked day-over-month is tall. Sit the new line on the day, not on the time underneath.
-    if ink.height > size * 1.6:
-        origin = (origin[0], ink.y0 + size * 0.92)
+    # Sit the baseline so the letters stay inside the old word, including a day stacked on its month.
+    origin = (origin[0], ink.y0 + size * asc)
     proposal["shrunk"] = bool(shrunk)
     proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
     proposal["guardBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]

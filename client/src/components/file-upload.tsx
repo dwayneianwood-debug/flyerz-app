@@ -146,7 +146,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
           className="fill-muted-foreground/50"
           fontSize="10"
           fontWeight="600"
-          fontFamily="system-ui"
+          fontFamily="Flyerz Sans, sans-serif"
         >
           A0 — {A0_W} × {A0_H}mm
         </text>
@@ -166,7 +166,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
               className="fill-amber-600 dark:fill-amber-400"
               fontSize="11"
               fontWeight="700"
-              fontFamily="system-ui"
+              fontFamily="Flyerz Sans, sans-serif"
             >
               Your Artwork
             </text>
@@ -178,7 +178,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
               className="fill-amber-600 dark:fill-amber-400"
               fontSize="10"
               fontWeight="500"
-              fontFamily="ui-monospace, monospace"
+              fontFamily="Flyerz Sans, sans-serif"
             >
               {originalW} × {originalH}mm
             </text>
@@ -200,7 +200,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
                 className="fill-amber-500/70"
                 fontSize="8"
                 fontWeight="600"
-                fontFamily="system-ui"
+                fontFamily="Flyerz Sans, sans-serif"
               >
                 Original {originalW}×{originalH}
               </text>
@@ -223,7 +223,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
               className="fill-primary"
               fontSize={targetDispW < 50 ? "8" : "11"}
               fontWeight="700"
-              fontFamily="system-ui"
+              fontFamily="Flyerz Sans, sans-serif"
             >
               {sizeLabel(targetW!, targetH!) || "Target"}
             </text>
@@ -236,7 +236,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
                 className="fill-primary"
                 fontSize={targetDispW < 50 ? "7" : "10"}
                 fontWeight="500"
-                fontFamily="ui-monospace, monospace"
+                fontFamily="Flyerz Sans, sans-serif"
               >
                 {targetW} × {targetH}mm
               </text>
@@ -253,7 +253,7 @@ function SizeComparator({ targetW, targetH, originalW, originalH }: {
             className="fill-muted-foreground/40"
             fontSize="12"
             fontWeight="500"
-            fontFamily="system-ui"
+            fontFamily="Flyerz Sans, sans-serif"
           >
             Select a size to preview
           </text>

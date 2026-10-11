@@ -111,21 +111,10 @@ def _potrace_in(raw: str) -> str:
 
 
 def overlay_fonts(bold: bool) -> list:
-    """Faces for a sharp overlay. Bundled Liberation, then the Windows font folder."""
+    """Faces for a sharp overlay. Bundled Liberation only, so Linux and Windows match."""
     bold_face = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
     regular = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
-    paths = [bold_face, regular] if bold else [regular, bold_face]
-    windir = (os.environ.get("WINDIR") or os.environ.get("SystemRoot") or "").strip()
-    if windir:
-        fonts = os.path.join(windir, "Fonts")
-        arial_bold = os.path.join(fonts, "arialbd.ttf")
-        arial = os.path.join(fonts, "arial.ttf")
-        calibri = os.path.join(fonts, "calibri.ttf")
-        if bold:
-            paths.extend([arial_bold, arial, calibri])
-        else:
-            paths.extend([arial, arial_bold, calibri])
-    return paths
+    return [bold_face, regular] if bold else [regular, bold_face]
 
 
 def bundled_sans(bold: bool = True) -> str:

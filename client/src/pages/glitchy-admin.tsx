@@ -32,7 +32,7 @@ export default function GlitchyAdmin() {
   }, []);
 
   return (
-    <div style={{ fontFamily: "sans-serif", background: "#f4f7f6", minHeight: "100vh", padding: 40 }}>
+    <div style={{ fontFamily: "Flyerz Sans, sans-serif", background: "#f4f7f6", minHeight: "100dvh", padding: 40 }}>
       <div
         data-testid="glitchy-admin-card"
         style={{
