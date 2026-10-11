@@ -845,9 +845,175 @@ def _font_weight() -> None:
         ]
         refused, refused_score = edits._closest_font(crop, "082 123 4567")
         only = refused == "" and refused_score < 0
+        serif_src = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+        sans_path = os.path.join(folder, "bahnschrift.ttf")
+        serif_path = os.path.join(folder, "times.ttf")
+        shutil.copyfile(regular, sans_path)
+        shutil.copyfile(serif_src, serif_path)
+        serif_face = ImageFont.truetype(serif_src, 48)
+        serif_plate = Image.new("RGB", (520, 90), (255, 255, 255))
+        ImageDraw.Draw(serif_plate).text((6, 8), "082 123 4567", font=serif_face, fill=(20, 20, 20))
+        serif_crop = np.array(serif_plate)[:, :, ::-1]
+        edits._FONT_INDEX = [
+            {"path": sans_path, "kind": "windows", "family": "bahnschrift", "style": "regular"},
+            {"path": serif_path, "kind": "windows", "family": "timesnewroman", "style": "regular"},
+        ]
+        chosen, chosen_score = edits._closest_font(serif_crop, "082 123 4567")
+        serif_won = os.path.basename(chosen).lower().startswith("times") and chosen_score >= 0
     finally:
         edits._FONT_INDEX = previous
     _record("font-not-cooper", both and only, f"{os.path.basename(path)} {score:.1f} only {refused_score}")
+    _record("font-serif-not-bahnschrift", serif_won, f"{os.path.basename(chosen)} {chosen_score:.1f}")
+
+
+def _picture_pdf(path: str, image) -> None:
+    import pymupdf as fitz
+
+    png = path + ".png"
+    image.save(png)
+    doc = fitz.open()
+    page = doc.new_page(width=image.size[0] / 2.0, height=image.size[1] / 2.0)
+    page.insert_image(page.rect, filename=png)
+    doc.save(path)
+    doc.close()
+
+
+def _outside_pixels(before: str, after: str, box: list) -> int:
+    import numpy as np
+    from artwork_edits import _render_rgb
+
+    left = _render_rgb(before, 2.5)
+    right = _render_rgb(after, 2.5)
+    if left.shape != right.shape or not box or len(box) < 4:
+        return 999999
+    delta = np.abs(left.astype(np.int16) - right.astype(np.int16)).max(axis=2)
+    scale = 2.5
+    margin = 1.25 * scale
+    x0 = max(0, int(np.floor(float(box[0]) * scale - margin)))
+    y0 = max(0, int(np.floor(float(box[1]) * scale - margin)))
+    x1 = min(left.shape[1], int(np.ceil(float(box[2]) * scale + margin)))
+    y1 = min(left.shape[0], int(np.ceil(float(box[3]) * scale + margin)))
+    outside = delta.copy()
+    outside[y0:y1, x0:x1] = 0
+    return int((outside > 12).sum())
+
+
+def _missing_named_date() -> None:
+    """9 OCT is not on a poster that has 10 OCT and 11 OCT. It must not become 11 OCT."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    from artwork_edits import SAFE_EDIT, _load, propose
+
+    font = ImageFont.truetype("/workspace/server/fonts/Poppins-Bold.ttf", 64)
+    small = ImageFont.truetype(FONT, 28)
+    plate = Image.new("RGB", (980, 420), (248, 244, 236))
+    draw = ImageDraw.Draw(plate)
+    draw.text((700, 36), "SUNDAY", font=small, fill=(20, 20, 20))
+    draw.text((80, 70), "10", font=font, fill=(20, 20, 20))
+    draw.text((80, 160), "OCT", font=font, fill=(20, 20, 20))
+    draw.text((360, 70), "11", font=font, fill=(20, 20, 20))
+    draw.text((360, 160), "OCT", font=font, fill=(20, 20, 20))
+    src = os.path.join(ROOT, "dates-10-11.pdf")
+    _picture_pdf(src, plate)
+    original = _sha(src)
+    for message, stem in (
+        ("change the date from 9 OCT to 12 October 2026", "missing-from"),
+        ("change 9 OCT to 12 OCT", "missing-bare"),
+    ):
+        asked = propose(src, message, stem, os.path.join(ROOT, "preview-" + stem)) or {}
+        reply = asked.get("reply") or ""
+        low = reply.lower()
+        staged = os.path.join(ROOT, "preview-" + stem, "staged.pdf")
+        body = _text(staged) if os.path.isfile(staged) else ""
+        ok = (
+            asked.get("pending") is not True
+            and "9 oct" in low
+            and "10 oct" in low
+            and "11 oct" in low
+            and "nothing was changed" in low
+            and "everything else" not in low
+            and "from 11 oct" not in low
+            and "12 oct" not in body.lower()
+            and _sha(src) == original
+        )
+        _record("missing-" + stem, ok, reply[:180])
+    flat = os.path.join(ROOT, "date-11-flat.pdf")
+    one = Image.new("RGB", (640, 280), (248, 244, 236))
+    pen = ImageDraw.Draw(one)
+    pen.text((70, 40), "11", font=font, fill=(20, 20, 20))
+    pen.text((70, 130), "OCT", font=font, fill=(20, 20, 20))
+    _picture_pdf(flat, one)
+    asked = propose(flat, "change the date from 11 OCT to 12 October 2026", "flat-11", os.path.join(ROOT, "preview-flat-11")) or {}
+    staged = os.path.join(ROOT, "preview-flat-11", "staged.pdf")
+    body = _text(staged) if os.path.isfile(staged) else ""
+    box = (_load("flat-11").get("proposal") or {}).get("editBox")
+    outside = _outside_pixels(flat, staged, box) if asked.get("pending") and box else 999999
+    face = str((_load("flat-11").get("proposal") or {}).get("faceLabel") or (_load("flat-11").get("proposal") or {}).get("fontfile") or "")
+    clean = (
+        asked.get("pending") is True
+        and "12 OCT" in body
+        and "11 OCT" not in body
+        and outside == 0
+        and "jokerman" not in face.lower()
+        and "could not read" not in (asked.get("reply") or "").lower()
+    )
+    _record("named-11-oct-clean", clean, f"outside {outside} {face} {(asked.get('reply') or '')[:100]}")
+    noise = np.random.default_rng(3).integers(80, 220, size=(360, 720, 3), dtype=np.uint8)
+    noise[:, :, 0] = np.clip(noise[:, :, 0].astype(np.int16) + 40, 0, 255)
+    photo = Image.fromarray(noise, "RGB")
+    pen = ImageDraw.Draw(photo)
+    pen.text((80, 40), "11", font=font, fill=(255, 255, 255))
+    pen.text((80, 140), "OCT", font=font, fill=(255, 255, 255))
+    busy = os.path.join(ROOT, "date-11-photo.pdf")
+    _picture_pdf(busy, photo)
+    before = _sha(busy)
+    asked = propose(busy, "change 11 OCT to 12 OCT", "photo-11", os.path.join(ROOT, "preview-photo-11")) or {}
+    reply = asked.get("reply") or ""
+    refused = asked.get("pending") is not True and reply.strip() == SAFE_EDIT and _sha(busy) == before
+    _record("photo-date-refused", refused, reply[:160])
+
+
+def _serif_phone_keeps_size() -> None:
+    """A serif phone stays a serif, and a number that started large does not fall under 7 pt."""
+    import pymupdf as fitz
+    from PIL import Image, ImageDraw, ImageFont
+    from artwork_edits import propose
+    from extra_checks import check_e5
+
+    serif = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+    face = ImageFont.truetype(serif, 48)
+    plate = Image.new("RGB", (980, 240), (255, 255, 255))
+    ImageDraw.Draw(plate).text((48, 80), "073 703 0766", font=face, fill=(12, 12, 12))
+    src = os.path.join(ROOT, "serif-phone.pdf")
+    _picture_pdf(src, plate)
+    asked = propose(src, "change the phone number to 082 123 4567", "serif-phone", os.path.join(ROOT, "preview-serif-phone")) or {}
+    staged = os.path.join(ROOT, "preview-serif-phone", "staged.pdf")
+    size = 0.0
+    font = ""
+    if os.path.isfile(staged):
+        doc = fitz.open(staged)
+        try:
+            for block in (doc[0].get_text("dict") or {}).get("blocks") or []:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines") or []:
+                    for span in line.get("spans") or []:
+                        if "082" in str(span.get("text") or ""):
+                            size = float(span.get("size") or 0)
+                            font = str(span.get("font") or "")
+        finally:
+            doc.close()
+    row = check_e5(staged) if os.path.isfile(staged) else {}
+    reply = asked.get("reply") or ""
+    ok = (
+        asked.get("pending") is True
+        and size >= 7.0
+        and "serif" in font.lower()
+        and "bahnschrift" not in font.lower()
+        and row.get("status") != "failed"
+        and "5.9" not in str(row.get("detail") or "")
+    )
+    _record("serif-phone-size", ok, f"{font} {size:.1f}pt e5={row.get('status')} {reply[:100]}")
 
 
 def _is_this_right() -> None:
@@ -917,6 +1083,8 @@ def run() -> list[str]:
     _shrink_venue()
     _exactly_once()
     _ocr_miss_keeps_the_edit()
+    _missing_named_date()
+    _serif_phone_keeps_size()
     _is_this_right()
     _cat_yes()
     _write()

@@ -37,14 +37,14 @@ test("Word and PowerPoint uploads explain the problem without a server path", ()
     const blob = JSON.stringify(result);
     assert.equal(result.allPassed, false);
     assert.ok(result.checks.every((check) => check.passed === false));
-    assert.match(result.checks[0].message, /not ideal for litho printing/);
-    assert.match(result.checks[0].message, /Please send a PDF or a picture \(JPG or PNG\)/);
+    assert.match(result.checks[0].message, /Word and PowerPoint files can't be printed as they are/);
+    assert.match(result.checks[0].message, /Please export it as a PDF and send that to us/);
     assert.doesNotMatch(blob, /\/workspace|\/uploads|cannot identify image file/i);
     const leaked = clientSafeQuickCheckError(
       `cannot identify image file '/workspace/uploads/${kind}-secret'`,
       kind,
     );
-    assert.match(leaked, /Please send a PDF or a picture/);
+    assert.match(leaked, /Please export it as a PDF/);
     assert.doesNotMatch(leaked, /workspace|uploads/);
   }
 });

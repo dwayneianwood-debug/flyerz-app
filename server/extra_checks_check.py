@@ -329,6 +329,49 @@ def test_png_is_not_screen_dpi() -> None:
     check("png-not-96", dpi >= 200 and "96 ppi" not in detail, f"dpi {dpi} {detail}")
 
 
+def test_type3_wording() -> None:
+    """A picture-font warning asks for a PDF. It does not say Type 3."""
+    import pikepdf
+    from extra_checks import check_e6
+    from quick_print import EPS_MESSAGE, OFFICE_MESSAGE, decide_light
+
+    folder = tempfile.mkdtemp(prefix="type3-words-")
+    path = os.path.join(folder, "picture-font.pdf")
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    font = pikepdf.Dictionary(
+        Type=pikepdf.Name("/Font"),
+        Subtype=pikepdf.Name("/Type3"),
+        FontMatrix=pikepdf.Array([0.001, 0, 0, 0.001, 0, 0]),
+        FontBBox=pikepdf.Array([0, 0, 1000, 1000]),
+        Encoding=pikepdf.Dictionary(Type=pikepdf.Name("/Encoding"), Differences=pikepdf.Array([65, pikepdf.Name("/A")])),
+        CharProcs=pikepdf.Dictionary(A=pikepdf.Stream(pdf, b"0 0 100 100 re f")),
+        FirstChar=65,
+        LastChar=65,
+        Widths=pikepdf.Array([1000]),
+    )
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F3=pdf.make_indirect(font)))
+    page.Contents = pikepdf.Stream(pdf, b"BT /F3 12 Tf 40 40 Td (A) Tj ET")
+    pdf.save(path)
+    pdf.close()
+    row = check_e6(path)
+    detail = str(row.get("detail") or "")
+    check(
+        "type3-plain",
+        row.get("status") == "warning" and "type 3" not in detail.lower() and "type3" not in detail.lower() and "embedded or outlined" in detail.lower(),
+        detail,
+    )
+    office = decide_light({"kind": "office"})
+    blob = " ".join(office.get("reasons") or []) + " " + str(office.get("clientMessage") or "")
+    check(
+        "word-polite",
+        blob == OFFICE_MESSAGE + " " + OFFICE_MESSAGE and "export it as a PDF" in blob and "can't be printed" in blob,
+        blob[:180],
+    )
+    check("eps-polite", "Type3" not in EPS_MESSAGE and "embedded or outlined" in EPS_MESSAGE, EPS_MESSAGE)
+    shutil.rmtree(folder, ignore_errors=True)
+
+
 def main() -> None:
     test_order_and_e1()
     test_canva_trim_decorations_and_blue()
@@ -337,6 +380,7 @@ def main() -> None:
     test_e6_e7_e8()
     test_e9_and_light()
     test_png_is_not_screen_dpi()
+    test_type3_wording()
     if FAILURES:
         print("extra checks failed: " + ", ".join(FAILURES))
         sys.exit(1)

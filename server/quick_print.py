@@ -32,10 +32,12 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
 VECTOR_EXT = {".pdf", ".ai", ".eps"}
 
 OFFICE_MESSAGE = (
-    "Thanks for sending this. Word and PowerPoint files cannot go on the printing press. "
-    "Please send a PDF (in Word or PowerPoint choose File, then Save as PDF) "
-    "or a high-resolution JPG or PNG. A print file should be about 300 DPI at the finished size, "
-    "with 5mm of extra image around the edge if you can."
+    "Word and PowerPoint files can't be printed as they are. "
+    "Please export it as a PDF and send that to us."
+)
+EPS_MESSAGE = (
+    "This EPS file can't be printed as it is. "
+    "Please send a PDF with the fonts embedded or outlined."
 )
 CORRUPT_MESSAGE = (
     "We could not open this file. It may be damaged, or it was saved in a program we cannot read. "
@@ -87,7 +89,7 @@ def decide_light(facts: dict) -> dict:
     """Traffic light. Amber is only for a real risk. Red means no press file."""
     kind = facts.get("kind")
     if kind == "office":
-        return {"light": "red", "reasons": ["Word and PowerPoint files cannot be printed as they are."], "clientMessage": OFFICE_MESSAGE}
+        return {"light": "red", "reasons": [OFFICE_MESSAGE], "clientMessage": OFFICE_MESSAGE}
     if kind in ("corrupt", "unsupported") or facts.get("readable") is False:
         return {"light": "red", "reasons": ["The file could not be read."], "clientMessage": CORRUPT_MESSAGE}
     if facts.get("tooSmall"):
@@ -189,6 +191,40 @@ def decide_light(facts: dict) -> dict:
     if reasons:
         return {"light": "amber", "reasons": reasons, "clientMessage": ""}
     return {"light": "green", "reasons": [], "clientMessage": ""}
+
+
+def _eps_font_wording(info: dict, facts: dict) -> dict:
+    """An EPS that cannot go to press as it is asks for a PDF. No Type 3 jargon."""
+    extra = facts.get("extraChecks") if isinstance(facts.get("extraChecks"), dict) else {}
+    twenty = facts.get("twentyFive") if isinstance(facts.get("twentyFive"), dict) else {}
+    rows = list(extra.get("checks") or []) + list(twenty.get("checks") or [])
+    font_row = False
+    for row in rows:
+        num = str(row.get("num") or row.get("id") or "")
+        detail = str(row.get("detail") or "")
+        status = str(row.get("status") or "")
+        if status in ("pass", "passed", "auto", "fixed"):
+            continue
+        low = detail.lower()
+        if num in ("4", "E6", "extra_E6") or "type 3" in low or "type3" in low or "not embedded" in low or "pictures of the letters" in low:
+            font_row = True
+            break
+    blob = " ".join(str(item) for item in (info.get("reasons") or [])) + " " + str(info.get("clientMessage") or "")
+    if not font_row and "type 3" not in blob.lower() and "type3" not in blob.lower():
+        return info
+    reasons = []
+    for line in info.get("reasons") or []:
+        text = str(line)
+        if "type 3" in text.lower() or "type3" in text.lower():
+            text = EPS_MESSAGE
+        if text and text not in reasons:
+            reasons.append(text)
+    if EPS_MESSAGE not in reasons:
+        reasons.insert(0, EPS_MESSAGE)
+    info = dict(info)
+    info["reasons"] = reasons
+    info["clientMessage"] = EPS_MESSAGE
+    return info
 
 
 def _safe_name(name: str) -> str:
@@ -1464,12 +1500,17 @@ def make_print_ready(
     try:
         from press_ready_engine import plate_exceeds_memory
 
+        source_ext = ext if ext in (".ai", ".eps") else ""
         if ext in (".ai", ".eps"):
             opened, prep_error = _prepare_vector(src_path, ext)
             if prep_error or not opened:
                 info = decide_light({"kind": "corrupt", "readable": False})
-                info["clientMessage"] = prep_error or CORRUPT_MESSAGE
-                info["reasons"] = ["This Illustrator file could not be opened."]
+                if ext == ".eps":
+                    info["clientMessage"] = EPS_MESSAGE
+                    info["reasons"] = [EPS_MESSAGE]
+                else:
+                    info["clientMessage"] = prep_error or CORRUPT_MESSAGE
+                    info["reasons"] = ["This Illustrator file could not be opened."]
                 return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
             work_path = opened
             ext = ".pdf"
@@ -1910,6 +1951,8 @@ def make_print_ready(
         except Exception:
             pass
     info = decide_light(facts)
+    if source_ext == ".eps":
+        info = _eps_font_wording(info, facts)
     result = _blank(info, decisions, product, quantity, notes)
     result["checklist"] = list((checklist or {}).get("items") or [])
     result["prepressChecks"] = list((facts.get("twentyFive") or {}).get("checks") or [])

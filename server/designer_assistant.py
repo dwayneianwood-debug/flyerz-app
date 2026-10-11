@@ -70,9 +70,6 @@ def _sentence(check_id: str, audit: dict, extra: dict) -> str | None:
             return "This is a picture, so there are no fonts to embed."
         problems = fonts.get("problems") or []
         if not problems:
-            type3 = fonts.get("type3") or []
-            if type3 and not fonts.get("embedded"):
-                return "The only fonts are Type 3, which is fine for press."
             return "The fonts are embedded."
         bits = [f"{row['name']} ({row['reason']})" for row in problems[:6]]
         return "Fonts need a new export: " + ", ".join(bits) + f". {FONT_ASK}"

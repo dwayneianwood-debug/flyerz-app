@@ -17,7 +17,16 @@ import shutil
 import subprocess
 import tempfile
 
-from edit_style import DATE_IN_TEXT, PHONE_IN_TEXT, TIME_IN_TEXT, VENUE_IN_TEXT, fragment, phone_with_icon, swap_text
+from edit_style import (
+    DATE_IN_TEXT,
+    PHONE_IN_TEXT,
+    TIME_IN_TEXT,
+    VENUE_IN_TEXT,
+    _parse_date,
+    fragment,
+    phone_with_icon,
+    swap_text,
+)
 
 _ASK_VERB = r"(?:change|update|set|replace|swap)"
 _ASK_FIELD = r"(phone(?:\s+number)?|date|time|venue)"
@@ -753,13 +762,100 @@ def _hint_key(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
 
 
+def _pieces(text: str, kind: str) -> list[str]:
+    """Every date, phone, time, or venue in this line. A date inside a phone is skipped."""
+    if kind == "date":
+        found = []
+        for match in DATE_IN_TEXT.finditer(text or ""):
+            inside = False
+            for phone in PHONE_IN_TEXT.finditer(text or ""):
+                if phone.start() <= match.start() and match.end() <= phone.end():
+                    inside = True
+                    break
+            if not inside:
+                found.append(match.group(0))
+        return found
+    one = fragment(text or "", kind)
+    return [one] if one else []
+
+
+def _same_date(hint: str, found: str) -> bool:
+    """9 OCT is 09 October. It is not 10 OCT, 11 OCT, or 19 OCT."""
+    try:
+        left = _parse_date(hint)
+        right = _parse_date(found)
+    except ValueError:
+        return False
+    if int(left[0]) != int(right[0]) or int(left[1]) != int(right[1]):
+        return False
+    if left[2] is not None and right[2] is not None and int(left[2]) != int(right[2]):
+        return False
+    return True
+
+
+def _hint_matches(kind: str, hint: str, found: str) -> bool:
+    """The words Ian named, not a different value that merely looks similar."""
+    if not str(hint or "").strip() or not str(found or "").strip():
+        return False
+    if kind == "date":
+        return _same_date(hint, found)
+    if kind == "phone":
+        digits_h = re.sub(r"\D", "", hint)
+        digits_f = re.sub(r"\D", "", found)
+        return len(digits_h) >= 6 and digits_h == digits_f
+    if kind == "time":
+        return _hint_key(hint) == _hint_key(found)
+    return bool(_hint_key(hint)) and _hint_key(hint) in _hint_key(found)
+
+
+def _same_label(kind: str, left: str, right: str) -> bool:
+    if kind == "date":
+        return _same_date(left, right) or _hint_key(left) == _hint_key(right)
+    return _hint_key(left) == _hint_key(right)
+
+
+def _unique_labels(kind: str, texts: list) -> list[str]:
+    kept = []
+    for text in texts:
+        text = " ".join(str(text or "").split())
+        if not text:
+            continue
+        if any(_same_label(kind, text, prev) for prev in kept):
+            continue
+        kept.append(text)
+    return kept
+
+
+def _missing_named_reply(kind: str, hint: str, found: list) -> dict:
+    """Ian named words that are not on the page. Another value is not a substitute."""
+    label = FIELD_NAME.get(kind, "text")
+    named = " ".join(str(hint or "").split()) or "That text"
+    labels = _unique_labels(kind, found)
+    if labels:
+        listed = ", ".join(labels[:6])
+        reply = (
+            f"{named} isn't on the artwork. I can see {listed}. "
+            f"Which {label} should I change? Nothing was changed."
+        )
+    else:
+        reply = f"{named} isn't on the artwork. Nothing was changed."
+    return {"ok": False, "reply": reply, "actions": [], "pending": False}
+
+
 def _live_matches(spans: list[dict], kind: str, hint: str = "") -> list[dict]:
-    """Spans of this kind. A from/to hint keeps only the span that contains it."""
-    hits = [span for span in spans if fragment(span.get("text") or "", kind)]
-    wanted = _hint_key(hint)
-    if wanted:
-        return [span for span in hits if wanted in _hint_key(span.get("text") or "")]
-    return hits
+    """Spans of this kind. A from/to hint keeps only the span that is that value."""
+    hits = []
+    for span in spans:
+        if _pieces(span.get("text") or "", kind):
+            hits.append(span)
+    if not str(hint or "").strip():
+        return hits
+    matched = []
+    for span in hits:
+        pieces = _pieces(span.get("text") or "", kind) or [span.get("text") or ""]
+        if any(_hint_matches(kind, hint, piece) for piece in pieces):
+            matched.append(span)
+    return matched
 
 
 def _live_target(spans: list[dict], kind: str, hint: str = "") -> dict | None:
@@ -916,6 +1012,70 @@ def _line_groups(words: list[dict]) -> list[list[dict]]:
     return [group["words"] for group in groups]
 
 
+_SERIF_MARKS = (
+    "serif", "times", "georgia", "garamond", "palatino", "cambria", "playfair",
+    "baskerville", "constantia", "bookantiqua", "century", "merriweather",
+)
+_DISPLAY_MARKS = (
+    "jokerman", "chiller", "freestyle", "viner", "mistral", "blackadder", "curlz",
+    "papyrus", "comic", "handwriting", "calligraphy", "greatvibes", "brushscript",
+    "rage", "pristina", "harlow", "ravie", "snapitc", "juice", "cooper",
+)
+
+
+def _style_of(path: str) -> str:
+    """serif, sans, or display. Jokerman and Cooper Black are display faces."""
+    family = ""
+    for row in _font_index():
+        if os.path.abspath(row["path"]) == os.path.abspath(path):
+            family = row.get("family") or ""
+            break
+    token = _family_token(family) + _family_token(os.path.basename(path))
+    if any(mark in token for mark in _DISPLAY_MARKS):
+        return "display"
+    if any(mark in token for mark in _SERIF_MARKS):
+        return "serif"
+    return "sans"
+
+
+def _reference_font(style: str) -> str:
+    preferred = {
+        "serif": ("dejavuserif", "playfair", "times", "georgia", "liberationserif"),
+        "sans": ("dejavusans", "liberationsans", "arial", "calibri"),
+    }.get(style, ())
+    for mark in preferred:
+        for row in _font_index():
+            if mark in (row.get("family") or "") and _style_of(row["path"]) == style:
+                return row["path"]
+    for row in _font_index():
+        if _style_of(row["path"]) == style:
+            return row["path"]
+    return ""
+
+
+def _wanted_style(ranked: list) -> str:
+    """Serif artwork stays with a serif. A plain sans is not a substitute for it."""
+    sans_path = _reference_font("sans")
+    serif_path = _reference_font("serif")
+
+    def iou_for(path: str) -> float:
+        if not path:
+            return -1.0
+        wanted = os.path.abspath(path)
+        for item in ranked:
+            if os.path.abspath(item[3]) == wanted:
+                return float(item[1])
+        return -1.0
+
+    sans_iou = iou_for(sans_path)
+    serif_iou = iou_for(serif_path)
+    if serif_iou >= 0 and serif_iou >= sans_iou + 0.03:
+        return "serif"
+    if sans_iou >= 0 and sans_iou >= serif_iou + 0.03:
+        return "sans"
+    return "either"
+
+
 def _closest_font(crop, text: str) -> tuple[str, float]:
     """The bundled face whose ink overlaps the word. Lower score is closer.
 
@@ -954,7 +1114,7 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     canvas_w = min(1024, draw_h * max(2, len(sample) + 1))
     canvas_h = draw_h + 8
     src_share = float(mask.mean()) if mask.size else 0.0
-    ranked: list[tuple[float, float, float, str]] = []
+    ranked: list[tuple[float, float, float, str, str]] = []
     for path in paths:
         if not os.path.isfile(path):
             continue
@@ -981,17 +1141,25 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
         penalty = 0.0
         if src_share >= 0.02 and ratio > 1.25:
             penalty = min(0.45, (ratio - 1.15) * 0.55)
-        ranked.append((iou - penalty, iou, ratio, path))
+        ranked.append((iou - penalty, iou, ratio, path, _style_of(path)))
     if not ranked:
         score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
         return best_path, score
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    _adjusted, best_iou, best_ratio, best_path = ranked[0]
+    wanted = _wanted_style(ranked)
+    if wanted == "either":
+        pool = [item for item in ranked if item[4] != "display"]
+    else:
+        pool = [item for item in ranked if item[4] == wanted]
+    if not pool:
+        # A sans stand-in, or a novelty face such as Jokerman, is not this lettering.
+        return "", -1.0
+    pool.sort(key=lambda item: item[0], reverse=True)
+    _adjusted, best_iou, best_ratio, best_path, _style = pool[0]
     if src_share >= 0.02 and best_ratio > 1.45:
-        lighter = [item for item in ranked if item[2] <= 1.25 and item[1] >= best_iou - 0.18]
+        lighter = [item for item in pool if item[2] <= 1.25 and item[1] >= best_iou - 0.18]
         if lighter:
             lighter.sort(key=lambda item: item[1], reverse=True)
-            _adjusted, best_iou, _ratio, best_path = lighter[0]
+            _adjusted, best_iou, _ratio, best_path, _style = lighter[0]
         else:
             # No face is close to this weight. Applying a much heavier one would be wrong.
             return "", -1.0
@@ -1020,7 +1188,14 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             if parsed["kind"] == "heading":
                 span = _heading_span(spans)
             else:
-                matches = _live_matches(spans, parsed["kind"], str(parsed.get("oldHint") or ""))
+                hint = str(parsed.get("oldHint") or "")
+                matches = _live_matches(spans, parsed["kind"], hint)
+                if hint and not matches:
+                    labels = []
+                    for item in spans:
+                        labels.extend(_pieces(item.get("text") or "", parsed["kind"]))
+                    if labels:
+                        return _missing_named_reply(parsed["kind"], hint, labels)
                 if len(matches) > 1:
                     return _many_reply(parsed["kind"])
                 span = matches[0] if matches else None
@@ -1126,6 +1301,9 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     staged = os.path.join(preview_dir, "staged.pdf")
     _render_page(src, before)
     _apply_proposal(src, staged, proposal)
+    if proposal.get("refuse"):
+        _save(key, {"proposal": {}, "undo": "", "current": src})
+        return {"ok": False, "reply": str(proposal.get("refuse") or SAFE_EDIT), "actions": [], "pending": False}
     _render_page(staged, after)
     proposal["staged"] = staged
     blocked = _preview_block(src, staged, proposal)
@@ -1344,10 +1522,120 @@ def _stack_day_and_month(words: list[dict]) -> list[dict]:
     return stacked
 
 
-def _select_hit(words: list[dict], parsed: dict) -> dict | None:
-    if parsed.get("kind") == "date":
-        words = list(words) + _stack_day_and_month(words)
+def _dedupe_hits(kind: str, hits: list[dict]) -> list[dict]:
+    kept = []
+    for hit in hits:
+        duplicate = False
+        for prev in kept:
+            close = abs(int(hit["left"]) - int(prev["left"])) < 14 and abs(int(hit["top"]) - int(prev["top"])) < 14
+            if close and _same_label(kind, hit["text"], prev["text"]):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(hit)
+    return kept
 
+
+def _union_box(group: list[dict]) -> tuple[int, int, int, int]:
+    left = min(int(item["left"]) for item in group)
+    top = min(int(item["top"]) for item in group)
+    right = max(int(item["left"]) + int(item["width"]) for item in group)
+    bottom = max(int(item["top"]) + int(item["height"]) for item in group)
+    return left, top, max(1, right - left), max(1, bottom - top)
+
+
+def _boxes_overlap(a: dict, b: dict) -> bool:
+    ax1, ay1 = int(a["left"]) + int(a["width"]), int(a["top"]) + int(a["height"])
+    bx1, by1 = int(b["left"]) + int(b["width"]), int(b["top"]) + int(b["height"])
+    overlap_w = min(ax1, bx1) - max(int(a["left"]), int(b["left"]))
+    overlap_h = min(ay1, by1) - max(int(a["top"]), int(b["top"]))
+    if overlap_w <= 0 or overlap_h <= 0:
+        return False
+    smaller = min(int(a["width"]) * int(a["height"]), int(b["width"]) * int(b["height"])) or 1
+    return (overlap_w * overlap_h) / float(smaller) >= 0.45
+
+
+def _collapse_same(kind: str, hits: list[dict]) -> list[dict]:
+    """Two reads of the same value are one hit. The tighter box is the one we paint."""
+    kept = []
+    for hit in hits:
+        placed = False
+        for index, prev in enumerate(kept):
+            if not _same_label(kind, hit.get("text") or "", prev.get("text") or ""):
+                continue
+            if not _boxes_overlap(hit, prev):
+                continue
+            if int(hit["width"]) * int(hit["height"]) < int(prev["width"]) * int(prev["height"]):
+                kept[index] = hit
+            placed = True
+            break
+        if not placed:
+            kept.append(hit)
+    return kept
+
+
+def _collect_hits(words: list[dict], kind: str) -> list[dict]:
+    """Every value of this kind, including a day painted above its month.
+
+    A line that holds two dates keeps a separate box for each. Painting "11 OCT"
+    must not cover "10 OCT" beside it.
+    """
+    pool = list(words)
+    if kind == "date":
+        pool = pool + _stack_day_and_month(words)
+    hits = []
+
+    def add(text: str, left: int, top: int, width: int, height: int) -> None:
+        for piece in _pieces(text, kind):
+            hits.append({
+                "text": piece,
+                "left": int(left),
+                "top": int(top),
+                "width": max(1, int(width)),
+                "height": max(1, int(height)),
+            })
+
+    for word in pool:
+        add(word.get("text") or "", word["left"], word["top"], word["width"], word["height"])
+    for group in _line_groups(words):
+        if kind == "phone":
+            candidate = _phone_run(group)
+            if candidate:
+                add(candidate["text"], candidate["left"], candidate["top"], candidate["width"], candidate["height"])
+            continue
+        ordered = sorted(group, key=lambda item: item["left"])
+        if not ordered:
+            continue
+        cursor = 0
+        spans = []
+        parts = []
+        for word in ordered:
+            start = cursor
+            parts.append(word["text"])
+            cursor += len(word["text"])
+            spans.append((start, cursor, word))
+            cursor += 1
+        joined = " ".join(parts)
+        for piece in _pieces(joined, kind):
+            at = joined.find(piece)
+            if at < 0:
+                continue
+            end = at + len(piece)
+            covered = [word for start, stop, word in spans if stop > at and start < end]
+            if not covered:
+                continue
+            left, top, width, height = _union_box(covered)
+            hits.append({
+                "text": piece,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+            })
+    return _collapse_same(kind, _dedupe_hits(kind, hits))
+
+
+def _select_hit(words: list[dict], parsed: dict) -> dict | None:
     def boxed(group: list[dict], joined: str) -> dict:
         group.sort(key=lambda item: item["left"])
         return {
@@ -1359,25 +1647,30 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
         }
 
     if parsed["kind"] in ("phone", "date", "time", "venue"):
-        singles = [word for word in words if fragment(word.get("text") or "", parsed["kind"])]
-        hint = _hint_key(str(parsed.get("oldHint") or ""))
-        if hint and singles:
-            hinted = [word for word in singles if hint in _hint_key(fragment(word.get("text") or "", parsed["kind"]))]
-            if hinted:
-                singles = hinted
-        if len(singles) > 1:
+        hits = _collect_hits(words, parsed["kind"])
+        hint = str(parsed.get("oldHint") or "")
+        if hint:
+            matched = [word for word in hits if _hint_matches(parsed["kind"], hint, word.get("text") or "")]
+            if not matched:
+                return {
+                    "missing": True,
+                    "named": hint,
+                    "found": _unique_labels(parsed["kind"], [word.get("text") or "" for word in hits]),
+                }
+            hits = matched
+        hits = _collapse_same(parsed["kind"], hits)
+        if len(hits) > 1:
             return {"ambiguous": True}
-        if singles:
-            # The number's own box, not a neighbouring line that happens to share its height.
-            word = singles[0]
-            text = fragment(word.get("text") or "", parsed["kind"]) or word["text"]
+        if hits:
+            word = hits[0]
             return {
-                "text": text,
+                "text": word["text"],
                 "left": word["left"],
                 "top": word["top"],
                 "width": word["width"],
                 "height": word["height"],
             }
+        return None
     hit = None
     if parsed["kind"] == "heading":
         for group in _line_groups(words):
@@ -1432,8 +1725,8 @@ def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
     if image is None:
         return None
     hit = _select_hit(_ocr_words(path), parsed)
-    if not hit or hit.get("ambiguous"):
-        return hit if hit and hit.get("ambiguous") else None
+    if not hit or hit.get("ambiguous") or hit.get("missing"):
+        return hit if hit and (hit.get("ambiguous") or hit.get("missing")) else None
     height, width = image.shape[:2]
     box = info["bbox"]
     sx = (box[2] - box[0]) / float(width or 1)
@@ -1478,7 +1771,9 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
     else:
         hit = _select_hit(_ocr_words(png), parsed)
         image = cv2.imread(png)
-        crop = None if hit is None or image is None or hit.get("ambiguous") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+        crop = None if hit is None or image is None or hit.get("ambiguous") or hit.get("missing") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    if hit and hit.get("missing"):
+        return _missing_named_reply(parsed["kind"], str(hit.get("named") or parsed.get("oldHint") or ""), hit.get("found") or [])
     if hit and hit.get("ambiguous"):
         return _many_reply(parsed["kind"])
     if not hit:
@@ -2140,6 +2435,80 @@ def _raster_ink(image, left: int, top: int, width: int, height: int):
     }
 
 
+def _fill_is_clean(window, mask, painted) -> bool:
+    """The hole has to match the colour just outside the letters.
+
+    A photograph or a coloured smear does not. That case is refused instead of
+    painting a blurred patch over the words beside it.
+    """
+    import cv2
+    import numpy as np
+
+    if window is None or mask is None or painted is None:
+        return False
+    core = (mask > 0).astype(np.uint8)
+    if int(core.sum()) < 8:
+        return False
+    ring_reach = cv2.dilate(core, np.ones((7, 7), np.uint8), iterations=1)
+    ring = (ring_reach > 0) & (core == 0)
+    samples = window[ring]
+    if samples.shape[0] < 8:
+        return False
+    ring_f = samples.astype(np.float32)
+    background = np.median(ring_f, axis=0)
+    near = np.linalg.norm(ring_f - background, axis=1) <= 22.0
+    local = ring_f[near] if int(near.sum()) >= 8 else ring_f
+    ground = np.median(local, axis=0)
+    spread = float(np.std(local, axis=0).mean()) if local.size else 99.0
+    filled = painted[core > 0].astype(np.float32)
+    if filled.shape[0] < 8:
+        return False
+    shift = float(np.linalg.norm(np.median(filled, axis=0) - ground))
+    blot = float(np.std(filled, axis=0).mean())
+    # Flat panel: the fill stays on that colour. A photo smear does not.
+    if spread <= 16.0 and shift <= 20.0 and blot <= 14.0:
+        return True
+    return shift <= 12.0 and blot <= 8.0
+
+
+def _glyph_height(mask) -> float:
+    """Median letter height. A day stacked on its month is not one giant glyph."""
+    import cv2
+    import numpy as np
+
+    if mask is None or getattr(mask, "size", 0) == 0:
+        return 0.0
+    count, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
+    heights = []
+    for index in range(1, count):
+        ys = np.where(labels == index)[0]
+        if ys.size < 8:
+            continue
+        heights.append(float(ys.max() - ys.min() + 1))
+    if not heights:
+        return 0.0
+    heights.sort()
+    return heights[len(heights) // 2]
+
+
+def _em_for_ink(fontfile: str, ink_height: float) -> float:
+    """Point size whose letters are as tall as the ink already on the page."""
+    import pymupdf as fitz
+
+    height = float(ink_height or 0)
+    if height < 1:
+        return 12.0
+    try:
+        face = fitz.Font(fontfile=fontfile) if fontfile and os.path.isfile(fontfile) else fitz.Font("helv")
+        asc = float(face.ascender or 0.8)
+    except Exception:
+        asc = 0.8
+    if asc > 2:
+        asc = asc / 1000.0
+    cap = min(0.82, max(0.55, asc * 0.78))
+    return height / cap
+
+
 def _paint_raster_text(doc, page, proposal: dict) -> None:
     """Inpaint only the word's strokes, then set the new words on that background."""
     import cv2
@@ -2152,18 +2521,23 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     left, top, width, height = [int(item) for item in proposal["pixelBox"]]
     found = _raster_ink(image, left, top, width, height)
     if found is None:
+        proposal["refuse"] = SAFE_EDIT
         return
     window = found["window"]
     painted = cv2.inpaint(window, found["mask"], 3, cv2.INPAINT_TELEA)
+    if not _fill_is_clean(window, found["mask"], painted):
+        proposal["refuse"] = SAFE_EDIT
+        return
     x0, y0, x1, y1 = found["bounds"]
     patch = painted[y0:y1, x0:x1]
     win_x0, win_y0, _win_x1, _win_y1 = found["win"]
-    overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
     clip = fitz.Rect((win_x0 + x0) / scale, (win_y0 + y0) / scale, (win_x0 + x1) / scale, (win_y0 + y1) / scale)
-    page.insert_image(clip, pixmap=overlay, overlay=True)
     ink = fitz.Rect(clip)
     fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
-    size = max(5.0, min(ink.height, ink.width) * 0.92) * float(proposal.get("sizeFactor") or 1.0)
+    letter_px = _glyph_height(found["mask"])
+    bounds_px = max(1.0, float(y1 - y0))
+    letter_pt = ink.height * (letter_px / bounds_px) if letter_px >= 4 else ink.height
+    natural = _em_for_ink(fontfile, letter_pt) * float(proposal.get("sizeFactor") or 1.0)
     origin_y = ink.y1 - max(2.0, ink.height * 0.12)
     center_x = (ink.x0 + ink.x1) / 2.0
     page_mid = (page.rect.x0 + page.rect.x1) / 2.0
@@ -2172,12 +2546,21 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         page,
         str(proposal.get("new") or ""),
         str(proposal.get("old") or ""),
-        size,
+        natural,
         fontfile,
         align,
         (ink.x0, origin_y),
         ink,
     )
+    # E5 warns under 7 pt and fails under 5 pt. A phone that started larger must not land there.
+    if str(proposal.get("kind") or "") == "phone" and natural >= 7.0 and float(size) < 7.0:
+        proposal["refuse"] = (
+            "I could not keep the original size in a matching font, so nothing was changed. "
+            "Please send the editable file if this has to stay that size."
+        )
+        return
+    overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], np.ascontiguousarray(patch).tobytes(), 0)
+    page.insert_image(clip, pixmap=overlay, overlay=True)
     # A stacked day-over-month is tall. Sit the new line on the day, not on the time underneath.
     if ink.height > size * 1.6:
         origin = (origin[0], ink.y0 + size * 0.92)
@@ -2378,6 +2761,7 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
         if _hint_key(text) not in _hint_key(got):
             problems.append("glyph did not render")
         wanted = _hint_key(text)
+        span_size = 0.0
         for block in (page.get_text("dict") or {}).get("blocks") or []:
             if block.get("type") != 0:
                 continue
@@ -2385,6 +2769,7 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
                 for span in line.get("spans") or []:
                     if wanted not in _hint_key(span.get("text") or ""):
                         continue
+                    span_size = max(span_size, float(span.get("size") or 0))
                     if str(span.get("font") or "").strip() in ("(null)", "null", ""):
                         problems.append("glyph did not render")
         if box and len(box) >= 4 and fontfile and os.path.isfile(fontfile):
@@ -2403,13 +2788,16 @@ def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
                 background = np.median(border, axis=0)
                 delta = np.linalg.norm(image.astype(np.float32) - background, axis=2)
                 cols = int((delta.max(axis=0) > 18).sum()) if delta.size else 0
+                # A day stacked on its month makes a tall box. Measure the letters
+                # at the size they were set, not at the height of that whole column.
+                measure = span_size if span_size > 0 else float(rect.height)
                 try:
                     from PIL import ImageFont
 
-                    drawn = ImageFont.truetype(fontfile, max(8, int(round(rect.height * 4))))
+                    drawn = ImageFont.truetype(fontfile, max(8, int(round(measure * 4))))
                     expected = float(drawn.getlength(text))
                 except (OSError, ValueError):
-                    expected = float(len(letters) * rect.height * 2)
+                    expected = float(len(letters) * measure * 2)
                 if float(border.std()) < 30.0 and cols < max(6.0, expected * 0.45):
                     problems.append("glyph did not render")
     finally:

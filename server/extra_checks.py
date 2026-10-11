@@ -1166,7 +1166,23 @@ def check_e6(path: str, apply: bool = False) -> dict:
         notes.append("Embedded from the local folder: " + ", ".join(fixed) + ".")
     if subsets or substituted:
         status = _worse_status(status, "warning")
-        notes.append("Subset, Type 3, or a substituted face: " + ", ".join((subsets + substituted)[:4]) + ".")
+        shown = []
+        for name in (subsets + substituted)[:6]:
+            token = re.sub(r"[^a-z0-9]", "", str(name).lower())
+            if not token or token in ("type3", "type1", "type0") or "type3" in token:
+                continue
+            if name not in shown:
+                shown.append(name)
+        if shown:
+            notes.append(
+                "Some fonts need a new export (" + ", ".join(shown[:4]) + "). "
+                "Please send a PDF with the fonts embedded or outlined."
+            )
+        else:
+            notes.append(
+                "Some of the fonts are pictures of the letters, so they may not print as drawn. "
+                "Please send a PDF with the fonts embedded or outlined."
+            )
     if any("can be embedded" in item for item in blocked):
         status = "warning"
         notes.append("An exact local font is available and was not embedded yet.")

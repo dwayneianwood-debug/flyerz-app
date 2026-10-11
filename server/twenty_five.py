@@ -205,7 +205,7 @@ def assess(path: str, trim_w: float | None = None, trim_h: float | None = None) 
         bits = [f"{row['name']} ({row['reason']})" for row in fonts["problems"][:6]]
         put("4", "failed", "Fonts are not embedded: " + ", ".join(bits) + ". Please export with fonts embedded or outlined.")
     else:
-        put("4", "passed", "Fonts are embedded. Type 3 is accepted.")
+        put("4", "passed", "Fonts are embedded.")
 
     linked = _linked_images(path)
     if linked is None:

@@ -287,7 +287,7 @@ export function auditOfficeFile(fileType: string): AuditCheck[] {
     {
       name: "Office File Format",
       passed: false,
-      message: `${kind} files are not ideal for litho printing. Please send a PDF or a picture (JPG or PNG).`,
+      message: "Word and PowerPoint files can't be printed as they are. Please export it as a PDF and send that to us.",
       autoFixed: false,
       details: "Recommend converting to high-resolution PDF (400 DPI) with embedded fonts and CMYK color space.",
       severity: "HIGH",

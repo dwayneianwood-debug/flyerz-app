@@ -9470,9 +9470,15 @@ def main():
                 "checks": [{
                     "name": "File Format",
                     "passed": False,
-                    "message": f"{file_type.upper()} files are not ideal for litho printing. Convert to high-resolution PDF.",
+                    "message": (
+                        "Word and PowerPoint files can't be printed as they are. Please export it as a PDF and send that to us."
+                        if str(file_type or "").lower() in ("doc", "docx", "ppt", "pptx")
+                        else "This EPS file can't be printed as it is. Please send a PDF with the fonts embedded or outlined."
+                        if str(file_type or "").lower() == "eps"
+                        else "This file can't be printed as it is. Please export it as a PDF and send that to us."
+                    ),
                     "autoFixed": False,
-                    "details": "Recommend PDF with embedded fonts, CMYK, 300 DPI"
+                    "details": "Please send a PDF with the fonts embedded or outlined."
                 }],
                 "correctedPath": None
             }
