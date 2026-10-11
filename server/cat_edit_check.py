@@ -370,6 +370,8 @@ def _real_field(src: str, stem: str, message: str, expect_new: str, expect_old: 
             problems.append("undo " + note)
         if _sha(src) != original:
             problems.append("source changed")
+        if not os.path.isfile(dest) or _sha(dest) != original:
+            problems.append("undo bytes differ")
     _record(stem, not problems, "; ".join(problems) or f"{expect_new} {gate}".strip())
 
 

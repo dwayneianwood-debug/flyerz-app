@@ -55,6 +55,14 @@ def main() -> int:
     huge_h, huge_w = cap_shape(12000, 9000, working_limit(12000, 9000, 420, 594, 200 * 1024 * 1024))
     if max(huge_h, huge_w) > 3600:
         failures.append(f"200 MB working edge {huge_h}x{huge_w}")
+    # The working copy of a scrolling screenshot is short on the narrow side.
+    # Print size is judged on the uploaded pixels, which still cover an A5.
+    from quick_print import too_small
+
+    if too_small(1080, 15444, 148, 210):
+        failures.append("15444px screenshot judged too small")
+    if not too_small(shot_w, shot_h, 148, 210):
+        failures.append(f"capped screenshot {shot_w}x{shot_h} should not be the size we judge")
     if failures:
         print("FAIL " + "; ".join(failures))
         return 1

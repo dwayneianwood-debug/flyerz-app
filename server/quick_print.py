@@ -1567,6 +1567,9 @@ def make_print_ready(
             if raster is not None:
                 from large_job import file_bytes
 
+                # A tall screenshot is reduced so the edge extend can finish.
+                # Sharpness is still judged on the pixels the customer sent.
+                orig_h, orig_w = raster.shape[:2]
                 raster, reduced = _tame_raster(raster, trim_w, trim_h, file_bytes(src_path))
                 if reduced:
                     decisions.append(
@@ -1579,8 +1582,9 @@ def make_print_ready(
             if float(raster.mean()) > 250 and float(raster.std()) < 4:
                 info = decide_light({"missingContent": True})
                 return _finish(_blank(info, decisions, product, quantity, notes), output_dir)
-            upscale = _cover_scale(src_w, src_h, trim_w, trim_h)
-            if too_small(src_w, src_h, trim_w, trim_h):
+            judge_w, judge_h = (orig_w, orig_h) if reduced else (src_w, src_h)
+            upscale = _cover_scale(judge_w, judge_h, trim_w, trim_h)
+            if too_small(judge_w, judge_h, trim_w, trim_h):
                 info = decide_light({
                     "tooSmall": True,
                     "tooSmallMessage": too_small_message(str(product.get("label") or "this size"), trim_w, trim_h),

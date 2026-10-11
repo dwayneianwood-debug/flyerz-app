@@ -295,6 +295,43 @@ def _proposal_box(job: str):
     return prop.get("editBox") or prop.get("bbox")
 
 
+def _sha(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        digest.update(handle.read())
+    return digest.hexdigest()
+
+
+def _church_date_clean(asked: dict, job: str) -> bool:
+    """The date preview says 12 OCT, pixels outside the edit are unchanged, and undo is the original file."""
+    from artwork_edits import confirm, undo
+
+    staged = os.path.join(asked.get("_preview") or "", "staged.pdf")
+    dest = asked.get("_dest") or ""
+    reply = asked.get("reply") or ""
+    if "could not read" in reply.lower() or not os.path.isfile(staged):
+        return False
+    body = _text(staged)
+    if "12 OCT" not in body or "9 OCT" in body:
+        return False
+    box = _proposal_box(job)
+    if not box:
+        return False
+    outside = _outside(CHURCH, staged, box)
+    _zoom(CHURCH, staged, job, box)
+    if outside != 0:
+        asked["_outside"] = outside
+        return False
+    original = _sha(CHURCH)
+    done = confirm(job, dest)
+    back = undo(job, dest)
+    if not done.get("ok") or not back.get("ok") or not os.path.isfile(dest):
+        return False
+    return _sha(dest) == original and _sha(CHURCH) == original
+
+
 def _pictures() -> None:
     if os.path.isfile(FLYER):
         asked = _ask(FLYER, "change the phone number to 082 123 4567", "medella-flyer", 148, 210)
@@ -309,20 +346,24 @@ def _pictures() -> None:
         phone = _ask(CHURCH, "change the phone number to 082 123 4567", "church-phone", 420, 420)
         date = _ask(CHURCH, "change the date from 9 OCT to 12 October 2026", "church-date", 420, 420)
         bare = _ask(CHURCH, "change the date to 12 October 2026", "church-date-many", 420, 420)
+        short = _ask(CHURCH, "change 9 OCT to 12 OCT", "church-date-bare", 420, 420)
         phone_ok = phone.get("pending") is True and "072" in (phone.get("reply") or "")
         date_reply = date.get("reply") or ""
         date_ok = date.get("pending") is True and "9 OCT" in date_reply and "72-97" not in date_reply
+        date_ok = date_ok and _church_date_clean(date, "church-date")
         bare_reply = (bare.get("reply") or "").lower()
         bare_ok = bare.get("pending") is not True and "more than one" in bare_reply and "safely change" in bare_reply
+        short_ok = short.get("pending") is True and _church_date_clean(short, "church-date-bare")
         _zoom(CHURCH, os.path.join(phone["_preview"], "staged.pdf"), "church-phone", _proposal_box("church-phone"))
-        _zoom(CHURCH, os.path.join(date["_preview"], "staged.pdf"), "church-date", _proposal_box("church-date"))
         _record("church-phone", phone_ok, (phone.get("reply") or "")[:140])
-        _record("church-date", date_ok, date_reply[:140])
+        _record("church-date", date_ok, (date_reply[:120] + (f" outside {date.get('_outside')}" if date.get("_outside") is not None else ""))[:180])
         _record("church-date-many", bare_ok, (bare.get("reply") or "")[:160])
+        _record("church-date-bare", short_ok, ((short.get("reply") or short.get("_err") or "")[:120] + (f" outside {short.get('_outside')}" if short.get("_outside") is not None else ""))[:180])
     else:
         _record("church-phone", False, "missing church pdf")
         _record("church-date", False, "missing church pdf")
         _record("church-date-many", False, "missing church pdf")
+        _record("church-date-bare", False, "missing church pdf")
 
 
 def _broken_subset() -> None:
