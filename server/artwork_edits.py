@@ -33,6 +33,7 @@ LOGO_MOVE_ASK = re.compile(r"move\s+the\s+logo\s+(up|down|left|right)\b", re.I)
 HEADING_ASK = re.compile(r"make\s+the\s+heading\s+(bigger|smaller|larger)\b", re.I)
 MOVE_ASK = re.compile(r"move\s+the\s+text\s+away\s+from\s+the\s+edge", re.I)
 FIELD_NAME = {"phone": "phone number", "date": "date", "time": "time", "venue": "venue"}
+SAFE_EDIT = "I can't safely change this one, please send the editable file."
 
 _BUNDLED_FONTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _FIXTURE_FONTS = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "fonts"))
@@ -702,14 +703,28 @@ def _hint_key(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
 
 
-def _live_target(spans: list[dict], kind: str, hint: str = "") -> dict | None:
+def _live_matches(spans: list[dict], kind: str, hint: str = "") -> list[dict]:
+    """Spans of this kind. A from/to hint keeps only the span that contains it."""
     hits = [span for span in spans if fragment(span.get("text") or "", kind)]
     wanted = _hint_key(hint)
     if wanted:
-        for span in hits:
-            if wanted in _hint_key(span.get("text") or ""):
-                return span
-    return hits[0] if hits else None
+        return [span for span in hits if wanted in _hint_key(span.get("text") or "")]
+    return hits
+
+
+def _live_target(spans: list[dict], kind: str, hint: str = "") -> dict | None:
+    hits = _live_matches(spans, kind, hint)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _many_reply(kind: str) -> dict:
+    label = FIELD_NAME.get(kind, "piece of text")
+    return {
+        "ok": False,
+        "reply": f"I found more than one {label} on this page. {SAFE_EDIT}",
+        "actions": [],
+        "pending": False,
+    }
 
 
 def _rapid_words(png: str) -> list[dict]:
@@ -897,7 +912,10 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             if parsed["kind"] == "heading":
                 span = _heading_span(spans)
             else:
-                span = _live_target(spans, parsed["kind"], str(parsed.get("oldHint") or ""))
+                matches = _live_matches(spans, parsed["kind"], str(parsed.get("oldHint") or ""))
+                if len(matches) > 1:
+                    return _many_reply(parsed["kind"])
+                span = matches[0] if matches else None
             if span:
                 old = span["text"]
                 shown_old = old
@@ -1239,9 +1257,11 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
             hinted = [word for word in singles if hint in _hint_key(fragment(word.get("text") or "", parsed["kind"]))]
             if hinted:
                 singles = hinted
+        if len(singles) > 1:
+            return {"ambiguous": True}
         if singles:
             # The number's own box, not a neighbouring line that happens to share its height.
-            word = min(singles, key=lambda item: (len(item["text"]), item["width"] * item["height"]))
+            word = singles[0]
             text = fragment(word.get("text") or "", parsed["kind"]) or word["text"]
             return {
                 "text": text,
@@ -1263,6 +1283,7 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
     pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(parsed["kind"])
     if pattern is None:
         return None
+    found_groups = []
     for group in _line_groups(words):
         if parsed["kind"] == "phone":
             candidate = _phone_run(group)
@@ -1274,9 +1295,10 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
             if not found:
                 continue
             candidate = boxed(group, found)
-        if hit is None or len(candidate["text"]) > len(hit["text"]):
-            hit = candidate
-    return hit
+        found_groups.append(candidate)
+    if len(found_groups) > 1:
+        return {"ambiguous": True}
+    return found_groups[0] if found_groups else None
 
 
 def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
@@ -1302,8 +1324,8 @@ def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
     if image is None:
         return None
     hit = _select_hit(_ocr_words(path), parsed)
-    if not hit:
-        return None
+    if not hit or hit.get("ambiguous"):
+        return hit if hit and hit.get("ambiguous") else None
     height, width = image.shape[:2]
     box = info["bbox"]
     sx = (box[2] - box[0]) / float(width or 1)
@@ -1348,7 +1370,9 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
     else:
         hit = _select_hit(_ocr_words(png), parsed)
         image = cv2.imread(png)
-        crop = None if hit is None or image is None else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+        crop = None if hit is None or image is None or hit.get("ambiguous") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+    if hit and hit.get("ambiguous"):
+        return _many_reply(parsed["kind"])
     if not hit:
         label = "a heading" if parsed["kind"] == "heading" else "a " + FIELD_NAME.get(parsed["kind"], "text")
         return {
@@ -2201,7 +2225,7 @@ def _plain_block(problems: list[str]) -> str:
         sentences.append("The new font did not embed.")
     if not sentences:
         sentences.append("The preview did not pass the checks.")
-    return " ".join(sentences) + " I have not changed the file, and there is nothing to apply."
+    return " ".join(sentences) + " " + SAFE_EDIT
 
 
 def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:

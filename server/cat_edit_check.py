@@ -392,7 +392,7 @@ def _real_a6() -> None:
         _record("ian-a6-date", honest and asked.get("pending") is not True, reply[:180] or "no reply")
     phone = swap_text("PHONE: 067 1345 937", "phone", NEW_PHONE)
     _real_field(src, "ian-a6-phone", f"change the phone number to {NEW_PHONE}", phone[1] if phone else NEW_PHONE, "067 1345 937")
-    _real_field(src, "ian-a6-time", "change the time to 7:30 pm", "7:30PM", "10:00AM")
+    _real_field(src, "ian-a6-time", "change the time from 10:00AM to 7:30PM", "7:30PM", "10:00AM")
     _real_field(src, "ian-a6-venue", "change the venue to Community Centre", "COMMUNITY CENTRE", "BELLAVISTA")
 
 

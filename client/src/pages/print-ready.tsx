@@ -122,7 +122,7 @@ export default function PrintReady() {
       setFiles([]);
     } catch {
       setBusy(false);
-      setError("Could not start. Try the file again.");
+      setError("I couldn't start that. Please try the file again.");
     }
   }
 

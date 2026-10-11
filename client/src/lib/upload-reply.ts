@@ -2,7 +2,7 @@
 export function messageFromStartResponse(body: string, ok: boolean): string {
   if (ok) return "";
   const trimmed = String(body || "").trim();
-  if (!trimmed) return "Could not start.";
+  if (!trimmed) return "I couldn't start that. Please try the file again.";
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const payload = JSON.parse(trimmed) as { message?: unknown };
@@ -10,7 +10,7 @@ export function messageFromStartResponse(body: string, ok: boolean): string {
     } catch {
       return trimmed;
     }
-    return "Could not start.";
+    return "I couldn't start that. Please try the file again.";
   }
   return trimmed;
 }

@@ -695,6 +695,44 @@ def _baked_contact() -> None:
     _record("baked-contact", not problems and bool(asked), "; ".join(problems) or f"heading kept, phone retyped {gate}")
 
 
+def _exactly_once() -> None:
+    """A bare request applies only when that field is on the page once."""
+    import pymupdf as fitz
+    from artwork_edits import propose
+
+    src = os.path.join(ROOT, "once.pdf")
+    doc = fitz.open()
+    page = doc.new_page(width=420, height=280)
+    page.insert_font(fontname="DEJAVU", fontfile=FONT)
+    black = (0, 0, 0)
+    page.insert_text((36, 50), "10:00AM", fontsize=16, fontname="DEJAVU", fontfile=FONT, color=black)
+    page.insert_text((36, 90), "5:00PM", fontsize=16, fontname="DEJAVU", fontfile=FONT, color=black)
+    page.insert_text((36, 140), "CHURCH IS NOT ABOUT", fontsize=16, fontname="DEJAVU", fontfile=FONT, color=black)
+    page.insert_text((36, 190), "18 BELLAVISTA ROAD HADDON", fontsize=16, fontname="DEJAVU", fontfile=FONT, color=black)
+    page.insert_text((36, 240), "Keep me", fontsize=14, fontname="DEJAVU", fontfile=FONT, color=black)
+    doc.save(src)
+    doc.close()
+
+    problems = []
+    bare = propose(src, "change the time to 7:30 pm", "once-time", os.path.join(ROOT, "preview-once-time"))
+    bare_reply = ((bare or {}).get("reply") or "").lower()
+    if (bare or {}).get("pending") is True or "more than one" not in bare_reply or "safely change" not in bare_reply:
+        problems.append("bare " + ((bare or {}).get("reply") or "")[:160])
+    named = propose(src, "change the time from 10:00AM to 7:30PM", "once-named", os.path.join(ROOT, "preview-once-named"))
+    staged = os.path.join(ROOT, "preview-once-named", "staged.pdf")
+    body = _text(staged) if os.path.isfile(staged) else ""
+    if (named or {}).get("pending") is not True or "7:30" not in body or "5:00PM" not in body or "Keep me" not in body:
+        problems.append("named " + body.replace("\n", " ")[:120])
+    venue = propose(src, "change the venue to Community Centre", "once-venue", os.path.join(ROOT, "preview-once-venue"))
+    vstaged = os.path.join(ROOT, "preview-once-venue", "staged.pdf")
+    vbody = _text(vstaged) if os.path.isfile(vstaged) else ""
+    if (venue or {}).get("pending") is not True or "COMMUNITY CENTRE" not in vbody or "CHURCH IS NOT ABOUT" not in vbody:
+        problems.append("venue " + ((venue or {}).get("reply") or "")[:120])
+    if "BELLAVISTA" in vbody:
+        problems.append("old venue left")
+    _record("exactly-once", not problems, "; ".join(problems) or "named time applied, bare time refused, slogan kept")
+
+
 def _write() -> None:
     os.makedirs(ART, exist_ok=True)
     lines = ["case\tresult\tdetail"]
@@ -742,6 +780,7 @@ def run() -> list[str]:
     _baked_contact()
     _overlap_time()
     _shrink_venue()
+    _exactly_once()
     _cat_yes()
     _write()
     return list(FAILURES)

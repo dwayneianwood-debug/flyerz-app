@@ -223,6 +223,16 @@ def _a6() -> None:
         _zoom(A6, staged_pdf, stem, union or tbox)
         _record(stem, not problems, "; ".join(problems) or "10:00AM became 7:30PM")
 
+    many = _ask(A6, "change the time to 7:30PM", "a6-time-many")
+    many_reply = (many.get("reply") or "").lower()
+    many_ok = (
+        many.get("pending") is not True
+        and not many.get("actions")
+        and "more than one" in many_reply
+        and "safely change" in many_reply
+    )
+    _record("a6-time-many", many_ok, (many.get("reply") or "")[:160])
+
 
 def _phrases() -> None:
     import pymupdf as fitz
@@ -297,17 +307,22 @@ def _pictures() -> None:
         _record("medella-flyer-phone", False, "missing flyer pdf")
     if os.path.isfile(CHURCH):
         phone = _ask(CHURCH, "change the phone number to 082 123 4567", "church-phone", 420, 420)
-        date = _ask(CHURCH, "change the date to 12 October 2026", "church-date", 420, 420)
+        date = _ask(CHURCH, "change the date from 9 OCT to 12 October 2026", "church-date", 420, 420)
+        bare = _ask(CHURCH, "change the date to 12 October 2026", "church-date-many", 420, 420)
         phone_ok = phone.get("pending") is True and "072" in (phone.get("reply") or "")
         date_reply = date.get("reply") or ""
         date_ok = date.get("pending") is True and "9 OCT" in date_reply and "72-97" not in date_reply
+        bare_reply = (bare.get("reply") or "").lower()
+        bare_ok = bare.get("pending") is not True and "more than one" in bare_reply and "safely change" in bare_reply
         _zoom(CHURCH, os.path.join(phone["_preview"], "staged.pdf"), "church-phone", _proposal_box("church-phone"))
         _zoom(CHURCH, os.path.join(date["_preview"], "staged.pdf"), "church-date", _proposal_box("church-date"))
         _record("church-phone", phone_ok, (phone.get("reply") or "")[:140])
         _record("church-date", date_ok, date_reply[:140])
+        _record("church-date-many", bare_ok, (bare.get("reply") or "")[:160])
     else:
         _record("church-phone", False, "missing church pdf")
         _record("church-date", False, "missing church pdf")
+        _record("church-date-many", False, "missing church pdf")
 
 
 def _broken_subset() -> None:
@@ -391,7 +406,7 @@ def _broken_subset() -> None:
     doc.save(white)
     doc.close()
     blank = _ask(white, "change the phone number to 082 123 4567", "white-phone")
-    refused = blank.get("pending") is not True and not blank.get("actions") and "nothing to apply" in (blank.get("reply") or "").lower()
+    refused = blank.get("pending") is not True and not blank.get("actions") and "safely change" in (blank.get("reply") or "").lower()
     _record("no-apply-when-blank", refused, (blank.get("reply") or "")[:140])
 
 

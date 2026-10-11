@@ -106,6 +106,9 @@ def fragment(text: str, kind: str) -> str:
     found = match.group(0)
     if kind == "phone":
         return _clean_phone(found)
+    # "CHURCH" at the start of a slogan is not an address. A venue names the place.
+    if kind == "venue" and len(found.split()) < 2:
+        return ""
     return found
 
 
