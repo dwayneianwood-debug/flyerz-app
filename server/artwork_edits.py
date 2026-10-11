@@ -777,11 +777,16 @@ def _pieces(text: str, kind: str) -> list[str]:
                 found.append(match.group(0))
         return found
     if kind == "venue":
-        bounds = _venue_region(text or "")
-        if bounds:
-            venue = (text or "")[bounds[0]:bounds[1]].strip()
-            if venue:
-                return [venue]
+        # "CHURCH" at the start of a slogan is not an address. A street can keep its suburb.
+        core = fragment(text or "", "venue")
+        if core and len(core.split()) >= 2:
+            bounds = _venue_region(text or "")
+            if bounds:
+                venue = (text or "")[bounds[0]:bounds[1]].strip()
+                if venue:
+                    return [venue]
+            return [core]
+        return []
     one = fragment(text or "", kind)
     return [one] if one else []
 
