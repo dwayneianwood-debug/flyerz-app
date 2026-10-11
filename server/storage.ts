@@ -19,7 +19,17 @@ const dbPath = process.env.FLYERZ_DB_PATH
   : path.join(dataDir, "flyerz.sqlite");
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const sqlite = new DatabaseSync(dbPath);
+const sqlite = new DatabaseSync(dbPath, { timeout: 5000 });
+// Concurrent uploads used to fail with "database is locked". WAL lets a reader
+// and a writer proceed, and a busy timeout waits instead of failing the upload.
+sqlite.exec("PRAGMA journal_mode = WAL");
+sqlite.exec("PRAGMA busy_timeout = 5000");
+
+/** How long a locked write waits, in milliseconds. Per connection, so a new handle does not show it. */
+export function databaseWaitMs(): number {
+  const row = sqlite.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined;
+  return Number(row?.timeout || 0);
+}
 sqlite.exec(`
   CREATE TABLE IF NOT EXISTS file_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

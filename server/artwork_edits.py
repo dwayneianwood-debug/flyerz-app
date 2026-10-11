@@ -27,6 +27,19 @@ FIELD_TO_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+to\s+(.+)$", re.
 FIELD_FROM_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+from\s+(.+?)\s+to\s+(.+)$", re.I)
 # "change the time 10:00AM to 7:30PM"
 FIELD_X_TO_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+(.+?)\s+to\s+(.+)$", re.I)
+# "change 9 OCT to 12 OCT" — the old and new values, without the word date.
+BARE_TO_ASK = re.compile(rf"(?:please\s+)?{_ASK_VERB}\s+(.+?)\s+to\s+(.+)$", re.I)
+# "from 9 OCT to 12 October 2026"
+FROM_TO_ASK = re.compile(r"(?:please\s+)?from\s+(.+?)\s+to\s+(.+)$", re.I)
+# "change the phone number" / "change the venue to" with nothing after it.
+INCOMPLETE_FIELD_ASK = re.compile(
+    rf"(?:please\s+)?{_ASK_VERB}\s+the\s+({_ASK_FIELD})(?:\s+to)?\s*\.?$",
+    re.I,
+)
+VAGUE_ASK = re.compile(
+    r"(?:please\s+)?(?:(?:change|update|fix|edit)\s+it|make\s+it\s+(?:better|nicer|clearer|pop|good))\.?$",
+    re.I,
+)
 _COMPARE_PX = 64
 LOGO_ASK = re.compile(r"make\s+the\s+logo\s+(bigger|smaller|larger)\b", re.I)
 LOGO_MOVE_ASK = re.compile(r"move\s+the\s+logo\s+(up|down|left|right)\b", re.I)
@@ -650,6 +663,31 @@ def _ask_kind(label: str) -> str:
     return low
 
 
+def _swap_kind(old: str, new: str) -> str:
+    """Date, time, phone, or venue when the words themselves say which one."""
+    best = ""
+    best_rank = 0
+    for kind in ("date", "time", "phone", "venue"):
+        old_hit = bool(fragment(old, kind))
+        new_hit = bool(fragment(new, kind))
+        rank = (2 if old_hit and new_hit else 1 if old_hit or new_hit else 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = kind
+    return best
+
+
+def _values_ask(old: str, new: str) -> dict | None:
+    old = (old or "").strip(" .")
+    new = (new or "").strip(" .")
+    if not old or not new or old.lower() in ("to", "from") or new.lower() in ("to", "from"):
+        return None
+    kind = _swap_kind(old, new)
+    if not kind:
+        return None
+    return {"kind": kind, "new": new, "oldHint": old}
+
+
 def _parse(message: str) -> dict | None:
     text = " ".join((message or "").split())
     found = FIELD_FROM_ASK.search(text)
@@ -661,7 +699,9 @@ def _parse(message: str) -> dict | None:
         }
     found = FIELD_TO_ASK.search(text)
     if found:
-        return {"kind": _ask_kind(found.group(1)), "new": found.group(2).strip(" .")}
+        new = found.group(2).strip(" .")
+        if new:
+            return {"kind": _ask_kind(found.group(1)), "new": new}
     found = FIELD_X_TO_ASK.search(text)
     if found and found.group(2).strip().lower() not in ("to", "from"):
         return {
@@ -669,6 +709,16 @@ def _parse(message: str) -> dict | None:
             "new": found.group(3).strip(" ."),
             "oldHint": found.group(2).strip(" ."),
         }
+    found = BARE_TO_ASK.search(text)
+    if found:
+        parsed = _values_ask(found.group(1), found.group(2))
+        if parsed:
+            return parsed
+    found = FROM_TO_ASK.search(text)
+    if found:
+        parsed = _values_ask(found.group(1), found.group(2))
+        if parsed:
+            return parsed
     logo_move = LOGO_MOVE_ASK.search(text)
     if logo_move:
         return {"kind": "logo", "scale": 1.0, "direction": logo_move.group(1).lower()}
@@ -725,6 +775,34 @@ def _many_reply(kind: str) -> dict:
         "actions": [],
         "pending": False,
     }
+
+
+def _need_reply(kind: str) -> dict:
+    """An edit that does not say the new words. Nothing on the file changes."""
+    asked = {
+        "phone": "the new phone number, written out in full",
+        "date": "the new date",
+        "time": "the new time",
+        "venue": "the new venue, written out in full",
+    }.get(kind, "the exact words to change, and what they should say")
+    return {
+        "ok": False,
+        "reply": f"Nothing was changed. Please tell me {asked}.",
+        "actions": [],
+        "pending": False,
+    }
+
+
+def _incomplete_edit(message: str) -> dict | None:
+    text = " ".join((message or "").split())
+    if not text:
+        return None
+    if VAGUE_ASK.search(text):
+        return _need_reply("")
+    found = INCOMPLETE_FIELD_ASK.search(text)
+    if found:
+        return _need_reply(_ask_kind(found.group(1)))
+    return None
 
 
 def _rapid_words(png: str) -> list[dict]:
@@ -838,6 +916,30 @@ def _line_groups(words: list[dict]) -> list[list[dict]]:
     return [group["words"] for group in groups]
 
 
+def _face_would_shrink(fontfile: str, old: str, new: str, hit: dict, scale: float) -> bool:
+    """A much heavier face set in the same box comes out smaller. That is not a match."""
+    if not fontfile or not os.path.isfile(fontfile):
+        return False
+    import pymupdf as fitz
+
+    box_w = max(1.0, float(hit.get("width") or 1) / max(float(scale or 1), 0.1))
+    box_h = max(1.0, float(hit.get("height") or 1) / max(float(scale or 1), 0.1))
+    try:
+        face = fitz.Font(fontfile=fontfile)
+        size = max(5.0, min(box_h, box_w) * 0.92)
+        width = float(face.text_length(new or old, fontsize=size))
+    except (OSError, ValueError, RuntimeError):
+        return False
+    if width <= box_w + 0.4:
+        return False
+    old_len = max(1, len(re.sub(r"\s", "", old or "")))
+    new_len = len(re.sub(r"\s", "", new or ""))
+    if new_len > old_len * 1.45:
+        return False
+    shrunk = size * (box_w / max(width, 0.1)) * 0.98
+    return shrunk < box_h * 0.72
+
+
 def _closest_font(crop, text: str) -> tuple[str, float]:
     """The bundled face whose ink overlaps the word. Lower score is closer.
 
@@ -860,6 +962,13 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
         mask = gray > 140
     best_path = ""
     best_iou = -1.0
+    # Compare the letter strokes, not the empty margin around the reader box.
+    # A heavy face wins that padded overlap even when the original is a regular weight.
+    ink_y, ink_x = np.where(mask)
+    if len(ink_x) == 0:
+        path = next((item for item in paths if os.path.isfile(item)), "")
+        return path, 999.0
+    mask = mask[int(ink_y.min()): int(ink_y.max()) + 1, int(ink_x.min()): int(ink_x.max()) + 1]
     # Compare at a fixed height. A church-poster crop is hundreds of megapixels at full size.
     draw_h = _COMPARE_PX
     if int(mask.shape[0]) > draw_h:
@@ -868,6 +977,8 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     sample = (text or "")[:80]
     canvas_w = min(1024, draw_h * max(2, len(sample) + 1))
     canvas_h = draw_h + 8
+    src_share = float(mask.mean()) if mask.size else 0.0
+    ranked: list[tuple[float, float, float, str]] = []
     for path in paths:
         if not os.path.isfile(path):
             continue
@@ -887,9 +998,27 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
         ink = glyph < 170
         union = int(np.logical_or(mask, ink).sum()) or 1
         iou = float(np.logical_and(mask, ink).sum()) / float(union)
-        if iou > best_iou:
-            best_iou = iou
-            best_path = path
+        share = float(ink.mean()) if ink.size else 0.0
+        ratio = share / max(src_share, 0.02)
+        # A heavy display face covers the letters and the counters. That overlap
+        # is not a closer match when the original strokes are thinner.
+        penalty = 0.0
+        if src_share >= 0.02 and ratio > 1.25:
+            penalty = min(0.45, (ratio - 1.15) * 0.55)
+        ranked.append((iou - penalty, iou, ratio, path))
+    if not ranked:
+        score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
+        return best_path, score
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    _adjusted, best_iou, best_ratio, best_path = ranked[0]
+    if src_share >= 0.02 and best_ratio > 1.45:
+        lighter = [item for item in ranked if item[2] <= 1.25 and item[1] >= best_iou - 0.18]
+        if lighter:
+            lighter.sort(key=lambda item: item[1], reverse=True)
+            _adjusted, best_iou, _ratio, best_path = lighter[0]
+        else:
+            # No face is close to this weight. Applying a much heavier one would be wrong.
+            return "", -1.0
     # Callers treat a high score as a poor match. 0 would be a perfect overlap.
     score = 999.0 if best_iou < 0 else (1.0 - best_iou) * 100.0
     return best_path, score
@@ -898,6 +1027,9 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
 def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     parsed = _parse(message)
     if not parsed:
+        incomplete = _incomplete_edit(message)
+        if incomplete:
+            return incomplete
         return None
     import pymupdf as fitz
 
@@ -1395,6 +1527,16 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
             return {"ok": False, "reply": f"I read the picture and could not find a {label}, so I have not changed anything.", "actions": []}
         shown_old, shown_new, new_text = swapped
     fontfile, score = _closest_font(crop, hit["text"])
+    if score < 0 or (fontfile and _face_would_shrink(fontfile, shown_old, shown_new, hit, scale)):
+        return {
+            "ok": False,
+            "reply": (
+                "I could not match the original font, weight, and size closely enough, "
+                "so nothing was changed. Please send the editable file if this has to stay in that exact face."
+            ),
+            "actions": [],
+            "pending": False,
+        }
     if not fontfile:
         return {"ok": False, "reply": "I found the words but I have no font to set them in. Nothing was changed.", "actions": []}
     missing = _missing_glyphs(fontfile, new_text + _stray_chars(parsed["kind"], parsed.get("new") or ""))
@@ -2181,6 +2323,20 @@ def _read_as(text: str, digits: bool) -> str:
     return compact
 
 
+def _pdf_has_reading(path: str, wanted: str, digits: bool) -> bool:
+    """The new words are in the PDF text layer, which does not depend on OCR."""
+    if not wanted or not path or not os.path.isfile(path):
+        return False
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        text = doc[0].get_text("text") or ""
+    finally:
+        doc.close()
+    return wanted in _read_as(text, digits)
+
+
 def _fresh_font_problems(before_pdf: str, after_pdf: str) -> list[str]:
     """Embedding or substitution problems the edit added. Problems already in the file stay."""
     from client_file_audit import font_report
@@ -2360,8 +2516,13 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
             inside.append(text)
     readings.append(" ".join(inside))
     compacts = [_read_as(text, digits) for text in readings if text and text.strip()]
+    # White type on a photograph often will not OCR, on Windows in particular.
+    # The new words are still in the page as real text, and only that box may change.
+    text_has_new = _pdf_has_reading(after_pdf, wanted, digits)
+    inside_changed = int((delta[y0:y1, x0:x1] > 12).sum()) if y1 > y0 and x1 > x0 else 0
     if wanted and not any(wanted in item for item in compacts):
-        problems.append("region OCR missed " + (new_text or "")[:40])
+        if not (text_has_new and changed <= 40 and inside_changed > 20):
+            problems.append("region OCR missed " + (new_text or "")[:40])
     if old_compact and old_compact != wanted and any(old_compact in item for item in compacts):
         problems.append("region OCR still has the old words")
 

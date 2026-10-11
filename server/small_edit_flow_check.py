@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,8 @@ def _flow(name: str, line: str, message: str, expect: str, absent: str) -> None:
     TRANSCRIPT.append(f"undo -> {undone.get('reply')}\n")
     if not undone.get("ok") or absent not in _text(dest) or expect in _text(dest):
         problems.append("undo " + _text(dest).replace("\n", " ")[:80])
+    if os.path.isfile(dest) and _sha(dest) != original:
+        problems.append("undo bytes differ")
     _record(name, not problems, "; ".join(problems) or f"{expect} {gate}")
 
 
@@ -744,12 +747,144 @@ def _write() -> None:
         handle.write("\n".join(TRANSCRIPT))
 
 
+def _natural_and_vague() -> None:
+    """Dates and times in ordinary sentences, and a vague ask that changes nothing."""
+    from artwork_edits import _incomplete_edit, _parse, propose
+
+    phrases = [
+        ("change 9 OCT to 12 OCT", "date", "9OCT", "12 OCT"),
+        ("change the date from 9 OCT to 12 October 2026", "date", "9OCT", "12 October 2026"),
+        ("from 9 OCT to 12 October 2026", "date", "9OCT", "12 October 2026"),
+        ("change the date to 12 October 2026", "date", "", "12 October 2026"),
+        ("change 10:00AM to 7:30PM", "time", "1000AM", "7:30PM"),
+        ("change the time from 10:00AM to 7:30 pm", "time", "1000AM", "7:30 pm"),
+        ("change 5/3/26 to 12/10/2026", "date", "53", "12/10/2026"),
+        ("please change October 9 to 12 October 2026", "date", "OCTOBER9", "12 October 2026"),
+    ]
+    for message, kind, hint, new in phrases:
+        parsed = _parse(message) or {}
+        got_hint = re.sub(r"[^A-Z0-9]", "", str(parsed.get("oldHint") or "").upper())
+        ok = parsed.get("kind") == kind and new.lower() in str(parsed.get("new") or "").lower()
+        if hint and hint not in got_hint:
+            ok = False
+        _record("phrase-" + kind + "-" + re.sub(r"[^a-z0-9]+", "-", message.lower())[:32], ok, str(parsed)[:140])
+    for message in ("change it", "make it better", "change the phone number", "change the venue to"):
+        reply = str((propose("/no/such/file.pdf", message, "vague", ROOT) or {}).get("reply") or "")
+        low = reply.lower()
+        ok = "nothing was changed" in low and "everything else" not in low and reply.endswith(".")
+        _record("vague-" + re.sub(r"[^a-z0-9]+", "-", message.lower())[:24], ok, reply[:160])
+        if _incomplete_edit(message) is None:
+            _record("vague-parse-" + message[:12], False, "not incomplete")
+
+
+def _ocr_miss_keeps_the_edit() -> None:
+    """A preview whose new words are real text still applies when OCR cannot read them."""
+    import artwork_edits as edits
+
+    src = os.path.join(ROOT, "ocr-miss.pdf")
+    _live(src, "Doors 9 OCT")
+    real_tesseract = edits._tesseract
+    real_rapid = edits._rapid_line
+    edits._tesseract = lambda *_args, **_kwargs: ""
+    edits._rapid_line = lambda *_args, **_kwargs: ""
+    try:
+        asked = edits.propose(src, "change the date from 9 OCT to 12 October 2026", "ocr-miss", os.path.join(ROOT, "preview-ocr-miss"))
+    finally:
+        edits._tesseract = real_tesseract
+        edits._rapid_line = real_rapid
+    reply = (asked or {}).get("reply") or ""
+    staged = os.path.join(ROOT, "preview-ocr-miss", "staged.pdf")
+    body = _text(staged) if os.path.isfile(staged) else ""
+    ok = asked.get("pending") is True and "12 OCT" in body and "could not read" not in reply.lower()
+    outside = ""
+    if ok:
+        import numpy as np
+
+        before = edits._render_rgb(src, 1)
+        after = edits._render_rgb(staged, 1)
+        box = (edits._load("ocr-miss").get("proposal") or {}).get("editBox") or [0, 0, 0, 0]
+        delta = np.abs(before.astype(np.int16) - after.astype(np.int16)).max(axis=2)
+        y0, y1 = int(box[1]), int(box[3]) + 1
+        x0, x1 = int(box[0]), int(box[2]) + 1
+        outside_n = int((delta > 12).sum()) - int((delta[y0:y1, x0:x1] > 12).sum())
+        outside = f" outside {outside_n}"
+        if outside_n > 40:
+            ok = False
+    _record("ocr-miss-date", ok, (reply[:120] or body[:80]) + outside)
+
+
+def _font_weight() -> None:
+    """Cooper Black must not replace a regular phone face."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    import artwork_edits as edits
+
+    regular = FONT
+    bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    folder = os.path.join(ROOT, "win-fonts")
+    os.makedirs(folder, exist_ok=True)
+    regular_path = os.path.join(folder, "arial.ttf")
+    heavy_path = os.path.join(folder, "CooperBlack.ttf")
+    shutil.copyfile(regular, regular_path)
+    shutil.copyfile(bold, heavy_path)
+    face = ImageFont.truetype(regular, 48)
+    canvas = Image.new("RGB", (520, 80), (255, 255, 255))
+    ImageDraw.Draw(canvas).text((6, 8), "082 123 4567", font=face, fill=(20, 20, 20))
+    crop = np.array(canvas)[:, :, ::-1]
+    previous = edits._FONT_INDEX
+    edits._FONT_INDEX = [
+        {"path": regular_path, "kind": "windows", "family": "arial", "style": "regular"},
+        {"path": heavy_path, "kind": "windows", "family": "cooper", "style": "black"},
+    ]
+    try:
+        path, score = edits._closest_font(crop, "082 123 4567")
+        both = os.path.basename(path).lower().startswith("arial") and score >= 0
+        edits._FONT_INDEX = [
+            {"path": heavy_path, "kind": "windows", "family": "cooper", "style": "black"},
+        ]
+        refused, refused_score = edits._closest_font(crop, "082 123 4567")
+        only = refused == "" and refused_score < 0
+    finally:
+        edits._FONT_INDEX = previous
+    _record("font-not-cooper", both and only, f"{os.path.basename(path)} {score:.1f} only {refused_score}")
+
+
+def _is_this_right() -> None:
+    """The short question runs the same stored check, including low resolution."""
+    src = os.path.join(ROOT, "right.pdf")
+    _live(src, "Keep me")
+    stored = os.path.join(ROOT, "stored-checks.json")
+    with open(stored, "w", encoding="utf-8") as handle:
+        json.dump({
+            "checks": [
+                {"num": "6", "name": "Resolution", "status": "failed", "detail": "The picture is about 72 ppi. It needs about 300 ppi."},
+                {"num": "1", "name": "Bleed", "status": "passed", "detail": "Bleed is 5 mm."},
+            ]
+        }, handle)
+    replies = {}
+    for message in ("is this right", "is this artwork right?"):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--input", src, "--stored", stored, "--message", message, "--job-id", "right"],
+            capture_output=True, text=True, cwd=os.path.dirname(SCRIPT),
+        )
+        replies[message] = proc.stdout
+        low = proc.stdout.lower()
+        ok = "72 ppi" in low and "everything else" in low and proc.returncode == 0
+        _record("check-" + re.sub(r"[^a-z]+", "-", message.lower()).strip("-"), ok, proc.stdout.replace("\n", " ")[:180])
+    same = "72 ppi" in replies["is this right"] and "72 ppi" in replies["is this artwork right?"]
+    _record("check-same-problems", same, "both list the low resolution")
+
+
 def run() -> list[str]:
     _windows_font_paths()
     _windows_ocr_shape()
     _phone_grouping()
     _no_helvetica()
+    _natural_and_vague()
+    _font_weight()
     date = "change the date to 12 October 2026"
+    _flow("date-bare", "Doors 9 OCT", "change 9 OCT to 12 OCT", "12 OCT", "9 OCT")
     _flow("date-slash", "Doors 5/3", date, "12/10", "5/3")
     _flow("date-slash-year", "Doors 05/03/25", date, "12/10/26", "05/03/25")
     _flow("date-month", "Doors 5 March", date, "12 October", "5 March")
@@ -781,6 +916,8 @@ def run() -> list[str]:
     _overlap_time()
     _shrink_venue()
     _exactly_once()
+    _ocr_miss_keeps_the_edit()
+    _is_this_right()
     _cat_yes()
     _write()
     return list(FAILURES)

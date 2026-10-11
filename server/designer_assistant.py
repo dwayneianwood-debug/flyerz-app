@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 
 from client_file_audit import (
@@ -466,8 +467,16 @@ def actions_for_checks(checks: list) -> list[dict]:
 
 
 def _asks_about_artwork(message: str) -> bool:
+    """A check question. "is this right" is the same question as "is this artwork right?"."""
     text = " ".join((message or "").lower().split())
-    return "artwork" in text and any(word in text for word in ("right", "ok", "okay", "correct", "wrong", "fine", "good"))
+    if not text:
+        return False
+    judging = any(word in text for word in ("right", "ok", "okay", "correct", "wrong", "fine", "good", "check"))
+    if not judging:
+        return False
+    if any(word in text for word in ("artwork", "file", "design", "poster", "flyer")):
+        return True
+    return bool(re.match(r"^(?:is|does|do)\s+(?:this|it)\b", text))
 
 
 def _check_title(row: dict) -> str:

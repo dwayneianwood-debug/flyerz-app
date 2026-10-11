@@ -467,9 +467,62 @@ def test_bleed_strip_does_not_fail_cmyk() -> None:
     check("artwork-rgb-still-fails", failed["passed"] is False and "not CMYK" in failed["detail"], str(failed))
 
 
+def test_large_vector_form_is_measured() -> None:
+    """A poster whose CMYK lives in a form is still CMYK. Real RGB paint is not."""
+    import pikepdf
+    from pikepdf import Array, Dictionary, Name
+
+    from green_gate import _colour
+
+    folder = tempfile.mkdtemp(prefix="gate-a2-form-")
+    # A2-ish page. The artwork is a form, the way a kept-vector poster is stored.
+    width, height = 1786.0, 2526.0
+
+    def poster(stream: bytes, name: str) -> str:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(width, height))
+        page.MediaBox = Array([0, 0, width, height])
+        page.TrimBox = Array([14, 14, width - 14, height - 14])
+        form = pdf.make_stream(stream)
+        form.Type = Name("/XObject")
+        form.Subtype = Name("/Form")
+        form.BBox = Array([0, 0, 400, 400])
+        edge = pdf.make_stream(bytes([180, 180, 180] * 40))
+        edge.Type = Name("/XObject")
+        edge.Subtype = Name("/Image")
+        edge.Width = 1
+        edge.Height = 40
+        edge.ColorSpace = Name("/DeviceRGB")
+        edge.BitsPerComponent = 8
+        page.Resources = Dictionary(XObject=Dictionary())
+        page.Resources.XObject[Name("/Art")] = form
+        page.Resources.XObject[Name("/Bleed0_0")] = edge
+        page.Contents = pdf.make_stream(
+            b"q 400 0 0 400 40 40 cm /Art Do Q\n q 14 0 0 40 0 14 cm /Bleed0_0 Do Q\n"
+        )
+        path = os.path.join(folder, name)
+        pdf.save(path)
+        pdf.close()
+        return path
+
+    cmyk, ink = _colour(poster(b"0 0 0 1 k 0 0 200 200 re f\n", "cmyk.pdf"))
+    check(
+        "a2-form-cmyk",
+        cmyk["passed"] is True and ink["passed"] is True and "could not be measured" not in ink["detail"] and "not CMYK" not in cmyk["detail"],
+        str(cmyk) + " " + str(ink),
+    )
+    rgb, rgb_ink = _colour(poster(b"1 0 0 rg 0 0 200 200 re f\n", "rgb.pdf"))
+    check(
+        "a2-form-rgb-fails",
+        rgb["passed"] is False and "not CMYK" in rgb["detail"],
+        str(rgb) + " " + str(rgb_ink),
+    )
+
+
 def main() -> None:
     test_messages()
     test_bleed_strip_does_not_fail_cmyk()
+    test_large_vector_form_is_measured()
     test_embedded_dpi()
     test_sharpen_keeps_the_hole()
     test_paint_and_ink_colour()

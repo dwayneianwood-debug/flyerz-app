@@ -319,17 +319,57 @@ def _colour(path: str) -> tuple[dict, dict]:
     )
 
 
+def _art_operators(path: str) -> str:
+    """Page content plus form streams. Bleed images are not artwork paint.
+
+    A large poster keeps its vectors inside a form. The page stream is only a
+    Do, so the colour lives in that form. An image stream is binary and is not
+    searched for operators.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    parts: list[str] = []
+    try:
+        for page in doc:
+            try:
+                parts.append(page.read_contents().decode("latin1", "replace"))
+            except Exception:
+                pass
+            try:
+                xobjects = page.get_xobjects() or []
+            except Exception:
+                xobjects = []
+            for item in xobjects:
+                try:
+                    xref = int(item[0])
+                    name = str(item[1] if len(item) > 1 else "")
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if name.startswith("Bleed"):
+                    continue
+                try:
+                    obj = doc.xref_object(xref)
+                except Exception:
+                    obj = ""
+                if "/Subtype /Image" in obj or "/Subtype/Image" in obj:
+                    continue
+                try:
+                    data = doc.xref_stream(xref) or b""
+                except Exception:
+                    data = b""
+                if data:
+                    parts.append(data.decode("latin1", "replace"))
+    finally:
+        doc.close()
+    return "\n".join(parts)
+
+
 def _vector_cmyk(path: str) -> tuple[bool, float]:
     """A page of CMYK fills and live text, with no RGB. Returns (ok, peak TAC)."""
     import re
 
-    import pymupdf as fitz
-
-    doc = fitz.open(path)
-    try:
-        raw = "".join(page.read_contents().decode("latin1", "replace") for page in doc)
-    finally:
-        doc.close()
+    raw = _art_operators(path)
     if re.search(r"\brg\b|\bRG\b|DeviceRGB", raw):
         return False, 0.0
     found = re.findall(r"([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+k\b", raw)
@@ -338,6 +378,8 @@ def _vector_cmyk(path: str) -> tuple[bool, float]:
     tac = 0.0
     for parts in found:
         tac = max(tac, sum(float(channel) for channel in parts) * 100.0)
+    if tac <= 0.0:
+        tac = _sampled_cmyk_tac(path)
     return True, tac
 
 
@@ -362,16 +404,30 @@ def _tac(blob: bytes) -> float:
     return float(np.percentile(total, 99))
 
 
-def _vector_has_rgb(path: str) -> bool:
-    import re
-
+def _sampled_cmyk_tac(path: str) -> float:
+    """Ink from a small CMYK render. A poster is not decoded at 300 DPI for this."""
     import pymupdf as fitz
+    import numpy as np
 
     doc = fitz.open(path)
     try:
-        raw = "".join(page.read_contents().decode("latin1", "replace") for page in doc)
+        page = doc[0]
+        long_pt = max(float(page.rect.width), float(page.rect.height), 1.0)
+        zoom = min(1.2, 700.0 / long_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csCMYK)
+        if pix.n < 4 or pix.width < 1 or pix.height < 1:
+            return 0.0
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        total = arr[:, :, :4].astype(np.float32).sum(axis=2) / 255.0 * 100.0
+        return float(np.percentile(total, 99))
     finally:
         doc.close()
+
+
+def _vector_has_rgb(path: str) -> bool:
+    import re
+
+    raw = _art_operators(path)
     return bool(re.search(r"\brg\b|\bRG\b|DeviceRGB", raw))
 
 

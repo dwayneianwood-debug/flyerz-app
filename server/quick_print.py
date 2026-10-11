@@ -217,9 +217,77 @@ def _to_bgr(img):
 
 
 def _read_image(path: str):
-    import cv2
+    import os
 
+    import cv2
+    from large_job import LARGE_JOB_BYTES
+
+    try:
+        huge = os.path.getsize(path) >= LARGE_JOB_BYTES
+    except OSError:
+        huge = False
+    if huge:
+        return _thumbnail_bgr(path, 3600)
     return _to_bgr(cv2.imread(path, cv2.IMREAD_UNCHANGED))
+
+
+def _thumbnail_bgr(path: str, limit: int):
+    """A large picture is reduced while it is opened, so the full bitmap is not the working file."""
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = max(int(previous or 0), 400_000_000)
+    try:
+        with Image.open(path) as image:
+            image.draft("RGB", (limit, limit))
+            image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
+            rgb = np.array(image.convert("RGB"))
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _header_long(path: str) -> int:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return max(image.size)
+    except Exception:
+        return 0
+
+
+def _write_working_image(src: str, dest: str, limit: int) -> str:
+    """Save a smaller copy. The press path then places this instead of the full file."""
+    from PIL import Image
+
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = max(int(previous or 0), 400_000_000)
+    try:
+        with Image.open(src) as image:
+            image.draft("RGB", (limit, limit))
+            image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
+            image.convert("RGB").save(dest, format="JPEG", quality=90, dpi=(300, 300))
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+    return dest
+
+
+def _tame_raster(img, trim_w: float, trim_h: float, nbytes: int):
+    """Shrink a screenshot or a huge file before OCR and the bleed extend."""
+    import cv2
+    from large_job import cap_shape, working_limit
+
+    if img is None:
+        return None, False
+    height, width = img.shape[:2]
+    limit = working_limit(height, width, trim_w, trim_h, nbytes)
+    new_h, new_w = cap_shape(height, width, limit)
+    if new_h == height and new_w == width:
+        return img, False
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA), True
 
 
 def _place_large_image(src: str, dest: str, trim_w: float, trim_h: float) -> None:
@@ -335,7 +403,7 @@ def _render_pdf_image(path: str):
     try:
         page = doc[0]
         long_pt = max(page.rect.width, page.rect.height, 1)
-        cap = 1200.0 if is_large_job(file_bytes(path)) else 4500.0
+        cap = 2400.0 if is_large_job(file_bytes(path)) else 4500.0
         zoom = min(300.0 / 72.0, cap / long_pt)
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
@@ -1410,9 +1478,23 @@ def make_print_ready(
         live_type = False
         if ext == ".pdf":
             from ai_rebuild import _pdf_has_live_type
+            from large_job import file_bytes, is_large_job
 
             # Live text and vector drawings stay as they are. A raster page can still be traced.
             live_type = _pdf_has_live_type(work_path)
+            # A ~200 MB picture-PDF used to be killed at 300 s and never finished.
+            # The working picture is a smaller render. Live type stays a PDF.
+            if is_large_job(file_bytes(work_path)) and not live_type:
+                try:
+                    raster = _render_pdf_image(work_path)
+                except Exception:
+                    raster = None
+                if raster is not None:
+                    ext = ".png"
+                    decisions.append(
+                        "This file is large, so it was prepared from a smaller working picture. The press file is still built."
+                    )
+        if ext == ".pdf":
             measured = _pdf_trim_mm(work_path)
             fit = _fit_page_to_trim(*measured, trim_w, trim_h) if measured else None
             if fit and fit["rotated"]:
@@ -1458,16 +1540,23 @@ def make_print_ready(
                 else:
                     from large_job import file_bytes, is_large_job
 
+                    raster = _render_pdf_image(work_path)
                     if is_large_job(file_bytes(work_path)):
                         decisions.append(
-                            "This file is large, so it goes to the press plate as it is. The picture is not drawn again at full size."
+                            "This file is large, so it was prepared from a smaller working picture. The press file is still built."
                         )
-                    else:
-                        raster = _render_pdf_image(work_path)
                     ext = ".png"
         if plate_exceeds_memory(trim_w, trim_h) and ext in IMAGE_EXT:
+            from large_job import HUGE_EDGE_PX, file_bytes, is_large_job
+
+            place_src = work_path
+            if is_large_job(file_bytes(work_path)) or _header_long(work_path) >= HUGE_EDGE_PX:
+                place_src = _write_working_image(work_path, os.path.join(output_dir, "large-working.jpg"), 3600)
+                decisions.append(
+                    "This picture is very large, so a smaller working copy was placed before the bleed edge was added."
+                )
             placed = os.path.join(output_dir, "large-placed.pdf")
-            _place_large_image(work_path, placed, trim_w, trim_h)
+            _place_large_image(place_src, placed, trim_w, trim_h)
             work_path = placed
             ext = ".pdf"
             raster = None
@@ -1475,6 +1564,14 @@ def make_print_ready(
         if ext in IMAGE_EXT or raster is not None:
             if raster is None:
                 raster = _read_image(work_path)
+            if raster is not None:
+                from large_job import file_bytes
+
+                raster, reduced = _tame_raster(raster, trim_w, trim_h, file_bytes(src_path))
+                if reduced:
+                    decisions.append(
+                        "The picture was very large, so the working copy was reduced before the press file was built. It is still placed at 300 DPI."
+                    )
             if raster is None:
                 info = decide_light({"kind": "corrupt", "readable": False})
                 return _finish(_blank(info, decisions, product, quantity, notes), output_dir)

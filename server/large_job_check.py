@@ -9,7 +9,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from large_job import LARGE_JOB_BYTES, is_large_job, proof_zoom
+from large_job import LARGE_JOB_BYTES, cap_shape, is_large_job, proof_zoom, working_limit
 
 
 def main() -> int:
@@ -46,6 +46,15 @@ def main() -> int:
 
         if not is_large_job(file_bytes(handle.name)):
             failures.append("truncated file not large")
+    normal_h, normal_w = cap_shape(*[int(x) for x in (6000, 4000)], working_limit(6000, 4000, 210, 297, 2_000_000))
+    if (normal_h, normal_w) != (6000, 4000):
+        failures.append(f"normal photo was reduced {normal_h}x{normal_w}")
+    shot_h, shot_w = cap_shape(15444, 1080, working_limit(15444, 1080, 148, 210, 4_000_000))
+    if shot_h > 4000 or shot_w > 4000 or shot_h >= 15444:
+        failures.append(f"screenshot stayed tall {shot_h}x{shot_w}")
+    huge_h, huge_w = cap_shape(12000, 9000, working_limit(12000, 9000, 420, 594, 200 * 1024 * 1024))
+    if max(huge_h, huge_w) > 3600:
+        failures.append(f"200 MB working edge {huge_h}x{huge_w}")
     if failures:
         print("FAIL " + "; ".join(failures))
         return 1
