@@ -41,6 +41,9 @@ test("the page font and the cat panel do not depend on a system face", () => {
   const css = readFileSync(new URL("../index.css", here), "utf8");
   const html = readFileSync(new URL("../../index.html", here), "utf8");
   const widget = readFileSync(new URL("../components/glitchy-widget.tsx", here), "utf8");
+  const layout = readFileSync(new URL("../components/layout.tsx", here), "utf8");
+  assert.match(layout, /overflow-x-clip/);
+  assert.match(layout, /overflow-hidden/);
   assert.equal(css.includes("fonts.googleapis.com"), false);
   assert.equal(html.includes("fonts.googleapis.com"), false);
   assert.equal(css.includes("system-ui"), false);

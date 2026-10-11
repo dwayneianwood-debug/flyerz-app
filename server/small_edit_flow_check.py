@@ -623,6 +623,20 @@ def _windows_font_paths() -> None:
     _record("bundled-fonts-only", not problems, "; ".join(problems) or "system fonts hidden, same bundled face twice")
 
 
+def _bundled_space_stays_a_space() -> None:
+    """Lato used to store a normal space as a non-breaking space. 12 OCT must read back as 12 OCT."""
+    import pymupdf
+
+    path = os.path.join(os.path.dirname(__file__), "fonts", "Lato-Regular.ttf")
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=80)
+    page.insert_font(fontname="LATO", fontfile=path)
+    page.insert_text((20, 50), "12 OCT", fontsize=18, fontname="LATO", fontfile=path)
+    chars = "".join(chr(item[0]) for item in (page.get_texttrace() or [{}])[0].get("chars") or [])
+    doc.close()
+    _record("bundled-space", chars == "12 OCT", repr(chars))
+
+
 def _windows_ocr_shape() -> None:
     """A numpy box must not be thrown away by a truth-value check."""
     import numpy as np
@@ -1081,6 +1095,7 @@ def _is_this_right() -> None:
 
 def run() -> list[str]:
     _windows_font_paths()
+    _bundled_space_stays_a_space()
     _windows_ocr_shape()
     _phone_grouping()
     _no_helvetica()

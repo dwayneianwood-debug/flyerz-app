@@ -1061,7 +1061,7 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
 
     paths = _candidate_fonts()
     if crop is None or getattr(crop, "size", 0) == 0:
-        path = next((item for item in paths if os.path.isfile(item)), "")
+        path = _plain_text_face(paths, text) or next((item for item in paths if os.path.isfile(item)), "")
         return path, 999.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     # The letters are the minority: darker on a light ground, or lighter on a dark one.
@@ -1075,7 +1075,7 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
     # A heavy face wins that padded overlap even when the original is a regular weight.
     ink_y, ink_x = np.where(mask)
     if len(ink_x) == 0:
-        path = next((item for item in paths if os.path.isfile(item)), "")
+        path = _plain_text_face(paths, text) or next((item for item in paths if os.path.isfile(item)), "")
         return path, 999.0
     mask = mask[int(ink_y.min()): int(ink_y.max()) + 1, int(ink_x.min()): int(ink_x.max()) + 1]
     # Compare at a fixed height. A church-poster crop is hundreds of megapixels at full size.
