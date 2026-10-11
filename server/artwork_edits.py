@@ -17,24 +17,17 @@ import shutil
 import subprocess
 import tempfile
 
-from edit_style import DATE_IN_TEXT, PHONE_IN_TEXT, TIME_IN_TEXT, VENUE_IN_TEXT, fragment, swap_text
+from edit_style import DATE_IN_TEXT, PHONE_IN_TEXT, TIME_IN_TEXT, VENUE_IN_TEXT, fragment, phone_with_icon, swap_text
 
-PHONE_ASK = re.compile(
-    r"(?:change|update|set|replace|swap)\s+the\s+phone(?:\s+number)?\s+to\s+(.+)$",
-    re.I,
-)
-DATE_ASK = re.compile(
-    r"(?:change|update|set|replace|swap)\s+the\s+date\s+to\s+(.+)$",
-    re.I,
-)
-TIME_ASK = re.compile(
-    r"(?:change|update|set|replace|swap)\s+the\s+time\s+to\s+(.+)$",
-    re.I,
-)
-VENUE_ASK = re.compile(
-    r"(?:change|update|set|replace|swap)\s+the\s+venue\s+to\s+(.+)$",
-    re.I,
-)
+_ASK_VERB = r"(?:change|update|set|replace|swap)"
+_ASK_FIELD = r"(phone(?:\s+number)?|date|time|venue)"
+# "change the time to 7:30PM"
+FIELD_TO_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+to\s+(.+)$", re.I)
+# "change the time from 10:00AM to 7:30PM"
+FIELD_FROM_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+from\s+(.+?)\s+to\s+(.+)$", re.I)
+# "change the time 10:00AM to 7:30PM"
+FIELD_X_TO_ASK = re.compile(rf"{_ASK_VERB}\s+the\s+{_ASK_FIELD}\s+(.+?)\s+to\s+(.+)$", re.I)
+_COMPARE_PX = 64
 LOGO_ASK = re.compile(r"make\s+the\s+logo\s+(bigger|smaller|larger)\b", re.I)
 LOGO_MOVE_ASK = re.compile(r"move\s+the\s+logo\s+(up|down|left|right)\b", re.I)
 HEADING_ASK = re.compile(r"make\s+the\s+heading\s+(bigger|smaller|larger)\b", re.I)
@@ -327,6 +320,67 @@ def _named_font(fontname: str) -> str | None:
     return best
 
 
+def _font_file_usable(fontfile: str, text: str) -> bool:
+    """A file we can embed. A nameless subset, or one outlined glyph for every letter, is not."""
+    if not fontfile or fontfile in ("helv", "times", "cour") or not os.path.isfile(fontfile):
+        return False
+    letters = [char for char in text if not char.isspace()]
+    if not letters:
+        return False
+    try:
+        from fontTools.ttLib import TTFont
+
+        face = TTFont(fontfile, fontNumber=0)
+        try:
+            names = face["name"].names if "name" in face else []
+            family = ""
+            for rec in names:
+                if rec.nameID == 1:
+                    family = str(rec.toUnicode() or "").strip()
+                    if family and family not in ("(null)", "null"):
+                        break
+            if not family or family in ("(null)", "null"):
+                return False
+            cmap = face.getBestCmap() or {}
+            glyf = face["glyf"] if "glyf" in face else None
+            glyph_names = []
+            for char in letters:
+                name = cmap.get(ord(char))
+                if not name:
+                    return False
+                glyph_names.append(name)
+                if glyf is not None:
+                    glyph = glyf[name]
+                    if int(getattr(glyph, "numberOfContours", 0) or 0) == 0 and not glyph.isComposite():
+                        return False
+            if len(set(letters)) >= 2 and len(set(glyph_names)) <= 1:
+                return False
+        finally:
+            face.close()
+    except Exception:
+        return False
+    if not _glyphs_present(fontfile, text):
+        return False
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import numpy as np
+
+        drawn = ImageFont.truetype(fontfile, 28)
+        marks = []
+        for char in dict.fromkeys(letters):
+            canvas = Image.new("L", (40, 40), 255)
+            ImageDraw.Draw(canvas).text((2, 2), char, font=drawn, fill=0)
+            plate = np.array(canvas)
+            if int(plate.min()) > 210:
+                return False
+            marks.append(plate)
+        if len(marks) >= 2 and all(np.array_equal(marks[0], item) for item in marks[1:]):
+            return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _glyphs_present(fontfile: str, text: str) -> bool:
     if not fontfile or not text:
         return False
@@ -350,17 +404,24 @@ def _closest_among(crop, text: str, paths: list[str]) -> tuple[str, float]:
         return usable[0], 999.0
     best_path = usable[0]
     best_score = 1e9
-    height = max(12, crop.shape[0])
+    height = min(_COMPARE_PX, max(12, int(crop.shape[0])))
+    sample = crop
+    if int(crop.shape[0]) > height:
+        sample = cv2.resize(
+            crop,
+            (max(8, int(crop.shape[1] * height / float(crop.shape[0]))), height),
+            interpolation=cv2.INTER_AREA,
+        )
     for path in usable:
         try:
             font = ImageFont.truetype(path, max(10, height - 2))
-        except Exception:
+            canvas = Image.new("RGB", (max(int(sample.shape[1]), 8), max(height, 8)), (255, 255, 255))
+            ImageDraw.Draw(canvas).text((0, 0), (text or "")[:80], font=font, fill=(0, 0, 0))
+        except (OSError, ValueError):
             continue
-        canvas = Image.new("RGB", (max(crop.shape[1], 8), max(height, 8)), (255, 255, 255))
-        ImageDraw.Draw(canvas).text((0, 0), text, font=font, fill=(0, 0, 0))
         plate = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
-        plate = cv2.resize(plate, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_AREA)
-        score = float(np.mean(np.abs(plate.astype(np.float32) - crop.astype(np.float32))))
+        plate = cv2.resize(plate, (sample.shape[1], sample.shape[0]), interpolation=cv2.INTER_AREA)
+        score = float(np.mean(np.abs(plate.astype(np.float32) - sample.astype(np.float32))))
         if score < best_score:
             best_score = score
             best_path = path
@@ -380,16 +441,49 @@ def _span_crop(page, bbox) -> object:
     return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
 
 
+def _crop_has_strokes(crop) -> bool:
+    """False when the letters never painted, so a blank crop must not pick a script face."""
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return False
+    gray = crop.mean(axis=2) if getattr(crop, "ndim", 1) == 3 else crop
+    if float(gray.mean()) > 140:
+        share = float((gray < 160).mean())
+    else:
+        share = float((gray > 140).mean())
+    return share >= 0.008
+
+
+def _plain_text_face(paths: list[str], text: str) -> str:
+    """A regular text face. A blank sample must not fall through to a script."""
+    ranked = []
+    for path in paths:
+        if not _font_file_usable(path, text):
+            continue
+        token = os.path.splitext(os.path.basename(path))[0].lower().replace("-", "").replace(" ", "")
+        if any(word in token for word in ("script", "vibes", "handwrit", "brush", "calligraphy", "signature", "cursive")):
+            continue
+        rank = 9
+        for index, name in enumerate(("dejavusans", "liberationsans", "arial", "calibri", "carlito", "anton", "roboto", "notosans")):
+            if name in token and "bold" not in token and "italic" not in token:
+                rank = index
+                break
+        ranked.append((rank, token, path))
+    if not ranked:
+        return next((path for path in paths if _font_file_usable(path, text)), "")
+    ranked.sort()
+    return ranked[0][2]
+
+
 def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
     """Embedded face, then the full family, then the closest face that has the letters."""
     embedded = _embedded_font(doc, page, fontname)
     # Base-14 names are not files. Inserting them leaves Helvetica unembedded.
     if embedded in ("helv", "times", "cour"):
         embedded = None
-    if embedded and _glyphs_present(embedded, text):
+    if embedded and _font_file_usable(embedded, text):
         return {"fontfile": embedded, "amber": False, "fontSource": "embedded", "faceLabel": _face_label(embedded, fontname)}
     full = _named_font(fontname)
-    if full and _glyphs_present(full, text):
+    if full and _font_file_usable(full, text):
         return {"fontfile": full, "amber": False, "fontSource": "full", "faceLabel": _face_label(full, fontname)}
     paths = [
         row["path"]
@@ -411,7 +505,32 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
             ),
         }
     crop = _span_crop(page, bbox) if bbox else None
+    if not _crop_has_strokes(crop):
+        path = _plain_text_face(paths, text)
+        if path:
+            return {
+                "fontfile": path,
+                "amber": True,
+                "fontSource": "closest",
+                "fontScore": 999.0,
+                "faceLabel": _face_label(path, fontname),
+            }
     path, score = _closest_among(crop, text, paths)
+    if path and not _font_file_usable(path, text):
+        path = next((item for item in paths if _font_file_usable(item, text)), "")
+        score = 999.0
+    if not path:
+        missing = [char for char in text if not char.isspace()]
+        shown = "".join(dict.fromkeys(missing))[:24] or "the new letters"
+        return {
+            "fontfile": "",
+            "amber": False,
+            "fontSource": "none",
+            "reply": (
+                f"The font {fontname or 'on the page'} has no glyph for {shown}, "
+                "and none of the installed fonts do either. Nothing was changed."
+            ),
+        }
     return {
         "fontfile": path,
         "amber": True,
@@ -523,20 +642,32 @@ def _render_page(path: str, dest: str, page_index: int = 0) -> None:
         doc.close()
 
 
+def _ask_kind(label: str) -> str:
+    low = (label or "").lower()
+    if low.startswith("phone"):
+        return "phone"
+    return low
+
+
 def _parse(message: str) -> dict | None:
     text = " ".join((message or "").split())
-    phone = PHONE_ASK.search(text)
-    if phone:
-        return {"kind": "phone", "new": phone.group(1).strip(" .")}
-    date = DATE_ASK.search(text)
-    if date:
-        return {"kind": "date", "new": date.group(1).strip(" .")}
-    time_ask = TIME_ASK.search(text)
-    if time_ask:
-        return {"kind": "time", "new": time_ask.group(1).strip(" .")}
-    venue = VENUE_ASK.search(text)
-    if venue:
-        return {"kind": "venue", "new": venue.group(1).strip(" .")}
+    found = FIELD_FROM_ASK.search(text)
+    if found:
+        return {
+            "kind": _ask_kind(found.group(1)),
+            "new": found.group(3).strip(" ."),
+            "oldHint": found.group(2).strip(" ."),
+        }
+    found = FIELD_TO_ASK.search(text)
+    if found:
+        return {"kind": _ask_kind(found.group(1)), "new": found.group(2).strip(" .")}
+    found = FIELD_X_TO_ASK.search(text)
+    if found and found.group(2).strip().lower() not in ("to", "from"):
+        return {
+            "kind": _ask_kind(found.group(1)),
+            "new": found.group(3).strip(" ."),
+            "oldHint": found.group(2).strip(" ."),
+        }
     logo_move = LOGO_MOVE_ASK.search(text)
     if logo_move:
         return {"kind": "logo", "scale": 1.0, "direction": logo_move.group(1).lower()}
@@ -567,11 +698,18 @@ def _heading_span(spans: list[dict]) -> dict | None:
     return max(scored, key=lambda span: (float(span.get("size") or 0), -float(span["bbox"][1])))
 
 
-def _live_target(spans: list[dict], kind: str) -> dict | None:
-    for span in spans:
-        if fragment(span.get("text") or "", kind):
-            return span
-    return None
+def _hint_key(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def _live_target(spans: list[dict], kind: str, hint: str = "") -> dict | None:
+    hits = [span for span in spans if fragment(span.get("text") or "", kind)]
+    wanted = _hint_key(hint)
+    if wanted:
+        for span in hits:
+            if wanted in _hint_key(span.get("text") or ""):
+                return span
+    return hits[0] if hits else None
 
 
 def _rapid_words(png: str) -> list[dict]:
@@ -707,13 +845,23 @@ def _closest_font(crop, text: str) -> tuple[str, float]:
         mask = gray > 140
     best_path = ""
     best_iou = -1.0
-    draw_h = max(48, int(mask.shape[0]))
+    # Compare at a fixed height. A church-poster crop is hundreds of megapixels at full size.
+    draw_h = _COMPARE_PX
+    if int(mask.shape[0]) > draw_h:
+        new_w = max(8, int(round(mask.shape[1] * draw_h / float(mask.shape[0]))))
+        mask = cv2.resize(mask.astype(np.uint8) * 255, (new_w, draw_h), interpolation=cv2.INTER_AREA) > 127
+    sample = (text or "")[:80]
+    canvas_w = min(1024, draw_h * max(2, len(sample) + 1))
+    canvas_h = draw_h + 8
     for path in paths:
         if not os.path.isfile(path):
             continue
-        font = ImageFont.truetype(path, draw_h)
-        canvas = Image.new("L", (draw_h * max(8, len(text) + 1), draw_h + 8), 255)
-        ImageDraw.Draw(canvas).text((0, 2), text, font=font, fill=0)
+        try:
+            font = ImageFont.truetype(path, draw_h)
+            canvas = Image.new("L", (canvas_w, canvas_h), 255)
+            ImageDraw.Draw(canvas).text((0, 2), sample, font=font, fill=0)
+        except (OSError, ValueError):
+            continue
         plate = np.array(canvas)
         cols = np.where(plate.min(axis=0) < 200)[0]
         rows = np.where(plate.min(axis=1) < 200)[0]
@@ -749,7 +897,7 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             if parsed["kind"] == "heading":
                 span = _heading_span(spans)
             else:
-                span = _live_target(spans, parsed["kind"])
+                span = _live_target(spans, parsed["kind"], str(parsed.get("oldHint") or ""))
             if span:
                 old = span["text"]
                 shown_old = old
@@ -774,7 +922,14 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                             "actions": [],
                         }
                     shown_old, shown_new, new_text = swapped
-                probe = new_text + _stray_chars(parsed["kind"], parsed.get("new") or "")
+                # Redact and draw only the words that change. A label such as PHONE: or Call stays.
+                # Empty icon brackets against a phone are part of that change.
+                placed_old = shown_old or old
+                if parsed["kind"] == "phone":
+                    placed_old = phone_with_icon(old, placed_old)
+                placed_new = shown_new if parsed["kind"] != "heading" else new_text
+                partial = " ".join(placed_old.split()) != " ".join(str(old).split())
+                probe = placed_new + _stray_chars(parsed["kind"], parsed.get("new") or "")
                 face = _resolve_face(doc, page, str(span.get("font") or ""), probe, span.get("bbox"))
                 if face.get("fontSource") == "none":
                     return {"ok": False, "reply": face.get("reply") or "Nothing was changed.", "actions": []}
@@ -784,13 +939,14 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                 mid = (float(page.rect.x0) + float(page.rect.x1)) / 2.0
                 proposal.update({
                     "mode": "live-text",
-                    "old": old,
-                    "new": new_text,
+                    "old": placed_old,
+                    "new": placed_new,
+                    "line": new_text,
                     "shownOld": shown_old,
                     "shownNew": shown_new,
                     "bbox": bbox,
                     "origin": list(span.get("origin") or (span["bbox"][0], span["bbox"][3])),
-                    "align": "center" if abs(center - mid) <= 14 else "left",
+                    "align": "left" if partial else ("center" if abs(center - mid) <= 14 else "left"),
                     "size": float(span.get("size") or 12) * (float(parsed["factor"]) if parsed["kind"] == "heading" else 1.0),
                     "font": str(span.get("font") or ""),
                     "fontfile": face["fontfile"],
@@ -846,6 +1002,10 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     _apply_proposal(src, staged, proposal)
     _render_page(staged, after)
     proposal["staged"] = staged
+    blocked = _preview_block(src, staged, proposal)
+    if blocked:
+        _save(key, {"proposal": {}, "undo": "", "current": src})
+        return {"ok": False, "reply": blocked, "actions": [], "pending": False}
     _save(key, {"proposal": proposal, "undo": "", "current": src})
     label = ""
     if proposal.get("faceLabel") or proposal.get("fontfile"):
@@ -1023,7 +1183,45 @@ def _phone_run(group: list[dict]) -> dict | None:
     }
 
 
+def _stack_day_and_month(words: list[dict]) -> list[dict]:
+    """A poster often paints the day above the month. Read that pair as one date."""
+    month = re.compile(
+        r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)$",
+        re.I,
+    )
+    days = [word for word in words if re.fullmatch(r"\d{1,2}", str(word.get("text") or "").strip())]
+    months = [word for word in words if month.match(str(word.get("text") or "").strip())]
+    stacked = []
+    for day in days:
+        day_mid = day["left"] + day["width"] / 2.0
+        for name in months:
+            if name["top"] < day["top"] + day["height"] * 0.4:
+                continue
+            gap = name["top"] - (day["top"] + day["height"])
+            if gap > max(12.0, day["height"] * 0.85):
+                continue
+            if day_mid < name["left"] - day["width"] * 0.35 or day_mid > name["left"] + name["width"] + day["width"] * 0.35:
+                continue
+            left = min(day["left"], name["left"])
+            top = min(day["top"], name["top"])
+            right = max(day["left"] + day["width"], name["left"] + name["width"])
+            bottom = max(day["top"] + day["height"], name["top"] + name["height"])
+            stacked.append({
+                "text": f"{str(day['text']).strip()} {str(name['text']).strip()}",
+                "left": int(left),
+                "top": int(top),
+                "width": max(1, int(right - left)),
+                "height": max(1, int(bottom - top)),
+                "line": ("stacked", str(int(top))),
+            })
+            break
+    return stacked
+
+
 def _select_hit(words: list[dict], parsed: dict) -> dict | None:
+    if parsed.get("kind") == "date":
+        words = list(words) + _stack_day_and_month(words)
+
     def boxed(group: list[dict], joined: str) -> dict:
         group.sort(key=lambda item: item["left"])
         return {
@@ -1036,6 +1234,11 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
 
     if parsed["kind"] in ("phone", "date", "time", "venue"):
         singles = [word for word in words if fragment(word.get("text") or "", parsed["kind"])]
+        hint = _hint_key(str(parsed.get("oldHint") or ""))
+        if hint and singles:
+            hinted = [word for word in singles if hint in _hint_key(fragment(word.get("text") or "", parsed["kind"]))]
+            if hinted:
+                singles = hinted
         if singles:
             # The number's own box, not a neighbouring line that happens to share its height.
             word = min(singles, key=lambda item: (len(item["text"]), item["width"] * item["height"]))
@@ -1067,9 +1270,10 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
                 continue
         else:
             joined = " ".join(item["text"] for item in sorted(group, key=lambda item: item["left"]))
-            if not pattern.search(joined):
+            found = fragment(joined, parsed["kind"])
+            if not found:
                 continue
-            candidate = boxed(group, joined)
+            candidate = boxed(group, found)
         if hit is None or len(candidate["text"]) > len(hit["text"]):
             hit = candidate
     return hit
@@ -1231,6 +1435,7 @@ def _apply_proposal(src: str, dest: str, proposal: dict) -> None:
                     "new": move["old"],
                     "origin": [move["origin"][0] + move["dx"], move["origin"][1] + move["dy"]],
                     "fontfile": move.get("fontfile") or "helv",
+                    "shifted": True,
                 })
         elif mode == "logo":
             _resize_logo(doc, page, proposal)
@@ -1350,9 +1555,22 @@ def _trace_chars(page, old_text: str, loose) -> list:
             center = fitz.Point((box.x0 + box.x1) / 2.0, (box.y0 + box.y1) / 2.0)
             if not loose_rect.contains(center):
                 continue
-        if norm == wanted:
-            if exact is None or len(chars) > len(exact):
-                exact = chars
+        sliced = None
+        found_at = text.find(wanted) if wanted else -1
+        if found_at >= 0 and found_at + len(wanted) <= len(chars) and (norm == wanted or wanted in text):
+            sliced = chars[found_at:found_at + len(wanted)]
+            sx0 = min(char[3][0] for char in sliced)
+            sy0 = min(char[3][1] for char in sliced)
+            sx1 = max(char[3][2] for char in sliced)
+            sy1 = max(char[3][3] for char in sliced)
+            box = fitz.Rect(sx0, sy0, sx1, sy1)
+        if loose_rect and sliced is not None:
+            center = fitz.Point((box.x0 + box.x1) / 2.0, (box.y0 + box.y1) / 2.0)
+            if not loose_rect.contains(center):
+                sliced = None
+        if sliced is not None:
+            if exact is None or (norm == wanted and len(sliced) >= len(exact)) or len(sliced) < len(exact):
+                exact = sliced
             continue
         if norm in wanted:
             partial.append((box.x0, box.y0, box, chars))
@@ -1391,7 +1609,7 @@ def _other_span_rects(page, old_text: str) -> list:
         for line in block.get("lines") or []:
             for span in line.get("spans") or []:
                 text = " ".join(str(span.get("text") or "").split())
-                if not text or text == wanted:
+                if not text or text == wanted or wanted in text or text in wanted:
                     continue
                 boxes.append(fitz.Rect(span["bbox"]))
     return boxes
@@ -1530,18 +1748,30 @@ def _fit_on_line(page, text: str, old_text: str, size: float, fontfile: str, ali
     pad = 3.0
     origin_x = float(origin[0])
     origin_y = float(origin[1])
+    span_width = float(ink.width) if ink is not None and ink.width > 1 else old_width
     if align == "center" and ink is not None:
-        room = max(4.0, column.width - 2 * pad)
+        room = span_width
     else:
         room = max(4.0, (column.x1 - pad) - origin_x)
     shrunk = False
-    if width > old_width + 0.4 and width > room:
+    # A centred line, including a venue, stays inside the old width.
+    # A picture's words do too: there is no column to grow into.
+    # A left-aligned live line may use the rest of its column.
+    if align in ("center", "fit") and width > span_width + 0.4:
+        size = max(4.0, size * (span_width / width) * 0.98)
+        width = float(face.text_length(text, fontsize=size))
+        shrunk = True
+    elif width > old_width + 0.4 and width > room:
         size = max(4.0, size * (room / width) * 0.98)
         width = float(face.text_length(text, fontsize=size))
         shrunk = True
     if align == "center" and ink is not None:
         center = (ink.x0 + ink.x1) / 2.0
         origin_x = center - width / 2.0
+    elif align == "fit" and ink is not None:
+        origin_x = float(ink.x0)
+    elif ink is not None and origin_x + width > ink.x1 + 0.4 and width <= span_width + 0.6:
+        origin_x = ink.x1 - width
     return (origin_x, origin_y), size, shrunk, width
 
 
@@ -1555,10 +1785,8 @@ def _replace_span(page, proposal: dict) -> None:
         ink = fitz.Rect(loose)
     origin = trace_origin or proposal.get("origin") or (ink.x0 if ink else 0, ink.y1 if ink else 0)
     asked = proposal.get("origin")
-    if asked and len(asked) >= 2 and trace_origin:
-        # A move hands in a shifted point. An in-place edit keeps the drawn baseline.
-        if abs(float(asked[0]) - float(trace_origin[0])) > 0.6 or abs(float(asked[1]) - float(trace_origin[1])) > 0.6:
-            origin = (float(asked[0]), float(asked[1]))
+    if proposal.get("shifted") and asked and len(asked) >= 2:
+        origin = (float(asked[0]), float(asked[1]))
     size = float(proposal.get("size") or 12)
     text = str(proposal.get("new") or "")
     rgb = proposal.get("rgb")
@@ -1571,10 +1799,13 @@ def _replace_span(page, proposal: dict) -> None:
     proposal["shrunk"] = bool(proposal.get("shrunk") or shrunk)
     proposal["size"] = size
     if ink is not None:
-        placed = fitz.Rect(origin[0], ink.y0, origin[0] + width, ink.y1)
-        guard = fitz.Rect(min(ink.x0, placed.x0), ink.y0, max(ink.x1, placed.x1), ink.y1)
-        proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
-        proposal["guardBox"] = [guard.x0, guard.y0, guard.x1, guard.y1]
+        placed = fitz.Rect(float(origin[0]), ink.y0, float(origin[0]) + width, ink.y1)
+        if str(proposal.get("align") or "") == "center":
+            box = fitz.Rect(ink)
+        else:
+            box = fitz.Rect(min(ink.x0, placed.x0), ink.y0, max(ink.x1, placed.x1), ink.y1)
+        proposal["editBox"] = [box.x0, box.y0, box.x1, box.y1]
+        proposal["guardBox"] = [box.x0, box.y0, box.x1, box.y1]
     if isinstance(redact, list):
         for piece in redact:
             page.add_redact_annot(piece)
@@ -1589,11 +1820,21 @@ def _replace_span(page, proposal: dict) -> None:
     )
     # A Canva heading can also be painted into the picture under the live letters.
     # Clear only this word's leftover pixels, so the live copy is the one that remains.
-    _clear_baked(page, ink)
+    cleared = _clear_baked(page, ink)
+    if cleared is not None and proposal.get("editBox"):
+        box = fitz.Rect(proposal["editBox"])
+        box = fitz.Rect(
+            min(box.x0, cleared.x0),
+            min(box.y0, cleared.y0),
+            max(box.x1, cleared.x1),
+            max(box.y1, cleared.y1),
+        )
+        proposal["editBox"] = [box.x0, box.y0, box.x1, box.y1]
+        proposal["guardBox"] = [box.x0, box.y0, box.x1, box.y1]
     _place_font_text(page, origin, text, size, rgb, fontfile)
 
 
-def _clear_baked(page, ink) -> None:
+def _clear_baked(page, ink):
     """Inpaint word-shaped ink that is still in an image after the live glyphs are gone.
 
     The colour sample is a thin ring just outside the word, so the baked letters
@@ -1638,28 +1879,47 @@ def _clear_baked(page, ink) -> None:
     # panel is still flat when most of the ring matches the median.
     near = np.linalg.norm(ring_f - background, axis=1) <= 28.0
     flat = float(near.mean()) if near.size else 0.0
-    crop = image[iy0:iy1, ix0:ix1]
-    distance = np.linalg.norm(crop.astype(np.float32) - background, axis=2)
-    mask = distance > 18.0
-    share = float(mask.mean()) if mask.size else 0.0
+    distance = np.linalg.norm(image.astype(np.float32) - background, axis=2)
+    import cv2
+
+    core = np.zeros(image.shape[:2], dtype=np.uint8)
+    core[iy0:iy1, ix0:ix1] = 1
+    reach = max(1, int(round(1.5 * scale)))
+    search = cv2.dilate(core, np.ones((reach * 2 + 1, reach * 2 + 1), np.uint8), iterations=1)
+    strokes = ((distance > 22.0) & (search > 0)).astype(np.uint8)
+    count, labels = cv2.connectedComponents(strokes)
+    mask = np.zeros(strokes.shape, dtype=bool)
+    core_bool = core.astype(bool)
+    for index in range(1, count):
+        comp = labels == index
+        if np.any(comp & core_bool):
+            mask |= comp
+    share = float(mask[iy0:iy1, ix0:ix1].mean()) if mask[iy0:iy1, ix0:ix1].size else 0.0
     # Letters on a flat panel can fill a tight box. A photograph's ring does not
     # match one colour, so that case is left alone.
     if int(mask.sum()) < 8 or share > 0.85:
-        return
+        return None
     if flat < 0.55 and share > 0.45:
-        return
-    import cv2
-
-    mask_u8 = cv2.dilate(mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
-    painted = cv2.inpaint(crop, mask_u8, 3, cv2.INPAINT_TELEA)
+        return None
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    crop_mask = mask[y0:y1, x0:x1]
+    painted = cv2.inpaint(image[y0:y1, x0:x1], crop_mask.astype(np.uint8) * 255, 2, cv2.INPAINT_TELEA)
+    patch = image[y0:y1, x0:x1].copy()
+    patch[crop_mask] = painted[crop_mask]
+    patch = np.ascontiguousarray(patch)
     target = fitz.Rect(
-        outer.x0 + ix0 / scale,
-        outer.y0 + iy0 / scale,
-        outer.x0 + ix1 / scale,
-        outer.y0 + iy1 / scale,
+        outer.x0 + x0 / scale,
+        outer.y0 + y0 / scale,
+        outer.x0 + x1 / scale,
+        outer.y0 + y1 / scale,
     )
-    overlay = fitz.Pixmap(fitz.csRGB, painted.shape[1], painted.shape[0], np.ascontiguousarray(painted).tobytes(), 0)
+    overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], patch.tobytes(), 0)
     page.insert_image(target, pixmap=overlay, overlay=True)
+    return target
 
 
 def _resize_logo(doc, page, proposal: dict) -> None:
@@ -1687,8 +1947,13 @@ def _raster_ink(image, left: int, top: int, width: int, height: int):
     import numpy as np
 
     height_px, width_px = image.shape[:2]
-    grow_y = max(4, int(round(height * 1.5)))
-    grow_x = max(2, int(round(width * 0.04)))
+    # A short reader box has to grow to the whole glyph. A day-over-month box is
+    # already the whole date, and a big grow would swallow the line underneath.
+    if height > 80:
+        grow_y, grow_x = 8, 4
+    else:
+        grow_y = max(4, int(round(height * 1.5)))
+        grow_x = max(2, int(round(width * 0.04)))
     win_y0, win_y1 = max(0, top - grow_y), min(height_px, top + height + grow_y)
     win_x0, win_x1 = max(0, left - grow_x), min(width_px, left + width + grow_x)
     window = image[win_y0:win_y1, win_x0:win_x1]
@@ -1713,7 +1978,8 @@ def _raster_ink(image, left: int, top: int, width: int, height: int):
         if xs.max() < box_x0 or xs.min() >= box_x1 or ys.max() < box_y0 or ys.min() >= box_y1:
             continue
         center_y = float(ys.mean())
-        if center_y < box_y0 - height * 0.35 or center_y > box_y1 + height * 0.35:
+        slack = min(height * 0.35, 14)
+        if center_y < box_y0 - slack or center_y > box_y1 + slack:
             continue
         keep[ys, xs] = 255
     if int(keep.sum()) < 255:
@@ -1755,11 +2021,11 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     page.insert_image(clip, pixmap=overlay, overlay=True)
     ink = fitz.Rect(clip)
     fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
-    size = max(5.0, ink.height * 0.92) * float(proposal.get("sizeFactor") or 1.0)
-    origin_y = ink.y1 - ink.height * 0.12
+    size = max(5.0, min(ink.height, ink.width) * 0.92) * float(proposal.get("sizeFactor") or 1.0)
+    origin_y = ink.y1 - max(2.0, ink.height * 0.12)
     center_x = (ink.x0 + ink.x1) / 2.0
     page_mid = (page.rect.x0 + page.rect.x1) / 2.0
-    align = "center" if abs(center_x - page_mid) <= 14 else "left"
+    align = "center" if abs(center_x - page_mid) <= 14 else "fit"
     origin, size, shrunk, text_width = _fit_on_line(
         page,
         str(proposal.get("new") or ""),
@@ -1770,11 +2036,12 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
         (ink.x0, origin_y),
         ink,
     )
+    # A stacked day-over-month is tall. Sit the new line on the day, not on the time underneath.
+    if ink.height > size * 1.6:
+        origin = (origin[0], ink.y0 + size * 0.92)
     proposal["shrunk"] = bool(shrunk)
     proposal["editBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
-    placed = fitz.Rect(origin[0], ink.y0, origin[0] + text_width, ink.y1)
-    guard = fitz.Rect(min(ink.x0, placed.x0), ink.y0, max(ink.x1, placed.x1), ink.y1)
-    proposal["guardBox"] = [guard.x0, guard.y0, guard.x1, guard.y1]
+    proposal["guardBox"] = [ink.x0, ink.y0, ink.x1, ink.y1]
     # The reply uses the guard, which includes a longer replacement on the same line.
     color = found["color"]
     rgb = (float(color[0]) / 255.0, float(color[1]) / 255.0, float(color[2]) / 255.0)
@@ -1829,6 +2096,28 @@ def _render_rgb(path: str, scale: float = 2.5):
         return image
     finally:
         doc.close()
+
+
+def _rapid_line(image) -> str:
+    """A second reader for white type on a photograph, which Tesseract often skips."""
+    try:
+        import cv2
+        from ocr_reader import local_rows
+
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if getattr(image, "ndim", 0) == 3 else image
+        rows = local_rows(bgr) or []
+    except Exception:
+        return ""
+    parts = []
+    for item in rows:
+        try:
+            text = str(item.get("text") or item.get("txt") or "") if isinstance(item, dict) else str(item[1] or "")
+        except Exception:
+            text = ""
+        text = text.strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
 
 
 def _tesseract(image, psm: str, tsv: bool) -> str:
@@ -1896,6 +2185,100 @@ def _marked_safe(path: str, marked) -> set[tuple[str, str]]:
         return {("unreadable", "not embedded")}
 
 
+def _plain_block(problems: list[str]) -> str:
+    """What to tell Ian when the preview is not good enough to apply."""
+    blob = " ".join(problems or [])
+    sentences = []
+    if "pixels outside" in blob or "page size changed" in blob:
+        sentences.append("The preview changed the page outside those words.")
+    if "region OCR" in blob:
+        sentences.append("I could not read the new words in the preview.")
+    if "page OCR" in blob:
+        sentences.append("Other words on the page changed.")
+    if "glyph" in blob:
+        sentences.append("Some of the new letters did not render.")
+    if "font not embedded" in blob:
+        sentences.append("The new font did not embed.")
+    if not sentences:
+        sentences.append("The preview did not pass the checks.")
+    return " ".join(sentences) + " I have not changed the file, and there is nothing to apply."
+
+
+def _glyph_problems(pdf: str, text: str, fontfile: str, box) -> list[str]:
+    """Every letter of the new words has to extract and paint. One shared glyph does not count."""
+    import pymupdf as fitz
+    import numpy as np
+
+    letters = [char for char in (text or "") if not char.isspace()]
+    if not letters:
+        return []
+    problems = []
+    if fontfile and not _font_file_usable(fontfile, text):
+        problems.append("glyph did not render")
+    doc = fitz.open(pdf)
+    try:
+        page = doc[0]
+        got = page.get_text("text") or ""
+        if _hint_key(text) not in _hint_key(got):
+            problems.append("glyph did not render")
+        wanted = _hint_key(text)
+        for block in (page.get_text("dict") or {}).get("blocks") or []:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines") or []:
+                for span in line.get("spans") or []:
+                    if wanted not in _hint_key(span.get("text") or ""):
+                        continue
+                    if str(span.get("font") or "").strip() in ("(null)", "null", ""):
+                        problems.append("glyph did not render")
+        if box and len(box) >= 4 and fontfile and os.path.isfile(fontfile):
+            rect = fitz.Rect(box) & page.rect
+            grown = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2) & page.rect
+            if grown.width > 2 and grown.height > 2:
+                pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=grown, alpha=False, colorspace=fitz.csRGB)
+                image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+                frame = max(2, int(2 * 4))
+                border = np.concatenate([
+                    image[:frame].reshape(-1, 3),
+                    image[-frame:].reshape(-1, 3),
+                    image[:, :frame].reshape(-1, 3),
+                    image[:, -frame:].reshape(-1, 3),
+                ]).astype(np.float32)
+                background = np.median(border, axis=0)
+                delta = np.linalg.norm(image.astype(np.float32) - background, axis=2)
+                cols = int((delta.max(axis=0) > 18).sum()) if delta.size else 0
+                try:
+                    from PIL import ImageFont
+
+                    drawn = ImageFont.truetype(fontfile, max(8, int(round(rect.height * 4))))
+                    expected = float(drawn.getlength(text))
+                except (OSError, ValueError):
+                    expected = float(len(letters) * rect.height * 2)
+                if float(border.std()) < 30.0 and cols < max(6.0, expected * 0.45):
+                    problems.append("glyph did not render")
+    finally:
+        doc.close()
+    if problems:
+        return ["glyph did not render"]
+    return []
+
+
+def _preview_block(before_pdf: str, after_pdf: str, proposal: dict) -> str:
+    """Gates (a), (b), (c) and a rendered glyph, before Apply is offered."""
+    if proposal.get("kind") not in ("phone", "date", "time", "venue"):
+        return ""
+    if proposal.get("mode") not in ("live-text", "raster-text"):
+        return ""
+    box = proposal.get("editBox") or proposal.get("bbox")
+    old = str(proposal.get("shownOld") or proposal.get("old") or "")
+    new = str(proposal.get("shownNew") or proposal.get("new") or "")
+    problems = visual_gates(before_pdf, after_pdf, box, old, new)
+    problems.extend(_glyph_problems(after_pdf, new, str(proposal.get("fontfile") or ""), box))
+    if not problems:
+        return ""
+    return _plain_block(problems)
+
+
 def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_text: str) -> list[str]:
     """Four gates. A neighbour deleted, a flat block, a missing new word, or a new unembedded font fails.
 
@@ -1944,6 +2327,7 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
         readings.append(" ".join(item[4] for item in _tsv_words(bigger)))
         readings.append(_tesseract(bigger, "6", False))
         readings.append(_tesseract(bigger, "7", False))
+        readings.append(_rapid_line(bigger))
     inside = []
     for left, top, width, height, text in after_words:
         cx = left + width / 2.0

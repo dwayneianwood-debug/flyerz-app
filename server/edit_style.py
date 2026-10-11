@@ -59,8 +59,45 @@ def _clean_phone(text: str) -> str:
     return cleaned.strip()
 
 
+def phone_with_icon(line: str, phone: str) -> str:
+    """Empty icon brackets sitting against the number are replaced with it.
+
+    A word such as Call stays. The brackets are not a phone number, and they
+    must not remain after the number changes.
+    """
+    if not phone:
+        return phone
+    idx = (line or "").find(phone)
+    if idx < 0:
+        return phone
+    start = idx
+    mark = re.search(r"(?:[®©™]\s*\)|\(\s*\))\s*$", line[:idx])
+    if mark:
+        start = mark.start()
+    end = idx + len(phone)
+    tail = re.match(r"\s*(?:[®©™]\s*\)|\(\s*\))", line[end:])
+    if tail:
+        end += tail.end()
+    return (line[start:end] or phone).strip()
+
+
+def _date_not_in_phone(text: str) -> str:
+    """A date on the page. Digits inside a phone number are not a date."""
+    for match in DATE_IN_TEXT.finditer(text or ""):
+        inside = False
+        for phone in PHONE_IN_TEXT.finditer(text or ""):
+            if phone.start() <= match.start() and match.end() <= phone.end():
+                inside = True
+                break
+        if not inside:
+            return match.group(0)
+    return ""
+
+
 def fragment(text: str, kind: str) -> str:
-    pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(kind)
+    if kind == "date":
+        return _date_not_in_phone(text)
+    pattern = {"phone": PHONE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(kind)
     if pattern is None:
         return ""
     match = pattern.search(text or "")
@@ -84,9 +121,65 @@ def restyle(kind: str, original: str, requested: str) -> str:
     return requested.strip()
 
 
+def _case_like(sample: str, word: str) -> bool:
+    """A trailing place name keeps going only while the capitals match."""
+    sample_letters = [char for char in sample if char.isalpha()]
+    word_letters = [char for char in word if char.isalpha()]
+    if not sample_letters or not word_letters:
+        return False
+    if all(char.isupper() for char in sample_letters):
+        return all(char.isupper() for char in word_letters)
+    if all(char.islower() for char in sample_letters):
+        return all(char.islower() for char in word_letters)
+    return word[:1].isupper()
+
+
+def _venue_region(text: str) -> tuple[int, int] | None:
+    """The whole venue on this line, including the suburb after the street."""
+    match = VENUE_IN_TEXT.search(text or "")
+    if not match:
+        return None
+    start, end = match.start(), match.end()
+    cursor = end
+    while True:
+        extra = re.match(r"\s+([A-Za-z][A-Za-z0-9'’.-]*)", text[cursor:])
+        if not extra or not _case_like(match.group(0), extra.group(1)):
+            break
+        cursor += extra.end()
+    return start, cursor
+
+
+def _drop_words_already_typed(suffix: str, styled: str) -> str:
+    """A word Ian already typed must not be left sitting after the new line."""
+    typed = {re.sub(r"[^A-Za-z0-9]", "", word).upper() for word in (styled or "").split()}
+    typed.discard("")
+    kept = []
+    for word in (suffix or "").split():
+        token = re.sub(r"[^A-Za-z0-9]", "", word).upper()
+        if token and token in typed:
+            continue
+        kept.append(word)
+    if not kept:
+        return ""
+    lead = " " if (suffix or "")[:1].isspace() else ""
+    return lead + " ".join(kept)
+
+
 def swap_text(text: str, kind: str, requested: str) -> tuple[str, str, str] | None:
     """Return the found words, the styled replacement, and the full line."""
-    pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT, "venue": VENUE_IN_TEXT}.get(kind)
+    if kind == "venue":
+        bounds = _venue_region(text or "")
+        if not bounds:
+            return None
+        start, end = bounds
+        raw = text[start:end]
+        styled = restyle("venue", raw, requested)
+        if not styled:
+            return None
+        prefix = text[:start]
+        suffix = _drop_words_already_typed(text[end:], styled)
+        return raw.strip(), styled, f"{prefix}{styled}{suffix}"
+    pattern = {"phone": PHONE_IN_TEXT, "date": DATE_IN_TEXT, "time": TIME_IN_TEXT}.get(kind)
     match = pattern.search(text or "") if pattern is not None else None
     if not match:
         return None
