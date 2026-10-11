@@ -464,7 +464,7 @@ def _overlap_time() -> None:
     if time_box is None or (time_box & sunday).is_empty or (time_box & evening).is_empty:
         problems.append("fixture em-boxes do not overlap")
     preview = os.path.join(ROOT, "preview-overlap-time")
-    asked = propose(src, "change the time to 7:30 pm", "overlap-time", preview)
+    asked = propose(src, "change the time from 10:00AM to 7:30 pm", "overlap-time", preview)
     reply = (asked or {}).get("reply") or ""
     TRANSCRIPT.append(f"## overlap-time\n{reply}\n")
     staged = os.path.join(preview, "staged.pdf")
