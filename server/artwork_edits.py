@@ -1037,6 +1037,7 @@ def _incomplete_edit(message: str) -> dict | None:
 
 # A long side past this is shrunk before the reader runs. The word boxes are
 # mapped back onto the original pixels, so the font match still sees the real crop.
+# 1800 glues "9" and "10" into one token on the church poster. 1280 keeps them apart.
 _OCR_LONG = 1280
 _OCR_MEM: dict[str, list] = {}
 
@@ -1877,6 +1878,9 @@ _TIME_TOKEN = re.compile(r"^\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)$", re.I)
 _DAY_TOKEN = re.compile(r"^\d{1,2}$")
 # A raster face further than this from the letters is not offered.
 _FONT_SCORE_LIMIT = 70.0
+# White type on a person can be swallowed into the letter mask. The ring then
+# looks flat, so a clean plane is not enough. A real date mask stays under this.
+_SWALLOW_SHARE = 0.55
 # Digit height may move this far and still be the same size.
 _SIZE_TOLERANCE = 0.18
 # Stroke thickness versus the original. Heavier or lighter than this is refused.
@@ -3321,13 +3325,23 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     wide = np.zeros(found["mask"].shape, np.uint8)
     wide[ry0:ry1, rx0:rx1] = 255
     wide_painted, wide_spread = _paint_plane(window, wide)
+    win_x0, win_y0, _win_x1, _win_y1 = found["win"]
+    ix0 = max(0, left - win_x0)
+    iy0 = max(0, top - win_y0)
+    ix1 = min(found["mask"].shape[1], ix0 + max(1, width))
+    iy1 = min(found["mask"].shape[0], iy0 + max(1, height))
+    inside = found["mask"][iy0:iy1, ix0:ix1]
+    share = float((inside > 0).mean()) if inside.size else 1.0
+    # The person was painted as the letters. Do not offer that fill.
+    if share > _SWALLOW_SHARE and (wide_painted is None or wide_spread > 18.0):
+        proposal["refuse"] = SAFE_EDIT
+        return
     if wide_painted is not None and wide_spread <= 18.0:
         painted = wide_painted
         found = dict(found)
         found["bounds"] = (rx0, ry0, rx1, ry1)
     x0, y0, x1, y1 = found["bounds"]
     patch = painted[y0:y1, x0:x1]
-    win_x0, win_y0, _win_x1, _win_y1 = found["win"]
     clip = fitz.Rect((win_x0 + x0) / scale, (win_y0 + y0) / scale, (win_x0 + x1) / scale, (win_y0 + y1) / scale)
     ink = fitz.Rect(clip)
     fontfile = proposal.get("fontfile") or ((_candidate_fonts() or [""])[0])
