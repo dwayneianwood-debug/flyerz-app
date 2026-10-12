@@ -13,11 +13,16 @@ import os
 
 import numpy as np
 
-# About 4.4 mm at 300 dpi. Wide enough for a low-resolution JPEG block and a
-# page that is a fraction of a millimetre short, and short of a real border.
-SLIVER_CAP_PX = 52
-# CIE76. The press file's 5 mm bleed has to stay this close to the artwork.
+# About 1.5 mm at 300 dpi. A 1 px white column at 72 ppi becomes about 4 device
+# pixels, and a page 0.5 mm short is about 6. A real 2.5 mm border is left alone:
+# looking 4 mm in was treating that border as a sliver and comparing the bleed
+# with the darker artwork behind it.
+SLIVER_CAP_PX = 18
+# CIE76. A flat band has to stay this close. A textured continuation can sit a
+# little further off without being a different colour painted into the bleed.
 BLEED_DELTA_E = 10.0
+_HARD_DELTA_E = 22.0
+_FLAT_STD = 18.0
 _SAMPLE_PX = 3
 
 
@@ -34,6 +39,18 @@ def _is_light(pixels: np.ndarray) -> np.ndarray:
         pale = (plate[..., 0] < 45.0) & (plate[..., 1] < 45.0) & (plate[..., 3] < 20.0) & (ink < 170.0)
         return (ink < 80.0) | pale
     return values[..., :3].mean(axis=-1) > 186.0
+
+
+def _is_paper(pixels: np.ndarray) -> np.ndarray:
+    """Pure paper, including the 1 px white column Canva leaves on a photo.
+
+    A pale shirt can sit close to that column in CMYK distance. Paper is still
+    not the colour that should be continued.
+    """
+    values = np.asarray(pixels, np.float32)
+    if values.shape[-1] >= 4:
+        return values[..., :4].sum(axis=-1) < 12.0
+    return values[..., :3].mean(axis=-1) > 248.0
 
 
 def fringe_depths(strip: np.ndarray) -> np.ndarray:
@@ -67,7 +84,10 @@ def fringe_depths(strip: np.ndarray) -> np.ndarray:
     else:
         lighter = (window[..., :3].mean(axis=-1) - anchor[:, None, :3].mean(axis=-1)) >= 18.0
     distance = np.linalg.norm(window - anchor[:, None, :], axis=2)
-    fringe = (light | lighter) & (distance >= 36.0)
+    # Paper is a sliver even when it is close to a pale neighbour. Artwork that
+    # is merely lighter than the anchor still has to be far from that anchor,
+    # and the cap is short enough that a real pale border fills it.
+    fringe = _is_paper(window) | ((light | lighter) & (distance >= 36.0))
     ink = ~fringe
     has_ink = ink.any(axis=1)
     first = np.argmax(ink, axis=1).astype(np.int32)
@@ -150,15 +170,26 @@ def _delta_e(left, right) -> float:
 
 
 def _mean_rgb(pixels: np.ndarray) -> np.ndarray:
-    """Robust colour of a band. One white sliver column does not move it."""
+    """Robust colour of a band. One white sliver column does not move it.
+
+    A light edge that is most of the band is the artwork. Only a few light
+    pixels are dropped.
+    """
     flat = np.asarray(pixels, np.float32).reshape(-1, 3)
     if flat.size < 3:
         return np.zeros(3, np.float32)
     if flat.shape[0] > 8:
         light = flat.mean(axis=1) > 186.0
-        if light.any() and not light.all():
+        if light.any() and not light.all() and float(light.mean()) < 0.15:
             flat = flat[~light]
     return np.median(flat, axis=0)
+
+
+def _std_rgb(pixels: np.ndarray) -> float:
+    flat = np.asarray(pixels, np.float32).reshape(-1, 3)
+    if flat.size < 3:
+        return 0.0
+    return float(flat.std())
 
 
 def _side_report(name: str, art: np.ndarray, bleed: np.ndarray, outer: np.ndarray, seam: np.ndarray) -> dict:
@@ -174,14 +205,20 @@ def _side_report(name: str, art: np.ndarray, bleed: np.ndarray, outer: np.ndarra
     if bleed.size < 3:
         flags.append("missing")
     else:
-        light = float(bleed_mean.mean()) > 186.0 and float(art_mean.mean()) < 170.0
-        flat = float(np.std(bleed.astype(np.float32))) < 18.0
-        if light and flat:
+        art_level = float(art_mean.mean())
+        bleed_std = _std_rgb(bleed)
+        outer_std = _std_rgb(outer)
+        # A flat light band is the grey/white strip, including one that fills
+        # only the outer bleed. A continuation can differ by dE 10–19 and
+        # still be the artwork. A real miss sits near 40.
+        light = float(bleed_mean.mean()) > 186.0 and art_level < 170.0 and bleed_std < _FLAT_STD
+        outer_light = float(outer_mean.mean()) > 186.0 and art_level < 170.0 and outer_std < _FLAT_STD
+        if light or (outer_light and outer_delta > BLEED_DELTA_E):
             flags.append("light-band")
-        if seam_delta > BLEED_DELTA_E:
-            flags.append("seam")
-        if max(delta, outer_delta) > BLEED_DELTA_E:
+        if max(delta, outer_delta) > _HARD_DELTA_E:
             flags.append("mismatch")
+        if seam_delta > _HARD_DELTA_E:
+            flags.append("seam")
     score = max(delta, outer_delta, seam_delta)
     if "missing" in flags:
         score = max(score, 100.0)
@@ -305,7 +342,8 @@ def staff_note(report: dict) -> str:
             if int(page.get("page") or 1) > 1 or len(report.get("pages") or []) > 1:
                 label = f"page {page.get('page')} {label}"
             flags = ",".join(side.get("flags") or [])
-            worst.append(f"{label} ΔE {float(side.get('delta') or 0):.0f}" + (f" ({flags})" if flags else ""))
+            # ASCII. A Windows console raises UnicodeEncodeError on the delta glyph.
+            worst.append(f"{label} dE {float(side.get('delta') or 0):.0f}" + (f" ({flags})" if flags else ""))
     detail = "; ".join(worst) or "the edge does not match"
     return (
         f"The bleed does not continue the artwork ({detail}). "

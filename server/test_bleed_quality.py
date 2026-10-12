@@ -1,9 +1,9 @@
 """Bleed continuation and the press-file check, for every file customers send.
 
 The table is the evidence: each file type, each upload path, and each print
-size. A row fails when the outer 5 mm does not stay within ΔE 10 of the
-artwork, when a real full bleed is repainted, or when a bad bleed is delivered
-as a silent green.
+size. A row fails when the outer 5 mm does not continue the artwork,
+when a real full bleed is repainted, or when a bad bleed is delivered
+as a silent green. Staff text uses "dE" so a Windows console can print it.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from bleed_builder import (  # noqa: E402
     check_press_pdf,
     fringe_depths,
     repair_light_fringe,
+    staff_note,
 )
 from press_ready_engine import compile_raster_canvas, compile_vector_press  # noqa: E402
 from quick_print import OFFICE_MESSAGE, decide_light, make_print_ready  # noqa: E402
@@ -84,10 +85,10 @@ def _worst(report: dict) -> tuple[bool, str]:
     sides = []
     for page in report.get("pages") or []:
         for side in page.get("sides") or []:
-            sides.append(f"p{page.get('page')} {side.get('side')} ΔE {side.get('delta')}")
+            sides.append(f"p{page.get('page')} {side.get('side')} dE {side.get('delta')}")
     if not sides and report.get("sides"):
         for side in report["sides"]:
-            sides.append(f"{side.get('side')} ΔE {side.get('delta')}")
+            sides.append(f"{side.get('side')} dE {side.get('delta')}")
     detail = ", ".join(sides) if sides else (report.get("note") or "")
     return bool(report.get("ok")), detail[:240]
 
@@ -224,7 +225,7 @@ class BleedQualityTest(unittest.TestCase):
 
     def test_a_failed_check_is_amber_for_staff_and_the_file_stays(self):
         note = (
-            "The bleed does not continue the artwork (right ΔE 40 (light-band,mismatch)). "
+            "The bleed does not continue the artwork (right dE 40 (light-band,mismatch)). "
             "Check that edge before printing."
         )
         info = decide_light({
@@ -242,6 +243,71 @@ class BleedQualityTest(unittest.TestCase):
         })
         self.assertEqual(clear["light"], "green")
 
+    def test_bleed_note_is_ascii(self):
+        note = staff_note({
+            "ok": False,
+            "pages": [{
+                "page": 1,
+                "ok": False,
+                "sides": [{"side": "right", "ok": False, "delta": 43, "flags": ["mismatch"]}],
+            }],
+        })
+        note.encode("ascii")
+        self.assertIn("right dE 43 (mismatch)", note)
+        self.assertNotIn("\u0394", note)
+
+    def test_paper_beside_a_pale_edge_is_not_the_sample(self):
+        pale = np.full((40, 50, 4), (16, 20, 1, 0), np.uint8)
+        pale[:, 0] = 0
+        self.assertGreaterEqual(int(fringe_depths(pale).min()), 1)
+
+    def test_a_light_border_stays_green_and_a_flat_grey_band_does_not(self):
+        """A 2.5 mm light edge that continues must stay green. Outer grey must not."""
+        from bleed_builder import _delta_e
+
+        height, width = 240, 320
+        trim = (40, 30, 280, 210)
+        edge = (246, 220, 140)
+        inner = (80, 90, 30)
+        page = np.empty((height, width, 3), np.uint8)
+        page[:, :] = inner
+        band = 14  # about 2.5 mm at the scale used below
+        page[:, trim[2] - band:trim[2]] = edge
+        page[:, trim[0]:trim[0] + band] = edge
+        page[trim[1]:trim[1] + band, :] = edge
+        page[trim[3] - band:trim[3], :] = edge
+        page[:, trim[2]:] = edge
+        page[:, :trim[0]] = edge
+        page[:trim[1], :] = edge
+        page[trim[3]:, :] = edge
+        scored = check_page_array(page, trim, (0, 0, width, height), 2.0)
+        self.assertTrue(scored["ok"], scored)
+
+        # Textured continuation, dE in the old false-amber band, stays green.
+        art = np.array([76, 92, 38], np.float32)
+        shift = np.array([110, 130, 60], np.float32)
+        self.assertGreater(_delta_e(art, shift), 10.0)
+        self.assertLess(_delta_e(art, shift), 19.0)
+        busy = np.empty((height, width, 3), np.uint8)
+        busy[:, :] = np.clip(art, 0, 255)
+        noise = np.random.default_rng(3).integers(-12, 13, (height, width, 3), dtype=np.int16)
+        bleed = np.clip(shift.astype(np.int16) + noise[:, trim[2]:], 0, 255).astype(np.uint8)
+        busy[:, trim[2]:] = bleed
+        busy[:, :trim[0]] = np.clip(shift.astype(np.int16) + noise[:, :trim[0]], 0, 255).astype(np.uint8)
+        scored = check_page_array(busy, trim, (0, 0, width, height), 2.0)
+        self.assertTrue(scored["ok"], scored)
+
+        grey = np.empty((height, width, 3), np.uint8)
+        grey[:, :] = inner
+        right_span = width - trim[2]
+        outer = max(1, int(round(right_span * 0.64)))
+        grey[:, trim[2] + (right_span - outer):] = (218, 215, 211)
+        grey[:, :outer] = (218, 215, 211)
+        scored = check_page_array(grey, trim, (0, 0, width, height), 2.0)
+        self.assertFalse(scored["ok"], scored)
+        flags = {flag for side in scored["sides"] if not side["ok"] for flag in side["flags"]}
+        self.assertIn("light-band", flags)
+
     def test_every_file_type_size_and_upload_path(self):
         ROWS.clear()
         folder = tempfile.mkdtemp(prefix="bleed-matrix-")
@@ -256,6 +322,8 @@ class BleedQualityTest(unittest.TestCase):
     def _matrix(self, folder: str) -> None:
         self._sizes(folder)
         self._pdf_kinds(folder)
+        self._partial_bleed(folder)
+        self._real_vob(folder)
         self._images(folder)
         self._paths(folder)
         self._refused(folder)
@@ -310,7 +378,7 @@ class BleedQualityTest(unittest.TestCase):
             shift = _delta_e(before, after)
             ok, detail = _worst(report)
             ok = ok and shift <= BLEED_DELTA_E
-            detail = f"kept outer ΔE {shift:.2f}; {detail}"
+            detail = f"kept outer dE {shift:.2f}; {detail}"
         except Exception as exc:
             ok, detail = False, str(exc)[:240]
         _add("PDF existing full bleed", "press engine", "A5", ok, detail)
@@ -383,6 +451,66 @@ class BleedQualityTest(unittest.TestCase):
         except Exception as exc:
             ok, detail = False, str(exc)[:240]
         _add("PDF white bleed band", "press check", "A6", ok, detail)
+
+    def _partial_bleed(self, folder: str) -> None:
+        """Correct 2.5 mm bleed on A3, A4 and A5, both orientations, stays green.
+
+        The rim is light and the artwork a few millimetres in is darker. The
+        old check compared the bleed with that darker interior.
+        """
+        sizes = (
+            ("A3", 297.0, 420.0),
+            ("A3 landscape", 420.0, 297.0),
+            ("A4", 210.0, 297.0),
+            ("A4 landscape", 297.0, 210.0),
+            ("A5", 148.0, 210.0),
+            ("A5 landscape", 210.0, 148.0),
+        )
+        for label, trim_w, trim_h in sizes:
+            src = os.path.join(folder, f"partial-{label}.pdf".replace(" ", "-"))
+            dest = src + ".press.pdf"
+            try:
+                _write_light_rim_pdf(src, trim_w + 5.0, trim_h + 5.0, 2.5)
+                report = _compile_pdf(src, dest, trim_w, trim_h)
+                ok, detail = _worst(report)
+                info = decide_light({
+                    "compiled": True,
+                    "enginePassed": True,
+                    "bleedQuality": report,
+                })
+                ok = ok and info["light"] == "green"
+                if info["light"] != "green":
+                    detail = f"light {info['light']}; {detail}"
+            except Exception as exc:
+                ok, detail = False, str(exc)[:240]
+            _add("PDF partial 2.5 mm light edge", "press engine", label, ok, detail)
+
+    def _real_vob(self, folder: str) -> None:
+        src = _real_vob_path()
+        if not src:
+            print("[SKIP] real VOB flyer is not on this machine", flush=True)
+            return
+        try:
+            result = make_print_ready(
+                src, os.path.join(folder, "vob"), 148, 210, "a5", "A5", filename="vob_original.pdf",
+            )
+            quality = result.get("bleedQuality") or {}
+            right = 999.0
+            for page in quality.get("pages") or []:
+                for side in page.get("sides") or []:
+                    if side.get("side") == "right" and side.get("delta") is not None:
+                        right = min(right, float(side.get("delta")))
+            press = result.get("pressPath") or ""
+            spot = _right_artwork_delta(press) if os.path.isfile(press) else 999.0
+            # Small type on this flyer can turn the job red. The bleed itself has to match.
+            ok = bool(quality.get("ok")) and right < 10.0 and spot < 10.0 and os.path.isfile(press)
+            detail = (
+                f"right dE {right:.2f}; artwork dE {spot:.2f}; light {result.get('light')}; "
+                f"{quality.get('note') or 'bleed matches'}"
+            )
+        except Exception as exc:
+            ok, detail = False, str(exc)[:240]
+        _add("PDF real VOB flyer", "quick-print", "A5", ok, detail)
 
     def _images(self, folder: str) -> None:
         specs = [
@@ -535,6 +663,91 @@ def _write_eps(path: str, w_mm: float, h_mm: float) -> None:
     )
     with open(path, "w", encoding="ascii") as handle:
         handle.write(body)
+
+
+def _write_light_rim_pdf(path: str, page_w_mm: float, page_h_mm: float, trim_inset_mm: float) -> None:
+    """Light outer rim, darker artwork further in, with a real trim box."""
+    import io
+
+    import pymupdf as fitz
+    from PIL import Image
+
+    w_pt = float(page_w_mm) * MM
+    h_pt = float(page_h_mm) * MM
+    ppi = 72.0
+    pw = max(8, int(round(w_pt * ppi / 72.0)))
+    ph = max(8, int(round(h_pt * ppi / 72.0)))
+    rgb = np.empty((ph, pw, 3), np.uint8)
+    rgb[:, :] = (80, 90, 30)
+    rim_mm = float(trim_inset_mm) + 3.5
+    rim = max(1, int(round(rim_mm / 25.4 * ppi)))
+    rim = min(rim, pw // 4, ph // 4)
+    rgb[:, :rim] = (246, 220, 140)
+    rgb[:, -rim:] = (246, 220, 140)
+    rgb[:rim, :] = (246, 220, 140)
+    rgb[-rim:, :] = (246, 220, 140)
+    buf = io.BytesIO()
+    Image.fromarray(rgb, "RGB").save(buf, format="JPEG", quality=92)
+    doc = fitz.open()
+    page = doc.new_page(width=w_pt, height=h_pt)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    inset = float(trim_inset_mm) * MM
+    page.set_trimbox(fitz.Rect(inset, inset, w_pt - inset, h_pt - inset))
+    page.set_cropbox(page.rect)
+    page.set_bleedbox(page.rect)
+    doc.save(path)
+    doc.close()
+
+
+def _right_artwork_delta(path: str) -> float:
+    """dE between the right bleed and the artwork pixel just inside the trim.
+
+    The press file carries the FOGRA39 output intent, so this is the colour
+    a viewer of that file sees. A flat grey outer band fails even if one
+    pixel at the trim matches.
+    """
+    import pymupdf as fitz
+
+    from bleed_builder import _delta_e
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+        trim = page.trimbox if page.trimbox.width > 2 else page.rect
+        edge = int(round(trim.x1))
+        margin = int(round(3.0 * MM))
+        worst = 0.0
+        grey = np.array([218, 215, 211], np.float32)
+        y0 = int(round(trim.y0)) + margin
+        y1 = int(round(trim.y1)) - margin
+        page_edge = rgb.shape[1] - 1
+        for y in range(max(0, y0), min(rgb.shape[0], y1), 8):
+            art_x = min(rgb.shape[1] - 1, max(0, edge - 1))
+            art = rgb[y, art_x]
+            for x in (min(page_edge, edge + 4), page_edge):
+                bleed = rgb[y, x]
+                worst = max(worst, _delta_e(art, bleed))
+                art_is_grey = float(np.linalg.norm(art.astype(np.float32) - grey)) < 12.0
+                bleed_is_grey = float(np.linalg.norm(bleed.astype(np.float32) - grey)) < 12.0
+                if bleed_is_grey and not art_is_grey:
+                    worst = max(worst, 40.0)
+        return worst
+    finally:
+        doc.close()
+
+
+def _real_vob_path() -> str:
+    candidates = [
+        os.environ.get("VOB_ORIGINAL", ""),
+        "/tmp/vob-real/vob_original.pdf",
+        "/home/ubuntu/.cursor/projects/workspace/uploads/008567316b52356f279e12baf4d9558d32db15f6205c1097a2f8fe67cc755ba9_eae3.pdf",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 100000:
+            return path
+    return ""
 
 
 def _write_white_ring(path: str, trim_w: float, trim_h: float) -> None:

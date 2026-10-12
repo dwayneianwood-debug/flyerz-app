@@ -2262,10 +2262,12 @@ def _paint_cmyk_edge(page, placed) -> None:
     """
     import pymupdf as fitz
 
+    from bleed_builder import SLIVER_CAP_PX
+
     full = page.rect
     pixel = _EDGE_PIXEL_PT
-    # Look far enough in to step over a scaled 1px white column, then read the artwork.
-    search = pixel * 52
+    # The sample has to include the short sliver cap and the pixels just past it.
+    search = pixel * (SLIVER_CAP_PX + 4)
     placed = fitz.Rect(placed)
     if placed.width < 1 or placed.height < 1:
         return
@@ -2285,6 +2287,8 @@ def _paint_cmyk_edge(page, placed) -> None:
         rect = fitz.Rect(*box) & page.rect
         if rect.width < 0.12 or rect.height < 0.12:
             return None
+        # The page is already CMYK. Those samples match the photo once the
+        # FOGRA39 output intent is attached. An RGB round-trip does not.
         return _pixmap_cmyk(page, rect)
 
     def snap(rect):
