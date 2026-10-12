@@ -465,7 +465,6 @@ def _pictures() -> None:
 
 
 def _broken_subset() -> None:
-    import numpy as np
     import pymupdf as fitz
     from fontTools.subset import Options, Subsetter
     from fontTools.ttLib import TTFont
@@ -508,43 +507,20 @@ def _broken_subset() -> None:
     opened.save(src)
     opened.close()
 
-    phone = _ask(src, "change the phone number to 082 123 4567", "broken-phone")
-    body = _text(os.path.join(phone["_preview"], "staged.pdf")) if phone.get("pending") else ""
-    problems = []
-    reply = phone.get("reply") or ""
-    from artwork_edits import _load
+    # The name table and BaseFont are gone, so the class cannot be known.
+    # Guessing a bundled face would be the wrong style. Refuse, and leave the file.
+    before = open(src, "rb").read()
+    from artwork_edits import SAFE_EDIT
 
-    bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), "fonts"))
-    fontfile = os.path.abspath(str((_load("broken-phone").get("proposal") or {}).get("fontfile") or ""))
-    if phone.get("pending") is not True or not fontfile.startswith(bundled) or "dejavu" in fontfile.lower():
-        problems.append((reply[:120] or "no proposal") + " " + fontfile)
-    if "Call" not in body or "082 123 4567" not in body:
-        problems.append(body.replace("\n", " ")[:100])
-    staged = os.path.join(phone["_preview"], "staged.pdf")
-    if os.path.isfile(staged):
-        doc = fitz.open(staged)
-        names = [str(item[3]) for item in doc[0].get_fonts()]
-        pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-        dark = int((image.min(axis=2) < 80).sum())
-        doc.close()
-        joined = " ".join(names).lower()
-        bundled_marks = (
-            "liberation", "inter", "roboto", "opensans", "lato", "montserrat", "poppins",
-            "nunito", "crimson", "playfair", "garamond", "baskerville", "cormorant", "marcellus",
-        )
-        if not any(mark in joined for mark in bundled_marks):
-            problems.append("font " + " ".join(names))
-        if dark < 200:
-            problems.append(f"ink {dark}")
-    _zoom(src, staged, "broken-phone", _proposal_box("broken-phone"))
-    _record("broken-phone", not problems, "; ".join(problems) or "Call kept, bundled face embedded")
+    phone = _ask(src, "change the phone number to 082 123 4567", "broken-phone")
+    reply = (phone.get("reply") or "").strip()
+    phone_ok = phone.get("pending") is not True and reply == SAFE_EDIT and open(src, "rb").read() == before
+    _record("broken-phone", phone_ok, reply[:140] or "no reply")
 
     date = _ask(src, "change the date to 12 October 2026", "broken-date")
-    date_body = _text(os.path.join(date["_preview"], "staged.pdf")) if date.get("pending") else ""
-    date_ok = date.get("pending") is True and "12 October 2026" in date_body and "Call 012" in date_body
-    _zoom(src, os.path.join(date["_preview"], "staged.pdf"), "broken-date", _proposal_box("broken-date"))
-    _record("broken-date", date_ok, (date.get("reply") or "")[:140])
+    date_reply = (date.get("reply") or "").strip()
+    date_ok = date.get("pending") is not True and date_reply == SAFE_EDIT and open(src, "rb").read() == before
+    _record("broken-date", date_ok, date_reply[:140] or "no reply")
 
     white = os.path.join(ROOT, "white.pdf")
     doc = fitz.open()
