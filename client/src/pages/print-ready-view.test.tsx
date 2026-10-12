@@ -124,6 +124,34 @@ test("result cards show green download, amber reasons, and a red client message"
   assert.match(red, /Copy message for the client/);
   assert.match(red, /Nothing is sent until you copy this and send it yourself/);
   assert.equal(red.includes("Download press PDF"), false);
+  assert.equal(red.includes("This file has warnings. Please check them before printing."), false);
+  assert.equal(red.includes("link-download-proof-3"), false);
+
+  const redPress = renderToStaticMarkup(
+    <QuickResultCard
+      card={{
+        id: 4,
+        filename: "vob-flyer.pdf",
+        status: "complete",
+        light: "red",
+        reasons: ["A picture is under 300 ppi."],
+        decisions: [],
+        clientMessage: "Please check the pictures.",
+        approved: false,
+        hasPress: true,
+        hasProof: true,
+        productLabel: "A5",
+        quantity: null,
+        notes: "",
+      }}
+    />,
+  );
+  assert.match(redPress, /data-testid="link-download-press-4"/);
+  assert.match(redPress, /bg-secondary/);
+  assert.match(redPress, /\/api\/jobs\/4\/download\/press-ready/);
+  assert.match(redPress, /Download press PDF/);
+  assert.match(redPress, /This file has warnings\. Please check them before printing\./);
+  assert.equal(redPress.includes("link-download-proof-4"), false);
 });
 
 test("a job that is still running shows the real stage", () => {

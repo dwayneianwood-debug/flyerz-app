@@ -492,6 +492,8 @@ TALL_CLEAR_MM = 2.0
 # Lettering stays this far inside the trim when a short page is lengthened.
 SAFE_ZONE_MM = 4.0
 EDGE_LOWPASS_FRACTION = 0.04
+# Canva leaves a 1px pure-white column. Skip that sliver before the colour sample.
+EDGE_SLIVER_PX = 2
 
 
 def _lowpass_along(row, fraction: float = EDGE_LOWPASS_FRACTION):
@@ -945,6 +947,41 @@ def seam_metrics(image, join: int, side: str = "top", px_per_mm: float | None = 
     }
 
 
+def _sliver_row(edge, inner) -> bool:
+    """A near-white or anomalous edge row. A smooth gradient is neither."""
+    import numpy as np
+
+    edge_f = np.asarray(edge, np.float32)
+    inner_f = np.asarray(inner, np.float32)
+    if edge_f.ndim != 2 or edge_f.shape[0] < 1 or inner_f.shape != edge_f.shape:
+        return False
+    white = np.min(edge_f, axis=-1) >= 245.0
+    if float(np.mean(white)) >= 0.8:
+        return True
+    dist = np.linalg.norm(edge_f - inner_f, axis=-1)
+    return bool(float(np.median(dist)) >= 36.0 and float(edge_f.std()) < 12.0)
+
+
+def _drop_edge_sliver(work):
+    """Row -1 is the outer edge. Skip up to 2 near-white or anomalous rows.
+
+    The reference is the row just inside that window, so two matching fringe
+    pixels are still skipped when they differ from the artwork.
+    """
+    height = int(work.shape[0])
+    if height < EDGE_SLIVER_PX + 2:
+        return work
+    anchor = work[-(EDGE_SLIVER_PX + 1)]
+    drop = 0
+    while drop < EDGE_SLIVER_PX:
+        if not _sliver_row(work[-(drop + 1)], anchor):
+            break
+        drop += 1
+    if drop:
+        return work[: height - drop]
+    return work
+
+
 def _colour_pad(band, pad: int, forward: bool):
     """Continue one edge from its own colour. Nothing from inside the picture is copied out.
 
@@ -961,6 +998,8 @@ def _colour_pad(band, pad: int, forward: bool):
     work = np.ascontiguousarray(band.astype(np.float32))
     if not forward:
         work = work[::-1]
+    # A 1px Canva white column (or a 2px fringe) must not become the bleed colour.
+    work = _drop_edge_sliver(work)
     height = int(work.shape[0])
     depth = min(5, height)
     strip = work[-depth:]

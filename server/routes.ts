@@ -45,7 +45,7 @@ import { readJobProgress } from "./jobProgress";
 import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import { registerQuickPrintRoutes } from "./quickPrintRoutes";
-import { firstExistingPressFile } from "./pressDownload";
+import { PRESS_FILE_MISSING, firstExistingPressFile } from "./pressDownload";
 import {
   IllustratorIntakeError,
   INVALID_UPLOAD_MESSAGE,
@@ -714,7 +714,7 @@ function isPathSafe(filePath: string): boolean {
   return resolved.startsWith(uploadsResolved) || resolved.startsWith(cwd);
 }
 
-function existingPressFile(job: { correctedPath?: string | null; auditResults?: AuditResults | null }): string | null {
+function existingPressFile(job: { id?: number | string | null; correctedPath?: string | null; auditResults?: AuditResults | null }): string | null {
   return firstExistingPressFile(job, isPathSafe, (filePath) => {
     try { return fsSync.existsSync(filePath); } catch { return false; }
   });
@@ -1285,7 +1285,7 @@ export async function registerRoutes(
       } else if (type === 'press-ready') {
         const compiledPath = existingPressFile(job);
         if (!compiledPath) {
-          return res.status(404).json({ message: 'No compiled PDF available' });
+          return res.status(404).json({ message: PRESS_FILE_MISSING });
         }
         const downloadName = `Print Ready Artwork.pdf`;
         return res.download(compiledPath, downloadName);
@@ -3236,7 +3236,7 @@ export async function registerRoutes(
       const compiledPath = existingPressFile(job);
 
       if (!compiledPath) {
-        return res.status(404).json({ message: "No compiled PDF available" });
+        return res.status(404).json({ message: PRESS_FILE_MISSING });
       }
 
       const downloadName = `Print Ready Artwork.pdf`;

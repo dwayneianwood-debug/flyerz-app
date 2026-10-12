@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { displayPercent } from "@shared/jobProgress";
-import { autoPostsForJobPage, jobPageMayAutoStart, proceedButtonState } from "./job-page-actions";
+import { PRESS_FILE_MISSING, PRESS_READY_FILENAME, autoPostsForJobPage, jobPageMayAutoStart, proceedButtonState, proceedPressDownload, proceedPressResult } from "./job-page-actions";
 import { shouldStartAutomaticCompile } from "./press-ready-ui";
 
 test("opening a job page mid-run or after it finishes starts nothing", () => {
@@ -70,4 +70,23 @@ test("the proceed button spins only while work is running", () => {
   });
   assert.equal(review.spinning, false);
   assert.match(review.label, /Review/);
+});
+
+test("proceed to download fetches the press PDF and stays quiet when it is missing", () => {
+  const plan = proceedPressDownload(1270);
+  assert.equal(plan.url, "/api/jobs/1270/download/press-ready");
+  assert.equal(plan.filename, PRESS_READY_FILENAME);
+  assert.equal(plan.filename.endsWith(".pdf"), true);
+
+  const ready = proceedPressResult(true);
+  assert.equal(ready.notifyCat, true);
+  assert.equal(ready.message, null);
+
+  const missing = proceedPressResult(false, "");
+  assert.equal(missing.notifyCat, false);
+  assert.equal(missing.message, PRESS_FILE_MISSING);
+
+  const server = proceedPressResult(false, PRESS_FILE_MISSING);
+  assert.equal(server.notifyCat, false);
+  assert.equal(server.message, "There isn't a press-ready PDF for this job yet.");
 });
