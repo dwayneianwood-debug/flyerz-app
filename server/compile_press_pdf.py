@@ -3031,6 +3031,33 @@ def main():
         }
 
         glitchy_state = "triumphant"
+        try:
+            from bleed_builder import check_press_pdf
+
+            bleed_quality = check_press_pdf(
+                args.output,
+                float(args.trim_w),
+                float(args.trim_h),
+                float(PRESS_DEFAULT_BLEED_MM),
+            )
+        except Exception as exc:
+            bleed_quality = {
+                "ok": False,
+                "pages": [],
+                "note": (
+                    "The bleed check could not read the press file "
+                    f"({str(exc)[:120]}). Check the edges before printing."
+                ),
+            }
+        compile_stats["bleedQuality"] = bleed_quality
+        if not bleed_quality.get("ok"):
+            engine = dict(compile_stats.get("press_engine") or {})
+            engine["passed"] = False
+            engine["status"] = "needs-attention"
+            engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
+            compile_stats["press_engine"] = engine
+            glitchy_state = "concerned"
+            glitchy_msg = engine["reason"]
 
         sys.stderr.write(f"PROFILE: [COMPILE] TOTAL Compile took {(time.time() - _prof_compile_t0)*1000:.1f}ms\n")
         sys.stderr.flush()
@@ -3045,6 +3072,7 @@ def main():
             "trimHeight": args.trim_h,
             "bleedMm": PRESS_DEFAULT_BLEED_MM,
             "pressEngine": compile_stats.get("press_engine"),
+            "bleedQuality": compile_stats.get("bleedQuality"),
             "compile_stats": compile_stats,
             "audit_report": job_audit_payload,
             "glitchy_message": glitchy_msg,

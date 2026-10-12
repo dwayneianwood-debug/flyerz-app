@@ -259,6 +259,12 @@ export interface AuditResults {
     resolution_and_lenses?: { action_taken: string };
   };
   jobAudit?: JobAudit;
+  /** Rendered press-file bleed check. A failure is a staff note, not a silent pass. */
+  bleedQuality?: {
+    ok?: boolean;
+    note?: string;
+    pages?: Array<{ page?: number; ok?: boolean; sides?: Array<{ side?: string; delta?: number; ok?: boolean; flags?: string[] }> }>;
+  };
   /** Press-Ready Engine: per-edge choice and the press-file check. */
   pressEngine?: {
     passed?: boolean;

@@ -515,6 +515,10 @@ def _synth(img: np.ndarray, side: str, bleed: int, method: str) -> np.ndarray:
         edge = band[0].astype(np.float32)
         inner = band[-1].astype(np.float32)
         step = (edge - inner) / max(1, band.shape[0] - 1)
+        # A smooth fade can continue. A steep halo must not paint a new colour
+        # across the whole 5 mm, or the outer bleed no longer matches the art.
+        limit = 8.0 / max(1, bleed)
+        step = np.clip(step, -limit, limit)
         rows = [edge + step * (index + 1) for index in range(bleed)]
         grown = np.clip(np.stack(rows, axis=0), 0, 255).astype(np.uint8)
         grown[0] = edge.astype(np.uint8)
@@ -809,8 +813,10 @@ def _crop_trim(img: np.ndarray, info: dict) -> np.ndarray:
 
 
 def extend_trim(img: np.ndarray, bleed_px: int, analysis: dict) -> tuple[np.ndarray, dict]:
+    from bleed_builder import repair_light_fringe
+
     step = {side: 0 for side in SIDES}
-    source = img
+    source = repair_light_fringe(img)
     canvas = None
     methods = _methods_for(analysis, step)
     problems: list[str] = []
@@ -907,6 +913,9 @@ def compile_raster_canvas(
     else:
         trim = cover_scale(plane, trim_w_px, trim_h_px)
 
+    from bleed_builder import repair_light_fringe
+
+    trim = repair_light_fringe(trim)
     analysis = analyse_bgr(trim, dpi, safe_zone_mm)
     rescued, rescue = _rescue(trim, dpi, safe_zone_mm, analysis)
     # Re-read edges after a shrink so the fill matches the new outer pixels.
@@ -2195,21 +2204,68 @@ def _paint_bleed_matching(path: str, placements: list) -> None:
         pdf.close()
 
 
-def _paint_cmyk_edge(page, placed) -> None:
-    """Continue each edge from one inset colour per row or column.
+def _oriented_edge(band: np.ndarray, from_end: bool, along_rows: bool):
+    """Column 0 is the outer edge. along_rows: columns run inward from that edge."""
+    if band is None or getattr(band, "ndim", 0) != 3 or band.shape[0] < 1 or band.shape[1] < 1:
+        return None
+    if along_rows:
+        view = band[:, ::-1] if from_end else band
+    else:
+        view = np.transpose(band[::-1] if from_end else band, (1, 0, 2))
+    if view.shape[0] < 1 or view.shape[1] < 1:
+        return None
+    return view
 
-    The sample sits 3 px inside the page, past a 1–2 px light line. A thin
-    column or a curve is carried straight out, with no mirror, tiling, blur,
-    or sharpening. Each corner is a blend of the two edge colours that meet
-    there, and those shared edges keep that colour so the seam has no hairline.
+
+def _colors_from_edge(band: np.ndarray, from_end: bool, along_rows: bool):
+    """One colour per row or column, past a light sliver.
+
+    along_rows: each row runs along the edge and columns run inward.
+    from_end: the outer edge is the last column or the last row.
+    """
+    from bleed_builder import colors_past_fringe
+
+    view = _oriented_edge(band, from_end, along_rows)
+    if view is None:
+        return None
+    return _clear_crossed_fringe(colors_past_fringe(view))
+
+
+def _sliver_cover_pt(band: np.ndarray, from_end: bool, along_rows: bool) -> float:
+    """How far the paint reaches back into the trim, past a light sliver.
+
+    A 1px white column at screen resolution is several device pixels. The
+    fixed 2px seam cover leaves the rest of that column as a light line.
+    A real pale border that fills the sample cap is not covered.
+    """
+    from bleed_builder import fringe_depths
+
+    view = _oriented_edge(band, from_end, along_rows)
+    if view is None or view.shape[1] < 4:
+        return _SEAM_COVER_PT
+    depths = fringe_depths(view)
+    if depths.size < 1:
+        return _SEAM_COVER_PT
+    depth = int(np.percentile(depths, 90))
+    if depth < 1:
+        return _SEAM_COVER_PT
+    return max(_SEAM_COVER_PT, float(depth + 1) * _EDGE_PIXEL_PT)
+
+
+def _paint_cmyk_edge(page, placed) -> None:
+    """Continue each edge from the artwork just inside a light sliver.
+
+    A 1px white column, including the band it becomes after a low-resolution
+    scale, is not the colour that is copied out. A thin column or a curve is
+    carried straight out, with no mirror, tiling, blur, or sharpening. Each
+    corner is a blend of the two edge colours that meet there.
     """
     import pymupdf as fitz
 
     full = page.rect
     pixel = _EDGE_PIXEL_PT
-    cover = _SEAM_COVER_PT
-    inset = pixel * _INSET_PX
-    sample_span = pixel * _INSET_MEDIAN_PX
+    # Look far enough in to step over a scaled 1px white column, then read the artwork.
+    search = pixel * 52
     placed = fitz.Rect(placed)
     if placed.width < 1 or placed.height < 1:
         return
@@ -2223,6 +2279,7 @@ def _paint_cmyk_edge(page, placed) -> None:
         return
 
     scale = 300.0 / 72.0
+    left_cover = right_cover = top_cover = bottom_cover = _SEAM_COVER_PT
 
     def grab(box):
         rect = fitz.Rect(*box) & page.rect
@@ -2244,48 +2301,40 @@ def _paint_cmyk_edge(page, placed) -> None:
 
     left_colors = right_colors = top_colors = bottom_colors = None
     if gaps["left"] > 0.3:
-        rect = snap(fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1))
+        raw = grab((placed.x0, placed.y0, placed.x0 + search, placed.y1))
+        left_cover = _sliver_cover_pt(raw, False, True)
+        rect = snap(fitz.Rect(full.x0, placed.y0, placed.x0 + left_cover, placed.y1))
         out_h = max(1, int(round(rect.height * scale)))
         out_w = max(1, int(round(rect.width * scale)))
-        band = _fit_nearest(
-            grab((placed.x0 + inset, placed.y0, placed.x0 + inset + sample_span, placed.y1)),
-            out_h,
-            True,
-        )
-        left_colors = _clear_crossed_fringe(_median_cols(band, False))
+        band = _fit_nearest(raw, out_h, True)
+        left_colors = _colors_from_edge(band, False, True)
         _insert_cmyk(page, _replicate_cols(left_colors, out_w), rect)
     if gaps["right"] > 0.3:
-        rect = snap(fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1))
+        raw = grab((placed.x1 - search, placed.y0, placed.x1, placed.y1))
+        right_cover = _sliver_cover_pt(raw, True, True)
+        rect = snap(fitz.Rect(placed.x1 - right_cover, placed.y0, full.x1, placed.y1))
         out_h = max(1, int(round(rect.height * scale)))
         out_w = max(1, int(round(rect.width * scale)))
-        band = _fit_nearest(
-            grab((placed.x1 - inset - sample_span, placed.y0, placed.x1 - inset, placed.y1)),
-            out_h,
-            True,
-        )
-        right_colors = _clear_crossed_fringe(_median_cols(band, True))
+        band = _fit_nearest(raw, out_h, True)
+        right_colors = _colors_from_edge(band, True, True)
         _insert_cmyk(page, _replicate_cols(right_colors, out_w), rect)
     if gaps["top"] > 0.3:
-        rect = snap(fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover))
+        raw = grab((placed.x0, placed.y0, placed.x1, placed.y0 + search))
+        top_cover = _sliver_cover_pt(raw, False, False)
+        rect = snap(fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + top_cover))
         out_h = max(1, int(round(rect.height * scale)))
         out_w = max(1, int(round(rect.width * scale)))
-        band = _fit_nearest(
-            grab((placed.x0, placed.y0 + inset, placed.x1, placed.y0 + inset + sample_span)),
-            out_w,
-            False,
-        )
-        top_colors = _clear_crossed_fringe(_median_rows(band, False))
+        band = _fit_nearest(raw, out_w, False)
+        top_colors = _colors_from_edge(band, False, False)
         _insert_cmyk(page, _replicate_rows(top_colors, out_h), rect)
     if gaps["bottom"] > 0.3:
-        rect = snap(fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1))
+        raw = grab((placed.x0, placed.y1 - search, placed.x1, placed.y1))
+        bottom_cover = _sliver_cover_pt(raw, True, False)
+        rect = snap(fitz.Rect(placed.x0, placed.y1 - bottom_cover, placed.x1, full.y1))
         out_h = max(1, int(round(rect.height * scale)))
         out_w = max(1, int(round(rect.width * scale)))
-        band = _fit_nearest(
-            grab((placed.x0, placed.y1 - inset - sample_span, placed.x1, placed.y1 - inset)),
-            out_w,
-            False,
-        )
-        bottom_colors = _clear_crossed_fringe(_median_rows(band, True))
+        band = _fit_nearest(raw, out_w, False)
+        bottom_colors = _colors_from_edge(band, True, False)
         _insert_cmyk(page, _replicate_rows(bottom_colors, out_h), rect)
 
     def paint_corner(rect, vertical, horizontal, pin_row_end, pin_col_end):
@@ -2307,7 +2356,7 @@ def _paint_cmyk_edge(page, placed) -> None:
 
     if gaps["left"] > 0.3 and gaps["top"] > 0.3:
         paint_corner(
-            fitz.Rect(full.x0, full.y0, placed.x0 + cover, placed.y0 + cover),
+            fitz.Rect(full.x0, full.y0, placed.x0 + left_cover, placed.y0 + top_cover),
             _color_at(left_colors, False),
             _color_at(top_colors, False),
             True,
@@ -2315,7 +2364,7 @@ def _paint_cmyk_edge(page, placed) -> None:
         )
     if gaps["right"] > 0.3 and gaps["top"] > 0.3:
         paint_corner(
-            fitz.Rect(placed.x1 - cover, full.y0, full.x1, placed.y0 + cover),
+            fitz.Rect(placed.x1 - right_cover, full.y0, full.x1, placed.y0 + top_cover),
             _color_at(right_colors, False),
             _color_at(top_colors, True),
             True,
@@ -2323,7 +2372,7 @@ def _paint_cmyk_edge(page, placed) -> None:
         )
     if gaps["left"] > 0.3 and gaps["bottom"] > 0.3:
         paint_corner(
-            fitz.Rect(full.x0, placed.y1 - cover, placed.x0 + cover, full.y1),
+            fitz.Rect(full.x0, placed.y1 - bottom_cover, placed.x0 + left_cover, full.y1),
             _color_at(left_colors, True),
             _color_at(bottom_colors, False),
             False,
@@ -2331,7 +2380,7 @@ def _paint_cmyk_edge(page, placed) -> None:
         )
     if gaps["right"] > 0.3 and gaps["bottom"] > 0.3:
         paint_corner(
-            fitz.Rect(placed.x1 - cover, placed.y1 - cover, full.x1, full.y1),
+            fitz.Rect(placed.x1 - right_cover, placed.y1 - bottom_cover, full.x1, full.y1),
             _color_at(right_colors, True),
             _color_at(bottom_colors, True),
             False,
@@ -2846,17 +2895,37 @@ def _paint_mirrored_strips(page, placed) -> None:
         canvas[row:row_end, col:col_end, :4] = view[:, :, :4]
         canvas[row:row_end, col:col_end, 4] = 255
 
-    # Ghostscript leaves a 1–2 px light fringe on the content edge, including the
-    # corners. Copy the clean pixel just inside that fringe over it before the
-    # mirror, or the corner of each strip is a light line.
-    inset = 3
-    inset = min(inset, max(0, (x1 - x0) // 2), max(0, (y1 - y0) // 2))
-    if inset >= 1:
+    # Ghostscript leaves a 1–2 px light fringe. A Canva white column can be wider
+    # once a low-resolution picture is scaled. Copy the artwork past that fringe
+    # over it before the mirror, or the strip repeats the sliver.
+    from bleed_builder import fringe_depths
+
+    content = plate[y0:y1, x0:x1]
+    half_x = max(0, (x1 - x0) // 2)
+    half_y = max(0, (y1 - y0) // 2)
+
+    def _inset(strip: np.ndarray, limit: int) -> int:
+        if strip is None or strip.size == 0 or limit < 1:
+            return 0
+        found = int(fringe_depths(strip).max()) if strip.shape[0] and strip.shape[1] else 0
+        # Keep clearing the 1–2 px renderer line when there is no sliver.
+        depth = 3 if found < 1 else found
+        return min(depth, limit)
+
+    left_inset = _inset(content, half_x)
+    right_inset = _inset(content[:, ::-1], half_x)
+    top_inset = _inset(np.transpose(content, (1, 0, 2)), half_y)
+    bottom_inset = _inset(np.transpose(content, (1, 0, 2))[:, ::-1], half_y)
+    if max(left_inset, right_inset, top_inset, bottom_inset) >= 1:
         plate = np.array(plate, copy=True)
-        plate[y0:y1, x0:x0 + inset] = plate[y0:y1, x0 + inset:x0 + inset + 1]
-        plate[y0:y1, x1 - inset:x1] = plate[y0:y1, x1 - inset - 1:x1 - inset]
-        plate[y0:y0 + inset, x0:x1] = plate[y0 + inset:y0 + inset + 1, x0:x1]
-        plate[y1 - inset:y1, x0:x1] = plate[y1 - inset - 1:y1 - inset, x0:x1]
+        if left_inset >= 1:
+            plate[y0:y1, x0:x0 + left_inset] = plate[y0:y1, x0 + left_inset:x0 + left_inset + 1]
+        if right_inset >= 1:
+            plate[y0:y1, x1 - right_inset:x1] = plate[y0:y1, x1 - right_inset - 1:x1 - right_inset]
+        if top_inset >= 1:
+            plate[y0:y0 + top_inset, x0:x1] = plate[y0 + top_inset:y0 + top_inset + 1, x0:x1]
+        if bottom_inset >= 1:
+            plate[y1 - bottom_inset:y1, x0:x1] = plate[y1 - bottom_inset - 1:y1 - bottom_inset, x0:x1]
 
     left = plate[y0:y1, x0:x0 + max(x0, 1)] if x0 > 0 else None
     right_w = width - x1

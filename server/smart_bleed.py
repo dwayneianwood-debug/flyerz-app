@@ -350,7 +350,10 @@ def pixel_drift_bleed_expand(
     if bleed_top <= 0 and bleed_bottom <= 0 and bleed_left <= 0 and bleed_right <= 0:
         return img_bgr
 
-    trim = _pixel_drift_work_to_bgr_u8(img_bgr)
+    from bleed_builder import repair_light_fringe
+
+    # Step over a light sliver first. The 1px pixel-drift sample then reads the artwork.
+    trim = repair_light_fringe(_pixel_drift_work_to_bgr_u8(img_bgr))
     th, tw = trim.shape[:2]
     bt, bb, bl, br = bleed_top, bleed_bottom, bleed_left, bleed_right
     oh, ow = th + bt + bb, tw + bl + br
@@ -9462,7 +9465,7 @@ def main():
         elif is_vector_type(file_type):
             result = apply_smart_bleed_to_pdf(input_path, output_path, bleed_opts)
 
-        elif file_type in ("jpg", "jpeg", "png"):
+        elif file_type in ("jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp"):
             result = apply_smart_bleed_to_image(standardized_path or input_path, output_path, bleed_opts)
             _attach_proof(result)
         else:
@@ -9484,6 +9487,12 @@ def main():
             }
 
         _timer_log("Python smart_bleed total", t_py_total)
+        try:
+            from bleed_builder import attach_result
+
+            result = attach_result(result, bleed_opts)
+        except Exception as exc:
+            sys.stderr.write(f"[BLEED] Quality check failed open: {exc}\n")
         _write_result_file(result, result_file)
         print(json.dumps({"ok": True, "resultFile": result_file}))
     except Exception as e:

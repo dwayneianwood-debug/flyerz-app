@@ -188,6 +188,13 @@ def decide_light(facts: dict) -> dict:
         for line in combined.get("reasons") or []:
             if line and line not in reasons:
                 reasons.append(line)
+    quality = facts.get("bleedQuality") if isinstance(facts.get("bleedQuality"), dict) else None
+    if quality and quality.get("ok") is False:
+        note = str(quality.get("note") or "").strip() or (
+            "The bleed does not continue the artwork. Check that edge before printing."
+        )
+        if note not in reasons:
+            reasons.append(note)
     if reasons:
         return {"light": "amber", "reasons": reasons, "clientMessage": ""}
     return {"light": "green", "reasons": [], "clientMessage": ""}
@@ -1989,6 +1996,22 @@ def make_print_ready(
             facts["extraChecks"] = extra_report
         except Exception:
             pass
+    if press_ok and os.path.isfile(press_path):
+        try:
+            from bleed_builder import check_press_pdf
+
+            facts["bleedQuality"] = check_press_pdf(press_path, trim_w, trim_h, BLEED_MM)
+        except Exception as exc:
+            facts["bleedQuality"] = {
+                "ok": False,
+                "pages": [],
+                "note": (
+                    "The bleed check could not read the press file "
+                    f"({str(exc)[:120]}). Check the edges before printing."
+                ),
+            }
+        if facts["bleedQuality"].get("note"):
+            decisions.append(str(facts["bleedQuality"]["note"]))
     info = decide_light(facts)
     if source_ext == ".eps":
         info = _eps_font_wording(info, facts)
@@ -2000,6 +2023,8 @@ def make_print_ready(
     result["existingBleedKept"] = existing_kept
     result["enginePassed"] = facts["enginePassed"]
     result["pressEngine"] = engine if isinstance(engine, dict) else None
+    if facts.get("bleedQuality"):
+        result["bleedQuality"] = facts["bleedQuality"]
     if press_ok and (info["light"] != "red" or info.get("checklistRed")):
         result["pressPath"] = press_path
         try:

@@ -1,6 +1,6 @@
 {
-  "uploadExtensions": [".pdf", ".jpg", ".jpeg", ".png", ".docx", ".pptx", ".ai", ".eps"],
-  "printToolExtensions": [".pdf", ".jpg", ".jpeg", ".png", ".ai", ".eps"],
+  "uploadExtensions": [".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".docx", ".pptx", ".ai", ".eps"],
+  "printToolExtensions": [".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".ai", ".eps"],
   "vectorExtensions": [".pdf", ".ai", ".eps"],
   "rasterExtensions": [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"],
   "vectorTypes": ["pdf", "ai", "eps"],

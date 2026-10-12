@@ -371,6 +371,7 @@ function spawnPreCompile(jobId: number, artworkPath: string, strategy: string, j
             compiledStrategy: strategy,
             compileAuditReport: result.audit_report || undefined,
             pressEngine: result.pressEngine || freshAudit.pressEngine,
+            bleedQuality: result.bleedQuality || freshAudit.bleedQuality,
             overallPassed: result.pressEngine ? result.pressEngine.passed === true && freshAudit.overallPassed !== false : freshAudit.overallPassed,
           };
           await storage.updateJob(jobId, { auditResults: updatedResults });
@@ -3153,6 +3154,7 @@ export async function registerRoutes(
                 compiledStrategy: effectiveStrategy,
                 compileAuditReport: result.audit_report || undefined,
                 pressEngine: result.pressEngine || freshAudit.pressEngine,
+                bleedQuality: result.bleedQuality || freshAudit.bleedQuality,
                 overallPassed: result.pressEngine ? result.pressEngine.passed === true && freshAudit.overallPassed !== false : freshAudit.overallPassed,
               };
               await storage.updateJob(jobId, { auditResults: updatedResults });

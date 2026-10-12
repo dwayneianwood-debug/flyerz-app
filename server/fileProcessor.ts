@@ -783,6 +783,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       jobAudit,
       autoHealEvent: bleedPythonResult?.autoHealEvent ?? undefined,
       pressEngine: (bleedPythonResult as { pressEngine?: AuditResults["pressEngine"] } | null)?.pressEngine,
+      bleedQuality: (bleedPythonResult as { bleedQuality?: AuditResults["bleedQuality"] } | null)?.bleedQuality,
     };
 
     await storage.updateJob(jobId, {
