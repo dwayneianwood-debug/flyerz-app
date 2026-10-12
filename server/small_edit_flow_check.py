@@ -252,33 +252,22 @@ def _subset_gap() -> None:
 
 
 def _subset_closest() -> None:
-    """An unknown family with a short subset is the closest bundled face, and it says so."""
-    from artwork_edits import propose
+    """An unknown family is refused. A script face is not offered as amber."""
+    from artwork_edits import SAFE_EDIT, propose
 
     src = _subset_file("PHONE: 067 1345 937", "Xylophone")
     preview = os.path.join(ROOT, "preview-subset-closest")
+    original = open(src, "rb").read()
     asked = propose(src, "change the phone number to 082 123 4567", "subset-closest", preview)
     reply = (asked or {}).get("reply") or ""
-    staged = os.path.join(preview, "staged.pdf")
-    text = _text(staged) if os.path.isfile(staged) else ""
     problems = []
-    if "amber" not in reply.lower() or "closest font" not in reply.lower():
+    if reply.strip() != SAFE_EDIT or asked.get("pending") is True:
         problems.append(reply[:180] or "silent")
-    if "082 123 4567" not in text or "082 1234 567" in text:
-        problems.append(text.replace("\n", " ")[:120] or "no staged text")
-    if os.path.isfile(staged):
-        import pymupdf as fitz
-
-        doc = fitz.open(staged)
-        try:
-            names = [str(item[3]) for item in (doc[0].get_fonts() or [])]
-        finally:
-            doc.close()
-        if any(name == "Helvetica" for name in names) or not any("+" not in name and "Xylophone" not in name for name in names):
-            problems.append("font " + ", ".join(names))
-    gate, gate_problems = _visual(src, preview, "subset-closest")
-    problems.extend(gate_problems)
-    _record("subset-closest", not problems, "; ".join(problems) or f"amber closest {gate}")
+    if "amber" in reply.lower() or "great vibes" in reply.lower() or "parisienne" in reply.lower():
+        problems.append("style mismatch offered")
+    if open(src, "rb").read() != original:
+        problems.append("source changed")
+    _record("subset-closest", not problems, "; ".join(problems) or "refused, unknown family")
 
 
 def _subset_font() -> None:
@@ -816,7 +805,7 @@ def _natural_and_vague() -> None:
         if hint and hint not in got_hint:
             ok = False
         _record("phrase-" + kind + "-" + re.sub(r"[^a-z0-9]+", "-", message.lower())[:32], ok, str(parsed)[:140])
-    for message in ("change it", "make it better", "change the phone number", "change the venue to"):
+    for message in ("change it", "make it better", "make it look better", "change the phone number", "change the venue to"):
         reply = str((propose("/no/such/file.pdf", message, "vague", ROOT) or {}).get("reply") or "")
         low = reply.lower()
         ok = "nothing was changed" in low and "everything else" not in low and reply.endswith(".")

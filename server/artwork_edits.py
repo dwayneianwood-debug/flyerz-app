@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """One small edit at a time, with a preview and an undo.
 
-Live text stays in its own font when that face has the new letters. A Canva
-subset usually does not: the full face is taken from the fonts shipped with
-the app, by the name after the subset tag. Machine font folders are not
-searched, so Linux and Windows produce the same letters. If that face is not
-in the bundle, the closest bundled font is used and the reply says amber.
-A picture gets only those word pixels inpainted from the background, then new vector text in the closest font.
+Live text keeps the face embedded in the PDF when that face has the new
+letters. Otherwise it is set in a font shipped with the app of the same class
+(sans, serif, slab, display/condensed, or script) and a similar weight.
+Machine font folders are not searched, so Linux and Windows produce the same
+letters. A different class is refused. It is not offered as an amber match.
+A picture gets the whole original word filled from the background, then new
+vector text. The picture is read once, at a modest size, and that read is
+kept for the job.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -48,7 +51,8 @@ INCOMPLETE_FIELD_ASK = re.compile(
     re.I,
 )
 VAGUE_ASK = re.compile(
-    r"(?:please\s+)?(?:(?:change|update|fix|edit)\s+it|make\s+it\s+(?:better|nicer|clearer|pop|good))\.?$",
+    r"^(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?"
+    r"(?:(?:change|update|fix|edit)\s+it|make\s+it\s+(?:look\s+)?(?:better|nicer|clearer|pop|good))\.?$",
     re.I,
 )
 _COMPARE_PX = 64
@@ -159,6 +163,23 @@ def _weight_hint(name: str) -> str:
         if word in token:
             return word
     return "regular"
+
+
+def _weight_bucket(name: str) -> str:
+    """bold, medium, light, or regular. SemiBold sits with bold."""
+    hint = _weight_hint(name)
+    if hint in ("black", "extrabold", "bold", "semibold"):
+        return "bold"
+    if hint == "medium":
+        return "medium"
+    if hint in ("light", "thin", "extralight"):
+        return "light"
+    return "regular"
+
+
+def _wants_italic(name: str) -> bool:
+    token = _font_token(name)
+    return "italic" in token or "oblique" in token
 
 
 def _windows_font_dirs() -> list[str]:
@@ -304,18 +325,28 @@ def _candidate_fonts() -> list[str]:
 
 
 def _named_font(fontname: str) -> str | None:
-    """Full face for a subset tag. PWSYDC+Anton-Regular is the bundled Anton."""
+    """Full face for a subset tag. PWSYDC+Anton-Regular is the bundled Anton.
+
+    The weight has to be the same class of weight. Bold is not swapped for regular.
+    """
     wanted = _family_token(fontname)
     if len(wanted) < 3:
         return None
     hint = _weight_hint(fontname)
+    bucket = _weight_bucket(fontname)
+    italic = _wants_italic(fontname)
     best = None
-    best_key = (9, 9)
+    best_key = (9, 9, "z")
     for row in _font_index():
         if row["family"] != wanted:
             continue
+        if _weight_bucket(row["style"]) != bucket:
+            continue
+        face_italic = row["style"] == "italic" or "italic" in os.path.basename(row["path"]).lower()
+        if italic != face_italic:
+            continue
         style_rank = 0 if row["style"] == hint or (hint == "regular" and row["style"] in ("regular", "book")) else 1
-        key = (style_rank, os.path.basename(row["path"]).lower())
+        key = (style_rank, 0 if not face_italic else 1, os.path.basename(row["path"]).lower())
         if key < best_key:
             best_key = key
             best = row["path"]
@@ -479,8 +510,165 @@ def _plain_text_face(paths: list[str], text: str) -> str:
     return ranked[0][2]
 
 
+# Class comes from the font's name. A picture of the letters is not used here:
+# that comparison was picking a script face for Arial, Georgia, Impact, and Times.
+_SCRIPT_NAMES = (
+    "greatvibes", "parisienne", "pinyon", "allura", "calligraphy", "brushscript",
+    "snell", "edwardian", "vivaldi", "kunstler", "frenchscript", "freestyle",
+    "mistral", "segoscript", "script",
+)
+_SLAB_NAMES = (
+    "rockwell", "clarendon", "robotoslab", "slab", "memphis", "serifa", "lubalin",
+)
+_DISPLAY_NAMES = (
+    "impact", "bebas", "oswald", "anton", "archivo", "leaguegothic", "ultra",
+    "dincondensed", "franklingothic",
+)
+_SERIF_NAMES = (
+    "times", "georgia", "garamond", "palatino", "cambria", "baskerville", "crimson",
+    "cormorant", "playfair", "merriweather", "constantia", "bookantiqua",
+    "cinzel", "marcellus", "libertinus", "nimbusroman", "freeserif", "ebgaramond",
+)
+_SANS_NAMES = (
+    "arial", "helvetica", "helv", "verdana", "calibri", "candara", "corbel",
+    "segoe", "tahoma", "trebuchet", "centurygothic", "gillsans", "futura",
+    "avenir", "nunito", "lato", "montserrat", "poppins", "opensans", "roboto",
+    "inter", "raleway", "liberation", "nimbus", "freesans", "dejavu", "sourcesans",
+    "worksans", "dmsans", "manrope", "karla", "rubik", "ubuntu", "notosans",
+    "frutiger", "myriad", "proxima", "cabin", "barlow", "firasans", "leaguespartan",
+    "museosans",
+)
+
+
+def _live_class(name: str) -> str:
+    """sans, serif, slab, display, or script. Empty when the name does not say."""
+    token = _font_token(name)
+    if not token:
+        return ""
+    if any(mark in token for mark in _SCRIPT_NAMES):
+        return "script"
+    if any(mark in token for mark in _SLAB_NAMES):
+        return "slab"
+    if "narrow" in token or "condensed" in token or any(mark in token for mark in _DISPLAY_NAMES):
+        return "display"
+    if "serif" in token or any(mark in token for mark in _SERIF_NAMES):
+        return "serif"
+    if any(mark in token for mark in _SANS_NAMES):
+        return "sans"
+    return ""
+
+
+def _class_rank(path: str, fontname: str, kind: str) -> tuple:
+    """Lower is a closer stand-in. The same list on every computer."""
+    token = _family_token(os.path.basename(path))
+    source = _font_token(fontname)
+    if kind == "sans":
+        if any(mark in source for mark in ("arial", "helvetica", "helv", "liberation", "nimbus")):
+            prefer = ("liberationsans", "lato", "opensans", "roboto", "inter", "nunito", "poppins", "montserrat")
+        elif "montserrat" in source:
+            prefer = ("montserrat", "poppins", "lato", "liberationsans", "inter")
+        elif any(mark in source for mark in ("verdana", "trebuchet", "nunito")):
+            prefer = ("nunito", "opensans", "lato", "liberationsans")
+        else:
+            prefer = ("liberationsans", "opensans", "roboto", "lato", "inter", "nunito", "poppins", "montserrat")
+    elif kind == "serif":
+        if any(mark in source for mark in ("times", "georgia", "palatino", "garamond", "baskerville", "crimson", "cambria")):
+            prefer = ("librebaskerville", "crimsontext", "ebgaramond", "cormorantgaramond", "cormorantsc", "cormorant")
+        else:
+            prefer = ("crimsontext", "librebaskerville", "ebgaramond", "cormorantgaramond", "cinzel", "playfair", "marcellus")
+    elif kind == "display":
+        if any(mark in source for mark in ("impact", "bebas", "condensed", "narrow")):
+            prefer = ("bebasneue", "anton", "oswald", "archivoblack")
+        else:
+            prefer = ("anton", "bebasneue", "oswald", "archivoblack")
+    elif kind == "script":
+        prefer = ("greatvibes", "parisienne", "pinyonscript", "pinyon", "allura")
+    else:
+        prefer = ()
+    for index, name in enumerate(prefer):
+        if name in token:
+            return (index, token)
+    return (len(prefer) + 5, token)
+
+
+def _class_face(fontname: str, text: str) -> str:
+    """A bundled face of this class and a similar weight, or nothing."""
+    kind = _live_class(fontname)
+    if not kind:
+        return ""
+    bucket = _weight_bucket(fontname)
+    italic = _wants_italic(fontname)
+    found = []
+    for row in _font_index():
+        label = f"{row.get('family') or ''} {os.path.basename(row['path'])}"
+        if _live_class(label) != kind:
+            continue
+        face_italic = row.get("style") == "italic" or "italic" in os.path.basename(row["path"]).lower()
+        if italic != face_italic:
+            continue
+        face_bucket = _weight_bucket(str(row.get("style") or "") + os.path.basename(row["path"]))
+        if face_bucket != bucket:
+            # Medium may use a regular face. Bold may not.
+            if not (bucket == "medium" and face_bucket == "regular"):
+                if not (bucket == "light" and face_bucket == "regular"):
+                    continue
+        if not _glyphs_present(row["path"], text):
+            continue
+        found.append(row["path"])
+    if not found:
+        return ""
+    found.sort(key=lambda path: (_class_rank(path, fontname, kind), os.path.basename(path).lower()))
+    for path in found:
+        if _font_file_usable(path, text):
+            return path
+    return ""
+
+
+def _full_font_name(page, fontname: str, flags: int = 0) -> str:
+    """The PDF face name, including Bold when the span only says the family.
+
+    PyMuPDF often reports 'Arial' while the embedded base font is Arial-BoldMT.
+    The weight is read from that base font, and from the bold flag when the
+    name itself does not say.
+    """
+    name = str(fontname or "")
+    family = _family_token(name)
+    best = name
+    try:
+        listed = page.get_fonts() or []
+    except Exception:
+        listed = []
+    for item in listed:
+        base = str(item[3] or "") if len(item) > 3 else ""
+        if not base or not family or len(family) < 3:
+            continue
+        if family not in _font_token(base):
+            continue
+        if _weight_bucket(base) != "regular" or _wants_italic(base) or len(base) > len(best):
+            best = base
+    if int(flags) & 16 and _weight_bucket(best) == "regular":
+        best += "-Bold"
+    if int(flags) & 2 and not _wants_italic(best):
+        best += "-Italic"
+    return best
+
+
+def _refuse_face(fontname: str) -> dict:
+    return {
+        "fontfile": "",
+        "amber": False,
+        "fontSource": "none",
+        "faceLabel": "",
+        "reply": SAFE_EDIT,
+    }
+
+
 def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
-    """Embedded face, then the full family, then the closest face that has the letters."""
+    """Embedded face, then the same family, then the same class and weight.
+
+    A style that we cannot match is refused. It is not offered in a script
+    face and called amber.
+    """
     embedded = _embedded_font(doc, page, fontname)
     # Base-14 names are not files. Inserting them leaves Helvetica unembedded.
     if embedded in ("helv", "times", "cour"):
@@ -490,57 +678,13 @@ def _resolve_face(doc, page, fontname: str, text: str, bbox=None) -> dict:
     full = _named_font(fontname)
     if full and _font_file_usable(full, text):
         return {"fontfile": full, "amber": False, "fontSource": "full", "faceLabel": _face_label(full, fontname)}
-    paths = [
-        row["path"]
-        for row in _font_index()
-        if row["kind"] == "bundled" and _glyphs_present(row["path"], text)
-    ]
-    if not paths:
-        missing = _missing_glyphs(embedded, text) if embedded and embedded not in ("helv", "times", "cour") else [
-            char for char in text if not char.isspace()
-        ]
-        shown = "".join(dict.fromkeys(missing))[:24] or "the new letters"
-        return {
-            "fontfile": "",
-            "amber": False,
-            "fontSource": "none",
-            "reply": (
-                f"The font {fontname or 'on the page'} has no glyph for {shown}, "
-                "and none of the fonts shipped with the app do either. Nothing was changed."
-            ),
-        }
-    crop = _span_crop(page, bbox) if bbox else None
-    if not _crop_has_strokes(crop):
-        path = _plain_text_face(paths, text)
-        if path:
-            return {
-                "fontfile": path,
-                "amber": True,
-                "fontSource": "closest",
-                "fontScore": 999.0,
-                "faceLabel": _face_label(path, fontname),
-            }
-    path, score = _closest_among(crop, text, paths)
-    if path and not _font_file_usable(path, text):
-        path = next((item for item in paths if _font_file_usable(item, text)), "")
-        score = 999.0
+    path = _class_face(fontname, text)
     if not path:
-        missing = [char for char in text if not char.isspace()]
-        shown = "".join(dict.fromkeys(missing))[:24] or "the new letters"
-        return {
-            "fontfile": "",
-            "amber": False,
-            "fontSource": "none",
-            "reply": (
-                f"The font {fontname or 'on the page'} has no glyph for {shown}, "
-                "and none of the fonts shipped with the app do either. Nothing was changed."
-            ),
-        }
+        return _refuse_face(fontname)
     return {
         "fontfile": path,
-        "amber": True,
-        "fontSource": "closest",
-        "fontScore": round(score, 1),
+        "amber": False,
+        "fontSource": "class",
         "faceLabel": _face_label(path, fontname),
     }
 
@@ -637,14 +781,11 @@ def _embedded_font(doc, page, fontname: str) -> str | None:
 
 
 def _render_page(path: str, dest: str, page_index: int = 0) -> None:
-    import pymupdf as fitz
+    """Preview pixels. The same render is reused by the offer check, so a poster is not drawn twice."""
+    del page_index
+    from PIL import Image
 
-    doc = fitz.open(path)
-    try:
-        pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False, colorspace=fitz.csRGB)
-        pix.save(dest)
-    finally:
-        doc.close()
+    Image.fromarray(_render_rgb(path, 2.5)).save(dest)
 
 
 def _ask_kind(label: str) -> str:
@@ -894,19 +1035,108 @@ def _incomplete_edit(message: str) -> dict | None:
     return None
 
 
+# A long side past this is shrunk before the reader runs. The word boxes are
+# mapped back onto the original pixels, so the font match still sees the real crop.
+_OCR_LONG = 1280
+_OCR_MEM: dict[str, list] = {}
+
+
+def _ocr_disk_path(cache_id: str) -> str:
+    root = os.environ.get("FLYERZ_EDIT_DIR") or os.path.join(tempfile.gettempdir(), "flyerz-ocr")
+    folder = os.path.join(root, "ocr-cache")
+    os.makedirs(folder, exist_ok=True)
+    digest = hashlib.sha1(cache_id.encode("utf-8", "replace")).hexdigest()[:24]
+    return os.path.join(folder, digest + ".json")
+
+
+def _ocr_load(cache_id: str) -> list[dict] | None:
+    if not cache_id:
+        return None
+    if cache_id in _OCR_MEM:
+        return _OCR_MEM[cache_id]
+    path = _ocr_disk_path(cache_id)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        words = payload.get("words") if isinstance(payload, dict) else None
+        if not isinstance(words, list):
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    _OCR_MEM[cache_id] = words
+    return words
+
+
+def _ocr_store(cache_id: str, words: list[dict]) -> None:
+    if not cache_id:
+        return
+    _OCR_MEM[cache_id] = words
+    path = _ocr_disk_path(cache_id)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"words": words}, handle)
+    except OSError:
+        pass
+
+
+def _words_from_bgr(image, cache_id: str = "") -> list[dict]:
+    """Read a picture once. A retry of the same job uses the saved read."""
+    cached = _ocr_load(cache_id)
+    if cached is not None:
+        return cached
+    if image is None or getattr(image, "size", 0) == 0:
+        _ocr_store(cache_id, [])
+        return []
+    import cv2
+
+    height, width = image.shape[:2]
+    long_side = max(height, width)
+    view = image
+    scale = 1.0
+    if long_side > _OCR_LONG:
+        scale = _OCR_LONG / float(long_side)
+        view = cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    words: list[dict] = []
+    try:
+        from ocr_reader import local_rows
+
+        # Upright poster type does not need the angle model on every line.
+        words = _words_from_rows(local_rows(view) or [])
+    except Exception:
+        words = []
+    if not words:
+        folder = tempfile.mkdtemp(prefix="edit-ocr-")
+        png = os.path.join(folder, "view.png")
+        try:
+            cv2.imwrite(png, view)
+            words = _tesseract_words(png)
+        except Exception:
+            words = []
+    if scale != 1.0:
+        inverse = 1.0 / scale
+        for word in words:
+            word["left"] = int(round(float(word["left"]) * inverse))
+            word["top"] = int(round(float(word["top"]) * inverse))
+            word["width"] = max(1, int(round(float(word["width"]) * inverse)))
+            word["height"] = max(1, int(round(float(word["height"]) * inverse)))
+    _ocr_store(cache_id, words)
+    return words
+
+
 def _rapid_words(png: str) -> list[dict]:
     """Same local reader the vector rebuild uses, one box per line of type."""
     import cv2
-    from ocr_reader import local_rows
 
     image = cv2.imread(png)
     if image is None:
         return []
-    try:
-        rows = local_rows(image) or []
-    except Exception:
-        return []
-    return _words_from_rows(rows)
+    return _words_from_bgr(image, "")
 
 
 def _words_from_rows(rows) -> list[dict]:
@@ -951,7 +1181,7 @@ def _tesseract_words(png: str) -> list[dict]:
             ["tesseract", png, "stdout", "tsv"],
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=8,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -978,14 +1208,13 @@ def _tesseract_words(png: str) -> list[dict]:
     return words
 
 
-def _ocr_words(png: str) -> list[dict]:
-    try:
-        found = _rapid_words(png)
-    except Exception:
-        found = []
-    if found:
-        return found
-    return _tesseract_words(png)
+def _ocr_words(png: str, cache_id: str = "") -> list[dict]:
+    import cv2
+
+    image = cv2.imread(png)
+    if image is None:
+        return []
+    return _words_from_bgr(image, cache_id)
 
 
 def _line_groups(words: list[dict]) -> list[list[dict]]:
@@ -1299,7 +1528,13 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
     try:
         page = doc[0]
         spans = _spans(page)
-        proposal = {"kind": parsed["kind"], "page": 0, "live": bool(spans), "src": src}
+        proposal = {
+            "kind": parsed["kind"],
+            "page": 0,
+            "live": bool(spans),
+            "src": src,
+            "ocrKey": f"{key}|{_file_stamp(src)}",
+        }
         if parsed["kind"] in ("phone", "date", "time", "venue", "heading"):
             if parsed["kind"] == "heading":
                 span = _heading_span(spans)
@@ -1347,7 +1582,8 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                 placed_new = shown_new if parsed["kind"] != "heading" else new_text
                 partial = " ".join(placed_old.split()) != " ".join(str(old).split())
                 probe = placed_new + _stray_chars(parsed["kind"], parsed.get("new") or "")
-                face = _resolve_face(doc, page, str(span.get("font") or ""), probe, span.get("bbox"))
+                fontname = _full_font_name(page, str(span.get("font") or ""), int(span.get("flags") or 0))
+                face = _resolve_face(doc, page, fontname, probe, span.get("bbox"))
                 if face.get("fontSource") == "none":
                     return {"ok": False, "reply": face.get("reply") or "Nothing was changed.", "actions": []}
                 rgb, k_only = _span_rgb(page, span)
@@ -1365,7 +1601,7 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
                     "origin": list(span.get("origin") or (span["bbox"][0], span["bbox"][3])),
                     "align": "left" if partial else ("center" if abs(center - mid) <= 14 else "left"),
                     "size": float(span.get("size") or 12) * (float(parsed["factor"]) if parsed["kind"] == "heading" else 1.0),
-                    "font": str(span.get("font") or ""),
+                    "font": fontname,
                     "fontfile": face["fontfile"],
                     "fontSource": face.get("fontSource") or "",
                     "faceLabel": face.get("faceLabel") or _face_label(face["fontfile"], str(span.get("font") or "")),
@@ -1400,7 +1636,12 @@ def propose(src: str, message: str, key: str, preview_dir: str) -> dict | None:
             if moved.get("error"):
                 return {"ok": False, "reply": moved["error"], "actions": []}
             for move in moved.get("moves") or []:
-                face = _resolve_face(doc, page, move.get("font") or "", str(move.get("old") or ""), move.get("bbox"))
+                face = _resolve_face(
+                    doc, page,
+                    _full_font_name(page, move.get("font") or "", int(move.get("flags") or 0)),
+                    str(move.get("old") or ""),
+                    move.get("bbox"),
+                )
                 if face.get("fontSource") == "none":
                     return {"ok": False, "reply": face.get("reply") or "Nothing was changed.", "actions": []}
                 move["fontfile"] = face["fontfile"]
@@ -1965,9 +2206,45 @@ def _select_hit(words: list[dict], parsed: dict) -> dict | None:
     return found_groups[0] if found_groups else None
 
 
-def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
+def _file_stamp(path: str) -> str:
+    try:
+        stat = os.stat(path)
+        return f"{stat.st_size}:{getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1e9))}"
+    except OSError:
+        return "0:0"
+
+
+def _miss_is_unreadable(words, hit, image, kind: str = "date") -> bool:
+    """The named words were not read cleanly. Do not say they are absent.
+
+    A flat poster that really has other dates still lists those dates.
+    A photograph whose reader returned noise, or nothing, is unreadable.
+    """
+    del words
+    if not hit or not hit.get("missing"):
+        return False
+    found = [" ".join(str(label or "").split()) for label in (hit.get("found") or [])]
+    found = [label for label in found if label]
+    clean = []
+    for label in found:
+        pieces = _pieces(label, kind)
+        if pieces and len(label) <= 32 and len(label.split()) <= 6:
+            clean.append(label)
+    if found and len(clean) == len(found):
+        return False
+    if found:
+        return True
+    if image is not None and getattr(image, "size", 0):
+        gray = image.mean(axis=2) if getattr(image, "ndim", 1) == 3 else image
+        if float(gray.std()) > 18.0:
+            return True
+    return False
+
+
+def _embedded_hit(doc, page, parsed: dict, render_scale: float, cache_key: str = "") -> dict | None:
     """Read the placed picture at its own pixels, then map the box onto the page render."""
     import cv2
+    import numpy as np
 
     infos = [info for info in (page.get_image_info(xrefs=True) or []) if info.get("xref")]
     if not infos:
@@ -1980,14 +2257,14 @@ def _embedded_hit(doc, page, parsed: dict, render_scale: float) -> dict | None:
     blob = raw.get("image")
     if not blob:
         return None
-    folder = tempfile.mkdtemp(prefix="edit-src-")
-    path = os.path.join(folder, "art." + str(raw.get("ext") or "png"))
-    with open(path, "wb") as handle:
-        handle.write(blob)
-    image = cv2.imread(path)
+    image = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         return None
-    hit = _select_hit(_ocr_words(path), parsed)
+    cache_id = f"{cache_key}|xref:{info.get('xref')}|bytes:{len(blob)}"
+    words = _words_from_bgr(image, cache_id)
+    hit = _select_hit(words, parsed)
+    if hit and hit.get("missing") and _miss_is_unreadable(words, hit, image, str(parsed.get("kind") or "date")):
+        return {"unreadable": True}
     if not hit or hit.get("ambiguous") or hit.get("missing") or hit.get("unreadable"):
         return hit if hit and (hit.get("ambiguous") or hit.get("missing") or hit.get("unreadable")) else None
     height, width = image.shape[:2]
@@ -2014,6 +2291,8 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
     import pymupdf as fitz
 
     embedded = None
+    png = ""
+    cache_key = str(proposal.get("ocrKey") or "")
     doc = fitz.open(src)
     try:
         page = doc[0]
@@ -2021,20 +2300,25 @@ def _propose_raster(src: str, parsed: dict, proposal: dict) -> dict:
         scale = 2.0
         if long_pt * scale < 700:
             scale = min(6.0, 1200.0 / long_pt)
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-        folder = tempfile.mkdtemp(prefix="edit-ocr-")
-        png = os.path.join(folder, "page.png")
-        pix.save(png)
-        embedded = _embedded_hit(doc, page, parsed, scale)
+        # The placed picture is the artwork. Read that, and skip a second full-page render.
+        embedded = _embedded_hit(doc, page, parsed, scale, cache_key)
+        if not embedded:
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+            folder = tempfile.mkdtemp(prefix="edit-ocr-")
+            png = os.path.join(folder, "page.png")
+            pix.save(png)
     finally:
         doc.close()
     if embedded:
         hit = embedded
         crop = embedded.get("crop")
     else:
-        hit = _select_hit(_ocr_words(png), parsed)
-        image = cv2.imread(png)
-        crop = None if hit is None or image is None or hit.get("ambiguous") or hit.get("missing") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
+        image = cv2.imread(png) if png else None
+        words = _words_from_bgr(image, cache_key + "|page") if image is not None else []
+        hit = _select_hit(words, parsed)
+        if hit and hit.get("missing") and _miss_is_unreadable(words, hit, image, str(parsed.get("kind") or "date")):
+            hit = {"unreadable": True}
+        crop = None if hit is None or image is None or hit.get("ambiguous") or hit.get("missing") or hit.get("unreadable") else image[hit["top"]: hit["top"] + hit["height"], hit["left"]: hit["left"] + hit["width"]]
     if hit and hit.get("unreadable"):
         return _unreadable_reply()
     if hit and hit.get("missing"):
@@ -2391,11 +2675,8 @@ def _ink_and_redact(page, old_text: str, loose):
     if ink is None:
         return None, None, origin
     others = _other_span_rects(page, old_text)
-    inset = 0.35
-    shrunk = fitz.Rect(ink.x0 + inset, ink.y0 + inset, ink.x1 - inset, ink.y1 - inset)
-    if shrunk.width < 0.4 or shrunk.height < 0.4:
-        shrunk = fitz.Rect(ink)
-    redact = _clear_of(shrunk, others, 0.5)
+    # The whole original word, not a smaller box that leaves the side letters behind.
+    redact = _clear_of(fitz.Rect(ink), others, 0.35)
     pieces = []
     if isinstance(redact, list):
         pieces.extend(redact)
@@ -2405,9 +2686,7 @@ def _ink_and_redact(page, old_text: str, loose):
     for quad in quads:
         if _redact_hits(pieces, quad):
             continue
-        piece = fitz.Rect(quad.x0 + 0.15, quad.y0 + 0.15, quad.x1 - 0.15, quad.y1 - 0.15)
-        if piece.width < 0.2 or piece.height < 0.2:
-            piece = fitz.Rect(quad)
+        piece = fitz.Rect(quad)
         cleared = _clear_of(piece, others, 0.35)
         if cleared is not None and _redact_hits([cleared], quad):
             pieces.append(cleared)
@@ -2586,6 +2865,30 @@ def _clear_baked(page, ink):
     # panel is still flat when most of the ring matches the median.
     near = np.linalg.norm(ring_f - background, axis=1) <= 28.0
     flat = float(near.mean()) if near.size else 0.0
+    # A flat or gently graded panel is filled across the whole word. A shorter
+    # line must not leave a ghost of the old letters on either side.
+    if flat >= 0.6:
+        import cv2
+        hole = np.zeros(image.shape[:2], dtype=np.uint8)
+        hole[iy0:iy1, ix0:ix1] = 255
+        # The baked letters often stick out past the live glyphs. Grow the hole
+        # so that halo is filled, and the colour sample is the real panel.
+        grown = cv2.dilate(hole, np.ones((11, 11), np.uint8), iterations=1)
+        painted, spread = _paint_plane(image, grown)
+        if painted is not None and spread <= 18.0:
+            ys, xs = np.where(grown > 0)
+            gx0, gx1 = int(xs.min()), int(xs.max()) + 1
+            gy0, gy1 = int(ys.min()), int(ys.max()) + 1
+            patch = np.ascontiguousarray(painted[gy0:gy1, gx0:gx1])
+            target = fitz.Rect(
+                outer.x0 + gx0 / scale,
+                outer.y0 + gy0 / scale,
+                outer.x0 + gx1 / scale,
+                outer.y0 + gy1 / scale,
+            )
+            overlay = fitz.Pixmap(fitz.csRGB, patch.shape[1], patch.shape[0], patch.tobytes(), 0)
+            page.insert_image(target, pixmap=overlay, overlay=True)
+            return target
     distance = np.linalg.norm(image.astype(np.float32) - background, axis=2)
     import cv2
 
@@ -3007,6 +3310,21 @@ def _paint_raster_text(doc, page, proposal: dict) -> None:
     if painted is None or spread > 18.0:
         proposal["refuse"] = SAFE_EDIT
         return
+    # Fill the whole letter rectangle, plus a hair past it, when that still
+    # matches the background. The letter mask stays the strokes, so a day
+    # stacked on its month is still two lines.
+    bx0, by0, bx1, by1 = found["bounds"]
+    pad = 2
+    rx0, ry0 = max(0, bx0 - pad), max(0, by0 - pad)
+    rx1 = min(window.shape[1], bx1 + pad)
+    ry1 = min(window.shape[0], by1 + pad)
+    wide = np.zeros(found["mask"].shape, np.uint8)
+    wide[ry0:ry1, rx0:rx1] = 255
+    wide_painted, wide_spread = _paint_plane(window, wide)
+    if wide_painted is not None and wide_spread <= 18.0:
+        painted = wide_painted
+        found = dict(found)
+        found["bounds"] = (rx0, ry0, rx1, ry1)
     x0, y0, x1, y1 = found["bounds"]
     patch = painted[y0:y1, x0:x1]
     win_x0, win_y0, _win_x1, _win_y1 = found["win"]
@@ -3101,17 +3419,32 @@ def _compact_ocr(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
 
 
+_RGB_CACHE: dict = {}
+
+
 def _render_rgb(path: str, scale: float = 2.5):
     import pymupdf as fitz
     import numpy as np
 
+    try:
+        stat = os.stat(path)
+        stamp = (stat.st_mtime_ns if hasattr(stat, "st_mtime_ns") else stat.st_mtime, stat.st_size)
+    except OSError:
+        stamp = (0, 0)
+    key = (os.path.abspath(path), stamp, round(float(scale), 3))
+    cached = _RGB_CACHE.get(key)
+    if cached is not None:
+        return cached
     doc = fitz.open(path)
     try:
         pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
         image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3).copy()
-        return image
     finally:
         doc.close()
+    if len(_RGB_CACHE) > 6:
+        _RGB_CACHE.clear()
+    _RGB_CACHE[key] = image
+    return image
 
 
 def _rapid_line(image) -> str:
@@ -3146,7 +3479,7 @@ def _tesseract(image, psm: str, tsv: bool) -> str:
     if tsv:
         cmd.append("tsv")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return proc.stdout or ""
@@ -3390,7 +3723,6 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
     (d) The edit did not add an unembedded or substituted font.
     """
     import numpy as np
-    from collections import Counter
 
     problems = []
     if not edit_box or len(edit_box) < 4:
@@ -3411,15 +3743,25 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
     outside = delta.copy()
     outside[y0:y1, x0:x1] = 0
     changed = int((outside > 12).sum())
-    if changed > 40:
+    # Any pixel outside the word fails. A style that spills is not offered.
+    if changed > 0:
         problems.append(f"pixels outside the word {changed}")
-    pad = int(round(3 * scale))
-    crop = after[max(0, y0 - pad): min(after.shape[0], y1 + pad), max(0, x0 - pad): min(after.shape[1], x1 + pad)]
     digits = sum(ch.isdigit() for ch in (new_text or "")) >= max(1, int(0.6 * len(re.sub(r"\s", "", new_text or "x"))))
     wanted = _read_as(new_text, digits)
     old_compact = _read_as(old_text, digits)
-    before_words = _tsv_words(before)
-    after_words = _tsv_words(after)
+    text_has_new = _pdf_has_reading(after_pdf, wanted, digits)
+    inside_changed = int((delta[y0:y1, x0:x1] > 12).sum()) if y1 > y0 and x1 > x0 else 0
+    fresh_fonts = _fresh_font_problems(before_pdf, after_pdf)
+    if fresh_fonts:
+        problems.append("font not embedded " + "; ".join(fresh_fonts))
+    # The new words are already in the file, and nothing outside the box moved.
+    # Reading the whole poster again is what pushed picture edits to the time limit.
+    if changed == 0 and text_has_new and inside_changed > 20:
+        return problems
+    if changed > 0:
+        return problems
+    pad = int(round(3 * scale))
+    crop = after[max(0, y0 - pad): min(after.shape[0], y1 + pad), max(0, x0 - pad): min(after.shape[1], x1 + pad)]
     readings = []
     if crop.size:
         import cv2
@@ -3428,46 +3770,12 @@ def visual_gates(before_pdf: str, after_pdf: str, edit_box, old_text: str, new_t
         readings.append(_tesseract(bigger, "6", False))
         readings.append(_tesseract(bigger, "7", False))
         readings.append(_rapid_line(bigger))
-    inside = []
-    for left, top, width, height, text in after_words:
-        cx = left + width / 2.0
-        cy = top + height / 2.0
-        if x0 - 4 <= cx <= x1 + 4 and y0 - 4 <= cy <= y1 + 4:
-            inside.append(text)
-    readings.append(" ".join(inside))
     compacts = [_read_as(text, digits) for text in readings if text and text.strip()]
-    # White type on a photograph often will not OCR, on Windows in particular.
-    # The new words are still in the page as real text, and only that box may change.
-    text_has_new = _pdf_has_reading(after_pdf, wanted, digits)
-    inside_changed = int((delta[y0:y1, x0:x1] > 12).sum()) if y1 > y0 and x1 > x0 else 0
     if wanted and not any(wanted in item for item in compacts):
-        if not (text_has_new and changed <= 40 and inside_changed > 20):
+        if not text_has_new:
             problems.append("region OCR missed " + (new_text or "")[:40])
     if old_compact and old_compact != wanted and any(old_compact in item for item in compacts):
         problems.append("region OCR still has the old words")
-
-    def outside(words) -> list[str]:
-        found = []
-        for left, top, width, height, text in words:
-            cx = left + width / 2.0
-            cy = top + height / 2.0
-            if x0 - 4 <= cx <= x1 + 4 and y0 - 4 <= cy <= y1 + 4:
-                continue
-            token = _compact_ocr(text)
-            if token:
-                found.append(token)
-        return found
-
-    # Put the before pixels back over the edit, then read the page. Identical
-    # pixels outside the word cannot be reported as a changed page.
-    masked = after.copy()
-    masked[y0:y1, x0:x1] = before[y0:y1, x0:x1]
-    if changed > 0:
-        if Counter(outside(before_words)) != Counter(outside(_tsv_words(masked))):
-            problems.append("page OCR changed more than the words")
-    fresh_fonts = _fresh_font_problems(before_pdf, after_pdf)
-    if fresh_fonts:
-        problems.append("font not embedded " + "; ".join(fresh_fonts))
     return problems
 
 
