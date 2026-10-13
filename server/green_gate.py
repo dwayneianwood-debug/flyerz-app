@@ -299,15 +299,22 @@ def _colour(path: str) -> tuple[dict, dict]:
         doc.close()
     vec_ok, vec_tac = _vector_cmyk(path)
     tac = max(tac, vec_tac)
+    text_rgb = (not vec_ok) and _vector_has_rgb(path)
     if not images:
         cmyk_ok, tac = vec_ok, vec_tac
         saw_cmyk = cmyk_ok
-        cmyk_detail = "The press file is not CMYK."
+        cmyk_detail = "The text/vector colour is RGB." if text_rgb else "The press file is not CMYK."
     else:
-        cmyk_ok = all(space == 4 for space in spaces) and vec_ok
-        if not vec_ok and vec_tac == 0.0 and not _vector_has_rgb(path):
-            cmyk_ok = all(space == 4 for space in spaces)
-        cmyk_detail = "The press picture is not CMYK."
+        pictures_ok = all(space == 4 for space in spaces)
+        cmyk_ok = pictures_ok and vec_ok
+        if not vec_ok and vec_tac == 0.0 and not text_rgb:
+            cmyk_ok = pictures_ok
+        named = []
+        if not pictures_ok:
+            named.append("The press picture is not CMYK.")
+        if text_rgb:
+            named.append("The text/vector colour is RGB.")
+        cmyk_detail = " ".join(named) if named else "The press picture is not CMYK."
     ink_ok = (not saw_cmyk and not vec_ok) or tac <= TAC_LIMIT + 8
     ink_detail = f"The heaviest ink is about {tac:.0f}%. The limit is {TAC_LIMIT:.0f}%."
     if not saw_cmyk:

@@ -65,6 +65,7 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
     reason?: string;
     fix?: string;
     rescue?: { note?: string };
+    bleedNote?: string;
     edges?: Array<{ side: string; note: string }>;
   } | null;
   beforeUrl?: string | null;
@@ -154,6 +155,9 @@ export function BleedMethodSelector({ jobId, variants, recommended, selected, on
             )}
             {pressEngine?.rescue?.note && (
               <p className="text-xs text-muted-foreground" data-testid="text-press-ready-rescue">{pressEngine.rescue.note}</p>
+            )}
+            {pressEngine?.bleedNote && (
+              <p className="text-xs text-foreground" data-testid="text-press-ready-bleed-note">{pressEngine.bleedNote}</p>
             )}
             <ul className="space-y-1" data-testid="list-press-ready-edges">
               {(pressEngine?.edges || []).map((edge) => (

@@ -140,6 +140,21 @@ def detect_artwork_size(doc, img_bgr, dpi, file_type):
     if _pdf_like(file_type) and doc is not None:
         page = doc[0]
         media = page.rect
+        try:
+            from quick_print import _pixels_as_points_product
+
+            pixel_product = _pixels_as_points_product(float(media.width), float(media.height))
+        except Exception:
+            pixel_product = None
+        if pixel_product:
+            width = float(pixel_product["widthMm"])
+            height = float(pixel_product["heightMm"])
+            result["document_width_mm"] = width
+            result["document_height_mm"] = height
+            result["width_mm"] = width
+            result["height_mm"] = height
+            result["pixelsAsPoints"] = True
+            return result
         doc_w = round(media.width * 25.4 / 72, 1)
         doc_h = round(media.height * 25.4 / 72, 1)
         result["document_width_mm"] = doc_w

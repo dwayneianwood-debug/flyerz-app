@@ -1324,6 +1324,22 @@ def main():
     print(f"CRITICAL DEBUG: Starting from ORIGINAL file. Input path = {args.input}", flush=True)
     from press_ready_engine import plate_exceeds_memory
 
+    _pixel_page = False
+    try:
+        from quick_print import pixels_as_points_trim
+
+        _pixel_product = pixels_as_points_trim(args.input)
+        if _pixel_product:
+            args.trim_w = float(_pixel_product["widthMm"])
+            args.trim_h = float(_pixel_product["heightMm"])
+            _pixel_page = True
+            sys.stderr.write(
+                f"[COMPILE] Pixels stored as points matched {_pixel_product.get('label')} "
+                f"({args.trim_w:g} x {args.trim_h:g} mm).\n"
+            )
+    except Exception as _pixel_err:
+        sys.stderr.write(f"[COMPILE] Pixel-as-point check skipped: {_pixel_err}\n")
+
     _large_sheet = plate_exceeds_memory(float(args.trim_w or 0), float(args.trim_h or 0))
     if _large_sheet:
         sys.stderr.write("[COMPILE] Large format: vectors stay live and only the bleed strips are drawn.\n")
@@ -1795,8 +1811,10 @@ def main():
                     page_count = len(doc)
                     pdf_file_mb = file_size / (1024 * 1024)
                     render_dpi = int(FINAL_RASTER_DPI)
+                    # A pixels-as-points page is already the 300 dpi grid. Zoom 1 reads those pixels.
+                    raster_zoom = 1.0 if _pixel_page else render_dpi / 72.0
                     sys.stderr.write(
-                        f"[COMPILE] Raster DPI locked to {render_dpi} (FINAL_RASTER_DPI; PyMuPDF matrix={render_dpi}/72) "
+                        f"[COMPILE] Raster DPI locked to {render_dpi} (FINAL_RASTER_DPI; PyMuPDF matrix={raster_zoom:g}) "
                         f"— pages={page_count}, size={pdf_file_mb:.1f}MB\n"
                     )
         
@@ -1838,8 +1856,8 @@ def main():
                             _prof_page_t0 = time.time()
                             page = doc[page_num]
                             cb = page_raster_clip_rect(page)
-                            w_px = int(cb.width / 72.0 * render_dpi)
-                            h_px = int(cb.height / 72.0 * render_dpi)
+                            w_px = int(cb.width * raster_zoom)
+                            h_px = int(cb.height * raster_zoom)
                             total_pixels = w_px * h_px
             
                             if total_pixels > TILE_PIXEL_LIMIT:
@@ -1851,7 +1869,7 @@ def main():
                                 sys.stderr.write(f"[COMPILE] Page {page_num+1} too large ({w_px}x{h_px}={total_pixels:,}px). Tiling {tiles_x}x{tiles_y}\n")
             
                                 full_img = np.zeros((h_px, w_px, 3), dtype=np.uint8)
-                                scale = render_dpi / 72.0
+                                scale = raster_zoom
             
                                 for ty in range(tiles_y):
                                     for tx in range(tiles_x):
@@ -1892,7 +1910,7 @@ def main():
                                     except Exception as _dbg_e:
                                         sys.stderr.write(f"[COMPILE] debug_initial_read save failed: {_dbg_e}\n")
                             else:
-                                mat = fitz.Matrix(render_dpi / 72.0, render_dpi / 72.0)
+                                mat = fitz.Matrix(raster_zoom, raster_zoom)
                                 pix = page.get_pixmap(matrix=mat, clip=cb, alpha=True)
                                 pix.set_dpi(render_dpi, render_dpi)
                                 if page_num == 0:
@@ -3072,14 +3090,21 @@ def main():
                 ),
             }
         compile_stats["bleedQuality"] = bleed_quality
+        engine = dict(compile_stats.get("press_engine") or {})
+        try:
+            from press_ready_engine import attach_bleed_note
+
+            attach_bleed_note(engine)
+        except Exception:
+            pass
         if not bleed_quality.get("ok"):
-            engine = dict(compile_stats.get("press_engine") or {})
             engine["passed"] = False
             engine["status"] = "needs-attention"
             engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
-            compile_stats["press_engine"] = engine
             glitchy_state = "concerned"
             glitchy_msg = engine["reason"]
+        if engine:
+            compile_stats["press_engine"] = engine
 
         sys.stderr.write(f"PROFILE: [COMPILE] TOTAL Compile took {(time.time() - _prof_compile_t0)*1000:.1f}ms\n")
         sys.stderr.flush()

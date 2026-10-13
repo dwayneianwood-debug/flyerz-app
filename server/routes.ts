@@ -3698,6 +3698,16 @@ def render_fitz(doc):
     w, h = pix.w, pix.h
     w_mm = page.rect.width * 25.4 / 72.0
     h_mm = page.rect.height * 25.4 / 72.0
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.getcwd(), "server"))
+        from quick_print import _pixels_as_points_product
+        _found = _pixels_as_points_product(float(page.rect.width), float(page.rect.height))
+        if _found:
+            w_mm = float(_found["widthMm"])
+            h_mm = float(_found["heightMm"])
+    except Exception:
+        pass
 
 if ext in FITZ_EXTS:
     import fitz

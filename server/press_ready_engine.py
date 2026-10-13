@@ -942,7 +942,7 @@ def compile_raster_canvas(
                 report["status"] = "needs-attention"
                 report["reason"] = problems[0]
                 report["fix"] = "Open the file and extend the background yourself, then upload it again."
-            return canvas, report
+            return canvas, attach_bleed_note(report)
         most = max(existing["top"], existing["bottom"], existing["left"], existing["right"])
         size_ok = abs(existing["trim_w_mm"] - trim_w_mm) <= 2 and abs(existing["trim_h_mm"] - trim_h_mm) <= 2
         if most >= 0.4 and size_ok and embedded_dpi:
@@ -1023,7 +1023,7 @@ def compile_raster_canvas(
         report["status"] = "needs-attention"
         report["reason"] = built["problems"][0]
         report["fix"] = "Try a manual bleed style, or move the artwork slightly in from the edge and upload it again."
-    return canvas, report
+    return canvas, attach_bleed_note(report)
 
 
 def _base_report(analysis, edges, kept, bleed_mm, safe_zone_mm, src_w, src_h, trim_w, trim_h) -> dict:
@@ -1285,7 +1285,8 @@ def convert_cmyk_keep_text(src: str, dest: str, block_font_substitution: bool = 
         "-dDownsampleColorImages=false",
         "-dDownsampleGrayImages=false",
         "-dDownsampleMonoImages=false",
-        *(["-dCannotEmbedFontPolicy=1"] if block_font_substitution else []),
+        # A number is a typecheck on this Ghostscript. /Error refuses a substitute face.
+        *(["-dCannotEmbedFontPolicy=/Error"] if block_font_substitution else []),
         "-c",
         "<< /AutoFilterColorImages false /AutoFilterGrayImages false "
         "/ColorImageFilter /FlateEncode /GrayImageFilter /FlateEncode "
@@ -3446,9 +3447,18 @@ def _stamp_original_text(dest, src, short_l: float, short_t: float) -> None:
         return
     folder = tempfile.mkdtemp(prefix="live-text-")
     cleaned = os.path.join(folder, "text.pdf")
+    cleaned_cmyk = os.path.join(folder, "text-cmyk.pdf")
     try:
         _clean_text_only_pdf(source_path, cleaned)
-        text_doc = fitz.open(cleaned)
+        try:
+            # The plate is already CMYK. The original words are still RGB until this conversion.
+            convert_cmyk_keep_text(cleaned, cleaned_cmyk, block_font_substitution=True)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[TEXT] CMYK text conversion failed, so the original words were not stamped in RGB: {exc}\n"
+            )
+            return
+        text_doc = fitz.open(cleaned_cmyk)
         try:
             index = int(src.number)
             if index < 0 or index >= text_doc.page_count:
@@ -3665,6 +3675,18 @@ def compile_vector_press(
     safe_zone_mm: float = SAFE_ZONE_MM,
 ) -> dict:
     import pymupdf as fitz
+
+    # A 300 dpi picture saved with its pixel counts as the page size is that
+    # product, even when the caller passed the point-as-millimetre size.
+    try:
+        from quick_print import pixels_as_points_trim
+
+        snapped = pixels_as_points_trim(src_path)
+    except Exception:
+        snapped = None
+    if snapped:
+        trim_w_mm = float(snapped["widthMm"])
+        trim_h_mm = float(snapped["heightMm"])
 
     ext = os.path.splitext(src_path)[1].lower()
     open_path = src_path
@@ -4015,7 +4037,76 @@ def compile_vector_press(
         report["resolutionNote"] = "No picture on the original file was large enough to measure."
     report["allowWhite"] = False
     report = preflight_pdf(out_path, trim_w_mm, trim_h_mm, bleed_mm, report, require_text="", source_path=open_path)
+    if snapped:
+        report["pixelsAsPoints"] = True
+        report["sizeNote"] = (
+            f"The page stores a picture's pixels as points, so it was matched to {snapped.get('label')}."
+        )
+    attach_bleed_note(report)
     return {"used": True, "report": report, "path": out_path, "pageCount": page_count}
+
+
+def bleed_method_sentence(edges) -> str:
+    """One card line that names the automatic method on every edge.
+
+    Sides stay in top, bottom, left, right order, and neighbours that used the
+    same method are written together: "Bleed: top/bottom flat colour, left/right mirrored photo".
+    """
+    phrases = {}
+    for edge in edges or []:
+        side = str((edge or {}).get("side") or "").lower()
+        if side in SIDES:
+            phrases[side] = _bleed_phrase(edge or {})
+    ordered = [side for side in SIDES if side in phrases]
+    if not ordered:
+        return ""
+    groups = []
+    current = [ordered[0]]
+    phrase = phrases[ordered[0]]
+    for side in ordered[1:]:
+        if phrases[side] == phrase:
+            current.append(side)
+        else:
+            groups.append((current, phrase))
+            current = [side]
+            phrase = phrases[side]
+    groups.append((current, phrase))
+    body = ", ".join(f"{'/'.join(sides)} {words}" for sides, words in groups)
+    return f"Bleed: {body}"
+
+
+def attach_bleed_note(report: dict) -> dict:
+    if not isinstance(report, dict):
+        return report
+    sentence = bleed_method_sentence(report.get("edges") or [])
+    if sentence:
+        report["bleedNote"] = sentence
+    return report
+
+
+def _bleed_phrase(edge: dict) -> str:
+    method = str(edge.get("method") or "").lower()
+    kind = str(edge.get("kind") or "").lower()
+    note = str(edge.get("note") or "").lower()
+    if method == "trimmed" or "trimmed to 5" in note:
+        return "trimmed to 5 mm"
+    if method == "kept" or "kept the bleed" in note:
+        return "kept"
+    if method == "mirror" or "mirrored" in note:
+        if "photo" in kind:
+            return "mirrored photo"
+        if "gradient" in kind:
+            return "mirrored gradient"
+        if "pattern" in kind:
+            return "mirrored pattern"
+        return "mirrored"
+    if "gradient" in kind or method == "gradient" or "continued the gradient" in note:
+        return "continued gradient"
+    if "pattern" in kind or method == "pattern":
+        return "continued pattern"
+    if "photo" in kind:
+        return "continued photo"
+    return "flat colour"
 
 
 def summary_sentence(report: dict) -> str:

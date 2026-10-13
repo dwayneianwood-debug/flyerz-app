@@ -404,6 +404,20 @@ def _product_for_trim(trim_w: float, trim_h: float):
     return None
 
 
+def _record_bleed_note(decisions: list, engine) -> None:
+    """Put the per-edge automatic method on the card, beside the generic bleed line."""
+    if not isinstance(engine, dict):
+        return
+    from press_ready_engine import bleed_method_sentence
+
+    sentence = str(engine.get("bleedNote") or "") or bleed_method_sentence(engine.get("edges") or [])
+    if not sentence:
+        return
+    engine["bleedNote"] = sentence
+    if sentence not in decisions:
+        decisions.append(sentence)
+
+
 def _remember_product(decisions: list, product: dict, trim_w: float, trim_h: float) -> None:
     line = f"Product set to {product.get('label')} ({trim_w:g} × {trim_h:g} mm)."
     for index, existing in enumerate(decisions):
@@ -454,6 +468,16 @@ def _page_points(path: str):
         return (float(page.rect.width), float(page.rect.height))
     finally:
         doc.close()
+
+
+def pixels_as_points_trim(path: str):
+    """Catalog product when a PDF page is a 300 dpi pixel count stored as points."""
+    if os.path.splitext(path)[1].lower() != ".pdf":
+        return None
+    points = _page_points(path)
+    if not points:
+        return None
+    return _pixels_as_points_product(*points)
 
 
 def _pixels_as_points_product(width_pt: float, height_pt: float):
@@ -1311,6 +1335,27 @@ def _layout_with_bar(img, trim_w: float, trim_h: float):
     return fitted
 
 
+def _image_bleed_for_product(path: str, trim_w: float, trim_h: float):
+    """Centred bleed already in a raster, from its embedded DPI. None when the tag is missing."""
+    if os.path.splitext(path)[1].lower() not in IMAGE_EXT:
+        return None
+    try:
+        import numpy as np
+        from PIL import Image
+
+        from press_ready_engine import _existing_image_bleed
+
+        with Image.open(path) as image:
+            dpi = image.info.get("dpi") or (0, 0)
+            dpi_x = float((dpi[0] if isinstance(dpi, tuple) else dpi) or 0)
+            if dpi_x < 150:
+                return None
+            rgb = np.asarray(image.convert("RGB"))
+        return _existing_image_bleed(np.ascontiguousarray(rgb[:, :, ::-1]), dpi_x, float(trim_w), float(trim_h))
+    except Exception:
+        return None
+
+
 def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, decisions: list) -> tuple:
     """Keep the whole picture. Fill a shape gap by mirroring the rim, not by smearing one pixel.
 
@@ -1612,6 +1657,18 @@ def make_print_ready(
             from ai_rebuild import _pdf_has_live_type
             from large_job import file_bytes, is_large_job
 
+            points = _page_points(work_path)
+            pixel_product = _pixels_as_points_product(*points) if points else None
+            if pixel_product is not None:
+                # This wins over a trim that is just the page points read as millimetres.
+                product = pixel_product
+                trim_w = float(pixel_product["widthMm"])
+                trim_h = float(pixel_product["heightMm"])
+                _remember_product(decisions, product, trim_w, trim_h)
+                decisions.append(
+                    f"The page stores a picture's pixels as points, so it was matched to {pixel_product.get('label')}."
+                )
+                native_pixels = True
             # Live text and vector drawings stay as they are. A raster page can still be traced.
             live_type = _pdf_has_live_type(work_path)
             # A ~200 MB picture-PDF used to be killed at 300 s and never finished.
@@ -1628,18 +1685,9 @@ def make_print_ready(
                     )
         if ext == ".pdf":
             measured = _pdf_trim_mm(work_path)
-            points = _page_points(work_path)
-            pixel_product = _pixels_as_points_product(*points) if points else None
-            fit = _fit_page_to_trim(*measured, trim_w, trim_h) if measured else None
-            if pixel_product is not None and fit is None:
-                product = pixel_product
-                trim_w = float(pixel_product["widthMm"])
-                trim_h = float(pixel_product["heightMm"])
-                _remember_product(decisions, product, trim_w, trim_h)
-                decisions.append(
-                    f"The page stores a picture's pixels as points, so it was matched to {pixel_product.get('label')}."
-                )
-                native_pixels = True
+            fit = None
+            if not native_pixels and measured:
+                fit = _fit_page_to_trim(*measured, trim_w, trim_h)
             if fit and fit["rotated"]:
                 turned = _product_for_trim(fit["trimW"], fit["trimH"])
                 if turned:
@@ -1655,7 +1703,7 @@ def make_print_ready(
                 trim_h = fit["trimH"]
                 _remember_product(decisions, product, trim_w, trim_h)
                 decisions.append("The page matches this product when it is turned the other way, so that orientation was used.")
-            if measured:
+            if measured and not native_pixels:
                 decisions.append(
                     f"The PDF trim is {measured[0]:.1f} × {measured[1]:.1f} mm."
                 )
@@ -1741,24 +1789,40 @@ def make_print_ready(
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
             picture = raster
-            # A contact band is laid out first so the trace sits on that page and
-            # the band stays at the bottom. A plain side pad is not part of the
-            # read: the smaller scale was dropping small marks such as a card's "7".
-            raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
-            if aspect_extended and _bottom_bar_row(picture) is not None:
+            # Extra bleed on a 300 dpi raster is the trim plus a ring. Extending the
+            # shape would treat that ring as the wrong aspect and the trim would be lost.
+            kept_source_bleed = None
+            if ext in IMAGE_EXT:
+                kept_source_bleed = _image_bleed_for_product(src_path, trim_w, trim_h)
+            over_raster = False
+            if kept_source_bleed:
+                over_raster = max(float(kept_source_bleed[side]) for side in ("left", "right", "top", "bottom")) > BLEED_MM + 0.6
+            if over_raster:
+                decisions.append("The picture already had more than 5 mm of bleed. Extra bleed is trimmed to 5 mm.")
+                aspect_extended = False
+                aspect_delta = 0.0
                 vector_source = raster
-            else:
-                vector_source = picture
-            try:
-                from ai_upscale import start_plate_upscale
-
-                upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
-            except Exception as exc:
-                sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
                 upscale_job = None
-            fitted_path = os.path.join(output_dir, "fitted.png")
-            _write_png(raster, fitted_path)
-            work_path = fitted_path
+            else:
+                kept_source_bleed = None
+                # A contact band is laid out first so the trace sits on that page and
+                # the band stays at the bottom. A plain side pad is not part of the
+                # read: the smaller scale was dropping small marks such as a card's "7".
+                raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
+                if aspect_extended and _bottom_bar_row(picture) is not None:
+                    vector_source = raster
+                else:
+                    vector_source = picture
+                try:
+                    from ai_upscale import start_plate_upscale
+
+                    upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
+                except Exception as exc:
+                    sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
+                    upscale_job = None
+                fitted_path = os.path.join(output_dir, "fitted.png")
+                _write_png(raster, fitted_path)
+                work_path = fitted_path
             from vector_text_v2 import font_substitution_enabled, vector_rebuild_enabled
 
             fonts_on = font_substitution_enabled()
@@ -1767,7 +1831,7 @@ def make_print_ready(
             has_lettering = False
             outer_ocr_s = 0.0
             # Font mode on an AI file reads the page itself. Every other raster is read once here.
-            if rebuild_on and not live_type and not (fonts_on and detected):
+            if (not over_raster) and rebuild_on and not live_type and not (fonts_on and detected):
                 try:
                     from vector_text_v2 import read_blocks
                     from vector_trace import is_lettering
@@ -1784,7 +1848,7 @@ def make_print_ready(
                 except Exception:
                     has_lettering = False
                     lettering_blocks = None
-            trace_raster = rebuild_on and not live_type and (detected or has_lettering)
+            trace_raster = (not over_raster) and rebuild_on and not live_type and (detected or has_lettering)
             if trace_raster:
                 if detected and fonts_on:
                     decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
@@ -1838,7 +1902,9 @@ def make_print_ready(
                 decisions.append("This file already has live type, so the lettering was left as it is.")
             else:
                 decisions.append("This was not treated as AI artwork. The original lettering is kept.")
-            if not (vector_built and vector_built.get("ok")):
+            if over_raster:
+                work_path = src_path
+            elif not (vector_built and vector_built.get("ok")):
                 _mark("enlarging", lettering_note)
                 upscaled_path = os.path.join(output_dir, "upscaled.png")
                 source_ppi = 300.0 / max(float(upscale), 1e-6)
@@ -1936,6 +2002,7 @@ def make_print_ready(
         engine = compiled["pressEngine"]
         press_ok = True
         decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
+        _record_bleed_note(decisions, engine)
     else:
         compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}
@@ -1947,6 +2014,7 @@ def make_print_ready(
             existing_kept = True
         elif press_ok:
             decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
+        _record_bleed_note(decisions, engine)
     if isinstance(engine, dict) and engine.get("headline"):
         decisions.append(f"Press engine: {engine.get('headline')}.")
 
