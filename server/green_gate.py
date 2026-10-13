@@ -46,10 +46,16 @@ def client_message(kind: str, label: str = "this size", trim_w: float = 148, tri
 
 def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None = None) -> dict:
     """Pass/fail checklist for one press PDF. Never raises."""
-    context = context or {}
+    context = dict(context or {})
     items = []
     severity = ""
     message = ""
+    try:
+        from client_file_audit import audit_pdf
+
+        context["fileAudit"] = audit_pdf(context.get("sourcePath") or press_path, trim_w, trim_h)
+    except Exception:
+        context["fileAudit"] = None
     try:
         items.append(_bleed(press_path, trim_w, trim_h))
         items.append(_boxes(press_path, trim_w, trim_h))
@@ -68,10 +74,10 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
         items.append(_paint_clean(press_path, context))
         items.append(_ink_colour(press_path, context))
         items.append(_picture_sharp(press_path, context))
-        items.append(_fonts(press_path))
-        if _page_empty(press_path):
-            severity = "red"
-            message = client_message("missing")
+        items.append(_fonts(press_path, context))
+        items.extend(_client_file_items(context))
+        empty = _page_empty(press_path)
+        if empty:
             items.append({
                 "id": "content",
                 "label": "The page has the artwork on it",
@@ -85,6 +91,7 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
                 "passed": True,
                 "detail": "",
             })
+        message, severity = _client_note(context, cut, empty)
     except Exception as exc:
         items.append({
             "id": "checklist",
@@ -93,6 +100,55 @@ def assess(press_path: str, trim_w: float, trim_h: float, context: dict | None =
             "detail": f"The press check could not finish ({str(exc)[:120]}).",
         })
     return {"items": items, "severity": severity, "clientMessage": message}
+
+
+def _client_note(context: dict, cut: bool, empty: bool) -> tuple[str, str]:
+    """One note that lists every real problem. Amber issues stay out of a red note unless the job is already red."""
+    from client_file_audit import font_sentence, low_res_sentence
+
+    audit = context.get("fileAudit") or {}
+    reds = []
+    font_line = font_sentence(audit.get("fonts") or {})
+    if font_line:
+        reds.append(font_line)
+    if cut:
+        reds.append(client_message("cut"))
+    if empty:
+        reds.append(client_message("missing"))
+    # Under 300 ppi is a warning. Under 75 is still a warning, not a failed job.
+    resolution = audit.get("resolution") or {}
+    if reds and (resolution.get("amber") or resolution.get("severe")):
+        line = low_res_sentence(resolution)
+        if line and line not in reds:
+            reds.append(line)
+    if not reds:
+        return "", ""
+    return "\n\n".join(reds), "red"
+
+
+def _client_file_items(context: dict) -> list[dict]:
+    audit = context.get("fileAudit") or {}
+    items = []
+    hair = audit.get("hairlines") or {}
+    if hair.get("checked") and not hair.get("picture"):
+        count = int(hair.get("count") or 0)
+        detail = ""
+        if count:
+            detail = f"Thin lines under 0.25 pt were found ({count}). They are raised to 0.25 pt in the press file."
+        items.append(_item("hairlines", "Strokes are at least 0.25 pt", count == 0, detail))
+    spots = audit.get("spots") or {}
+    if spots.get("checked"):
+        names = spots.get("names") or []
+        detail = ""
+        if names:
+            detail = "Spot colours (" + ", ".join(names[:6]) + ") are converted to CMYK in the press file."
+        items.append(_item("spots", "No spot colours left for the press", not names, detail))
+    black = audit.get("black") or {}
+    if black.get("checked") and not black.get("picture"):
+        bad = bool(black.get("registration") or black.get("tacOver") or black.get("richSmallText") or black.get("largeKOnly"))
+        detail = "Black ink was outside the press rules and is corrected in the press file." if bad else ""
+        items.append(_item("black", "Black ink follows the press rules", not bad, detail))
+    return items
 
 
 def _item(item_id: str, label: str, passed: bool, detail: str) -> dict:
@@ -190,6 +246,34 @@ def _content_xrefs(page) -> list[int]:
     return xrefs
 
 
+def _margin_xrefs(page) -> set[int]:
+    """Bleed strips painted into the margin. They are not the press picture.
+
+    The added edge is DeviceRGB so the colour matches the page. A strip named
+    Bleed, or a picture that sits outside the trim, does not decide CMYK.
+    """
+    import pymupdf as fitz
+
+    trim = page.trimbox
+    skip: set[int] = set()
+    for item in page.get_images(full=True) or []:
+        xref = int(item[0])
+        name = str(item[7] if len(item) > 7 else "")
+        if name.startswith("Bleed"):
+            skip.add(xref)
+    for info in page.get_image_info(xrefs=True) or []:
+        xref = int(info.get("xref") or 0)
+        if xref <= 0 or xref in skip:
+            continue
+        box = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
+        if box.is_empty or box.get_area() <= 1:
+            continue
+        overlap = box & trim
+        if overlap.is_empty or overlap.get_area() < 0.2 * box.get_area():
+            skip.add(xref)
+    return skip
+
+
 def _colour(path: str) -> tuple[dict, dict]:
     import pymupdf as fitz
 
@@ -200,7 +284,10 @@ def _colour(path: str) -> tuple[dict, dict]:
         tac = 0.0
         saw_cmyk = False
         for page in doc:
+            margin = _margin_xrefs(page)
             for xref in _content_xrefs(page):
+                if xref in margin:
+                    continue
                 images.append(xref)
                 info = doc.extract_image(xref)
                 space = int(info.get("colorspace") or 0)
@@ -210,14 +297,25 @@ def _colour(path: str) -> tuple[dict, dict]:
                     tac = max(tac, _tac(info.get("image") or b""))
     finally:
         doc.close()
+    vec_ok, vec_tac = _vector_cmyk(path)
+    tac = max(tac, vec_tac)
+    text_rgb = (not vec_ok) and _vector_has_rgb(path)
     if not images:
-        cmyk_ok, tac = _vector_cmyk(path)
+        cmyk_ok, tac = vec_ok, vec_tac
         saw_cmyk = cmyk_ok
-        cmyk_detail = "The press file is not CMYK."
+        cmyk_detail = "The text/vector colour is RGB." if text_rgb else "The press file is not CMYK."
     else:
-        cmyk_ok = all(space == 4 for space in spaces)
-        cmyk_detail = "The press picture is not CMYK."
-    ink_ok = (not saw_cmyk) or tac <= TAC_LIMIT + 8
+        pictures_ok = all(space == 4 for space in spaces)
+        cmyk_ok = pictures_ok and vec_ok
+        if not vec_ok and vec_tac == 0.0 and not text_rgb:
+            cmyk_ok = pictures_ok
+        named = []
+        if not pictures_ok:
+            named.append("The press picture is not CMYK.")
+        if text_rgb:
+            named.append("The text/vector colour is RGB.")
+        cmyk_detail = " ".join(named) if named else "The press picture is not CMYK."
+    ink_ok = (not saw_cmyk and not vec_ok) or tac <= TAC_LIMIT + 8
     ink_detail = f"The heaviest ink is about {tac:.0f}%. The limit is {TAC_LIMIT:.0f}%."
     if not saw_cmyk:
         ink_ok = cmyk_ok
@@ -228,17 +326,57 @@ def _colour(path: str) -> tuple[dict, dict]:
     )
 
 
+def _art_operators(path: str) -> str:
+    """Page content plus form streams. Bleed images are not artwork paint.
+
+    A large poster keeps its vectors inside a form. The page stream is only a
+    Do, so the colour lives in that form. An image stream is binary and is not
+    searched for operators.
+    """
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    parts: list[str] = []
+    try:
+        for page in doc:
+            try:
+                parts.append(page.read_contents().decode("latin1", "replace"))
+            except Exception:
+                pass
+            try:
+                xobjects = page.get_xobjects() or []
+            except Exception:
+                xobjects = []
+            for item in xobjects:
+                try:
+                    xref = int(item[0])
+                    name = str(item[1] if len(item) > 1 else "")
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if name.startswith("Bleed"):
+                    continue
+                try:
+                    obj = doc.xref_object(xref)
+                except Exception:
+                    obj = ""
+                if "/Subtype /Image" in obj or "/Subtype/Image" in obj:
+                    continue
+                try:
+                    data = doc.xref_stream(xref) or b""
+                except Exception:
+                    data = b""
+                if data:
+                    parts.append(data.decode("latin1", "replace"))
+    finally:
+        doc.close()
+    return "\n".join(parts)
+
+
 def _vector_cmyk(path: str) -> tuple[bool, float]:
     """A page of CMYK fills and live text, with no RGB. Returns (ok, peak TAC)."""
     import re
 
-    import pymupdf as fitz
-
-    doc = fitz.open(path)
-    try:
-        raw = "".join(page.read_contents().decode("latin1", "replace") for page in doc)
-    finally:
-        doc.close()
+    raw = _art_operators(path)
     if re.search(r"\brg\b|\bRG\b|DeviceRGB", raw):
         return False, 0.0
     found = re.findall(r"([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+k\b", raw)
@@ -247,6 +385,8 @@ def _vector_cmyk(path: str) -> tuple[bool, float]:
     tac = 0.0
     for parts in found:
         tac = max(tac, sum(float(channel) for channel in parts) * 100.0)
+    if tac <= 0.0:
+        tac = _sampled_cmyk_tac(path)
     return True, tac
 
 
@@ -261,39 +401,60 @@ def _tac(blob: bytes) -> float:
     image = Image.open(io.BytesIO(blob))
     if image.mode != "CMYK":
         return 0.0
-    image.thumbnail((48, 48))
     arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 3 and max(arr.shape[0], arr.shape[1]) > 400:
+        step = max(1, int(max(arr.shape[0], arr.shape[1]) / 400))
+        arr = arr[::step, ::step]
     if arr.ndim != 3 or arr.shape[2] < 4:
         return 0.0
     total = arr[:, :, :4].sum(axis=2) / 255.0 * 100.0
     return float(np.percentile(total, 99))
 
 
-def _resolution(path: str, context: dict) -> dict:
-    del context
+def _sampled_cmyk_tac(path: str) -> float:
+    """Ink from a small CMYK render. A poster is not decoded at 300 DPI for this."""
     import pymupdf as fitz
+    import numpy as np
 
     doc = fitz.open(path)
     try:
-        images = doc[0].get_images() or []
-        info = doc[0].get_image_info() or []
+        page = doc[0]
+        long_pt = max(float(page.rect.width), float(page.rect.height), 1.0)
+        zoom = min(1.2, 700.0 / long_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csCMYK)
+        if pix.n < 4 or pix.width < 1 or pix.height < 1:
+            return 0.0
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        total = arr[:, :, :4].astype(np.float32).sum(axis=2) / 255.0 * 100.0
+        return float(np.percentile(total, 99))
     finally:
         doc.close()
-    if not images:
+
+
+def _vector_has_rgb(path: str) -> bool:
+    import re
+
+    raw = _art_operators(path)
+    return bool(re.search(r"\brg\b|\bRG\b|DeviceRGB", raw))
+
+
+def _resolution(path: str, context: dict) -> dict:
+    audit = (context or {}).get("fileAudit")
+    if not audit:
+        try:
+            from client_file_audit import audit_pdf
+
+            audit = audit_pdf((context or {}).get("sourcePath") or path)
+        except Exception:
+            audit = {}
+    resolution = (audit or {}).get("resolution") or {}
+    images = resolution.get("images") or []
+    if not resolution.get("checked") or not images:
         return _item("resolution", "Remaining raster is at least 300 DPI at final size", True, "")
-    # Pixel size of the embedded picture against the box it is printed in.
-    file_dpi = 0.0
-    for image in info:
-        bbox = image.get("bbox")
-        if not bbox:
-            continue
-        width_in = max(0.01, (float(bbox[2]) - float(bbox[0])) / 72.0)
-        height_in = max(0.01, (float(bbox[3]) - float(bbox[1])) / 72.0)
-        dpi = min(float(image.get("width") or 0) / width_in, float(image.get("height") or 0) / height_in)
-        file_dpi = max(file_dpi, dpi)
-    ok = file_dpi + 1 >= MIN_EFFECTIVE_DPI
-    detail = f"The picture is about {file_dpi:.0f} DPI at the print size. It needs 300 DPI."
-    return _item("resolution", "Remaining raster is at least 300 DPI at final size", ok, detail)
+    worst = float(resolution.get("worst") or 0)
+    named = ", ".join(f"{row['name']} ({float(row['ppi']):.0f} ppi)" for row in images[:4])
+    detail = f"The lowest picture is about {worst:.0f} ppi ({named}). It needs about 300 ppi."
+    return _item("resolution", "Remaining raster is at least 300 DPI at final size", False, detail)
 
 
 def _safe_zone(path: str, trim_w: float, trim_h: float, context: dict) -> tuple[dict, bool]:
@@ -654,8 +815,25 @@ def _press_matrix(page):
     if images:
         width, height = _image_pixels(page, int(images[0][0]))
         if width >= 8 and height >= 8 and page.rect.width > 1 and page.rect.height > 1:
-            return fitz.Matrix(width / page.rect.width, height / page.rect.height)
-    return fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+            matrix = fitz.Matrix(width / page.rect.width, height / page.rect.height)
+        else:
+            matrix = fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+    else:
+        matrix = fitz.Matrix(600.0 / 72.0, 600.0 / 72.0)
+    long_mm = max(page.rect.width, page.rect.height) * 25.4 / 72.0
+    if long_mm > 430.0:
+        cap = 150.0 / 72.0
+        matrix = fitz.Matrix(min(abs(matrix.a), cap), min(abs(matrix.d), cap))
+    try:
+        from large_job import file_bytes, is_large_job, proof_zoom
+
+        source = str(getattr(page.parent, "name", "") or "")
+        if source and is_large_job(file_bytes(source)):
+            zoom = proof_zoom(max(page.rect.width, page.rect.height), file_bytes(source))
+            matrix = fitz.Matrix(min(abs(matrix.a), zoom), min(abs(matrix.d), zoom))
+    except Exception:
+        pass
+    return matrix
 
 
 def _page_rgb(path: str, zoom: float):
@@ -910,11 +1088,25 @@ def _picture_sharp(path: str, context: dict) -> dict:
         return _item("sharp", label, False, f"The sharpness could not be checked ({str(exc)[:80]}).")
 
 
-def _fonts(path: str) -> dict:
-    from vector_retype import fonts_embedded
+def _fonts(path: str, context: dict | None = None) -> dict:
+    audit = (context or {}).get("fileAudit")
+    if not audit:
+        try:
+            from client_file_audit import audit_pdf
 
-    ok = bool(fonts_embedded(path))
-    return _item("fonts", "Fonts are embedded", ok, "A font in the press file is not embedded.")
+            audit = audit_pdf((context or {}).get("sourcePath") or path)
+        except Exception:
+            audit = {}
+    problems = ((audit or {}).get("fonts") or {}).get("problems") or []
+    if not problems:
+        return _item("fonts", "Fonts are embedded", True, "")
+    names = ", ".join(row["name"] for row in problems[:6])
+    return _item(
+        "fonts",
+        "Fonts are embedded",
+        False,
+        f"These fonts are not embedded or were substituted: {names}. Please export with fonts embedded or outlined.",
+    )
 
 
 def _page_empty(path: str) -> bool:

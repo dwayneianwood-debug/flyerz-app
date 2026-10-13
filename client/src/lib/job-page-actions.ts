@@ -1,5 +1,25 @@
 /** What the job page may start, and what the proceed button should say. */
 
+export const PRESS_READY_FILENAME = "Print Ready Artwork.pdf";
+export const PRESS_FILE_MISSING = "There isn't a press-ready PDF for this job yet.";
+
+export function pressReadyDownloadUrl(jobId: number | string): string {
+  return `/api/jobs/${jobId}/download/press-ready`;
+}
+
+/** Proceed to Download fetches this press PDF, not the zip bundle. */
+export function proceedPressDownload(jobId: number | string): { url: string; filename: string } {
+  return { url: pressReadyDownloadUrl(jobId), filename: PRESS_READY_FILENAME };
+}
+
+/** A missing press file stays quiet for the cat and shows the polite sentence. */
+export function proceedPressResult(ok: boolean, serverMessage?: string): { notifyCat: boolean; message: string | null } {
+  if (ok) return { notifyCat: true, message: null };
+  const message = (serverMessage || "").trim() || PRESS_FILE_MISSING;
+  return { notifyCat: false, message };
+}
+
+
 export function jobPageMayAutoStart(status: string | undefined): boolean {
   return status !== "processing" && status !== "complete";
 }

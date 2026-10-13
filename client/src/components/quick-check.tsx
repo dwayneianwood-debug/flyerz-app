@@ -14,6 +14,7 @@ import {
   Wrench, Wand2, ChevronDown, ChevronUp, Search, Ruler
 } from "lucide-react";
 import { defaultBleedOptions } from "@shared/schema";
+import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
 
 interface QuickCheckItem {
   id: string;
@@ -135,8 +136,8 @@ export function QuickCheck() {
     const file = acceptedFiles[0];
     if (!file) return;
 
-    if (file.size > 50 * 1024 * 1024) {
-      toast({ title: "File too large", description: "Max 50MB.", variant: "destructive" });
+    if (file.size > UPLOAD_LIMIT_BYTES) {
+      toast({ title: "File too large", description: uploadTooLargeMessage(file.size), variant: "destructive" });
       return;
     }
 

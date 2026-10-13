@@ -11,6 +11,7 @@ import { beginJobRun, endJobRun, JobAlreadyRunning } from "./jobRunLock";
 import { runWithJobProgress, writeJobProgress } from "./jobProgress";
 import { getFlyerzTempRoot } from "./envPaths";
 import crypto from "crypto";
+import { checksAllPassed } from "./checkVerdict";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
 import { isPrintToolType } from "@shared/artwork-types";
 import {
@@ -286,7 +287,7 @@ export function auditOfficeFile(fileType: string): AuditCheck[] {
     {
       name: "Office File Format",
       passed: false,
-      message: `${kind} files are not ideal for litho printing. Please send a PDF or a picture (JPG or PNG).`,
+      message: "Word and PowerPoint files can't be printed as they are. Please export it as a PDF and send that to us.",
       autoFixed: false,
       details: "Recommend converting to high-resolution PDF (400 DPI) with embedded fonts and CMYK color space.",
       severity: "HIGH",
@@ -730,7 +731,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
 
     checks = normalizeChecksAfterPdfGeometryHeal(checks);
 
-    const overallPassed = checks.every((c) => c.passed || (c as any).severity === "WARNING" || (c as any).severity === "MANUAL_REVIEW");
+    const overallPassed = checksAllPassed(checks);
     const fixesApplied = checks.filter((c) => c.autoFixed).length;
     const complianceReport = generateComplianceReport(filename, checks, fixesApplied);
 
@@ -782,6 +783,7 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
       jobAudit,
       autoHealEvent: bleedPythonResult?.autoHealEvent ?? undefined,
       pressEngine: (bleedPythonResult as { pressEngine?: AuditResults["pressEngine"] } | null)?.pressEngine,
+      bleedQuality: (bleedPythonResult as { bleedQuality?: AuditResults["bleedQuality"] } | null)?.bleedQuality,
     };
 
     await storage.updateJob(jobId, {

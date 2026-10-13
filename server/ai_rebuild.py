@@ -139,9 +139,18 @@ def _credit_note(status: str) -> str:
     return ""
 
 
+def _looks_like_pdf(path: str) -> bool:
+    """Uploads are stored without an extension, so the header decides."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _load_bgr(path: str) -> np.ndarray:
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
+    if ext == ".pdf" or _looks_like_pdf(path):
         import pymupdf as fitz
 
         doc = fitz.open(path)
@@ -166,7 +175,7 @@ def _load_bgr(path: str) -> np.ndarray:
 
 
 def _pdf_has_live_type(path: str) -> bool:
-    if os.path.splitext(path)[1].lower() != ".pdf":
+    if os.path.splitext(path)[1].lower() != ".pdf" and not _looks_like_pdf(path):
         return False
     try:
         import pymupdf as fitz

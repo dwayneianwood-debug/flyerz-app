@@ -111,26 +111,37 @@ def _potrace_in(raw: str) -> str:
 
 
 def overlay_fonts(bold: bool) -> list:
-    """Faces for a sharp overlay. Bundled Liberation, then the Windows font folder."""
+    """Faces for a sharp overlay. Bundled Liberation only, so Linux and Windows match."""
     bold_face = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
     regular = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
-    paths = [bold_face, regular] if bold else [regular, bold_face]
-    windir = (os.environ.get("WINDIR") or os.environ.get("SystemRoot") or "").strip()
-    if windir:
-        fonts = os.path.join(windir, "Fonts")
-        arial_bold = os.path.join(fonts, "arialbd.ttf")
-        arial = os.path.join(fonts, "arial.ttf")
-        calibri = os.path.join(fonts, "calibri.ttf")
-        if bold:
-            paths.extend([arial_bold, arial, calibri])
-        else:
-            paths.extend([arial, arial_bold, calibri])
-    return paths
+    return [bold_face, regular] if bold else [regular, bold_face]
 
 
 def bundled_sans(bold: bool = True) -> str:
     name = "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf"
     return os.path.join(FONT_DIR, name)
+
+
+def pin_c_locale() -> dict:
+    """Pin this process to a dot decimal before any float formatting or Ghostscript spawn.
+
+    Ian's laptop locale uses a comma. LC_ALL hides LC_NUMERIC from child processes,
+    so the parent locale is recorded and then cleared.
+    """
+    import locale
+
+    seen = {
+        "LC_ALL": os.environ.get("LC_ALL") or "",
+        "LC_NUMERIC": os.environ.get("LC_NUMERIC") or "",
+    }
+    os.environ.pop("LC_ALL", None)
+    os.environ["LC_NUMERIC"] = "C"
+    try:
+        locale.setlocale(locale.LC_NUMERIC, "C")
+        seen["pinned"] = locale.setlocale(locale.LC_NUMERIC)
+    except locale.Error as exc:
+        seen["pinned"] = f"failed:{exc}"
+    return seen
 
 
 def c_numeric_env(base: dict | None = None) -> dict:

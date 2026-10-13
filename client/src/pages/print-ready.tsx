@@ -4,6 +4,7 @@ import { QuickPrintForm, QuickResultCard, WatcherSettings } from "./print-ready-
 import type { QuickPrintCard } from "@shared/quickPrint";
 import { QUICK_PRINT_DEFAULT_PRODUCT_ID } from "@shared/quickPrint";
 import { useQueryClient } from "@tanstack/react-query";
+import { messageFromStartResponse } from "@/lib/upload-reply";
 
 function mergeCards(current: QuickPrintCard[], incoming: QuickPrintCard[]): QuickPrintCard[] {
   const map = new Map(current.map((card) => [card.id, card]));
@@ -94,12 +95,13 @@ export default function PrintReady() {
     setBusy(true);
     try {
       const res = await fetch("/api/quick-print", { method: "POST", body, credentials: "include" });
-      const payload = await res.json();
+      const raw = await res.text();
       if (!res.ok) {
         setBusy(false);
-        setError(payload.message || "Could not start.");
+        setError(messageFromStartResponse(raw, false));
         return;
       }
+      const payload = raw ? JSON.parse(raw) : {};
       const ids = (payload.jobs || []).map((job: { id: number }) => job.id);
       setActiveIds(ids);
       setCards((current) => mergeCards(current, (payload.jobs || []).map((job: { id: number; filename: string }) => ({
@@ -120,7 +122,7 @@ export default function PrintReady() {
       setFiles([]);
     } catch {
       setBusy(false);
-      setError("Could not start. Try the file again.");
+      setError("I couldn't start that. Please try the file again.");
     }
   }
 

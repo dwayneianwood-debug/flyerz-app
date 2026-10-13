@@ -980,7 +980,7 @@ export default function ManualCrop({ embedded = false, onCropApply, sourceImageU
                       </div>
                       <div>
                         <p className="text-lg font-semibold text-foreground mb-1">Drop your file here or click to browse</p>
-                        <p className="text-sm text-muted-foreground">{PRINT_TOOL_TYPE_LABEL} — up to 50MB</p>
+                        <p className="text-sm text-muted-foreground">{PRINT_TOOL_TYPE_LABEL} — up to 500MB</p>
                       </div>
                     </div>
                   )}

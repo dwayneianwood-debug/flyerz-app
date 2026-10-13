@@ -742,7 +742,7 @@ CHECKS = [
                 "looks_for": "Scans all PDF content streams for the stroke weight operator (w in PDF syntax). Identifies any stroke where the weight is less than 0.25pt (0.088mm), including zero-width strokes that rely on device-specific minimums.",
                 "autofix": "Automatically rewrites all stroke weights below the 0.25pt threshold to a safe minimum of 0.3pt. Only the weight is modified \u2014 stroke colour is never altered. Applies across all colour spaces (CMYK, RGB, Grayscale) to ensure visibility across the entire document.",
                 "outcomes": [
-                    ("\u2705 Passed", "All strokes meet minimum weight requirements. No hairlines detected."),
+                    ("\u2705 Passed", "Strokes on the original file were checked. None were under 0.25 pt."),
                     ("\u2728 Auto-Fixed", "Hairline strokes detected (below 0.25pt) and bulked to 0.3pt for press stability."),
                 ]
             },

@@ -197,6 +197,11 @@ export function QuickResultCard(props: {
         </ul>
       )}
       <div className="mt-4 flex flex-wrap gap-2">
+        {card.hasPress && light === "red" && (
+          <a href={`/api/jobs/${card.id}/download/press-ready`}>
+            <Button type="button" variant="secondary" className="font-bold" data-testid={`link-download-press-${card.id}`}>Download press PDF</Button>
+          </a>
+        )}
         {light !== "red" && card.hasPress && (
           <a href={`/api/jobs/${card.id}/download/press-ready`}>
             <Button type="button" className="font-bold" data-testid={`link-download-press-${card.id}`}>Download press PDF</Button>
@@ -214,6 +219,11 @@ export function QuickResultCard(props: {
         )}
         {card.approved && <span className="text-sm font-semibold self-center">Approved</span>}
       </div>
+      {light === "red" && card.hasPress && (
+        <p className="mt-2 text-sm" data-testid={`text-press-warning-${card.id}`}>
+          This file has warnings. Please check them before printing.
+        </p>
+      )}
     </Card>
   );
 }

@@ -362,9 +362,22 @@ export async function runJobCleanup(deps: CleanupDeps): Promise<CleanupReport> {
   return report;
 }
 
+function anchoredDirs(roots: SafeRoots): Set<string> {
+  const anchored = new Set<string>();
+  for (const root of roots.allowed) {
+    const resolved = path.resolve(root);
+    anchored.add(resolved);
+    anchored.add(path.join(resolved, "quick-print"));
+  }
+  for (const root of roots.protected) anchored.add(path.resolve(root));
+  return anchored;
+}
+
 function removeEmptyParents(start: string, roots: SafeRoots): void {
+  const anchored = anchoredDirs(roots);
   let current = path.resolve(start);
   for (let i = 0; i < 6; i++) {
+    if (anchored.has(current)) return;
     if (!roots.allowed.some((root) => pathIsInside(current, root))) return;
     if (roots.protected.some((root) => current === path.resolve(root) || pathIsInside(current, root))) return;
     try {

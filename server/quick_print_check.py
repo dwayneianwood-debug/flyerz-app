@@ -78,7 +78,9 @@ def _bled_pdf(path: str) -> None:
     page = doc.new_page(width=trim_w + 2 * bleed, height=trim_h + 2 * bleed)
     page.draw_rect(page.rect, color=None, fill=(0.75, 0.08, 0.08))
     page.draw_rect(fitz.Rect(bleed, bleed, bleed + trim_w, bleed + trim_h), color=None, fill=(0.1, 0.55, 0.2))
-    page.insert_text((bleed + 36, bleed + 80), "ALREADY BLEED", fontsize=28, fontname="helv", color=(1, 1, 1))
+    font_file = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    page.insert_font(fontname="DEJAVU", fontfile=font_file)
+    page.insert_text((bleed + 36, bleed + 80), "ALREADY BLEED", fontsize=28, fontname="DEJAVU", color=(1, 1, 1))
     trim = fitz.Rect(bleed, bleed, bleed + trim_w, bleed + trim_h)
     page.set_trimbox(trim)
     page.set_bleedbox(page.rect)
@@ -184,7 +186,7 @@ def test_wide(root: str) -> None:
     path = os.path.join(root, "banner.png")
     _wide(path)
     result = _run(path, "wide")
-    check("wide-amber", result["light"] == "amber", f"{result['light']} {result.get('reasons')}")
+    check("wide-amber", result["light"] == "red" and any("over 12%" in line for line in result.get("reasons") or []), f"{result['light']} {result.get('reasons')}")
     check("wide-reason", any("extended" in line.lower() for line in result["reasons"]), str(result["reasons"]))
     check("wide-press", bool(result.get("pressPath") and os.path.getsize(result["pressPath"]) > 1000))
     check("wide-bleed", abs(float(result.get("mediaWidthMm") or 0) - 158) < 3, str(result.get("mediaWidthMm")))
@@ -945,6 +947,44 @@ def _pad_for_detector(band: np.ndarray) -> np.ndarray:
     return cv2.resize(band, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
+def test_white_edge_sliver_is_not_the_bleed() -> None:
+    """A 1px Canva white column must not paint the outer bleed light grey.
+
+    The VOB A5 page is 0.1 mm short of 148 mm, so the right fill is a short
+    colour pad of about 3.2 mm. That pad has to continue the artwork.
+    """
+    from quick_print import _extend_edges
+
+    art = (40, 90, 160)
+    page = np.full((90, 140, 3), art, np.uint8)
+    page[:, -1] = (255, 255, 255)
+    pad = 38
+    extended = _extend_edges(page, 0, 0, 0, pad, px_per_mm=300.0 / 25.4)
+    bleed = extended[:, -pad:].astype(np.int16)
+    median = np.median(bleed.reshape(-1, 3), axis=0)
+    delta = float(np.max(np.abs(median - np.array(art))))
+    check("white-sliver-bleed-matches-art", delta < 12, f"median {median.tolist()} delta {delta:.1f}")
+    check("white-sliver-not-grey", float(np.mean(bleed)) < 180, f"mean {float(np.mean(bleed)):.1f}")
+
+    two = np.full((90, 140, 3), art, np.uint8)
+    two[:, -2:] = (255, 255, 255)
+    extended_two = _extend_edges(two, 0, 0, 0, pad, px_per_mm=300.0 / 25.4)
+    median_two = np.median(extended_two[:, -pad:].reshape(-1, 3).astype(np.int16), axis=0)
+    check("two-px-white-sliver", float(np.max(np.abs(median_two - np.array(art)))) < 12, str(median_two.tolist()))
+
+    odd = np.full((90, 140, 3), art, np.uint8)
+    odd[:, -1] = (210, 210, 210)
+    extended_odd = _extend_edges(odd, 0, 0, 0, pad, px_per_mm=300.0 / 25.4)
+    median_odd = np.median(extended_odd[:, -pad:].reshape(-1, 3).astype(np.int16), axis=0)
+    check("anomalous-sliver", float(np.max(np.abs(median_odd - np.array(art)))) < 12, str(median_odd.tolist()))
+
+    grey = np.full((90, 140, 3), art, np.uint8)
+    grey[:, -2:] = (210, 210, 210)
+    extended_grey = _extend_edges(grey, 0, 0, 0, pad, px_per_mm=300.0 / 25.4)
+    median_grey = np.median(extended_grey[:, -pad:].reshape(-1, 3).astype(np.int16), axis=0)
+    check("two-px-anomalous-sliver", float(np.max(np.abs(median_grey - np.array(art)))) < 12, str(median_grey.tolist()))
+
+
 def test_product_edges_are_not_striped() -> None:
     """The flyer top-right and the poster right edge must not be stripes or bands."""
     import cv2
@@ -1194,6 +1234,7 @@ def main() -> None:
     test_touching_object_stays_reasonable_and_amber()
     test_bottom_bar_stays_at_the_bottom()
     test_tall_extension_is_not_striped()
+    test_white_edge_sliver_is_not_the_bleed()
     test_product_edges_are_not_striped()
     test_large_block_join_is_soft()
     test_catch_fire_raster_is_traced()

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -126,6 +127,9 @@ test("yesterday is removed, today and a processing job stay, and outside paths a
   assert.equal(report.backupCreated, true);
   assert.equal(fs.existsSync(path.join(uploads, "old.png")), false);
   assert.equal(fs.existsSync(path.join(uploads, "quick-print", "1")), false);
+  assert.equal(fs.existsSync(uploads), true);
+  assert.equal(fs.existsSync(path.join(uploads, "quick-print")), true);
+  assert.equal(fs.existsSync(jobsRoot), true);
   assert.equal(fs.existsSync(path.join(uploads, "thumbs", "1.jpg")), false);
   assert.equal(fs.existsSync(path.join(uploads, "1_press_ready_precompile.pdf")), false);
   assert.equal(fs.existsSync(path.join(jobsRoot, "old.txt")), false);
@@ -232,6 +236,51 @@ test("cleanup stays off when the setting is switched off", async () => {
   assert.equal(fs.readFileSync(path.join(uploads, "old.png"), "utf8"), "stay");
 });
 
+test("00:30 and 01:59 SAST stay when storage reads the clock in Johannesburg", () => {
+  const root = appDir();
+  const db = path.join(root, "clock.sqlite");
+  const script = path.join(root, "clock-check.ts");
+  const storagePath = path.join(process.cwd(), "server", "storage.ts");
+  const cleanupPath = path.join(process.cwd(), "server", "jobCleanup.ts");
+  fs.writeFileSync(script, `
+import { DatabaseStorage, rememberStoredUpload } from ${JSON.stringify(storagePath)};
+import { planCleanup } from ${JSON.stringify(cleanupPath)};
+
+async function main() {
+  const storage = new DatabaseStorage();
+  const early = await storage.createJob({ filename: "0030.pdf", originalPath: "/tmp/a.pdf", fileSize: 10, fileType: "pdf" });
+  const late = await storage.createJob({ filename: "0159.pdf", originalPath: "/tmp/b.pdf", fileSize: 10, fileType: "pdf" });
+  const yesterday = await storage.createJob({ filename: "yesterday.pdf", originalPath: "/tmp/c.pdf", fileSize: 10, fileType: "pdf" });
+  rememberStoredUpload(early.id, "2026-10-05 22:30:00");
+  rememberStoredUpload(late.id, "2026-10-05 23:59:00");
+  rememberStoredUpload(yesterday.id, "2026-10-05 21:59:00");
+  const jobs = await storage.getJobs();
+  const now = new Date("2026-10-06T04:00:00.000Z");
+  const plan = planCleanup(jobs.map((job) => ({
+    id: job.id,
+    filename: job.filename,
+    status: job.status,
+    uploadedAt: job.uploadedAt,
+  })), now);
+  const kept = plan.keepToday.map((job) => job.filename).sort();
+  const removed = plan.remove.map((job) => job.filename);
+  if (kept.join(",") !== "0030.pdf,0159.pdf" || removed.join(",") !== "yesterday.pdf") {
+    console.error(JSON.stringify({ kept, removed, instants: jobs.map((job) => [job.filename, job.uploadedAt]) }));
+    process.exit(2);
+  }
+  console.log("ok");
+}
+
+main();
+`);
+  const proc = spawnSync("npx", ["tsx", script], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, TZ: "Africa/Johannesburg", FLYERZ_DB_PATH: db },
+  });
+  assert.equal(proc.status, 0, `${proc.stdout}\n${proc.stderr}`);
+});
+
 test("Johannesburg midnight keeps today and the next cleanup is just after midnight", () => {
   const start = startOfTodayJohannesburg(NOW);
   assert.equal(start.toISOString(), "2026-09-29T22:00:00.000Z");
@@ -277,4 +326,71 @@ test("the cleanup setting is on until someone switches it off", async () => {
     if (previous === undefined) delete process.env.JOB_CLEANUP_SETTINGS_PATH;
     else process.env.JOB_CLEANUP_SETTINGS_PATH = previous;
   }
+});
+
+test("a second upload waits instead of failing with database is locked", () => {
+  const root = appDir();
+  const db = path.join(root, "jobs.sqlite");
+  const ready = path.join(root, "locked");
+  const script = path.join(root, "wal-check.ts");
+  const storagePath = path.join(process.cwd(), "server", "storage.ts");
+  fs.writeFileSync(script, `
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import { databaseWaitMs, storage } from ${JSON.stringify(storagePath)};
+
+async function main() {
+  const db = process.env.FLYERZ_DB_PATH || "";
+  const ready = process.env.LOCK_READY || "";
+  const probe = new DatabaseSync(db);
+  const mode = probe.prepare("PRAGMA journal_mode").get() as { journal_mode?: string };
+  probe.close();
+  if (String(mode.journal_mode || "").toLowerCase() !== "wal") {
+    console.error("mode " + JSON.stringify(mode));
+    process.exit(2);
+  }
+  if (databaseWaitMs() < 5000) {
+    console.error("timeout " + databaseWaitMs());
+    process.exit(3);
+  }
+  const holder = spawn(process.execPath, ["-e", \`
+    const { DatabaseSync } = require("node:sqlite");
+    const fs = require("node:fs");
+    const db = new DatabaseSync(process.env.FLYERZ_DB_PATH);
+    db.exec("BEGIN IMMEDIATE");
+    fs.writeFileSync(process.env.LOCK_READY, "1");
+    setTimeout(() => { db.exec("COMMIT"); db.close(); }, 350);
+  \`], { env: process.env });
+  const started = Date.now();
+  while (!fs.existsSync(ready)) {
+    if (Date.now() - started > 3000) {
+      console.error("holder did not lock");
+      process.exit(4);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const job = await storage.createJob({
+    filename: "concurrent.pdf",
+    originalPath: "/tmp/concurrent.pdf",
+    fileSize: 20,
+    fileType: "pdf",
+  });
+  const elapsed = Date.now() - started;
+  holder.kill();
+  if (!job.id || elapsed < 200) {
+    console.error(JSON.stringify({ id: job.id, elapsed }));
+    process.exit(5);
+  }
+  console.log("ok " + elapsed);
+}
+
+main();
+`);
+  const proc = spawnSync("npx", ["tsx", script], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, FLYERZ_DB_PATH: db, LOCK_READY: ready },
+  });
+  assert.equal(proc.status, 0, `${proc.stdout}\n${proc.stderr}`);
 });

@@ -36,6 +36,11 @@ test("quick print form lists the product sizes and one button", () => {
   assert.match(html, /Custom size/);
   assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a5" && product.widthMm === 148), true);
   assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a6-landscape" && product.widthMm === 148 && product.heightMm === 105), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a0" && product.widthMm === 841 && product.heightMm === 1189), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "a7-landscape" && product.widthMm === 105 && product.heightMm === 74), true);
+  assert.equal(QUICK_PRINT_PRODUCTS.some((product) => product.id === "card-50x90" && product.widthMm === 50 && product.heightMm === 90), true);
+  assert.match(html, /A0 \(841 × 1189 mm\)/);
+  assert.match(html, /A7 landscape \(105 × 74 mm\)/);
 });
 
 test("result cards show green download, amber reasons, and a red client message", () => {
@@ -119,6 +124,34 @@ test("result cards show green download, amber reasons, and a red client message"
   assert.match(red, /Copy message for the client/);
   assert.match(red, /Nothing is sent until you copy this and send it yourself/);
   assert.equal(red.includes("Download press PDF"), false);
+  assert.equal(red.includes("This file has warnings. Please check them before printing."), false);
+  assert.equal(red.includes("link-download-proof-3"), false);
+
+  const redPress = renderToStaticMarkup(
+    <QuickResultCard
+      card={{
+        id: 4,
+        filename: "vob-flyer.pdf",
+        status: "complete",
+        light: "red",
+        reasons: ["A picture is under 300 ppi."],
+        decisions: [],
+        clientMessage: "Please check the pictures.",
+        approved: false,
+        hasPress: true,
+        hasProof: true,
+        productLabel: "A5",
+        quantity: null,
+        notes: "",
+      }}
+    />,
+  );
+  assert.match(redPress, /data-testid="link-download-press-4"/);
+  assert.match(redPress, /bg-secondary/);
+  assert.match(redPress, /\/api\/jobs\/4\/download\/press-ready/);
+  assert.match(redPress, /Download press PDF/);
+  assert.match(redPress, /This file has warnings\. Please check them before printing\./);
+  assert.equal(redPress.includes("link-download-proof-4"), false);
 });
 
 test("a job that is still running shows the real stage", () => {

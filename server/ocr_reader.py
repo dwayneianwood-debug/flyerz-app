@@ -14,13 +14,82 @@ _ENGINE_NAME = ""
 def _as_list(value):
     if value is None:
         return []
-    return list(value)
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return []
+            return value.tolist()
+    except Exception:
+        pass
+    if isinstance(value, (str, bytes)):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _plain_box(box):
+    """Four points as floats. Windows builds hand back numpy arrays, which cannot be tested with `not`."""
+    if box is None:
+        return []
+    try:
+        import numpy as np
+
+        if isinstance(box, np.ndarray):
+            if box.size == 0:
+                return []
+            box = box.tolist()
+    except Exception:
+        pass
+    if isinstance(box, (int, float, str)):
+        return []
+    # A tight rectangle [x0, y0, x1, y1] rather than four corners.
+    if (
+        isinstance(box, (list, tuple))
+        and len(box) == 4
+        and all(isinstance(item, (int, float)) for item in box)
+    ):
+        x0, y0, x1, y1 = (float(item) for item in box)
+        return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    points = []
+    try:
+        pairs = list(box)
+    except TypeError:
+        return []
+    for point in pairs:
+        try:
+            import numpy as np
+
+            if isinstance(point, np.ndarray):
+                point = point.tolist()
+        except Exception:
+            pass
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            try:
+                points.append([float(point[0]), float(point[1])])
+            except (TypeError, ValueError):
+                continue
+    return points
 
 
 def rows_from_output(result):
-    """Normalise the old list result and the newer RapidOCROutput."""
-    if isinstance(result, tuple) and result and isinstance(result[0], list):
-        return result[0] or []
+    """Normalise the old list result and the newer RapidOCROutput.
+
+    Some Windows wheels return (RapidOCROutput, elapse) and store boxes as numpy
+    arrays. A bare list of rows is the older shape. Both become [box, text, score]
+    of plain numbers, so a numpy box is never tested with `not`.
+    """
+    if isinstance(result, tuple) and result:
+        first = result[0]
+        if isinstance(first, list):
+            return [row for row in (_plain_row(item) for item in first) if row]
+        if getattr(first, "txts", None) is not None or (isinstance(first, dict) and first.get("txts") is not None):
+            result = first
+    if isinstance(result, list):
+        return [row for row in (_plain_row(item) for item in result) if row]
     txts = getattr(result, "txts", None)
     if txts is None and isinstance(result, dict):
         txts = result.get("txts")
@@ -33,11 +102,31 @@ def rows_from_output(result):
         boxes = _as_list(getattr(result, "boxes", None))
         scores = _as_list(getattr(result, "scores", None))
     rows = []
-    for index, text in enumerate(txts):
-        box = boxes[index] if index < len(boxes) else [[0, 0], [1, 0], [1, 1], [0, 1]]
-        score = float(scores[index]) if index < len(scores) else 1.0
+    for index, text in enumerate(_as_list(txts)):
+        box = _plain_box(boxes[index] if index < len(boxes) else None)
+        if len(box) < 4:
+            box = [[0, 0], [1, 0], [1, 1], [0, 1]]
+        try:
+            score = float(scores[index]) if index < len(scores) else 1.0
+        except (TypeError, ValueError):
+            score = 1.0
         rows.append([box, str(text or ""), score])
     return rows
+
+
+def _plain_row(item):
+    if isinstance(item, dict):
+        box = _plain_box(item.get("box") or item.get("boxes"))
+        text = str(item.get("text") or item.get("txt") or "")
+        return [box, text, 1.0] if text and len(box) >= 4 else None
+    try:
+        box = _plain_box(item[0])
+        text = str(item[1] or "") if len(item) > 1 else ""
+    except Exception:
+        return None
+    if not text.strip() or len(box) < 4:
+        return None
+    return [box, text.strip(), 1.0]
 
 
 def _load():

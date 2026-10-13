@@ -74,11 +74,34 @@ def effective_print_dpi(px_w: int, px_h: int, trim_w_mm: float, trim_h_mm: float
     return int(min(px_w / width_in, px_h / height_in))
 
 
-def choose_upscale_plan(src_w: int, src_h: int, trim_w_mm: float, trim_h_mm: float, bleed_mm: float = DEFAULT_BLEED_MM) -> dict:
-    """Pick a Real-ESRGAN scale (1, 2, or 4) that aims for 300 DPI, capped at 4000px."""
+def choose_upscale_plan(
+    src_w: int,
+    src_h: int,
+    trim_w_mm: float,
+    trim_h_mm: float,
+    bleed_mm: float = DEFAULT_BLEED_MM,
+    max_scale: float | None = None,
+    skip_below_ppi: float | None = None,
+) -> dict:
+    """Pick a Real-ESRGAN scale (1, 2, or 4) that aims for 300 DPI, capped at 4000px.
+
+    When max_scale is set, the resize itself also stops at that multiple.
+    When skip_below_ppi is set, a picture under that ppi is not enlarged.
+    """
     need_w = (float(trim_w_mm) + 2.0 * float(bleed_mm)) / 25.4 * TARGET_DPI
     need_h = (float(trim_h_mm) + 2.0 * float(bleed_mm)) / 25.4 * TARGET_DPI
     factor = max(need_w / max(src_w, 1), need_h / max(src_h, 1))
+    effective = effective_print_dpi(src_w, src_h, trim_w_mm, trim_h_mm, bleed_mm)
+    if skip_below_ppi is not None and effective < float(skip_below_ppi):
+        return {
+            "model_scale": 1,
+            "target_w": int(src_w),
+            "target_h": int(src_h),
+            "needed_factor": round(float(factor), 3),
+            "effective_dpi": effective,
+            "skipped_low": True,
+            "applied_scale": 1,
+        }
     long_edge = max(src_w, src_h)
     if factor <= 1:
         model_scale = 2 if long_edge * 2 <= MAX_LONG_EDGE else 1
@@ -88,8 +111,12 @@ def choose_upscale_plan(src_w: int, src_h: int, trim_w_mm: float, trim_h_mm: flo
         model_scale = 4
     while model_scale > 1 and long_edge * model_scale > MAX_LONG_EDGE:
         model_scale //= 2
+    if max_scale is not None:
+        model_scale = min(int(model_scale), int(max_scale) if float(max_scale) >= 2 else 1)
 
     cover = max(factor, 1.0)
+    if max_scale is not None:
+        cover = min(cover, float(max_scale))
     out_w = int(round(src_w * cover))
     out_h = int(round(src_h * cover))
     long_out = max(out_w, out_h, 1)
@@ -100,12 +127,15 @@ def choose_upscale_plan(src_w: int, src_h: int, trim_w_mm: float, trim_h_mm: flo
     if factor <= 1 and max(src_w, src_h) <= MAX_LONG_EDGE:
         out_w, out_h = src_w, src_h
 
+    applied = max(out_w / max(src_w, 1), out_h / max(src_h, 1))
     return {
         "model_scale": int(model_scale),
         "target_w": int(out_w),
         "target_h": int(out_h),
         "needed_factor": round(float(factor), 3),
-        "effective_dpi": effective_print_dpi(src_w, src_h, trim_w_mm, trim_h_mm, bleed_mm),
+        "effective_dpi": effective,
+        "skipped_low": False,
+        "applied_scale": round(float(applied), 3),
     }
 
 
@@ -714,7 +744,25 @@ def apply_ai_upscale(input_path: str, options: Optional[dict] = None) -> dict:
         )
 
     src_h, src_w = source.shape[:2]
-    plan = choose_upscale_plan(src_w, src_h, trim_w, trim_h, bleed_mm)
+    raw_cap = options.get("max_scale")
+    raw_floor = options.get("skip_below_ppi")
+    plan = choose_upscale_plan(
+        src_w,
+        src_h,
+        trim_w,
+        trim_h,
+        bleed_mm,
+        max_scale=float(raw_cap) if raw_cap else None,
+        skip_below_ppi=float(raw_floor) if raw_floor else None,
+    )
+    if plan.get("skipped_low"):
+        return _original_result(
+            "Under 75 ppi, so enhancement was not run.",
+            src_w,
+            src_h,
+            plan,
+            kind_info["kind"],
+        )
     soft = looks_soft(source)
     forced = str(options.get("provider") or "").strip().lower()
 

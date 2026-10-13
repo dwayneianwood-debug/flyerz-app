@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { Buffer } from "node:buffer";
 import { DatabaseSync } from "node:sqlite";
-import { backupDatabaseFile } from "./jobCleanup";
+import { backupDatabaseFile, parseStoredTime } from "./jobCleanup";
 import type { FileJobResponse, CreateFileJobRequest, UpdateFileJobRequest, JobListItem, JobListPage, JobStatus } from "@shared/schema";
 
 export interface IStorage {
@@ -19,7 +19,17 @@ const dbPath = process.env.FLYERZ_DB_PATH
   : path.join(dataDir, "flyerz.sqlite");
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const sqlite = new DatabaseSync(dbPath);
+const sqlite = new DatabaseSync(dbPath, { timeout: 5000 });
+// Concurrent uploads used to fail with "database is locked". WAL lets a reader
+// and a writer proceed, and a busy timeout waits instead of failing the upload.
+sqlite.exec("PRAGMA journal_mode = WAL");
+sqlite.exec("PRAGMA busy_timeout = 5000");
+
+/** How long a locked write waits, in milliseconds. Per connection, so a new handle does not show it. */
+export function databaseWaitMs(): number {
+  const row = sqlite.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined;
+  return Number(row?.timeout || 0);
+}
 sqlite.exec(`
   CREATE TABLE IF NOT EXISTS file_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +50,21 @@ sqlite.exec(`
   CREATE INDEX IF NOT EXISTS idx_file_jobs_status_uploaded_at ON file_jobs (status, uploaded_at);
 `);
 
+for (const statement of [
+  "ALTER TABLE file_jobs ADD COLUMN product_width_mm REAL",
+  "ALTER TABLE file_jobs ADD COLUMN product_height_mm REAL",
+  "ALTER TABLE file_jobs ADD COLUMN sides TEXT",
+  "ALTER TABLE file_jobs ADD COLUMN ordered_page_count INTEGER",
+  "ALTER TABLE file_jobs ADD COLUMN finishes TEXT",
+  "ALTER TABLE file_jobs ADD COLUMN head_to_foot INTEGER",
+]) {
+  try {
+    sqlite.exec(statement);
+  } catch {
+    /* column already exists */
+  }
+}
+
 type JobRow = {
   id: number;
   filename: string;
@@ -53,6 +78,12 @@ type JobRow = {
   /** SQLite TEXT; driver may return string, Buffer, or Uint8Array */
   audit_results: string | Buffer | Uint8Array | null;
   error_message: string | null;
+  product_width_mm?: number | null;
+  product_height_mm?: number | null;
+  sides?: string | null;
+  ordered_page_count?: number | null;
+  finishes?: string | null;
+  head_to_foot?: number | null;
 };
 
 /** Coerce SQLite column value to UTF-8 text before JSON.parse. */
@@ -89,6 +120,7 @@ const NESTED_JSON_KEYS = [
   "artworkSize",
   "compileAuditReport",
   "checks",
+  "order",
 ] as const;
 
 /**
@@ -172,6 +204,16 @@ function parseAuditResultsColumn(raw: unknown): FileJobResponse["auditResults"] 
   }
 }
 
+/** SQLite stores UTC without a zone. Read that string as UTC before it becomes a Date. */
+export function storedInstant(value: string | null | undefined): Date {
+  if (!value) return new Date(NaN);
+  return parseStoredTime(String(value));
+}
+
+export function rememberStoredUpload(id: number, uploadedAt: string): void {
+  sqlite.prepare("UPDATE file_jobs SET uploaded_at = ?, status = 'complete' WHERE id = ?").run(uploadedAt, id);
+}
+
 function mapRowToResponse(row: JobRow): FileJobResponse {
   return {
     id: row.id,
@@ -179,12 +221,18 @@ function mapRowToResponse(row: JobRow): FileJobResponse {
     originalPath: row.original_path,
     correctedPath: row.corrected_path,
     status: row.status as FileJobResponse["status"],
-    uploadedAt: new Date(row.uploaded_at),
-    completedAt: row.completed_at ? new Date(row.completed_at) : null,
+    uploadedAt: storedInstant(row.uploaded_at),
+    completedAt: row.completed_at ? storedInstant(row.completed_at) : null,
     fileSize: row.file_size,
     fileType: row.file_type as FileJobResponse["fileType"],
     auditResults: parseAuditResultsColumn(row.audit_results as unknown),
     errorMessage: row.error_message,
+    productWidthMm: row.product_width_mm ?? null,
+    productHeightMm: row.product_height_mm ?? null,
+    sides: row.sides ?? null,
+    orderedPageCount: row.ordered_page_count ?? null,
+    finishes: row.finishes ?? null,
+    headToFoot: row.head_to_foot == null ? null : Boolean(row.head_to_foot),
   };
 }
 
@@ -247,7 +295,7 @@ export class DatabaseStorage implements IStorage {
     const jobs: JobListItem[] = rows.map((row) => {
       const overallPassed = passedFlag(row.overall_passed);
       const pressPassed = passedFlag(row.press_passed);
-      const uploaded = new Date(row.uploaded_at);
+      const uploaded = storedInstant(row.uploaded_at);
       const quickLight = row.quick_light === "green" || row.quick_light === "amber" || row.quick_light === "red"
         ? row.quick_light
         : null;
@@ -320,7 +368,8 @@ export class DatabaseStorage implements IStorage {
   async getJobs(): Promise<FileJobResponse[]> {
     const rows = sqlite
       .prepare(
-        `SELECT id, filename, original_path, corrected_path, status, uploaded_at, completed_at, file_size, file_type, audit_results, error_message
+        `SELECT id, filename, original_path, corrected_path, status, uploaded_at, completed_at, file_size, file_type, audit_results, error_message,
+                product_width_mm, product_height_mm, sides, ordered_page_count, finishes, head_to_foot
          FROM file_jobs
          ORDER BY uploaded_at`,
       )
@@ -331,7 +380,8 @@ export class DatabaseStorage implements IStorage {
   async getJob(id: number): Promise<FileJobResponse | undefined> {
     const row = sqlite
       .prepare(
-        `SELECT id, filename, original_path, corrected_path, status, uploaded_at, completed_at, file_size, file_type, audit_results, error_message
+        `SELECT id, filename, original_path, corrected_path, status, uploaded_at, completed_at, file_size, file_type, audit_results, error_message,
+                product_width_mm, product_height_mm, sides, ordered_page_count, finishes, head_to_foot
          FROM file_jobs
          WHERE id = ?`,
       )
@@ -343,10 +393,24 @@ export class DatabaseStorage implements IStorage {
   async createJob(job: CreateFileJobRequest): Promise<FileJobResponse> {
     const result = sqlite
       .prepare(
-        `INSERT INTO file_jobs (filename, original_path, file_size, file_type, status)
-         VALUES (?, ?, ?, ?, 'pending')`,
+        `INSERT INTO file_jobs (
+           filename, original_path, file_size, file_type, status,
+           product_width_mm, product_height_mm, sides, ordered_page_count, finishes, head_to_foot
+         )
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
       )
-      .run(job.filename, job.originalPath, job.fileSize, job.fileType);
+      .run(
+        job.filename,
+        job.originalPath,
+        job.fileSize,
+        job.fileType,
+        job.productWidthMm ?? null,
+        job.productHeightMm ?? null,
+        job.sides ?? null,
+        job.orderedPageCount ?? null,
+        job.finishes ?? null,
+        job.headToFoot == null ? null : job.headToFoot ? 1 : 0,
+      );
     const created = await this.getJob(Number(result.lastInsertRowid));
     if (!created) {
       throw new Error("Failed to create job");
@@ -377,6 +441,30 @@ export class DatabaseStorage implements IStorage {
     if (updates.errorMessage !== undefined) {
       setClauses.push("error_message = ?");
       values.push(updates.errorMessage);
+    }
+    if (updates.productWidthMm !== undefined) {
+      setClauses.push("product_width_mm = ?");
+      values.push(updates.productWidthMm);
+    }
+    if (updates.productHeightMm !== undefined) {
+      setClauses.push("product_height_mm = ?");
+      values.push(updates.productHeightMm);
+    }
+    if (updates.sides !== undefined) {
+      setClauses.push("sides = ?");
+      values.push(updates.sides);
+    }
+    if (updates.orderedPageCount !== undefined) {
+      setClauses.push("ordered_page_count = ?");
+      values.push(updates.orderedPageCount);
+    }
+    if (updates.finishes !== undefined) {
+      setClauses.push("finishes = ?");
+      values.push(updates.finishes);
+    }
+    if (updates.headToFoot !== undefined) {
+      setClauses.push("head_to_foot = ?");
+      values.push(updates.headToFoot == null ? null : updates.headToFoot ? 1 : 0);
     }
 
     if (setClauses.length > 0) {

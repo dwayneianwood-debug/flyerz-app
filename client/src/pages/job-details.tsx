@@ -34,7 +34,7 @@ import { AiRebuildPanel } from "@/components/ai-rebuild-panel";
 import { BleedSizeControl } from "@/components/bleed-size-control";
 import { BLEED_METHOD_LABELS, BleedMethodSelector } from "@/components/bleed-method-selector";
 import { shouldStartAutomaticCompile } from "@/lib/press-ready-ui";
-import { proceedButtonState } from "@/lib/job-page-actions";
+import { PRESS_FILE_MISSING, proceedButtonState, proceedPressDownload, proceedPressResult } from "@/lib/job-page-actions";
 import { displayPercent, formatElapsed } from "@shared/jobProgress";
 import { CoverCropNotice } from "@/components/cover-crop-notice";
 import { bleedPreviewQuery } from "@/lib/bleed-preview-request";
@@ -918,7 +918,10 @@ export default function JobDetails() {
       }
       const data = await res.json();
       setBleedPreview(data);
-      setProofPage(0);
+      setProofPage((current) => {
+        const count = Array.isArray(data.previewUrls) ? data.previewUrls.length : 1;
+        return current >= 0 && current < count ? current : 0;
+      });
     } catch (err: any) {
       setBleedPreviewError(err.message);
     } finally {
@@ -1896,21 +1899,32 @@ export default function JobDetails() {
                       const methodLabel = BLEED_METHOD_LABELS[selectedBleedMethod as keyof typeof BLEED_METHOD_LABELS]?.label || selectedBleedMethod;
                       const audit = job.auditResults?.jobAudit;
                       const auditResults = job.auditResults as any;
-                      const dlUrl = compileDownloadUrl || pressDownloadHref;
+                      const plan = proceedPressDownload(job.id);
 
-                      window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
-                        downloadUrl: dlUrl,
-                        lensesDetected: audit?.lensesDetected ?? false,
-                        lensesFlattened: audit?.lensesFlattened ?? false,
-                        supersampled: audit?.supersampled ?? false,
-                        aiEnhanced: audit?.aiEnhanced ?? false,
-                        originalTic: audit?.originalTic ?? null,
-                        finalTic: audit?.finalTic ?? null,
-                        auditReport: auditResults?.compileAuditReport || null,
-                        glitchyMessage: `Your artwork is compiled with ${methodLabel} bleed and ready for the press!`,
-                        glitchyState: "triumphant",
-                        selectedBleedMethod: methodLabel,
-                      } }));
+                      void blobDownload(plan.url, plan.filename, (errMsg) => {
+                        const outcome = proceedPressResult(false, errMsg);
+                        toast({
+                          title: "Download Failed",
+                          description: outcome.message || PRESS_FILE_MISSING,
+                          variant: "destructive",
+                        });
+                      }).then((success) => {
+                        if (!proceedPressResult(success).notifyCat) return;
+                        setHasDownloaded(true);
+                        window.dispatchEvent(new CustomEvent("glitchy:compile-complete", { detail: {
+                          downloadUrl: plan.url,
+                          lensesDetected: audit?.lensesDetected ?? false,
+                          lensesFlattened: audit?.lensesFlattened ?? false,
+                          supersampled: audit?.supersampled ?? false,
+                          aiEnhanced: audit?.aiEnhanced ?? false,
+                          originalTic: audit?.originalTic ?? null,
+                          finalTic: audit?.finalTic ?? null,
+                          auditReport: auditResults?.compileAuditReport || null,
+                          glitchyMessage: `Your artwork is compiled with ${methodLabel} bleed and ready for the press!`,
+                          glitchyState: "triumphant",
+                          selectedBleedMethod: methodLabel,
+                        } }));
+                      });
                     }}
                     data-testid="button-proceed-to-download"
                   >

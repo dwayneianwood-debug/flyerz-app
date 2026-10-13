@@ -1,6 +1,6 @@
 import "./loadEnv";
 import type { Express, Request, Response } from "express";
-import multer from "multer";
+import { diskUpload } from "./uploadLimit";
 import path from "path";
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -13,17 +13,13 @@ const PURE_CROP_SCRIPT = path.join(process.cwd(), "server", "pure_crop.py");
 const pureCropDir = path.join(process.cwd(), "uploads", "pure-crop");
 fsSync.mkdirSync(pureCropDir, { recursive: true });
 
-const pureCropUpload = multer({
-  dest: pureCropDir,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (ext === ".pdf" || ext === ".jpg" || ext === ".jpeg" || ext === ".png") {
-      cb(null, true);
-    } else {
-      cb(new Error("Only JPG, PNG, and PDF files can be cropped."));
-    }
-  },
+const pureCropUpload = diskUpload(pureCropDir, (_req, file, cb) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (ext === ".pdf" || ext === ".jpg" || ext === ".jpeg" || ext === ".png") {
+    cb(null, true);
+  } else {
+    cb(new Error("Only JPG, PNG, and PDF files can be cropped."));
+  }
 });
 
 type PythonResult = { code: number | null; stdout: string; stderr: string };

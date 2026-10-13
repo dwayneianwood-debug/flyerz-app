@@ -1,0 +1,4 @@
+These font files are the SIL Open Font License releases from https://github.com/google/fonts (main).
+Families: Anton, Archivo Black, Bebas Neue, Great Vibes, Inter, Lato, League Spartan, Montserrat, Nunito, Open Sans, Oswald, Playfair Display, Poppins, Raleway, Roboto.
+The license text is OFL.txt. They are bundled so a Canva subset can be set again from the full face.
+Raleway and Playfair Display keep their original files (those names are reserved). Raleway's default master is Thin, so the app instances regular weight only while setting the words. The other families are the regular (or bold) static files.

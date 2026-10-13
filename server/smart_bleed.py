@@ -350,7 +350,10 @@ def pixel_drift_bleed_expand(
     if bleed_top <= 0 and bleed_bottom <= 0 and bleed_left <= 0 and bleed_right <= 0:
         return img_bgr
 
-    trim = _pixel_drift_work_to_bgr_u8(img_bgr)
+    from bleed_builder import repair_light_fringe
+
+    # Step over a light sliver first. The 1px pixel-drift sample then reads the artwork.
+    trim = repair_light_fringe(_pixel_drift_work_to_bgr_u8(img_bgr))
     th, tw = trim.shape[:2]
     bt, bb, bl, br = bleed_top, bleed_bottom, bleed_left, bleed_right
     oh, ow = th + bt + bb, tw + bl + br
@@ -1361,7 +1364,7 @@ def scan_and_fix_qr_codes(pdf_path: str, output_path: str) -> dict:
         return {"status": "failed", "qr_count": 0, "decoded_data": [], "actions": [], "error": str(e)}
 
 
-def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str) -> bool:
+def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str, dpi: int | None = None) -> bool:
     try:
         from PIL import Image as PILImage
         doc = fitz.open(pdf_path)
@@ -1369,15 +1372,16 @@ def _render_page_pymupdf(pdf_path: str, page_num: int, output_path: str) -> bool
             doc.close()
             return False
         page = doc[page_num - 1]
-        _z = DEFAULT_DPI / 72.0
+        screen_dpi = int(dpi or DEFAULT_DPI)
+        _z = screen_dpi / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(_z, _z), colorspace=fitz.csRGB, alpha=True)
-        pix.set_dpi(DEFAULT_DPI, DEFAULT_DPI)
+        pix.set_dpi(screen_dpi, screen_dpi)
         img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
         alpha_ch = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
         rgb_ch = img_rgba[:, :, :3].astype(np.float32)
         white_bg = np.full_like(rgb_ch, 255.0)
         composited = (rgb_ch * alpha_ch + white_bg * (1.0 - alpha_ch)).astype(np.uint8)
-        PILImage.fromarray(composited, "RGB").save(output_path, dpi=(DEFAULT_DPI, DEFAULT_DPI))
+        PILImage.fromarray(composited, "RGB").save(output_path, dpi=(screen_dpi, screen_dpi))
         del pix, img_rgba, composited
         doc.close()
         sys.stderr.write(f"[FAI] PyMuPDF fallback rendered page {page_num} with forced white bg: {output_path}\n")
@@ -1405,6 +1409,22 @@ def generate_visual_proof(pdf_path: str, output_png_path: str) -> dict:
     if total_pages == 0:
         return {"success": False, "error": "PDF has no pages"}
 
+    try:
+        from screen_proof import write_screen_proof
+
+        fast = write_screen_proof(pdf_path, output_png_path, dpi=144)
+        if fast.get("success"):
+            fast["originalDpi"] = real_asset_dpi
+            fast["showLowDpiWarning"] = is_low_res_asset
+            fast["isBlank"] = any(_is_proof_blank(path) for path in (fast.get("proofPaths") or []))
+            sys.stderr.write(
+                f"[FAI] Visual proof: {len(fast.get('proofPaths') or [])} page(s) rendered at 144 DPI via PyMuPDF.\n"
+            )
+            return fast
+        sys.stderr.write(f"[PROOF] fast path declined: {fast.get('error')}\n")
+    except Exception as exc:
+        sys.stderr.write(f"[PROOF] fast path failed: {exc}\n")
+
     base, ext = os.path.splitext(output_png_path)
 
     def render_single_page(page_num):
@@ -1412,6 +1432,12 @@ def generate_visual_proof(pdf_path: str, output_png_path: str) -> dict:
             page_output = output_png_path
         else:
             page_output = f"{base}{page_num}{ext}"
+
+        # The first "before" view used to wait on Ghostscript for every page. A screen proof is PyMuPDF.
+        # A white page is still a proof. The blank check stays on Ghostscript, which can write white on failure.
+        if _render_page_pymupdf(pdf_path, page_num, page_output, dpi=144):
+            sys.stderr.write(f"[CORE] Rendered proof page {page_num}/{total_pages} via PyMuPDF at 144 DPI.\n")
+            return page_output
 
         gs_cmd = [
             GS_BIN,
@@ -2618,25 +2644,13 @@ def _compute_ink_savings(neutralization_result: dict) -> int:
 
 
 def verify_font_status(pdf_path: str) -> dict:
-    doc = fitz.open(pdf_path)
-    total_fonts = 0
-    embedded_fonts = 0
-    unembedded_fonts = []
+    from client_file_audit import font_report
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        font_list = page.get_fonts(full=True)
-        for font in font_list:
-            total_fonts += 1
-            font_name = font[3] if len(font) > 3 else "Unknown"
-            font_type = font[2] if len(font) > 2 else ""
-            is_embedded = font[4] if len(font) > 4 else ""
-            if is_embedded:
-                embedded_fonts += 1
-            else:
-                unembedded_fonts.append(font_name)
-
-    doc.close()
+    report = font_report(pdf_path)
+    problems = report.get("problems") or []
+    unembedded_fonts = [row["name"] for row in problems]
+    embedded_fonts = int(report.get("embedded") or 0) + len(report.get("type3") or [])
+    total_fonts = embedded_fonts + len(unembedded_fonts)
 
     fonts_as_vectors = total_fonts == 0
     all_embedded = total_fonts > 0 and embedded_fonts == total_fonts
@@ -3553,8 +3567,11 @@ BLEED_STRATEGY_FREQUENCY_SEPARATED = "frequency_separated"
 FREQ_SEP_STRIP_DEPTH = 28
 FREQ_SEP_INTERIOR_PX = 8
 FREQ_SEP_INTERIOR_MM = 6.0
+FREQ_SEP_SEARCH_MM = 18.0
 FREQ_SEP_GAUSSIAN_KSIZE = (5, 5)
 FREQ_SEP_GAUSSIAN_SIGMA = 1.2
+FREQ_SEP_GRAIN_KSIZE = 15
+FREQ_SEP_GRAIN_SIGMA = 3.0
 
 
 def _median_edge_bgr_u8(bgr: np.ndarray) -> np.ndarray:
@@ -5686,13 +5703,80 @@ def _repeat_depth(vol: np.ndarray, target: int) -> np.ndarray:
     return np.concatenate([vol.astype(np.float32)] * reps, axis=0)[:target]
 
 
-def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> np.ndarray:
+def _odd_kernel(limit: int, wanted: int) -> int:
+    size = min(wanted, int(limit))
+    size = max(3, size)
+    return size if size % 2 else size - 1
+
+
+def _grain_residual_std(strip: np.ndarray) -> float:
+    """High-frequency energy. A wide blur keeps a hard edge from looking like texture."""
+    if strip.size == 0 or min(strip.shape[:2]) < 5:
+        return 0.0
+    src = strip.astype(np.float32)
+    if src.ndim == 2:
+        src = src[:, :, None]
+    kernel = _odd_kernel(min(src.shape[0], src.shape[1]), FREQ_SEP_GRAIN_KSIZE)
+    low = cv2.GaussianBlur(src, (kernel, kernel), FREQ_SEP_GRAIN_SIGMA)
+    return float((src - low).std())
+
+
+def _inward_strip(work: np.ndarray, side: str, start: int, depth: int):
+    """Pixels walking in from one edge. Axis 0 is depth, 0 = closer to the edge."""
+    height, width = work.shape[:2]
+    if depth < 1 or start < 0:
+        return None
+    if side == "top":
+        if start + depth > height:
+            return None
+        return work[start:start + depth]
+    if side == "bottom":
+        if start + depth > height:
+            return None
+        return work[height - start - depth:height - start][::-1]
+    if side == "left":
+        if start + depth > width:
+            return None
+        return np.swapaxes(work[:, start:start + depth], 0, 1)
+    if side == "right":
+        if start + depth > width:
+            return None
+        return np.swapaxes(work[:, width - start - depth:width - start], 0, 1)[::-1]
+    return None
+
+
+def _frequency_grain_strip(work: np.ndarray, side: str, bleed_px: int, dpi: float):
+    """Edge tone, plus the grainiest strip within 18 mm. The tone stays the edge colour."""
+    height, width = work.shape[:2]
+    span = height if side in ("top", "bottom") else width
+    depth = min(max(FREQ_SEP_STRIP_DEPTH, int(bleed_px)), max(0, span - 1))
+    if depth < 2 or span < depth + 1:
+        return None, None
+    reach = max(int(round(FREQ_SEP_SEARCH_MM * float(dpi) / 25.4)), depth)
+    limit = min(reach, span - depth)
+    best = None
+    best_score = -1.0
+    for start in range(0, max(1, limit), 8):
+        strip = _inward_strip(work, side, start, depth)
+        if strip is None:
+            continue
+        score = _grain_residual_std(strip)
+        if score > best_score:
+            best_score = score
+            best = np.ascontiguousarray(strip)
+    tone_strip = _inward_strip(work, side, 0, 1)
+    tone = None if tone_strip is None else tone_strip[:1]
+    return tone, best if best is not None else tone_strip
+
+
+def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int, tone=None) -> np.ndarray:
     """
     Low-frequency colour is the trim-side tone replicated outward. High-frequency
-    grain measured just inside the trim is laid on top of that tone, so a
-    textured edge does not collapse to the same flat band as stretch.
+    grain from the strip is laid on that tone once. A repeated strip draws echo
+    lines, so nothing past the measured sample is tiled.
 
     edge_strip: (D, W, C) or (D, W), depth 0 = just inside the trim.
+    tone: optional (1, W, C) edge colour. When omitted, the strip's own tone is used.
     Returns (target_bleed_px, W, C) uint8.
     """
     if target_bleed_px <= 0 or edge_strip.size == 0:
@@ -5708,19 +5792,33 @@ def _frequency_separated_bleed(edge_strip: np.ndarray, target_bleed_px: int) -> 
     if min(d, w) < 3:
         low = src
     else:
-        def odd_k(limit: int, wanted: int) -> int:
-            size = min(wanted, int(limit))
-            size = max(3, size)
-            return size if size % 2 else size - 1
-
+        # A wide kernel leaves fine grain. A 5 px kernel turns a hard edge into an echo line.
+        wanted = FREQ_SEP_GRAIN_KSIZE if min(d, w) >= FREQ_SEP_GRAIN_KSIZE else FREQ_SEP_GAUSSIAN_KSIZE[0]
         low = cv2.GaussianBlur(
             src,
-            (odd_k(d, FREQ_SEP_GAUSSIAN_KSIZE[0]), odd_k(w, FREQ_SEP_GAUSSIAN_KSIZE[1])),
-            FREQ_SEP_GAUSSIAN_SIGMA,
+            (_odd_kernel(d, wanted), _odd_kernel(w, wanted)),
+            FREQ_SEP_GRAIN_SIGMA if wanted >= FREQ_SEP_GRAIN_KSIZE else FREQ_SEP_GAUSSIAN_SIGMA,
         )
     high = src - low
-    low_out = np.repeat(low[:1], target_bleed_px, axis=0)
-    out = np.clip(np.round(low_out + _repeat_depth(high, target_bleed_px)), 0, 255)
+    if high.shape[0] >= target_bleed_px:
+        grain = high[:target_bleed_px]
+    else:
+        pad = np.zeros((target_bleed_px - high.shape[0],) + high.shape[1:], dtype=np.float32)
+        grain = np.concatenate([high, pad], axis=0)
+    if tone is None:
+        tone_row = low[:1]
+    else:
+        tone_row = np.asarray(tone, np.float32)
+        if tone_row.ndim == 1:
+            tone_row = tone_row[None, :, None]
+        elif tone_row.ndim == 2:
+            tone_row = tone_row[None, :, :] if tone_row.shape[0] != 1 else tone_row[:, :, None]
+        if tone_row.shape[1] != w:
+            tone_row = low[:1]
+        if tone_row.shape[2] != c:
+            tone_row = low[:1]
+    low_out = np.repeat(tone_row[:1], target_bleed_px, axis=0)
+    out = np.clip(np.round(low_out + grain), 0, 255)
     out = out.astype(np.uint8)
     if c == 1:
         return out[:, :, 0]
@@ -5735,10 +5833,6 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     if bleed_px <= 0:
         return img
     h, w = img.shape[:2]
-    inset = _prepress_edge_sample_inset(h, w)
-    # A few millimetres in, so a flat existing bleed is not the sample.
-    interior = max(FREQ_SEP_INTERIOR_PX, int(round(FREQ_SEP_INTERIOR_MM * float(dpi) / 25.4)))
-    start = interior if min(h, w) > interior + 8 else inset
     is_gray = img.ndim == 2
     is_bgra = not is_gray and img.shape[2] == 4
     work = img[:, :, :3] if is_bgra else (img[:, :, np.newaxis] if is_gray else img)
@@ -5746,14 +5840,12 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
     def _maybe_fallback():
         return _pixel_drift_stretch(img, side, bleed_px)
 
+    tone, strip = _frequency_grain_strip(work, side, bleed_px, dpi)
+    if strip is None or strip.shape[0] < 2:
+        return _maybe_fallback()
+
     if side == "top":
-        if h < start + 2:
-            return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, h - start)
-        if d < 2:
-            return _maybe_fallback()
-        strip = work[start : start + d, :, :]
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             combined = np.vstack([bleed, img])
         else:
@@ -5761,7 +5853,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[start : start + 1, :, 3], (bleed_px, w))
+            aa = np.broadcast_to(img[0:1, :, 3], (bleed_px, w))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:bleed_px] = aa
             base_a[bleed_px:] = img[:, :, 3]
@@ -5769,14 +5861,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "bottom":
-        if h < start + 2:
-            return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, h - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[h - start - d : h - start, :, :]
-        strip = raw[::-1, :, :].copy()
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             combined = np.vstack([img, bleed])
         else:
@@ -5784,7 +5869,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[h - start - 1 : h - start, :, 3], (bleed_px, w))
+            aa = np.broadcast_to(img[h - 1:h, :, 3], (bleed_px, w))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:-bleed_px] = img[:, :, 3]
             base_a[-bleed_px:] = aa
@@ -5792,14 +5877,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "left":
-        if w < start + 2:
-            return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, w - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[:, start : start + d, :]
-        strip = np.swapaxes(raw, 0, 1)
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             bleed_hw = bleed.T
             combined = np.hstack([bleed_hw, img])
@@ -5809,7 +5887,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[:, start : start + 1, 3], (h, bleed_px))
+            aa = np.broadcast_to(img[:, 0:1, 3], (h, bleed_px))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:, :bleed_px] = aa
             base_a[:, bleed_px:] = img[:, :, 3]
@@ -5817,14 +5895,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         return combined
 
     if side == "right":
-        if w < start + 2:
-            return _maybe_fallback()
-        d = min(FREQ_SEP_STRIP_DEPTH, w - start)
-        if d < 2:
-            return _maybe_fallback()
-        raw = work[:, w - start - d : w - start, :]
-        strip = np.swapaxes(raw, 0, 1)[::-1, :, :].copy()
-        bleed = _frequency_separated_bleed(strip, bleed_px)
+        bleed = _frequency_separated_bleed(strip, bleed_px, tone)
         if bleed.ndim == 2:
             bleed_hw = bleed.T
             combined = np.hstack([img, bleed_hw])
@@ -5834,7 +5905,7 @@ def _frequency_separated_edge_bleed(img: np.ndarray, side: str, bleed_px: int, d
         if is_gray:
             return combined[:, :, 0] if combined.ndim == 3 else combined
         if is_bgra:
-            aa = np.broadcast_to(img[:, w - start - 1 : w - start, 3], (h, bleed_px))
+            aa = np.broadcast_to(img[:, w - 1:w, 3], (h, bleed_px))
             base_a = np.zeros((combined.shape[0], combined.shape[1]), dtype=np.uint8)
             base_a[:, :-bleed_px] = img[:, :, 3]
             base_a[:, -bleed_px:] = aa
@@ -7117,8 +7188,8 @@ def choose_automatic_bleed_api(img_bgr: np.ndarray, dpi: float = 300.0) -> str:
         if flat:
             print("[BLEED][AUTO] text or a face on a flat edge → colour border (no mirror)")
             return "colourBorder"
-        print("[BLEED][AUTO] text or a face at the edge → background extract (no mirror)")
-        return "bgExtract"
+        print("[BLEED][AUTO] text or a face at the edge → cleaned-edge replicate (no mirror)")
+        return "replicate"
     if flat:
         print("[BLEED][AUTO] flat edge → colour border matched to the edge")
         return "colourBorder"
@@ -7127,30 +7198,10 @@ def choose_automatic_bleed_api(img_bgr: np.ndarray, dpi: float = 300.0) -> str:
 
 
 def _bleed_dict_from_image_dpi(img: np.ndarray, dpi: float, trim_w_mm: float, trim_h_mm: float) -> dict | None:
-    """A centred file whose millimetre size is trim plus a uniform 2–25mm margin already has bleed."""
-    if img is None or dpi is None or dpi < 150 or trim_w_mm <= 0 or trim_h_mm <= 0:
-        return None
-    height, width = img.shape[:2]
-    doc_w = width / float(dpi) * 25.4
-    doc_h = height / float(dpi) * 25.4
-    extra_w = doc_w - float(trim_w_mm)
-    extra_h = doc_h - float(trim_h_mm)
-    if extra_w < 4.0 or extra_h < 4.0:
-        return None
-    left = right = extra_w / 2.0
-    top = bottom = extra_h / 2.0
-    if abs(left - top) > 1.5:
-        return None
-    if min(left, top) < 2.0 or max(left, top) > 25.0:
-        return None
-    return {
-        "top": top,
-        "bottom": bottom,
-        "left": left,
-        "right": right,
-        "trim_w_mm": float(trim_w_mm),
-        "trim_h_mm": float(trim_h_mm),
-    }
+    """A centred file whose millimetre size is the trim plus bleed already in the picture."""
+    from press_ready_engine import _existing_image_bleed
+
+    return _existing_image_bleed(img, dpi, trim_w_mm, trim_h_mm)
 
 
 def crop_to_trim_box(img: np.ndarray, info: dict) -> np.ndarray:
@@ -7317,18 +7368,19 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
     work = img_bgr.copy()
     meta = dict(empty_meta)
 
-    work, shrink_detail = _pre_bleed_safe_zone_uniform_shrink(work, dpi_f)
-    if shrink_detail.get("shrinkApplied"):
-        meta["shrinkApplied"] = True
-        meta["preBleedSafeZoneShrink"] = True
-        nw0 = int(shrink_detail.get("nw") or work.shape[1])
-        nh0 = int(shrink_detail.get("nh") or work.shape[0])
-        ow = int(shrink_detail.get("orig_w") or nw0)
-        oh = int(shrink_detail.get("orig_h") or nh0)
-        meta["pixelsRemovedPerSide"] = max((ow - nw0) // 2, (oh - nh0) // 2)
-        meta["preBleedScale"] = float(shrink_detail.get("scale", 1.0))
-    else:
-        meta["preBleedSafeZoneShrink"] = False
+    from bleed_builder import repair_light_fringe
+
+    work = repair_light_fringe(work)
+    from press_ready_engine import SAFE_ZONE_MM as _zone_mm
+    from press_ready_engine import _rescue, analyse_bgr
+
+    pulled, pull_note = _rescue(work, dpi_f, float(_zone_mm), analyse_bgr(work, dpi_f, float(_zone_mm)))
+    work = pulled
+    meta["rescue"] = pull_note
+    meta["shrinkApplied"] = bool(pull_note.get("applied"))
+    meta["preBleedSafeZoneShrink"] = bool(pull_note.get("applied"))
+    meta["preBleedScale"] = float(pull_note.get("scale") or 1.0)
+    meta["contentPullAmber"] = bool(pull_note.get("amber"))
 
     api_key = (bleed_strategy or "auto").strip().lower().replace("-", "").replace("_", "")
     if api_key == "aioutpaint":
@@ -7366,16 +7418,10 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
 
     bleed_px_use = target_bleed_px
     meta["bleedPxEffective"] = bleed_px_use
-    if violation:
-        if not meta.get("shrinkApplied"):
-            meta["pixelsRemovedPerSide"] = 0
-        work, gf_meta = composite_ghost_frame_pullback(work, dpi_f, vz)
-        meta["ghostFrameApplied"] = bool(gf_meta.get("ghostFrameApplied"))
-        meta["ghostFrameReason"] = gf_meta.get("reason", "")
-        sys.stderr.write(
-            f"[SAFE-ZONE] Violation ({len(vz.get('warnings', []) or [])} warnings) — "
-            f"Elastic Anchor ghostFrameApplied={meta['ghostFrameApplied']} ({gf_meta.get('reason','')}).\n"
-        )
+    meta["ghostFrameApplied"] = False
+    if violation and not meta.get("contentPullAmber"):
+        # The 2 mm pull already ran. A further elastic squeeze is not used.
+        meta["ghostFrameReason"] = "Brought in by at most 2 mm."
 
     cloud = bool(allow_cloud and api_key == "ai_outpaint")
     if api_key == "auto" or api_key not in strategy_map_lc:
@@ -7393,10 +7439,42 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
     out = _apply_forced_strategy_bleed(
         work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk, allow_cloud=cloud,
     )
-    if internal == BLEED_STRATEGY_COLOUR_BORDER:
+    if internal != BLEED_STRATEGY_COLOUR_BORDER:
+        out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
+    else:
         meta["colourBorder"] = True
-        return out, meta
-    out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
+    from bleed_builder import finish_raster_bleed
+
+    if out is not None and getattr(out, "ndim", 0) == 3 and bleed_px_use > 0:
+        expect_h = work.shape[0] + 2 * bleed_px_use
+        expect_w = work.shape[1] + 2 * bleed_px_use
+        if out.shape[0] == expect_h and out.shape[1] == expect_w:
+            out, edge_methods = finish_raster_bleed(out[:, :, :3] if out.shape[2] > 3 else out, bleed_px_use)
+            meta["edgeMethods"] = {side: edge_methods.get(side) for side in ("top", "bottom", "left", "right")}
+            spoken = {
+                "mirror": "mirrored the cleaned edge",
+                "replicate": "repeated the cleaned edge",
+                "stretch": "stretched the cleaned edge",
+                "bgExtract": "extended the cleaned background",
+                "colourBorder": "filled a colour border from the cleaned edge",
+                "gradient_extrapolate": "continued the gradient from the cleaned edge",
+                "frequency_separated": "continued the cleaned edge",
+                "upscale": "upscaled from the cleaned edge",
+                "ai_outpaint": "outpainted from the cleaned edge",
+            }
+            base = spoken.get(internal, "continued the cleaned edge colour")
+            notes = []
+            for side in ("top", "bottom", "left", "right"):
+                method = edge_methods.get(side) or "replicate"
+                if method == "mirror-amber":
+                    text = "mirrored the cleaned edge. Please check it before printing."
+                    meta["contentPullAmber"] = True
+                elif method == "mirror" and internal != "mirror":
+                    text = "mirrored the cleaned edge"
+                else:
+                    text = base
+                notes.append(f"{side.capitalize()}: {text}.")
+            meta["edgeNotes"] = notes
     return out, meta
 
 
@@ -7423,6 +7501,9 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             )
         return out_img
 
+    from bleed_builder import repair_light_fringe
+
+    img = repair_light_fringe(img)
     if strategy == BLEED_STRATEGY_AI_OUTPAINT:
         sys.stderr.write(
             "[BLEED][ROUTING] ai_outpaint → Google Imagen inpaint if GEMINI_API_KEY else "
@@ -7544,7 +7625,13 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
         "ai_outpaint": "ai_outpaint",
         "colourBorder": "colourBorder",
     }
+    def _usable(image) -> bool:
+        return image is not None and getattr(image, "size", 0) > 0 and float(np.std(image)) >= 2.0
+
     for _strategy_internal, suffix in all_strategies:
+        key = "bgExtract" if suffix == "bgextract" else suffix
+        variant_path = f"{output_base}_variant_{suffix}{ext}"
+        variant_img = None
         try:
             variant_img, _heal_meta = auto_resolve_safe_zone(
                 cropped.copy(),
@@ -7552,13 +7639,25 @@ def generate_bleed_variants(img: np.ndarray, dpi: float, output_base: str, ext: 
                 bleed_strategy=api_for_suffix[suffix],
                 dpi=actual_dpi,
             )
-            variant_path = f"{output_base}_variant_{suffix}{ext}"
-            cv2.imwrite(variant_path, variant_img)
-            key = "bgExtract" if suffix == "bgextract" else suffix
-            variant_paths[key] = variant_path
-            print(f"[BLEED] Generated variant: {suffix} -> {variant_path}")
         except Exception as e:
             print(f"[BLEED] Variant {suffix} failed: {e}")
+            variant_img = None
+        if not _usable(variant_img):
+            try:
+                variant_img, _heal_meta = auto_resolve_safe_zone(
+                    cropped.copy(),
+                    target_bleed_px=extend_px,
+                    bleed_strategy="replicate",
+                    dpi=actual_dpi,
+                )
+            except Exception as e:
+                print(f"[BLEED] Variant {suffix} replicate fallback failed: {e}")
+                variant_img = cropped
+        if variant_img is None:
+            variant_img = cropped
+        cv2.imwrite(variant_path, variant_img)
+        variant_paths[key] = variant_path
+        print(f"[BLEED] Generated variant: {suffix} -> {variant_path}")
 
     return {
         "paths": variant_paths,
@@ -8899,37 +8998,41 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
 
     gc.collect()
 
-    if font_status and font_status["fonts_as_vectors"]:
-        checks.append({
-            "name": "Fonts Embedded",
-            "passed": True,
-            "message": "Fonts Secured: Converted to Vector Outlines for Litho. All text characters have been converted to vector paths via Ghostscript -dNoOutputFonts — design integrity guaranteed.",
-            "autoFixed": True,
-            "details": f"Source PDF contained {len(source_font_names)} font reference(s): {', '.join(list(set(source_font_names))[:5]) or 'none'}. All converted to vector outlines (paths). No font dependencies remain."
-        })
-    elif font_status and font_status["all_embedded"]:
-        checks.append({
-            "name": "Fonts Embedded",
-            "passed": True,
-            "message": f"All {font_status['total_fonts']} fonts are fully embedded in the PDF.",
-            "autoFixed": False,
-            "details": f"PyMuPDF verified {font_status['embedded_fonts']}/{font_status['total_fonts']} fonts embedded"
-        })
-    elif font_status and font_status["unembedded_fonts"]:
+    source_fonts = {"checked": False, "problems": []}
+    try:
+        from client_file_audit import font_report
+
+        if str(input_path).lower().endswith(".pdf"):
+            source_fonts = font_report(input_path)
+    except Exception:
+        source_fonts = {"checked": False, "problems": []}
+    font_problems = source_fonts.get("problems") or []
+    if font_problems:
+        names = ", ".join(row["name"] for row in font_problems[:5])
         checks.append({
             "name": "Fonts Embedded",
             "passed": False,
-            "message": f"Font outlining attempted but {len(font_status['unembedded_fonts'])} font(s) remain unembedded: {', '.join(font_status['unembedded_fonts'][:3])}.",
+            "message": f"These fonts are not embedded or were substituted: {names}. Please export with fonts embedded or outlined.",
             "autoFixed": False,
-            "details": "Ghostscript -dNoOutputFonts was applied but some fonts persisted. Manual review recommended."
+            "details": "Checked on the original upload, before Ghostscript could embed a stand-in.",
+            "severity": "FAIL",
+        })
+    elif source_fonts.get("checked"):
+        checks.append({
+            "name": "Fonts Embedded",
+            "passed": True,
+            "message": "The original file's fonts are embedded, or the text was already outlines.",
+            "autoFixed": False,
+            "details": "Checked on the original upload.",
         })
     else:
         checks.append({
             "name": "Fonts Embedded",
-            "passed": True,
-            "message": "Fonts Secured: Converted to Vector Outlines for Litho. No font dependencies in output PDF.",
-            "autoFixed": True,
-            "details": "Ghostscript -dNoOutputFonts converted all text to vector paths"
+            "passed": False,
+            "message": "Fonts were not checked on the original file.",
+            "autoFixed": False,
+            "details": "No pass is recorded without a check of the upload.",
+            "severity": "FAIL",
         })
 
     checks.append({
@@ -9139,9 +9242,9 @@ def _apply_smart_bleed_core(input_path, output_path, bleed_opts, checks, file_si
     checks.append({
         "name": "Resolution Check",
         "passed": True,
-        "message": f"Output PDF rasterised at {dpi} DPI, meeting minimum print resolution.",
-        "autoFixed": True,
-        "details": f"All content rendered at {dpi} DPI. Ghostscript -r{dpi} ensures bitmap lenses stay crisp."
+        "message": f"The press bitmap was rendered at {dpi} DPI. That is the output grid, not the resolution of the pictures in the original file.",
+        "autoFixed": False,
+        "details": "Picture resolution is taken from the original file, not from this render."
     })
 
     gc.collect()
@@ -9392,7 +9495,7 @@ def main():
         elif is_vector_type(file_type):
             result = apply_smart_bleed_to_pdf(input_path, output_path, bleed_opts)
 
-        elif file_type in ("jpg", "jpeg", "png"):
+        elif file_type in ("jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp"):
             result = apply_smart_bleed_to_image(standardized_path or input_path, output_path, bleed_opts)
             _attach_proof(result)
         else:
@@ -9400,14 +9503,26 @@ def main():
                 "checks": [{
                     "name": "File Format",
                     "passed": False,
-                    "message": f"{file_type.upper()} files are not ideal for litho printing. Convert to high-resolution PDF.",
+                    "message": (
+                        "Word and PowerPoint files can't be printed as they are. Please export it as a PDF and send that to us."
+                        if str(file_type or "").lower() in ("doc", "docx", "ppt", "pptx")
+                        else "This EPS file can't be printed as it is. Please send a PDF with the fonts embedded or outlined."
+                        if str(file_type or "").lower() == "eps"
+                        else "This file can't be printed as it is. Please export it as a PDF and send that to us."
+                    ),
                     "autoFixed": False,
-                    "details": "Recommend PDF with embedded fonts, CMYK, 300 DPI"
+                    "details": "Please send a PDF with the fonts embedded or outlined."
                 }],
                 "correctedPath": None
             }
 
         _timer_log("Python smart_bleed total", t_py_total)
+        try:
+            from bleed_builder import attach_result
+
+            result = attach_result(result, bleed_opts)
+        except Exception as exc:
+            sys.stderr.write(f"[BLEED] Quality check failed open: {exc}\n")
         _write_result_file(result, result_file)
         print(json.dumps({"ok": True, "resultFile": result_file}))
     except Exception as e:
@@ -9438,5 +9553,59 @@ def main():
                 pass
 
 
+def render_style_page(pdf_path: str, method: str, page_index: int, output_path: str) -> str:
+    """One bleed style for one page. A failed or blank style falls back to edge replication."""
+    import pymupdf as fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_index < 0 or page_index >= len(doc):
+            raise IndexError(f"Page {page_index + 1} is not in this file.")
+        page = doc[page_index]
+        variant_dpi = 150
+        mat = fitz.Matrix(variant_dpi / 72.0, variant_dpi / 72.0)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=True)
+        img_rgba = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 4)
+        alpha = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
+        rgb = img_rgba[:, :, :3].astype(np.float32)
+        composited = (rgb * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+        image = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
+    finally:
+        doc.close()
+    extend_px = _mm_to_px(float(BLEED_TARGET_MM), variant_dpi)
+    try:
+        painted, _meta = auto_resolve_safe_zone(
+            image,
+            target_bleed_px=extend_px,
+            bleed_strategy=method,
+            dpi=float(variant_dpi),
+        )
+    except Exception:
+        painted = None
+    if painted is None or float(np.std(painted)) < 2.0:
+        try:
+            painted, _meta = auto_resolve_safe_zone(
+                image,
+                target_bleed_px=extend_px,
+                bleed_strategy="replicate",
+                dpi=float(variant_dpi),
+            )
+        except Exception:
+            painted = image
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cv2.imwrite(output_path, painted if painted is not None else image)
+    return output_path
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--one-style":
+        import json as _json
+        try:
+            _pdf, _method, _page, _output = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+            _path = render_style_page(_pdf, _method, _page, _output)
+            print(_json.dumps({"ok": True, "success": True, "path": _path}))
+        except Exception as _exc:
+            print(_json.dumps({"ok": False, "success": False, "error": str(_exc)}))
+            sys.exit(1)
+    else:
+        main()

@@ -150,8 +150,10 @@ def _canva_pdf(path: str) -> None:
     trim_bottom = height - inset_y
     # Capitals sit on the baseline. 1.4 mm inside the trim is inside the 3 mm safe zone.
     baseline = trim_bottom - (1.4 * 72.0 / 25.4)
-    front.insert_text((inset_x + 24, baseline), "LOCATION:", fontsize=36, fontname="helv", color=(0, 0, 0))
-    front.insert_text((inset_x + 30, inset_y + 40), "OPEN DAY", fontsize=18, fontname="helv", color=(1, 1, 1))
+    font_file = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    front.insert_font(fontname="DEJAVU", fontfile=font_file)
+    front.insert_text((inset_x + 24, baseline), "LOCATION:", fontsize=36, fontname="DEJAVU", color=(0, 0, 0))
+    front.insert_text((inset_x + 30, inset_y + 40), "OPEN DAY", fontsize=18, fontname="DEJAVU", color=(1, 1, 1))
     try:
         from PIL import Image as PILImage
 
@@ -173,7 +175,8 @@ def _canva_pdf(path: str) -> None:
     back = doc.new_page(width=width, height=height)
     back.draw_rect(back.rect, color=None, fill=(0.05, 0.75, 0.8))
     back.draw_rect(fitz.Rect(width / 2.0, 0, width, height), color=None, fill=(0.75, 0.1, 0.55))
-    back.insert_text((inset_x + 24, inset_y + 50), "BACK SIDE", fontsize=18, fontname="helv", color=(0, 0, 0))
+    back.insert_font(fontname="DEJAVU", fontfile="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    back.insert_text((inset_x + 24, inset_y + 50), "BACK SIDE", fontsize=18, fontname="DEJAVU", color=(0, 0, 0))
     doc.save(path)
     doc.close()
 
