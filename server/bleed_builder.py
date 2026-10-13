@@ -13,11 +13,12 @@ import os
 
 import numpy as np
 
-# About 1.5 mm at 300 dpi. A 1 px white column at 72 ppi becomes about 4 device
-# pixels, and a page 0.5 mm short is about 6. A real 2.5 mm border is left alone:
-# looking 4 mm in was treating that border as a sliver and comparing the bleed
-# with the darker artwork behind it.
-SLIVER_CAP_PX = 18
+# 0.5 mm at 300 dpi. A 1 px white column at 72 ppi becomes about 4 device
+# pixels. Only that pale line is stepped over. A real light border, including
+# a correct 2.5 mm bleed, is the artwork and is continued.
+SLIVER_CAP_PX = 6
+PALE_MM = 0.5
+MAX_PULL_MM = 2.0
 # CIE76. A flat band has to stay this close. A textured continuation can sit a
 # little further off without being a different colour painted into the bleed.
 BLEED_DELTA_E = 10.0
@@ -42,23 +43,39 @@ def _is_light(pixels: np.ndarray) -> np.ndarray:
 
 
 def _is_paper(pixels: np.ndarray) -> np.ndarray:
-    """Pure paper, including the 1 px white column Canva leaves on a photo.
+    """A pale or white edge line, not a light shirt or a yellow border.
 
-    A pale shirt can sit close to that column in CMYK distance. Paper is still
-    not the colour that should be continued.
+    Column 0 of a Canva photo is often pure white. A thin grey halo is the
+    same line. Artwork that is merely lighter than the inside of the page
+    is not paper, and it is the colour the bleed has to continue.
     """
     values = np.asarray(pixels, np.float32)
     if values.shape[-1] >= 4:
-        return values[..., :4].sum(axis=-1) < 12.0
-    return values[..., :3].mean(axis=-1) > 248.0
+        plate = values[..., :4]
+        return plate.sum(axis=-1) < 18.0
+    rgb = values[..., :3]
+    mean = rgb.mean(axis=-1)
+    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+    return (mean > 246.0) | ((mean > 206.0) & (chroma < 14.0))
+
+
+def _ink_amount(image: np.ndarray) -> np.ndarray:
+    """Higher means more colour. CMYK uses total ink. RGB uses darkness."""
+    values = np.asarray(image, np.float32)
+    if values.shape[-1] >= 4:
+        return values[..., :4].sum(axis=-1)
+    return 255.0 - values[..., :3].mean(axis=-1)
 
 
 def fringe_depths(strip: np.ndarray) -> np.ndarray:
-    """How many outer columns are a light sliver, per row.
+    """How many outer columns are a pale line, per row. Never more than 0.5 mm.
 
-    Column 0 is the outer edge. A light run that still has artwork behind it
-    inside the cap is skipped. A light run that fills the cap is the artwork
-    (a real pale border) and stays.
+    Column 0 is the outer edge. A pale run is skipped only while artwork sits
+    inside the cap. A pale border that fills the cap is the artwork.
+
+    A JPEG or Ghostscript halo is not pure paper: it keeps a little of the
+    colour beside it. That run is still a sliver when the pixel just inside
+    the cap is plainly darker. The depth never goes past the cap.
     """
     image = np.asarray(strip)
     if image.ndim == 2:
@@ -66,33 +83,24 @@ def fringe_depths(strip: np.ndarray) -> np.ndarray:
     count = int(image.shape[0])
     width = int(image.shape[1])
     depths = np.zeros(count, np.int32)
-    if count < 1 or width < 4:
+    if count < 1 or width < 2:
         return depths
-    cap = min(SLIVER_CAP_PX, width - 3)
+    cap = min(SLIVER_CAP_PX, width - 1)
     if cap < 1:
         return depths
-    anchor_at = min(width - 1, cap)
-    anchor_end = min(width, anchor_at + _SAMPLE_PX)
-    anchor = np.median(image[:, anchor_at:anchor_end].astype(np.float32), axis=1)
-    window = image[:, :cap].astype(np.float32)
-    light = _is_light(window)
-    # A 1px white column scaled up becomes a ramp, not pure paper. It is still
-    # lighter than the artwork behind it. A pale border that fills the cap is
-    # the same colour as the anchor, so the distance test leaves it alone.
-    if window.shape[-1] >= 4:
-        lighter = (anchor[:, None, :4].sum(axis=-1) - window[..., :4].sum(axis=-1)) >= 28.0
-    else:
-        lighter = (window[..., :3].mean(axis=-1) - anchor[:, None, :3].mean(axis=-1)) >= 18.0
-    distance = np.linalg.norm(window - anchor[:, None, :], axis=2)
-    # Paper is a sliver even when it is close to a pale neighbour. Artwork that
-    # is merely lighter than the anchor still has to be far from that anchor,
-    # and the cap is short enough that a real pale border fills it.
-    fringe = _is_paper(window) | ((light | lighter) & (distance >= 36.0))
+    look = min(cap + 2, width - 1)
+    window = image[:, :look].astype(np.float32)
+    paper = np.zeros((count, look), dtype=bool)
+    paper[:, :cap] = _is_paper(window[:, :cap])
+    amount = _ink_amount(window)
+    inner = amount[:, -1]
+    halo = amount + 120.0 < inner[:, None]
+    fringe = paper | halo
     ink = ~fringe
     has_ink = ink.any(axis=1)
     first = np.argmax(ink, axis=1).astype(np.int32)
     leading = fringe[:, 0] & has_ink
-    depths[leading] = first[leading]
+    depths[leading] = np.minimum(first[leading], cap)
     return depths
 
 
@@ -113,11 +121,131 @@ def colors_past_fringe(strip: np.ndarray) -> np.ndarray:
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
+def _row_colors(strip: np.ndarray) -> np.ndarray:
+    """One RGB colour per row, past a pale line. Column 0 is the outer edge."""
+    colors = colors_past_fringe(strip)
+    if colors.shape[-1] >= 4:
+        plate = colors[:, :4].astype(np.float32) / 255.0
+        red = (1.0 - plate[:, 0]) * (1.0 - plate[:, 3])
+        green = (1.0 - plate[:, 1]) * (1.0 - plate[:, 3])
+        blue = (1.0 - plate[:, 2]) * (1.0 - plate[:, 3])
+        return np.clip(np.round(np.stack([red, green, blue], axis=1) * 255.0), 0, 255).astype(np.uint8)
+    return colors[:, :3]
+
+
+def edge_row_delta(art_strip: np.ndarray, bleed_strip: np.ndarray) -> float:
+    """90th percentile CIE76. Art column 0 is the trim edge. Bleed column 0 touches the trim."""
+    art = _row_colors(art_strip)
+    bleed_img = np.asarray(bleed_strip)
+    if bleed_img.ndim == 2:
+        bleed_img = bleed_img[:, :, None]
+    count = min(art.shape[0], bleed_img.shape[0])
+    if count < 4 or bleed_img.shape[1] < 1:
+        return 0.0
+    outer_n = max(1, int(round(bleed_img.shape[1] * 0.64)))
+    outer = bleed_img[:count, -outer_n:]
+    if outer.shape[-1] >= 4:
+        plate = outer[..., :4].astype(np.float32) / 255.0
+        red = (1.0 - plate[..., 0]) * (1.0 - plate[..., 3])
+        green = (1.0 - plate[..., 1]) * (1.0 - plate[..., 3])
+        blue = (1.0 - plate[..., 2]) * (1.0 - plate[..., 3])
+        outer_rgb = np.clip(np.round(np.stack([red, green, blue], axis=-1) * 255.0), 0, 255)
+    else:
+        outer_rgb = outer[..., :3]
+    bleed = np.median(outer_rgb, axis=1)
+    step = max(1, count // 80)
+    scores = [_delta_e(art[index], bleed[index]) for index in range(0, count, step)]
+    return float(np.percentile(scores, 90)) if scores else 0.0
+
+
+def finish_raster_bleed(canvas: np.ndarray, bleed_px: int) -> tuple[np.ndarray, dict]:
+    """Self-check a raster bleed. A mismatched edge is mirrored from the cleaned art.
+
+    The canvas is trim in the middle and bleed_px around it. Returns the canvas
+    and the method used on each edge.
+    """
+    out = np.ascontiguousarray(canvas)
+    if out.ndim != 3 or out.shape[2] < 3 or bleed_px < 1:
+        return out, {side: "replicate" for side in ("top", "bottom", "left", "right")}
+    height, width = out.shape[:2]
+    methods = {}
+
+    def side_views(name: str):
+        cap = SLIVER_CAP_PX + 4
+        if name == "right":
+            return out[:, width - bleed_px - cap: width - bleed_px][:, ::-1], out[:, width - bleed_px:]
+        if name == "left":
+            return out[:, bleed_px: bleed_px + cap], out[:, :bleed_px][:, ::-1]
+        if name == "bottom":
+            return (
+                np.transpose(out[height - bleed_px - cap: height - bleed_px, :], (1, 0, 2))[:, ::-1],
+                np.transpose(out[height - bleed_px:, :], (1, 0, 2)),
+            )
+        return (
+            np.transpose(out[bleed_px: bleed_px + cap, :], (1, 0, 2)),
+            np.transpose(out[:bleed_px, :], (1, 0, 2))[:, ::-1],
+        )
+
+    def paint_mirror(name: str) -> None:
+        span = min(bleed_px, max(2, (width if name in ("left", "right") else height) // 5))
+        if name == "right":
+            src = out[:, width - bleed_px - span: width - bleed_px]
+            block = src[:, ::-1]
+            if block.shape[1] < bleed_px:
+                extra = np.repeat(block[:, :1], bleed_px - block.shape[1], axis=1)
+                block = np.concatenate([block, extra], axis=1)
+            out[:, width - bleed_px:] = block[:, :bleed_px]
+        elif name == "left":
+            src = out[:, bleed_px: bleed_px + span]
+            block = src[:, ::-1]
+            if block.shape[1] < bleed_px:
+                extra = np.repeat(block[:, -1:], bleed_px - block.shape[1], axis=1)
+                block = np.concatenate([extra, block], axis=1)
+            out[:, :bleed_px] = block[:, -bleed_px:]
+        elif name == "bottom":
+            src = out[height - bleed_px - span: height - bleed_px, :]
+            block = src[::-1, :]
+            if block.shape[0] < bleed_px:
+                extra = np.repeat(block[:1, :], bleed_px - block.shape[0], axis=0)
+                block = np.concatenate([block, extra], axis=0)
+            out[height - bleed_px:, :] = block[:bleed_px, :]
+        else:
+            src = out[bleed_px: bleed_px + span, :]
+            block = src[::-1, :]
+            if block.shape[0] < bleed_px:
+                extra = np.repeat(block[-1:, :], bleed_px - block.shape[0], axis=0)
+                block = np.concatenate([extra, block], axis=0)
+            out[:bleed_px, :] = block[-bleed_px:, :]
+
+    for name in ("top", "bottom", "left", "right"):
+        art, bleed = side_views(name)
+        if art.size == 0 or bleed.size == 0 or art.shape[1] < 1 or bleed.shape[1] < 1:
+            methods[name] = "replicate"
+            continue
+        delta = edge_row_delta(art[:, :, :3], bleed[:, :, :3])
+        if delta > BLEED_DELTA_E:
+            paint_mirror(name)
+            art, bleed = side_views(name)
+            again = edge_row_delta(art[:, :, :3], bleed[:, :, :3]) if art.size and bleed.size else delta
+            methods[name] = "mirror" if again <= _HARD_DELTA_E else "mirror-amber"
+            methods[name + "Delta"] = round(again, 2)
+        else:
+            methods[name] = "replicate"
+            methods[name + "Delta"] = round(delta, 2)
+    return out, methods
+
+
+# A 1 px white column at 72 ppi blooms to about 10 device pixels after a
+# cover scale. Look that far for the real colour, still inside a 2.5 mm border.
+_BLOOM_PX = SLIVER_CAP_PX + 10
+
+
 def repair_light_fringe(image: np.ndarray) -> np.ndarray:
-    """Replace a short light rim with the artwork directly inside it.
+    """Replace a short light rim with the artwork just inside the bloom.
 
     The trim's real edge is what later bleed samples, including the 1px
-    pixel-drift read. A pale border that continues is not rewritten.
+    pixel-drift read. Only the outer 0.5 mm is rewritten. A pale border
+    that still fills that look is not rewritten.
     """
     if image is None or getattr(image, "ndim", 0) != 3:
         return image
@@ -126,15 +254,24 @@ def repair_light_fringe(image: np.ndarray) -> np.ndarray:
     out = np.array(image, copy=True)
 
     def paint(view: np.ndarray) -> None:
-        depths = fringe_depths(view)
-        if int(depths.max()) < 1:
+        width = int(view.shape[1])
+        look = min(_BLOOM_PX, width - 1)
+        if look < 2:
             return
-        rows = np.arange(view.shape[0])
-        source = view[rows, np.clip(depths, 0, view.shape[1] - 1)]
+        reference = view[:, look].astype(np.int16)
+        window = view[:, :look].astype(np.int16)
+        diff = np.max(np.abs(window - reference[:, None, :]), axis=-1)
+        close = diff <= 24
+        has_art = close.any(axis=1)
+        first = np.argmax(close, axis=1)
         for index in range(view.shape[0]):
-            depth = int(depths[index])
-            if depth > 0:
-                view[index, :depth] = source[index]
+            if not has_art[index]:
+                continue
+            start = int(first[index])
+            if start < 1:
+                continue
+            depth = min(start, SLIVER_CAP_PX)
+            view[index, :depth] = view[index, look]
 
     paint(out)
     paint(out[:, ::-1])

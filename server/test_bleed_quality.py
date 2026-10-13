@@ -196,6 +196,44 @@ class BleedQualityTest(unittest.TestCase):
 
         self.assertEqual(smart_bleed.EDGE_SAMPLE_INSET, 1)
 
+    def test_a_partial_white_column_is_not_the_bleed_colour(self):
+        from quick_print import _colour_pad
+
+        band = np.zeros((8, 40, 3), np.uint8)
+        band[:] = (100, 90, 31)
+        band[-1, ::2] = 255
+        pad = _colour_pad(band, 30, forward=True)
+        outer = pad[-1].astype(np.int16)
+        self.assertLess(float(np.abs(outer - np.array([100, 90, 31])).max()), 8)
+
+    def test_pixels_stored_as_points_match_the_product(self):
+        from quick_print import _pixels_as_points_product
+
+        for product in _products():
+            width = float(product["widthMm"]) / 25.4 * 300.0
+            height = float(product["heightMm"]) / 25.4 * 300.0
+            found = _pixels_as_points_product(width, height)
+            self.assertIsNotNone(found, product["id"])
+            self.assertEqual(found["id"], product["id"])
+
+    def test_content_is_brought_in_by_at_most_2mm(self):
+        from press_ready_engine import SAFE_ZONE_MM, _rescue, analyse_bgr
+
+        image = np.full((900, 600, 3), (40, 70, 36), np.uint8)
+        analysis = analyse_bgr(image, 300.0, SAFE_ZONE_MM)
+        analysis["safeHits"] = 2
+        analysis["safeGapMm"] = 0.2
+        out, note = _rescue(image, 300.0, SAFE_ZONE_MM, analysis)
+        self.assertTrue(note["applied"])
+        self.assertTrue(note["amber"])
+        self.assertLessEqual(float(note["mm"]), 2.05)
+        self.assertEqual(out.shape, image.shape)
+        analysis["safeGapMm"] = 2.0
+        _out, near = _rescue(image, 300.0, SAFE_ZONE_MM, analysis)
+        self.assertTrue(near["applied"])
+        self.assertFalse(near["amber"])
+        self.assertLessEqual(float(near["mm"]), 2.05)
+
     def test_a_light_sliver_is_not_the_colour_that_is_continued(self):
         image = np.full((40, 50, 3), (76, 92, 38), np.uint8)
         image[:, -2:] = 255
@@ -260,6 +298,31 @@ class BleedQualityTest(unittest.TestCase):
         pale = np.full((40, 50, 4), (16, 20, 1, 0), np.uint8)
         pale[:, 0] = 0
         self.assertGreaterEqual(int(fringe_depths(pale).min()), 1)
+        self.assertLessEqual(int(fringe_depths(pale).max()), 1)
+
+    def test_a_scaled_white_column_is_not_the_bleed_colour(self):
+        from press_ready_engine import _px, cover_scale
+
+        width = max(32, int(round(90.0 / 25.4 * 72.0)))
+        height = max(32, int(round(50.0 / 25.4 * 72.0)))
+        rgb = _sliver(_rgb(width, height, "flat"), 1)
+        scaled = cover_scale(rgb[:, :, ::-1], _px(90, 300), _px(50, 300))[:, :, ::-1]
+        repaired = repair_light_fringe(scaled)
+        edge = repaired[repaired.shape[0] // 2, :6].astype(np.int16)
+        self.assertLess(float(np.abs(edge - np.array([36, 110, 72])).max()), 8)
+
+    def test_a_jpeg_halo_is_not_the_colour_that_is_continued(self):
+        from bleed_builder import colors_past_fringe
+
+        halo = np.zeros((30, 12, 4), np.uint8)
+        halo[:, 0] = 0
+        halo[:, 1:5] = (8, 6, 40, 0)
+        halo[:, 5:] = (40, 20, 180, 90)
+        depths = fringe_depths(halo)
+        self.assertGreaterEqual(int(depths.min()), 4)
+        self.assertLessEqual(int(depths.max()), 6)
+        colour = colors_past_fringe(halo)
+        self.assertGreater(float(colour[:, 2].mean()), 100.0)
 
     def test_a_light_border_stays_green_and_a_flat_grey_band_does_not(self):
         """A 2.5 mm light edge that continues must stay green. Outer grey must not."""
@@ -741,8 +804,8 @@ def _right_artwork_delta(path: str) -> float:
 def _real_vob_path() -> str:
     candidates = [
         os.environ.get("VOB_ORIGINAL", ""),
+        os.path.join(ROOT, "tests", "fixtures", "ian_2026-10-13", "vob_original.pdf"),
         "/tmp/vob-real/vob_original.pdf",
-        "/home/ubuntu/.cursor/projects/workspace/uploads/008567316b52356f279e12baf4d9558d32db15f6205c1097a2f8fe67cc755ba9_eae3.pdf",
     ]
     for path in candidates:
         if path and os.path.isfile(path) and os.path.getsize(path) > 100000:

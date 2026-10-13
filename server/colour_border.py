@@ -92,6 +92,12 @@ def sample_edge_cmyk(img: np.ndarray) -> tuple[float, float, float, float]:
         strips.append(plane[1:-1, 0, :])
         strips.append(plane[1:-1, -1, :])
     edge = np.concatenate([s.reshape(-1, 3) for s in strips], axis=0).astype(np.float64)
+    # A pale line (Canva's white column) is not the border colour.
+    mean_px = edge.mean(axis=1)
+    chroma = edge.max(axis=1) - edge.min(axis=1)
+    ink = ~((mean_px > 246.0) | ((mean_px > 206.0) & (chroma < 14.0)))
+    if int(ink.sum()) >= 8:
+        edge = edge[ink]
     mean = edge.mean(axis=0)
     return bgr_to_cmyk(float(mean[0]), float(mean[1]), float(mean[2]))
 

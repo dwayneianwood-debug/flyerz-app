@@ -144,6 +144,12 @@ def decide_light(facts: dict) -> dict:
         note = str(facts.get("vectorAmberReason") or "").strip()
         if note and note not in reasons:
             reasons.append(note)
+    if facts.get("contentPullAmber"):
+        note = str(facts.get("contentPullNote") or "").strip() or (
+            "Some text or a logo is still inside the 3 mm safe zone. It was brought in by 2 mm. Please check it before printing."
+        )
+        if note not in reasons:
+            reasons.append(note)
     if facts.get("enginePassed") is False:
         note = str(facts.get("engineReason") or "").strip() or "The press check flagged this file."
         if "live text that was already embedded" in note.lower():
@@ -437,7 +443,36 @@ def _match_product(width_mm: float, height_mm: float, tolerance: float = 2.5):
     return product, rotated
 
 
-def _render_pdf_image(path: str):
+def _page_points(path: str):
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        if doc.page_count < 1:
+            return None
+        page = doc[0]
+        return (float(page.rect.width), float(page.rect.height))
+    finally:
+        doc.close()
+
+
+def _pixels_as_points_product(width_pt: float, height_pt: float):
+    """Acrobat sometimes stores a 300 dpi picture's pixel counts as the page size.
+
+    2480 × 3508 pt is an A4 picture, not an 875 mm sheet.
+    """
+    best = None
+    for product in _products():
+        expect_w = float(product["widthMm"]) / 25.4 * 300.0
+        expect_h = float(product["heightMm"]) / 25.4 * 300.0
+        if abs(float(width_pt) - expect_w) <= 8.0 and abs(float(height_pt) - expect_h) <= 8.0:
+            err = abs(float(width_pt) - expect_w) + abs(float(height_pt) - expect_h)
+            if best is None or err < best[0]:
+                best = (err, product)
+    return best[1] if best else None
+
+
+def _render_pdf_image(path: str, native: bool = False):
     import numpy as np
     import pymupdf as fitz
     from large_job import file_bytes, is_large_job
@@ -447,7 +482,8 @@ def _render_pdf_image(path: str):
         page = doc[0]
         long_pt = max(page.rect.width, page.rect.height, 1)
         cap = 2400.0 if is_large_job(file_bytes(path)) else 4500.0
-        zoom = min(300.0 / 72.0, cap / long_pt)
+        # A pixels-as-points page is already the 300 dpi grid. Zoom 1 reads those pixels.
+        zoom = 1.0 if native else min(300.0 / 72.0, cap / long_pt)
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
         return arr[:, :, :3][:, :, ::-1].copy()
@@ -1006,7 +1042,15 @@ def _colour_pad(band, pad: int, forward: bool):
     if not forward:
         work = work[::-1]
     # A 1px Canva white column (or a 2px fringe) must not become the bleed colour.
+    # A column that is white on only some rows is still that pale line.
     work = _drop_edge_sliver(work)
+    if int(work.shape[0]) >= 2 and int(work.shape[1]) >= 1:
+        from bleed_builder import colors_past_fringe
+
+        oriented = np.ascontiguousarray(np.transpose(work[:, :, :3], (1, 0, 2))[:, ::-1])
+        cleaned = colors_past_fringe(oriented)
+        work = np.array(work, copy=True)
+        work[-1, :, :3] = cleaned
     height = int(work.shape[0])
     depth = min(5, height)
     strip = work[-depth:]
@@ -1529,6 +1573,7 @@ def make_print_ready(
 
     work_path = src_path
     raster = None
+    native_pixels = False
     aspect_extended = False
     aspect_delta = 0.0
     upscale = 1.0
@@ -1573,7 +1618,7 @@ def make_print_ready(
             # The working picture is a smaller render. Live type stays a PDF.
             if is_large_job(file_bytes(work_path)) and not live_type:
                 try:
-                    raster = _render_pdf_image(work_path)
+                    raster = _render_pdf_image(work_path, native=native_pixels)
                 except Exception:
                     raster = None
                 if raster is not None:
@@ -1583,7 +1628,18 @@ def make_print_ready(
                     )
         if ext == ".pdf":
             measured = _pdf_trim_mm(work_path)
+            points = _page_points(work_path)
+            pixel_product = _pixels_as_points_product(*points) if points else None
             fit = _fit_page_to_trim(*measured, trim_w, trim_h) if measured else None
+            if pixel_product is not None and fit is None:
+                product = pixel_product
+                trim_w = float(pixel_product["widthMm"])
+                trim_h = float(pixel_product["heightMm"])
+                _remember_product(decisions, product, trim_w, trim_h)
+                decisions.append(
+                    f"The page stores a picture's pixels as points, so it was matched to {pixel_product.get('label')}."
+                )
+                native_pixels = True
             if fit and fit["rotated"]:
                 turned = _product_for_trim(fit["trimW"], fit["trimH"])
                 if turned:
@@ -1627,7 +1683,7 @@ def make_print_ready(
                 else:
                     from large_job import file_bytes, is_large_job
 
-                    raster = _render_pdf_image(work_path)
+                    raster = _render_pdf_image(work_path, native=native_pixels)
                     if is_large_job(file_bytes(work_path)):
                         decisions.append(
                             "This file is large, so it was prepared from a smaller working picture. The press file is still built."
@@ -1908,6 +1964,8 @@ def make_print_ready(
         "aspectExtended": aspect_extended,
         "aspectDelta": aspect_delta,
         "enginePassed": bool(engine.get("passed")) if press_ok else False,
+        "contentPullAmber": bool((engine.get("rescue") or {}).get("amber")) if isinstance(engine, dict) else False,
+        "contentPullNote": str(((engine.get("rescue") or {}).get("note")) if isinstance(engine, dict) else "") or "",
         "engineReason": (engine.get("reason") if isinstance(engine, dict) else "") or "",
         "vectorAmber": bool(vector_built and vector_built.get("amber")),
         "vectorAmberReason": str((vector_built or {}).get("reason") or ""),

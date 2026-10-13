@@ -7188,8 +7188,8 @@ def choose_automatic_bleed_api(img_bgr: np.ndarray, dpi: float = 300.0) -> str:
         if flat:
             print("[BLEED][AUTO] text or a face on a flat edge → colour border (no mirror)")
             return "colourBorder"
-        print("[BLEED][AUTO] text or a face at the edge → background extract (no mirror)")
-        return "bgExtract"
+        print("[BLEED][AUTO] text or a face at the edge → cleaned-edge replicate (no mirror)")
+        return "replicate"
     if flat:
         print("[BLEED][AUTO] flat edge → colour border matched to the edge")
         return "colourBorder"
@@ -7368,18 +7368,19 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
     work = img_bgr.copy()
     meta = dict(empty_meta)
 
-    work, shrink_detail = _pre_bleed_safe_zone_uniform_shrink(work, dpi_f)
-    if shrink_detail.get("shrinkApplied"):
-        meta["shrinkApplied"] = True
-        meta["preBleedSafeZoneShrink"] = True
-        nw0 = int(shrink_detail.get("nw") or work.shape[1])
-        nh0 = int(shrink_detail.get("nh") or work.shape[0])
-        ow = int(shrink_detail.get("orig_w") or nw0)
-        oh = int(shrink_detail.get("orig_h") or nh0)
-        meta["pixelsRemovedPerSide"] = max((ow - nw0) // 2, (oh - nh0) // 2)
-        meta["preBleedScale"] = float(shrink_detail.get("scale", 1.0))
-    else:
-        meta["preBleedSafeZoneShrink"] = False
+    from bleed_builder import repair_light_fringe
+
+    work = repair_light_fringe(work)
+    from press_ready_engine import SAFE_ZONE_MM as _zone_mm
+    from press_ready_engine import _rescue, analyse_bgr
+
+    pulled, pull_note = _rescue(work, dpi_f, float(_zone_mm), analyse_bgr(work, dpi_f, float(_zone_mm)))
+    work = pulled
+    meta["rescue"] = pull_note
+    meta["shrinkApplied"] = bool(pull_note.get("applied"))
+    meta["preBleedSafeZoneShrink"] = bool(pull_note.get("applied"))
+    meta["preBleedScale"] = float(pull_note.get("scale") or 1.0)
+    meta["contentPullAmber"] = bool(pull_note.get("amber"))
 
     api_key = (bleed_strategy or "auto").strip().lower().replace("-", "").replace("_", "")
     if api_key == "aioutpaint":
@@ -7417,16 +7418,10 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
 
     bleed_px_use = target_bleed_px
     meta["bleedPxEffective"] = bleed_px_use
-    if violation:
-        if not meta.get("shrinkApplied"):
-            meta["pixelsRemovedPerSide"] = 0
-        work, gf_meta = composite_ghost_frame_pullback(work, dpi_f, vz)
-        meta["ghostFrameApplied"] = bool(gf_meta.get("ghostFrameApplied"))
-        meta["ghostFrameReason"] = gf_meta.get("reason", "")
-        sys.stderr.write(
-            f"[SAFE-ZONE] Violation ({len(vz.get('warnings', []) or [])} warnings) — "
-            f"Elastic Anchor ghostFrameApplied={meta['ghostFrameApplied']} ({gf_meta.get('reason','')}).\n"
-        )
+    meta["ghostFrameApplied"] = False
+    if violation and not meta.get("contentPullAmber"):
+        # The 2 mm pull already ran. A further elastic squeeze is not used.
+        meta["ghostFrameReason"] = "Brought in by at most 2 mm."
 
     cloud = bool(allow_cloud and api_key == "ai_outpaint")
     if api_key == "auto" or api_key not in strategy_map_lc:
@@ -7444,10 +7439,42 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
     out = _apply_forced_strategy_bleed(
         work, internal, bleed_px_use, dpi_f, border_cmyk=border_cmyk, allow_cloud=cloud,
     )
-    if internal == BLEED_STRATEGY_COLOUR_BORDER:
+    if internal != BLEED_STRATEGY_COLOUR_BORDER:
+        out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
+    else:
         meta["colourBorder"] = True
-        return out, meta
-    out = _finalize_bleed_texture_after_safe_zone(out, work, bleed_px_use)
+    from bleed_builder import finish_raster_bleed
+
+    if out is not None and getattr(out, "ndim", 0) == 3 and bleed_px_use > 0:
+        expect_h = work.shape[0] + 2 * bleed_px_use
+        expect_w = work.shape[1] + 2 * bleed_px_use
+        if out.shape[0] == expect_h and out.shape[1] == expect_w:
+            out, edge_methods = finish_raster_bleed(out[:, :, :3] if out.shape[2] > 3 else out, bleed_px_use)
+            meta["edgeMethods"] = {side: edge_methods.get(side) for side in ("top", "bottom", "left", "right")}
+            spoken = {
+                "mirror": "mirrored the cleaned edge",
+                "replicate": "repeated the cleaned edge",
+                "stretch": "stretched the cleaned edge",
+                "bgExtract": "extended the cleaned background",
+                "colourBorder": "filled a colour border from the cleaned edge",
+                "gradient_extrapolate": "continued the gradient from the cleaned edge",
+                "frequency_separated": "continued the cleaned edge",
+                "upscale": "upscaled from the cleaned edge",
+                "ai_outpaint": "outpainted from the cleaned edge",
+            }
+            base = spoken.get(internal, "continued the cleaned edge colour")
+            notes = []
+            for side in ("top", "bottom", "left", "right"):
+                method = edge_methods.get(side) or "replicate"
+                if method == "mirror-amber":
+                    text = "mirrored the cleaned edge. Please check it before printing."
+                    meta["contentPullAmber"] = True
+                elif method == "mirror" and internal != "mirror":
+                    text = "mirrored the cleaned edge"
+                else:
+                    text = base
+                notes.append(f"{side.capitalize()}: {text}.")
+            meta["edgeNotes"] = notes
     return out, meta
 
 
@@ -7474,6 +7501,9 @@ def _apply_forced_strategy_bleed(img: np.ndarray, strategy: str, bleed_px: int, 
             )
         return out_img
 
+    from bleed_builder import repair_light_fringe
+
+    img = repair_light_fringe(img)
     if strategy == BLEED_STRATEGY_AI_OUTPAINT:
         sys.stderr.write(
             "[BLEED][ROUTING] ai_outpaint → Google Imagen inpaint if GEMINI_API_KEY else "

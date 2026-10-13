@@ -437,12 +437,18 @@ def analyse_bgr(img_bgr: np.ndarray, dpi: float = 300.0, safe_zone_mm: float = S
         x, y, w, h = box
         if x < margin or y < margin or x + w > width - margin or y + h > height - margin:
             safe_hits.append({"x": x, "y": y, "w": w, "h": h, "kind": "face"})
+    gaps = []
+    for box in safe_hits:
+        x, y, w, h = box["x"], box["y"], box["w"], box["h"]
+        dist_px = min(x, y, width - (x + w), height - (y + h))
+        gaps.append(max(0.0, dist_px) / max(proxy_dpi, 1.0) * 25.4)
     return {
         "edges": edges,
         "corners": {name: edges[a]["kind"] for name, a in (
             ("tl", "top"), ("tr", "top"), ("bl", "bottom"), ("br", "bottom"),
         )},
         "safeHits": len(safe_hits),
+        "safeGapMm": None if not gaps else round(float(min(gaps)), 2),
         "contentKind": "raster",
     }
 
@@ -662,42 +668,55 @@ def _shrink_fraction(dpi: float, width: int, height: int, safe_zone_mm: float) -
 
 
 def _rescue(img: np.ndarray, dpi: float, safe_zone_mm: float, analysis: dict) -> tuple[np.ndarray, dict]:
-    note = {"applied": False, "scale": 1.0, "safeZoneMm": safe_zone_mm, "note": "Nothing inside the trim was moved."}
-    if analysis.get("safeHits", 0) <= 0:
+    """Bring important content in with one even scale. Never more than 2 mm per edge."""
+    note = {
+        "applied": False,
+        "amber": False,
+        "scale": 1.0,
+        "mm": 0.0,
+        "safeZoneMm": safe_zone_mm,
+        "note": "Nothing inside the trim was moved.",
+    }
+    gap = analysis.get("safeGapMm")
+    if analysis.get("safeHits", 0) <= 0 or gap is None or float(gap) >= float(safe_zone_mm) - 0.05:
         return img, note
     height, width = img.shape[:2]
-    raw = (float(safe_zone_mm) / 25.4) * float(dpi) / max(width, height, 1)
-    fraction = _shrink_fraction(dpi, width, height, safe_zone_mm)
+    need = max(0.0, float(safe_zone_mm) - float(gap))
+    pull_mm = min(2.0, need)
+    longer = max(height, width, 1)
+    pull_px = pull_mm / 25.4 * float(dpi)
+    fraction = min(0.5, (2.0 * pull_px) / longer)
+    if fraction < 1e-4:
+        return img, note
     scale = 1.0 - fraction
     new_w = max(1, int(round(width * scale)))
     new_h = max(1, int(round(height * scale)))
     scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
     canvas = np.empty_like(img)
     methods = _methods_for(analysis, {})
-    # Fill the freed ring with the same edge logic, then sit the artwork in the middle.
     pad_x = width - new_w
     pad_y = height - new_h
     left, top = pad_x // 2, pad_y // 2
-    # Build a tight canvas and paint pads as bleed, then crop back? The pad is small.
     temp_bleed = max(left, width - new_w - left, top, height - new_h - top, 1)
     temp = np.zeros((new_h + 2 * temp_bleed, new_w + 2 * temp_bleed, 3), np.uint8)
     _paint(temp, scaled, temp_bleed, methods)
     y0 = temp_bleed - top
     x0 = temp_bleed - left
     canvas[:, :] = temp[y0:y0 + height, x0:x0 + width]
-    # The shrunk artwork must stay pixel-identical in the middle.
     canvas[top:top + new_h, left:left + new_w] = scaled
-    short = raw > SAFE_ZONE_SHRINK_CAP + 1e-9
-    percent = round(fraction * 100.0, 2)
+    amber = need > 2.05
+    moved = round(fraction * longer / 2.0 / max(float(dpi), 1.0) * 25.4, 2)
     note = {
         "applied": True,
+        "amber": amber,
         "scale": round(scale, 4),
+        "mm": moved,
         "safeZoneMm": safe_zone_mm,
-        "percent": percent,
+        "percent": round(fraction * 100.0, 2),
         "note": (
-            f"Artwork shrunk by the 3% limit. Some text may still sit inside the {safe_zone_mm:g}mm safe zone."
-            if short
-            else f"Artwork shrunk by {percent:g}% so text sits inside the {safe_zone_mm:g}mm safe zone."
+            "Some text or a logo is still inside the 3 mm safe zone. It was brought in by 2 mm. Please check it before printing."
+            if amber
+            else f"Artwork was brought in by {moved:g} mm so it sits clear of the {safe_zone_mm:g} mm safe zone."
         ),
     }
     return canvas, note
@@ -836,8 +855,27 @@ def extend_trim(img: np.ndarray, bleed_px: int, analysis: dict) -> tuple[np.ndar
         if not bumped:
             for side in SIDES:
                 step[side] = step.get(side, 0) + 1
+    from bleed_builder import finish_raster_bleed
+
+    canvas, edge_methods = finish_raster_bleed(canvas, bleed_px)
     report_edges = _edge_lines(analysis, methods, kept=False)
-    return canvas, {"edges": report_edges, "methods": methods, "problems": problems, "rounds": step}
+    amber = False
+    for line in report_edges:
+        method = edge_methods.get(line["side"]) or line["method"]
+        side = str(line["side"])
+        if method == "mirror-amber":
+            line["method"] = "mirror"
+            line["note"] = f"{side.capitalize()}: mirrored the cleaned edge. Please check it before printing."
+            amber = True
+        elif method == "mirror":
+            line["method"] = "mirror"
+            line["note"] = f"{side.capitalize()}: mirrored the cleaned edge."
+        else:
+            line["method"] = "replicate"
+            line["note"] = f"{side.capitalize()}: continued the cleaned edge colour."
+    if amber:
+        problems.append("The bleed still does not match on one edge. Please check it before printing.")
+    return canvas, {"edges": report_edges, "methods": methods, "problems": problems, "rounds": step, "amber": amber}
 
 
 def compile_raster_canvas(
@@ -864,19 +902,36 @@ def compile_raster_canvas(
         ) else cv2.resize(trim, (trim_w_px, trim_h_px), interpolation=cv2.INTER_AREA)
         have = min(existing["top"], existing["bottom"], existing["left"], existing["right"])
         if have + 0.4 >= float(bleed_mm) and abs(existing["trim_w_mm"] - trim_w_mm) <= 2 and abs(existing["trim_h_mm"] - trim_h_mm) <= 2:
-            # Keep the supplied ring. Fit the whole file to trim + the requested bleed.
+            # Keep a full 5 mm ring as it is. Extra bleed is cropped back to 5 mm.
+            most = max(existing["top"], existing["bottom"], existing["left"], existing["right"])
+            over = most > float(bleed_mm) + 0.6
             out_w = trim_w_px + 2 * bleed_px
             out_h = trim_h_px + 2 * bleed_px
-            canvas = cv2.resize(plane, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            # Put the trim pixels back without a second resample of the middle when sizes match.
-            if plane.shape[1] == out_w and plane.shape[0] == out_h:
-                canvas = plane.copy()
+            if over:
+                topped = _pad_existing_raster(
+                    plane, existing, trim_w_mm, trim_h_mm, float(bleed_mm), float(embedded_dpi or dpi),
+                )
+                canvas = topped if topped is not None else cv2.resize(plane, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            else:
+                canvas = cv2.resize(plane, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                if plane.shape[1] == out_w and plane.shape[0] == out_h:
+                    canvas = plane.copy()
             analysis = analyse_bgr(trim, dpi, safe_zone_mm)
             kept = True
             edges = _edge_lines(analysis, {side: "kept" for side in SIDES}, kept=True)
+            if over:
+                for edge in edges:
+                    side = str(edge.get("side") or "")
+                    edge["method"] = "trimmed"
+                    edge["note"] = f"{side.capitalize()}: extra bleed was trimmed to 5 mm."
             report = _base_report(analysis, edges, True, bleed_mm, safe_zone_mm, src_w, src_h, trim_w_mm, trim_h_mm)
             report["existingBleed"] = True
-            report["rescue"] = {"applied": False, "scale": 1.0, "safeZoneMm": safe_zone_mm, "note": "Existing bleed kept. The trim was not shrunk."}
+            report["rescue"] = {
+                "applied": False,
+                "scale": 1.0,
+                "safeZoneMm": safe_zone_mm,
+                "note": "Extra bleed was trimmed to 5 mm." if over else "Existing bleed kept. The trim was not shrunk.",
+            }
             _finish_resolution(report, src_w, src_h, trim_w_mm, trim_h_mm, analysis)
             problems = _bitmap_problems(canvas, cv2.resize(trim, (trim_w_px, trim_h_px)), bleed_px, {s: "kept" for s in SIDES}, analysis)
             # Kept artwork will not match a resized trim exactly. Drop that one check.
@@ -898,15 +953,42 @@ def compile_raster_canvas(
                 if topped.shape[1] != out_w or topped.shape[0] != out_h:
                     topped = cv2.resize(topped, (out_w, out_h), interpolation=cv2.INTER_AREA)
                 analysis = analyse_bgr(trim, dpi, safe_zone_mm)
-                edges = _edge_lines(analysis, {side: "kept" for side in SIDES}, kept=True)
+                methods = {
+                    side: "kept" if float(existing[side]) + 0.4 >= float(bleed_mm) else "mirror"
+                    for side in SIDES
+                }
+                edges = _edge_lines(analysis, methods, kept=False)
+                for edge in edges:
+                    side = str(edge.get("side") or "")
+                    if methods.get(side) == "mirror":
+                        edge["note"] = f"{side.capitalize()}: mirrored the cleaned edge."
+                    else:
+                        edge["note"] = f"{side.capitalize()}: kept the bleed already in the file."
+                if any(method == "mirror" for method in methods.values()):
+                    from bleed_builder import finish_raster_bleed
+
+                    topped, edge_methods = finish_raster_bleed(topped, bleed_px)
+                else:
+                    edge_methods = {}
                 report = _base_report(analysis, edges, True, bleed_mm, safe_zone_mm, src_w, src_h, trim_w_mm, trim_h_mm)
                 report["existingBleed"] = True
+                amber = any(edge_methods.get(side) == "mirror-amber" for side in SIDES)
                 report["rescue"] = {
                     "applied": False,
+                    "amber": amber,
                     "scale": 1.0,
                     "safeZoneMm": safe_zone_mm,
-                    "note": "Existing bleed kept. Only the shortfall was added.",
+                    "note": (
+                        "The bleed still does not match on one edge. Please check it before printing."
+                        if amber
+                        else "Existing bleed kept. Only the shortfall was added."
+                    ),
                 }
+                if amber:
+                    for edge in edges:
+                        if edge_methods.get(edge.get("side")) == "mirror-amber":
+                            side = str(edge.get("side") or "")
+                            edge["note"] = f"{side.capitalize()}: mirrored the cleaned edge. Please check it before printing."
                 _finish_resolution(report, src_w, src_h, trim_w_mm, trim_h_mm, analysis)
                 report["bitmapProblems"] = []
                 return topped, report
@@ -926,6 +1008,11 @@ def compile_raster_canvas(
         source_for_check = trim
     canvas, built = extend_trim(source_for_check, bleed_px, analysis)
     edges = built["edges"]
+    if built.get("amber"):
+        rescue = dict(rescue)
+        rescue["amber"] = True
+        extra = "The bleed still does not match on one edge. Please check it before printing."
+        rescue["note"] = (str(rescue.get("note") or "") + " " + extra).strip()
     report = _base_report(analysis, edges, False, bleed_mm, safe_zone_mm, src_w, src_h, trim_w_mm, trim_h_mm)
     report["existingBleed"] = bool(existing) and kept
     report["rescue"] = rescue
@@ -2252,7 +2339,96 @@ def _sliver_cover_pt(band: np.ndarray, from_end: bool, along_rows: bool) -> floa
     return max(_SEAM_COVER_PT, float(depth + 1) * _EDGE_PIXEL_PT)
 
 
-def _paint_cmyk_edge(page, placed) -> None:
+def _repair_mismatched_edges(page, placed) -> dict:
+    """Redo an edge whose bleed does not match the cleaned art, using a mirror."""
+    import pymupdf as fitz
+
+    from bleed_builder import BLEED_DELTA_E, edge_row_delta
+
+    full = page.rect
+    placed = fitz.Rect(placed)
+    methods = {}
+    if placed.width < 1 or placed.height < 1:
+        return methods
+    gaps = {
+        "left": max(0.0, placed.x0 - full.x0),
+        "right": max(0.0, full.x1 - placed.x1),
+        "top": max(0.0, placed.y0 - full.y0),
+        "bottom": max(0.0, full.y1 - placed.y1),
+    }
+    cover = 0.5 * 72.0 / 25.4
+
+    def rgb(rect):
+        clip = fitz.Rect(*rect) & page.rect
+        if clip.width < 0.2 or clip.height < 0.2:
+            return None
+        return _pixmap_rgb(page, clip)
+
+    def mirror(side: str) -> None:
+        gap = gaps[side]
+        if side == "right":
+            src = _pixmap_cmyk(page, fitz.Rect(placed.x1 - gap, placed.y0, placed.x1, placed.y1))
+            if src is not None:
+                _insert_cmyk(page, src[:, ::-1], fitz.Rect(placed.x1 - cover, placed.y0, full.x1, placed.y1))
+        elif side == "left":
+            src = _pixmap_cmyk(page, fitz.Rect(placed.x0, placed.y0, placed.x0 + gap, placed.y1))
+            if src is not None:
+                _insert_cmyk(page, src[:, ::-1], fitz.Rect(full.x0, placed.y0, placed.x0 + cover, placed.y1))
+        elif side == "top":
+            src = _pixmap_cmyk(page, fitz.Rect(placed.x0, placed.y0, placed.x1, placed.y0 + gap))
+            if src is not None:
+                _insert_cmyk(page, src[::-1, :], fitz.Rect(placed.x0, full.y0, placed.x1, placed.y0 + cover))
+        elif side == "bottom":
+            src = _pixmap_cmyk(page, fitz.Rect(placed.x0, placed.y1 - gap, placed.x1, placed.y1))
+            if src is not None:
+                _insert_cmyk(page, src[::-1, :], fitz.Rect(placed.x0, placed.y1 - cover, placed.x1, full.y1))
+
+    specs = {
+        "right": (
+            (placed.x1 - 1.6, placed.y0 + 6, placed.x1 - 0.2, placed.y1 - 6),
+            (placed.x1 + gaps["right"] * 0.35, placed.y0 + 6, full.x1, placed.y1 - 6),
+            True,
+        ),
+        "left": (
+            (placed.x0 + 0.2, placed.y0 + 6, placed.x0 + 1.6, placed.y1 - 6),
+            (full.x0, placed.y0 + 6, placed.x0 - gaps["left"] * 0.35, placed.y1 - 6),
+            True,
+        ),
+        "top": (
+            (placed.x0 + 6, placed.y0 + 0.2, placed.x1 - 6, placed.y0 + 1.6),
+            (placed.x0 + 6, full.y0, placed.x1 - 6, placed.y0 - gaps["top"] * 0.35),
+            False,
+        ),
+        "bottom": (
+            (placed.x0 + 6, placed.y1 - 1.6, placed.x1 - 6, placed.y1 - 0.2),
+            (placed.x0 + 6, placed.y1 + gaps["bottom"] * 0.35, placed.x1 - 6, full.y1),
+            False,
+        ),
+    }
+    for side, (art_box, bleed_box, along_rows) in specs.items():
+        if gaps[side] < 0.4:
+            methods[side] = "kept"
+            continue
+        art = rgb(art_box)
+        bleed = rgb(bleed_box)
+        if art is None or bleed is None:
+            methods[side] = "replicate"
+            continue
+        if not along_rows:
+            art = np.transpose(art, (1, 0, 2))
+            bleed = np.transpose(bleed, (1, 0, 2))
+        if side in ("right", "bottom"):
+            art = art[:, ::-1]
+        delta = edge_row_delta(art, bleed if side in ("right", "bottom") else bleed[:, ::-1])
+        if delta > BLEED_DELTA_E:
+            mirror(side)
+            methods[side] = "mirror"
+        else:
+            methods[side] = "replicate"
+    return methods
+
+
+def _paint_cmyk_edge(page, placed) -> dict:
     """Continue each edge from the artwork just inside a light sliver.
 
     A 1px white column, including the band it becomes after a low-resolution
@@ -2270,7 +2446,7 @@ def _paint_cmyk_edge(page, placed) -> None:
     search = pixel * (SLIVER_CAP_PX + 4)
     placed = fitz.Rect(placed)
     if placed.width < 1 or placed.height < 1:
-        return
+        return {}
     gaps = {
         "left": max(0.0, placed.x0 - full.x0),
         "right": max(0.0, full.x1 - placed.x1),
@@ -2278,7 +2454,7 @@ def _paint_cmyk_edge(page, placed) -> None:
         "bottom": max(0.0, full.y1 - placed.y1),
     }
     if max(gaps.values()) < 0.3:
-        return
+        return {side: "kept" for side in ("left", "right", "top", "bottom")}
 
     scale = 300.0 / 72.0
     left_cover = right_cover = top_cover = bottom_cover = _SEAM_COVER_PT
@@ -2390,6 +2566,13 @@ def _paint_cmyk_edge(page, placed) -> None:
             False,
             False,
         )
+    methods = _repair_mismatched_edges(page, placed)
+    for side, gap in gaps.items():
+        if gap <= 0.3:
+            methods[side] = "kept"
+        elif methods.get(side) not in ("mirror", "mirror-amber"):
+            methods[side] = "replicate"
+    return methods
 
 
 def _probe_page_pixels(width_pt: float, height_pt: float) -> tuple[int, int]:
@@ -2976,9 +3159,10 @@ def _paint_mirrored_strips(page, placed) -> None:
     _cap_tac_array(canvas[:, :, :4])
     ring = fitz.Pixmap(fitz.csCMYK, width, height, np.ascontiguousarray(canvas).tobytes(), True)
     page.insert_image(full, pixmap=ring)
+    _repair_mismatched_edges(page, placed)
 
 
-def _paint_vector_strips(path: str, placements: list) -> None:
+def _paint_vector_strips(path: str, placements: list) -> list:
     """Add the missing bleed. Live type is not flattened and is not retyped.
 
     A shortfall of about 2.5 mm is a mirror of that edge, including the same
@@ -2992,10 +3176,12 @@ def _paint_vector_strips(path: str, placements: list) -> None:
     doc = fitz.open(path)
     tmp = path + ".vstrips.pdf"
     painted = False
+    page_methods = []
     try:
         for index, page in enumerate(doc):
             placement = placements[index] if index < len(placements) else None
             if not placement:
+                page_methods.append({})
                 continue
             placed = fitz.Rect(*placement)
             gap = max(
@@ -3005,9 +3191,10 @@ def _paint_vector_strips(path: str, placements: list) -> None:
                 page.rect.y1 - placed.y1,
             )
             if gap > wide_pt:
-                _paint_cmyk_edge(page, placed)
+                page_methods.append(_paint_cmyk_edge(page, placed) or {})
             else:
                 _paint_mirrored_strips(page, placed)
+                page_methods.append({side: "mirror" for side in ("left", "right", "top", "bottom")})
             painted = True
         if painted:
             doc.save(tmp, deflate=True, garbage=4)
@@ -3015,21 +3202,24 @@ def _paint_vector_strips(path: str, placements: list) -> None:
         doc.close()
     if painted and os.path.isfile(tmp):
         os.replace(tmp, path)
+    return page_methods
 
 
-def _paint_large_strips(path: str, placements: list) -> None:
+def _paint_large_strips(path: str, placements: list) -> list:
     """Draw only the 5 mm bleed. A poster is not flattened to one 300 dpi plate."""
     import pymupdf as fitz
 
     doc = fitz.open(path)
     tmp = path + ".strips.pdf"
     painted = False
+    page_methods = []
     try:
         for index, page in enumerate(doc):
             placement = placements[index] if index < len(placements) else None
             if not placement:
+                page_methods.append({})
                 continue
-            _paint_cmyk_edge(page, fitz.Rect(*placement))
+            page_methods.append(_paint_cmyk_edge(page, fitz.Rect(*placement)) or {})
             painted = True
         if painted:
             doc.save(tmp, deflate=True, garbage=4)
@@ -3037,6 +3227,7 @@ def _paint_large_strips(path: str, placements: list) -> None:
         doc.close()
     if painted and os.path.isfile(tmp):
         os.replace(tmp, path)
+    return page_methods
 
 
 def _keep_page_vector(page) -> bool:
@@ -3630,9 +3821,15 @@ def compile_vector_press(
         else:
             dest = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_mm * MM_TO_PT, bleed_pt + trim_h_mm * MM_TO_PT)
             scale = 1.0
-            if analysis.get("safeHits", 0) > 0:
-                scale = 1.0 - min(SAFE_ZONE_SHRINK_CAP, 0.02)
+            gap_mm = analysis.get("safeGapMm")
+            if gap_mm is not None and float(gap_mm) < float(safe_zone_mm) - 0.05:
+                need = max(0.0, float(safe_zone_mm) - float(gap_mm))
+                pull_mm = min(2.0, need)
+                longer = max(float(trim_w_mm), float(trim_h_mm), 1.0)
+                scale = 1.0 - min(0.5, (2.0 * pull_mm) / longer)
                 shrunk = scale < 0.999
+                if need > 2.05:
+                    analysis["pullAmber"] = True
             placed = dest
             if scale < 0.999:
                 margin_x = dest.width * (1 - scale) / 2
@@ -3686,6 +3883,7 @@ def compile_vector_press(
         edges = _edge_lines(analysis, methods, kept=True)
     page_count = src.page_count
     all_mirrored = bool(page_mirrored) and all(page_mirrored)
+    painted_edges: list = []
     if all_mirrored:
         # The plate is already CMYK at 300 dpi. Ghostscript would resample the mirror.
         doc.save(out_path, deflate=True, garbage=4)
@@ -3714,9 +3912,9 @@ def compile_vector_press(
         # Posters keep the one-pixel edge sample. A smaller vector page mirrors only
         # the missing bleed, so the seam matches and live type stays untouched.
         if plate_exceeds_memory(trim_w_mm, trim_h_mm):
-            _paint_large_strips(boxed, edge_placements)
+            painted_edges = _paint_large_strips(boxed, edge_placements) or []
         elif any(not mirrored for mirrored in page_mirrored):
-            _paint_vector_strips(boxed, edge_placements)
+            painted_edges = _paint_vector_strips(boxed, edge_placements) or []
         else:
             _paint_bleed_matching(boxed, edge_placements)
         os.replace(boxed, out_path)
@@ -3728,12 +3926,62 @@ def compile_vector_press(
             pass
 
     full_keep = kept and not extended
+    over_trimmed = bool(kept and not extended and most > bleed_mm + 0.6)
+    if over_trimmed:
+        for edge in edges:
+            side = str(edge.get("side") or "")
+            edge["method"] = "trimmed"
+            edge["note"] = f"{side.capitalize()}: extra bleed was trimmed to 5 mm."
+    elif not full_keep:
+        chosen = {}
+        for methods in painted_edges:
+            for side_name, picked in (methods or {}).items():
+                if picked in ("mirror", "mirror-amber"):
+                    chosen[side_name] = picked
+                elif side_name not in chosen:
+                    chosen[side_name] = picked
+        edge_amber = any(picked == "mirror-amber" for picked in chosen.values())
+        for edge in edges:
+            side = str(edge.get("side") or "")
+            mirrored_page = bool(page_mirrored) and all(page_mirrored)
+            method = chosen.get(side) or (
+                "mirror" if mirrored_page or (not mirrored_page and most >= 0.4 and have + 0.4 < bleed_mm) else "replicate"
+            )
+            if edge.get("method") == "mirror" and method not in ("mirror", "mirror-amber"):
+                method = "mirror"
+            if method == "mirror-amber":
+                edge["method"] = "mirror"
+                edge["note"] = f"{side.capitalize()}: mirrored the cleaned edge. Please check it before printing."
+            elif method == "mirror":
+                edge["method"] = "mirror"
+                edge["note"] = f"{side.capitalize()}: mirrored the cleaned edge."
+            elif method == "kept":
+                edge["method"] = "kept"
+                edge["note"] = f"{side.capitalize()}: kept the bleed already in the file."
+            else:
+                edge["method"] = "replicate"
+                edge["note"] = f"{side.capitalize()}: continued the cleaned edge colour."
+        if edge_amber:
+            analysis["edgeAmber"] = True
+    pull_amber = bool(analysis.get("pullAmber"))
     rescue = {
         "applied": shrunk,
-        "scale": 0.98 if shrunk else 1.0,
+        "amber": pull_amber,
+        "scale": round(1.0 - min(0.5, 4.0 / max(trim_w_mm, trim_h_mm, 1.0)), 4) if shrunk else 1.0,
         "safeZoneMm": safe_zone_mm,
-        "note": "Text and vectors were kept live." if kind != "raster" else "The picture stays as placed. Only the bleed ring was added.",
+        "note": (
+            "Some text or a logo is still inside the 3 mm safe zone. It was brought in by 2 mm. Please check it before printing."
+            if pull_amber
+            else "Text and vectors were kept live." if kind != "raster" else "The picture stays as placed. Only the bleed ring was added."
+        ),
     }
+    if over_trimmed:
+        rescue["note"] = "Extra bleed was trimmed to 5 mm. " + rescue["note"]
+    if analysis.get("edgeAmber"):
+        rescue["amber"] = True
+        extra = "The bleed still does not match on one edge. Please check it before printing."
+        if extra not in str(rescue.get("note") or ""):
+            rescue["note"] = (str(rescue.get("note") or "") + " " + extra).strip()
     report = _base_report(analysis, edges, full_keep, bleed_mm, safe_zone_mm, 0, 0, trim_w_mm, trim_h_mm)
     report["contentKind"] = kind
     report["analysis"]["contentKind"] = kind
