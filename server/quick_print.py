@@ -2386,6 +2386,9 @@ def make_print_ready(
         from customer_message import customer_message
 
         if result.get("pressPath"):
+            if not any("cmyk" in str(line).lower() for line in decisions):
+                decisions.append("The press file was converted to CMYK.")
+            result["decisions"] = decisions
             worry = list(concerns)
             if info.get("light") in ("amber", "red"):
                 for line in info.get("reasons") or []:

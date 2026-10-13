@@ -96,6 +96,17 @@ class PrintFlowTests(unittest.TestCase):
             "Your artwork has successfully been made print ready, but to ensure you are 100% happy we would recommend checking the points below."
         ))
         self.assertIn("Brought content in 2 mm", worried)
+        settled = customer_message(
+            ["Bleed: top/bottom/left/right trimmed to 5 mm.", "The press file was converted to CMYK."],
+            [
+                "Bleed Detection: There is no bleed past the trim.",
+                "CMYK: The file is RGB. It still needs a CMYK conversion.",
+                "Small text: we strongly recommend larger text.",
+            ],
+        )
+        self.assertNotIn("no bleed", settled.lower())
+        self.assertNotIn("still needs a CMYK", settled)
+        self.assertIn("strongly recommend larger text", settled)
         self.assertIn("Please have a look at this: Small text", worried)
         self.assertIn("Low resolution", worried)
 
@@ -110,6 +121,23 @@ class PrintFlowTests(unittest.TestCase):
         self.assertEqual(rows["checking"], 100)
         self.assertEqual(rows["press"], 78)
         self.assertEqual(rows["proof"], 0)
+
+    def test_reapply_uses_the_chosen_method_without_a_new_job(self):
+        import numpy as np
+
+        from bleed_reapply import reapply_bleed
+        from press_ready_engine import write_cmyk_pdf
+
+        folder = tempfile.mkdtemp(prefix="rebleed-")
+        art = np.zeros((80, 120, 3), dtype=np.uint8)
+        art[:, :] = (30, 90, 200)
+        art[:, :8] = (10, 10, 10)
+        press = os.path.join(folder, "press.pdf")
+        write_cmyk_pdf(art, press, 40, 30, 5.0)
+        changed = reapply_bleed(press, "mirror", 40, 30, folder)
+        self.assertTrue(changed["ok"])
+        self.assertIn("mirrored", changed["bleedNote"])
+        self.assertGreater(os.path.getsize(changed["pressPath"]), 1000)
 
     def test_change_bleed_sentence_names_one_method(self):
         self.assertEqual(bleed_sentence("mirror"), "Bleed: top/bottom/left/right mirrored.")

@@ -83,8 +83,13 @@ def reapply_bleed(press_path: str, strategy: str, trim_w: float, trim_h: float, 
     expect_w = trim_w_px + 2 * bleed_px
     if out is None or out.size == 0:
         raise RuntimeError("The bleed could not be drawn again.")
+    # A painter that stays inside the memory leash can return the trim alone.
+    # Reflect or repeat the edge instead of stretching the artwork into the bleed.
+    if out.shape[0] < expect_h or out.shape[1] < expect_w:
+        border = cv2.BORDER_REFLECT_101 if method == "mirror" else cv2.BORDER_REPLICATE
+        out = cv2.copyMakeBorder(plane, bleed_px, bleed_px, bleed_px, bleed_px, border)
     if out.shape[0] != expect_h or out.shape[1] != expect_w:
-        out = cv2.resize(out[:, :, :3], (expect_w, expect_h), interpolation=cv2.INTER_CUBIC)
+        out = cv2.resize(out[:, :, :3], (expect_w, expect_h), interpolation=cv2.INTER_AREA)
     os.makedirs(output_dir, exist_ok=True)
     press_out = os.path.join(output_dir, "press.pdf")
     temporary = press_out + ".rebleed.tmp"
