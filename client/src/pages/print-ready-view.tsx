@@ -125,6 +125,16 @@ export function QuickResultCard(props: {
           {card.elapsedSec != null ? ` · ${card.elapsedSec}s` : ""}
         </p>
         {card.note ? <p className="text-xs text-muted-foreground mt-1">{card.note}</p> : null}
+        {card.fixes && card.fixes.length > 0 && (
+          <ul className="mt-3 space-y-1 text-sm" data-testid={`list-fixes-${card.id}`}>
+            {card.fixes.map((fix) => (
+              <li key={fix.id} className="flex justify-between gap-3">
+                <span>{fix.label}</span>
+                <span>{fix.percent}%</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </Card>
     );
   }
@@ -135,6 +145,11 @@ export function QuickResultCard(props: {
           <p className="text-xs font-bold tracking-[0.2em]" data-testid={`text-quick-light-${card.id}`}>{light.toUpperCase()}</p>
           <h2 className="text-xl font-bold font-display mt-1">{card.filename}</h2>
           {card.productLabel && <p className="text-sm mt-1">{card.productLabel}{card.quantity ? ` · qty ${card.quantity}` : ""}</p>}
+          {(card.bleedNote || card.decisions.find((line) => line.startsWith("Bleed:"))) && (
+            <p className="text-sm mt-2 font-semibold" data-testid={`text-bleed-note-${card.id}`}>
+              {card.bleedNote || card.decisions.find((line) => line.startsWith("Bleed:"))}
+            </p>
+          )}
         </div>
       </div>
       {light !== "red" && card.hasProof && (

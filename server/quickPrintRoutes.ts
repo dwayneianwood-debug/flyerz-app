@@ -11,13 +11,15 @@ import {
   productIdForEngine,
   redFallback,
   resolveQuickProduct,
+  runBleedReapply,
+  runIntakeCheck,
   runQuickPrintFile,
   saveQuickResult,
 } from "./quickPrintRunner";
 import { beginJobRun, endJobRun } from "./jobRunLock";
 import { readJobProgress, writeJobProgress } from "./jobProgress";
 import { startQuickPrintWatcher } from "./quickPrintWatcher";
-import type { AuditResults } from "@shared/schema";
+import { BLEED_STRATEGY_IDS, type AuditResults } from "@shared/schema";
 import type { QuickPrintCard } from "@shared/quickPrint";
 
 const uploadDir = path.join(process.cwd(), "uploads");
@@ -54,10 +56,17 @@ export function slimQuickCard(job: {
       productLabel?: string;
       quantity?: number | null;
       notes?: string;
+      bleedNote?: string;
+      customerMessage?: string;
+      beforePng?: string;
+      trimWidthMm?: number | null;
+      trimHeightMm?: number | null;
+      bleedRevision?: number;
     };
   } | null;
 }): QuickPrintCard {
   const quick = job.auditResults?.quickPrint;
+  const engineNote = (job.auditResults as { pressEngine?: { bleedNote?: string } } | null | undefined)?.pressEngine?.bleedNote;
   const light = quick?.light === "green" || quick?.light === "amber" || quick?.light === "red" ? quick.light : null;
   return {
     id: job.id,
@@ -81,11 +90,17 @@ export function slimQuickCard(job: {
     productLabel: String(quick?.productLabel || ""),
     quantity: quick?.quantity == null ? null : Number(quick.quantity),
     notes: String(quick?.notes || ""),
+    bleedNote: String(quick?.bleedNote || engineNote || ""),
+    customerMessage: String(quick?.customerMessage || ""),
+    hasBefore: !!(quick?.beforePng && fs.existsSync(quick.beforePng)),
+    trimWidthMm: quick?.trimWidthMm == null ? null : Number(quick.trimWidthMm),
+    trimHeightMm: quick?.trimHeightMm == null ? null : Number(quick.trimHeightMm),
+    bleedRevision: Number(quick?.bleedRevision) || 0,
     ...progressFields(job.id),
   };
 }
 
-function progressFields(jobId: number): { stage?: string; percent?: number; elapsedSec?: number; note?: string } {
+function progressFields(jobId: number): { stage?: string; percent?: number; elapsedSec?: number; note?: string; fixes?: { id: string; label: string; percent: number }[] } {
   const progress = readJobProgress(jobId);
   if (!progress) return {};
   return {
@@ -93,6 +108,7 @@ function progressFields(jobId: number): { stage?: string; percent?: number; elap
     percent: progress.percent,
     elapsedSec: progress.elapsedSec,
     note: progress.note,
+    fixes: progress.fixes || [],
   };
 }
 
@@ -110,6 +126,10 @@ async function runJob(jobId: number, inputPath: string, filename: string, body: 
       notes,
       filename,
       jobId,
+      editRequest: String(body.editRequest || ""),
+      replicateEdit: body.replicateEdit === true || body.replicateEdit === "1",
+      skipUpscale: body.skipUpscale === true || body.skipUpscale === "1",
+      concerns: Array.isArray(body.concerns) ? body.concerns.map((line: unknown) => String(line)) : [],
     });
     await saveQuickResult(jobId, result);
     writeJobProgress(jobId, "done");
@@ -222,6 +242,130 @@ export function registerQuickPrintRoutes(app: Express) {
     for (const job of created) {
       if (job.skip) continue;
       void runJob(job.id, job.inputPath, job.filename, req.body || {});
+    }
+  });
+
+  app.post("/api/print-flow/check", upload.single("file"), async (req, res) => {
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: "Add a file to check." });
+    let product;
+    try {
+      product = resolveQuickProduct(String(req.body?.productId || "a5"), Number(req.body?.customWidth), Number(req.body?.customHeight));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Choose a product size.";
+      return res.status(400).json({ message });
+    }
+    const checkId = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    const folder = path.join(uploadDir, "print-flow", checkId);
+    fs.mkdirSync(folder, { recursive: true });
+    const filename = safeUploadName(file.originalname);
+    const stored = path.join(folder, filename);
+    fs.copyFileSync(file.path, stored);
+    try { fs.unlinkSync(file.path); } catch { /* copied */ }
+    try {
+      const report = await runIntakeCheck(stored, product.widthMm, product.heightMm);
+      const manifest = {
+        inputPath: stored,
+        filename: file.originalname || filename,
+        productId: String(req.body?.productId || product.id),
+        trimW: product.widthMm,
+        trimH: product.heightMm,
+        items: report.items,
+      };
+      fs.writeFileSync(path.join(folder, "check.json"), JSON.stringify(manifest));
+      res.json({ checkId, filename: manifest.filename, productLabel: product.label, ...report });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The check could not finish.";
+      res.status(500).json({ message });
+    }
+  });
+
+  app.post("/api/print-flow/make", async (req, res) => {
+    const checkId = String(req.body?.checkId || "").replace(/[^\w-]/g, "");
+    const manifestPath = path.join(uploadDir, "print-flow", checkId, "check.json");
+    if (!checkId || !insideWorkspace(manifestPath) || !fs.existsSync(manifestPath)) {
+      return res.status(400).json({ message: "Run the quick check first." });
+    }
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+      inputPath?: string;
+      filename?: string;
+      productId?: string;
+    };
+    const inputPath = String(manifest.inputPath || "");
+    if (!insideWorkspace(inputPath) || !fs.existsSync(inputPath)) {
+      return res.status(400).json({ message: "The checked file is no longer available." });
+    }
+    const filename = String(manifest.filename || path.basename(inputPath));
+    const job = await storage.createJob({
+      filename,
+      originalPath: inputPath,
+      fileSize: fs.statSync(inputPath).size,
+      fileType: fileTypeForName(filename),
+    });
+    await storage.updateJob(job.id, { status: "processing" });
+    const hold = beginJobRun(job.id, "quick");
+    if (!hold.started) {
+      return res.status(202).json({ jobs: [{ id: job.id, filename, status: "processing" }] });
+    }
+    writeJobProgress(job.id, "fitting", "Fitting the picture to the product.");
+    const body = {
+      ...(req.body || {}),
+      productId: String(req.body?.productId || manifest.productId || "a5"),
+    };
+    res.status(202).json({ jobs: [{ id: job.id, filename, status: "processing" }] });
+    void runJob(job.id, inputPath, filename, body);
+  });
+
+  app.get("/api/quick-print/:id/before", async (req, res) => {
+    const job = await storage.getJob(Number(req.params.id));
+    const quick = (job?.auditResults as { quickPrint?: { beforePng?: string } } | null)?.quickPrint;
+    const filePath = quick?.beforePng || "";
+    if (!job || !filePath || !insideWorkspace(filePath) || !fs.existsSync(filePath)) {
+      return res.status(404).json({ message: "Before picture not found" });
+    }
+    res.setHeader("Content-Type", "image/png");
+    res.sendFile(path.resolve(filePath));
+  });
+
+  app.post("/api/quick-print/:id/rebleed", async (req, res) => {
+    const job = await storage.getJob(Number(req.params.id));
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    const strategy = String(req.body?.strategy || "auto");
+    const allowed = new Set<string>(["auto", ...BLEED_STRATEGY_IDS]);
+    if (!allowed.has(strategy)) return res.status(400).json({ message: "Choose a bleed method from the list." });
+    const audit = { ...(job.auditResults || {}) } as Record<string, any>;
+    const quick = { ...(audit.quickPrint || {}) };
+    const pressPath = String(quick.pressPath || "");
+    const trimW = Number(quick.trimWidthMm || job.productWidthMm || 0);
+    const trimH = Number(quick.trimHeightMm || job.productHeightMm || 0);
+    if (!pressPath || !insideWorkspace(pressPath) || !fs.existsSync(pressPath) || trimW < 20 || trimH < 20) {
+      return res.status(400).json({ message: "This job does not have a press file to change." });
+    }
+    try {
+      const changed = await runBleedReapply(pressPath, strategy, trimW, trimH, path.dirname(pressPath));
+      const note = changed.bleedNote;
+      quick.bleedNote = note;
+      quick.bleedRevision = Number(quick.bleedRevision || 0) + 1;
+      const decisions: string[] = Array.isArray(quick.decisions) ? quick.decisions.map((line: unknown) => String(line)) : [];
+      const nextDecisions = decisions.filter((line) => !line.startsWith("Bleed:"));
+      if (note) nextDecisions.push(note);
+      quick.decisions = nextDecisions;
+      let message = String(quick.customerMessage || "");
+      if (note) {
+        if (/Bleed:/.test(message)) message = message.replace(/Bleed:[^.]*\./, note);
+        else message = `${message} ${note}`.trim();
+        quick.customerMessage = message;
+      }
+      audit.quickPrint = quick;
+      if (audit.pressEngine && typeof audit.pressEngine === "object") {
+        audit.pressEngine = { ...audit.pressEngine, bleedNote: note };
+      }
+      await storage.updateJob(job.id, { auditResults: audit as AuditResults, correctedPath: pressPath });
+      const updated = await storage.getJob(job.id);
+      res.json(slimQuickCard(updated || job));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The bleed could not be changed.";
+      res.status(500).json({ message });
     }
   });
 }

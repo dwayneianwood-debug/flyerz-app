@@ -404,16 +404,179 @@ def _product_for_trim(trim_w: float, trim_h: float):
     return None
 
 
-def _record_bleed_note(decisions: list, engine) -> None:
-    """Put the per-edge automatic method on the card, beside the generic bleed line."""
-    if not isinstance(engine, dict):
-        return
+def incoming_bleed_line(bleed: dict) -> tuple[str, str]:
+    """One sentence for bleed already on the page, and a short story tag.
+
+    A page with no trim box and more than 5 mm on a side is over-bleed.
+    It gets the trim sentence only. It does not also say a shortfall was added
+    or that the file already had exactly 5 mm.
+    """
+    sides = [float((bleed or {}).get(name) or 0) for name in ("left", "right", "top", "bottom")]
+    most = max(sides) if sides else 0.0
+    if (bleed or {}).get("kind") == "existing" and most > BLEED_MM + 0.6:
+        return (
+            f"The page already had about {most:.1f} mm of bleed. Extra bleed is trimmed to 5 mm.",
+            "over",
+        )
+    if (bleed or {}).get("kind") == "existing":
+        return (
+            f"The page is the trim plus about {float(bleed.get('left') or 0):.1f} mm of bleed already. "
+            "That bleed is kept and only the shortfall is added.",
+            "partial",
+        )
+    return ("The PDF already fits this product, so the page was kept and sent to the press engine.", "fit")
+
+
+def extra_bleed_lines(
+    over_incoming: bool,
+    full_kept: bool,
+    existing: bool,
+    press_ok: bool,
+    trimmed: bool = False,
+) -> tuple[bool, list[str]]:
+    """Sentences after the per-edge note. Extra bleed keeps the single trim sentence."""
+    if over_incoming or trimmed:
+        return bool(full_kept or existing), []
+    if full_kept:
+        return True, ["This file already had 5 mm bleed. That bleed was kept and was not added again."]
+    if existing:
+        return True, []
+    if press_ok:
+        return False, ["Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm."]
+    return False, []
+
+
+def _apply_cat_edit(path: str, output_dir: str, decisions: list, request: str) -> str:
+    """One time, date, or number change before the press file is built."""
+    try:
+        from artwork_edits import confirm, propose
+
+        key = "print-flow-" + os.path.basename(output_dir or "job")
+        proposed = propose(path, request, key, os.path.join(output_dir, "edit-preview"))
+        if not isinstance(proposed, dict) or not proposed.get("ok"):
+            reply = str((proposed or {}).get("reply") or "") if isinstance(proposed, dict) else ""
+            decisions.append(reply or "The small text edit could not be applied. The press file was made from the original artwork.")
+            return path
+        dest = os.path.join(output_dir, "edited-source.pdf")
+        done = confirm(key, dest)
+        if done.get("ok") and os.path.isfile(dest) and os.path.getsize(dest) > 100:
+            decisions.append("The time, date, or number you asked for was changed before the press file was made.")
+            return dest
+    except Exception:
+        pass
+    decisions.append("The small text edit could not be applied. The press file was made from the original artwork.")
+    return path
+
+
+def _apply_replicate_edit(path: str, output_dir: str, decisions: list, trim_w: float, trim_h: float) -> tuple[str, bool]:
+    """One Replicate picture pass. A missing token leaves the artwork as sent."""
+    token = ""
+    try:
+        from ai_enhancements import _get_replicate_token
+
+        token = (_get_replicate_token() or "").strip()
+    except Exception:
+        token = ""
+    if not token:
+        decisions.append(
+            "Replicate is not set up on this computer, so the artwork was left as you sent it and the press file was still made."
+        )
+        return path, False
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"):
+        decisions.append(
+            "Replicate is ready. This file stays on the press path, so the picture was not sent out for a separate edit."
+        )
+        return path, False
+    try:
+        from ai_upscale import apply_ai_upscale
+
+        dest = os.path.join(output_dir, "replicate-edit.png")
+        enlarged = apply_ai_upscale(path, {
+            "trim_w_mm": trim_w,
+            "trim_h_mm": trim_h,
+            "bleed_mm": 0,
+            "output_path": dest,
+            "max_scale": 4,
+            "skip_below_ppi": 75,
+        })
+        enhanced = str((enlarged or {}).get("enhanced_path") or "")
+        if enhanced and os.path.exists(enhanced) and not (enlarged or {}).get("used_original"):
+            if str((enlarged or {}).get("provider") or "") == "replicate":
+                decisions.append("The picture was edited with Replicate before the press file was made.")
+            else:
+                decisions.append(
+                    "Replicate did not return a picture, so a local enlargement was used before the press file was made."
+                )
+            return enhanced, True
+    except Exception:
+        pass
+    decisions.append("The Replicate edit could not be applied. The press file was made from the original artwork.")
+    return path, False
+
+
+def _write_before(src: str, dest: str) -> bool:
+    """A small picture of the file Ian sent, for the before side of the result."""
+    try:
+        import cv2
+
+        ext = os.path.splitext(src)[1].lower()
+        image = None
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"):
+            image = cv2.imread(src, cv2.IMREAD_COLOR)
+        else:
+            import numpy as np
+            import pymupdf as fitz
+
+            from page_zoom import adjusted_zoom
+
+            doc = fitz.open(src)
+            try:
+                if doc.page_count < 1:
+                    return False
+                page = doc[0]
+                zoom = adjusted_zoom(page.rect.width, page.rect.height, 1.0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+                if max(pix.w, pix.h) > 900 and max(pix.w, pix.h) > 0:
+                    zoom = zoom * (900.0 / max(pix.w, pix.h))
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+                rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+                image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            finally:
+                doc.close()
+        if image is None:
+            return False
+        height, width = image.shape[:2]
+        scale = 900.0 / max(height, width, 1)
+        if scale < 1:
+            image = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        return bool(cv2.imwrite(dest, image))
+    except Exception:
+        return False
+
+
+def _record_bleed_note(decisions: list, engine, extra_edges=None) -> None:
+    """Put the per-edge automatic method on every card that built or kept bleed."""
     from press_ready_engine import bleed_method_sentence
 
-    sentence = str(engine.get("bleedNote") or "") or bleed_method_sentence(engine.get("edges") or [])
+    if any(str(line).startswith("Bleed:") for line in decisions):
+        if isinstance(engine, dict) and not engine.get("bleedNote"):
+            engine["bleedNote"] = next(str(line) for line in decisions if str(line).startswith("Bleed:"))
+        return
+    edges = []
+    sentence = ""
+    if isinstance(engine, dict):
+        sentence = str(engine.get("bleedNote") or "")
+        edges = list(engine.get("edges") or [])
+    if not edges and extra_edges:
+        edges = list(extra_edges)
+    if not sentence:
+        sentence = bleed_method_sentence(edges)
     if not sentence:
         return
-    engine["bleedNote"] = sentence
+    if isinstance(engine, dict):
+        engine["bleedNote"] = sentence
     if sentence not in decisions:
         decisions.append(sentence)
 
@@ -1548,6 +1711,7 @@ def make_print_ready(
     quantity=None,
     notes: str = "",
     detect_size: bool = False,
+    options: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     locale_seen = {}
@@ -1625,13 +1789,18 @@ def make_print_ready(
     dpi_mode = ""
     dpi_detail = ""
     existing_kept = False
+    over_incoming = False
     ocr_low = False
     ocr_doubtful = False
     ocr_doubtful_reason = ""
     vector_built = None
+    engine = {}
     vector_source = None
     upscale_job = None
     lettering_note = "The original lettering is kept."
+    chosen = options or {}
+    skip_upscale = bool(chosen.get("skipUpscale"))
+    concerns = [str(line) for line in (chosen.get("concerns") or []) if str(line).strip()]
 
     try:
         from press_ready_engine import plate_exceeds_memory
@@ -1651,6 +1820,16 @@ def make_print_ready(
             work_path = opened
             ext = ".pdf"
             decisions.append("The Illustrator file was read onto the normal PDF path.")
+
+        request = str(chosen.get("editRequest") or "").strip()
+        if request:
+            work_path = _apply_cat_edit(work_path, output_dir, decisions, request)
+        if chosen.get("replicateEdit"):
+            work_path, replicate_done = _apply_replicate_edit(work_path, output_dir, decisions, trim_w, trim_h)
+            if replicate_done:
+                skip_upscale = True
+        elif skip_upscale:
+            decisions.append("Upscale with AI was left off, so the original picture was kept.")
 
         live_type = False
         if ext == ".pdf":
@@ -1707,15 +1886,13 @@ def make_print_ready(
                 decisions.append(
                     f"The PDF trim is {measured[0]:.1f} × {measured[1]:.1f} mm."
                 )
-            if fit:
-                bleed = fit["bleed"]
-                if bleed.get("kind") == "existing":
-                    decisions.append(
-                        f"The page is the trim plus about {bleed['left']:.1f} mm of bleed already. "
-                        "That bleed is kept and only the shortfall is added."
-                    )
-                else:
-                    decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
+            if native_pixels:
+                decisions.append("The page was sent straight to the press engine at the matched size.")
+            elif fit:
+                line, story = incoming_bleed_line(fit["bleed"])
+                if story == "over":
+                    over_incoming = True
+                decisions.append(line)
             elif live_type:
                 decisions.append(
                     "This PDF has live type and the wrong proportions. The edges cannot be extended without losing that type."
@@ -1813,13 +1990,14 @@ def make_print_ready(
                     vector_source = raster
                 else:
                     vector_source = picture
-                try:
-                    from ai_upscale import start_plate_upscale
+                if not skip_upscale:
+                    try:
+                        from ai_upscale import start_plate_upscale
 
-                    upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
-                except Exception as exc:
-                    sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
-                    upscale_job = None
+                        upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
+                    except Exception as exc:
+                        sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
+                        upscale_job = None
                 fitted_path = os.path.join(output_dir, "fitted.png")
                 _write_png(raster, fitted_path)
                 work_path = fitted_path
@@ -1904,6 +2082,8 @@ def make_print_ready(
                 decisions.append("This was not treated as AI artwork. The original lettering is kept.")
             if over_raster:
                 work_path = src_path
+            elif skip_upscale:
+                pass
             elif not (vector_built and vector_built.get("ok")):
                 _mark("enlarging", lettering_note)
                 upscaled_path = os.path.join(output_dir, "upscaled.png")
@@ -2001,20 +2181,34 @@ def make_print_ready(
         }
         engine = compiled["pressEngine"]
         press_ok = True
+        built_edges = (vector_built or {}).get("edges") if isinstance(vector_built, dict) else None
+        if built_edges:
+            engine["edges"] = built_edges
         decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
-        _record_bleed_note(decisions, engine)
+        _record_bleed_note(decisions, engine, built_edges)
     else:
         compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}
         press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
-        if isinstance(engine, dict) and engine.get("fullBleedKept"):
+        edges = list(engine.get("edges") or []) if isinstance(engine, dict) else []
+        trimmed = any(
+            str(edge.get("method") or "") == "trimmed" or "trimmed to 5" in str(edge.get("note") or "").lower()
+            for edge in edges
+            if isinstance(edge, dict)
+        )
+        kept_now, extra_lines = extra_bleed_lines(
+            over_incoming,
+            bool(isinstance(engine, dict) and engine.get("fullBleedKept")),
+            bool(isinstance(engine, dict) and engine.get("existingBleed")),
+            press_ok,
+            trimmed,
+        )
+        if kept_now:
             existing_kept = True
-            decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
-        elif isinstance(engine, dict) and engine.get("existingBleed"):
-            existing_kept = True
-        elif press_ok:
-            decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
-        _record_bleed_note(decisions, engine)
+        for line in extra_lines:
+            decisions.append(line)
+        built_edges = (vector_built or {}).get("edges") if isinstance(vector_built, dict) else None
+        _record_bleed_note(decisions, engine, built_edges)
     if isinstance(engine, dict) and engine.get("headline"):
         decisions.append(f"Press engine: {engine.get('headline')}.")
 
@@ -2178,6 +2372,31 @@ def make_print_ready(
     elif not press_ok:
         result["pressPath"] = ""
     result["decisions"] = decisions
+    bleed_note = str(engine.get("bleedNote") or "") if isinstance(engine, dict) else ""
+    if not bleed_note:
+        for line in decisions:
+            if str(line).startswith("Bleed:"):
+                bleed_note = str(line)
+                break
+    result["bleedNote"] = bleed_note
+    before_path = os.path.join(output_dir, "before.png")
+    if _write_before(src_path, before_path):
+        result["beforePng"] = before_path
+    try:
+        from customer_message import customer_message
+
+        if result.get("pressPath"):
+            worry = list(concerns)
+            if info.get("light") in ("amber", "red"):
+                for line in info.get("reasons") or []:
+                    text = str(line)
+                    if text and text not in worry:
+                        worry.append(text)
+            result["customerMessage"] = customer_message(decisions, worry)
+        else:
+            result["customerMessage"] = str(info.get("clientMessage") or "")
+    except Exception:
+        result["customerMessage"] = ""
     if ink_report:
         result["inkRepair"] = {
             "rewritten": int(ink_report.get("images") or ink_report.get("rewritten") or 0),
@@ -2248,6 +2467,10 @@ def main() -> None:
     parser.add_argument("--detect-size", action="store_true")
     parser.add_argument("--progress-file", default="")
     parser.add_argument("--result", default="")
+    parser.add_argument("--edit-request", default="")
+    parser.add_argument("--replicate-edit", action="store_true")
+    parser.add_argument("--skip-upscale", action="store_true")
+    parser.add_argument("--concern", action="append", default=[])
     args = parser.parse_args()
     if args.progress_file:
         os.environ["JOB_PROGRESS_FILE"] = args.progress_file
@@ -2269,6 +2492,12 @@ def main() -> None:
         quantity=args.quantity or None,
         notes=args.notes or "",
         detect_size=bool(args.detect_size or args.product_id == "auto"),
+        options={
+            "editRequest": args.edit_request or "",
+            "replicateEdit": bool(args.replicate_edit),
+            "skipUpscale": bool(args.skip_upscale),
+            "concerns": list(args.concern or []),
+        },
     )
     text = json.dumps(result)
     if args.result:

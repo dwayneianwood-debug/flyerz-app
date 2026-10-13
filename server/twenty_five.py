@@ -88,9 +88,13 @@ def _render(path: str):
     try:
         if doc.page_count < 1:
             return None, 0
-        pix = doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csRGB)
+        from page_zoom import adjusted_zoom
+
+        page = doc[0]
+        zoom = adjusted_zoom(page.rect.width, page.rect.height, 1.0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
         rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), 72
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), 72.0 * zoom
     except Exception:
         return None, 0
     finally:

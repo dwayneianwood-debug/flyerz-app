@@ -287,10 +287,30 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
     def mapper(x: float, y: float) -> tuple[float, float]:
         return paste_x + (float(x) / float(src_w)) * art_w, paste_y + (float(y) / float(src_h)) * art_h
 
+    from quick_print import TALL_PAD_PX
+
+    def _pad_method(pad: int) -> str:
+        if pad <= 0:
+            return "kept"
+        if pad >= TALL_PAD_PX:
+            return "mirror"
+        return "colour"
+
+    methods = {
+        "top": _pad_method(paste_y),
+        "bottom": _pad_method(media_h - paste_y - art_h),
+        "left": _pad_method(paste_x),
+        "right": _pad_method(media_w - paste_x - art_w),
+    }
+    edges = [
+        {"side": side, "method": method, "kind": "photo" if method == "mirror" else ""}
+        for side, method in methods.items()
+    ]
     return {
         "image": image,
         "provider": provider,
         "map": mapper,
+        "edges": edges,
         "px_per_src": px_per_src,
         "scale_mm": scale_mm,
         "off_mm": (off_x_mm, off_y_mm),

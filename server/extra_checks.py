@@ -20,6 +20,13 @@ TECHNICAL = re.compile(r"cut|contour|die|crease|perf|varnish|\buv\b|white|foil",
 FONT_EXTS = (".ttf", ".otf", ".ttc")
 
 
+def _matrix_zoom(page, zoom: float) -> float:
+    """Keep a 300 dpi pixel page at the size of the real catalog page."""
+    from page_zoom import adjusted_zoom
+
+    return adjusted_zoom(float(page.rect.width), float(page.rect.height), float(zoom))
+
+
 def _num(value) -> float | None:
     try:
         number = float(value)
@@ -372,7 +379,8 @@ def _scale_page(path: str, index: int, order_w: float, order_h: float) -> None:
 def _nearly_blank(page) -> bool:
     import pymupdf as fitz
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3), alpha=False, colorspace=fitz.csRGB)
+    z = _matrix_zoom(page, 0.3)
+    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csRGB)
     if pix.width < 2 or pix.height < 2 or pix.n < 3:
         return False
     data = pix.samples
@@ -693,9 +701,10 @@ def _text_ink(path: str) -> list[dict]:
                 origin_x = float(placed[0])
                 origin_y = float(placed[1])
             else:
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False, colorspace=fitz.csCMYK)
+                z = _matrix_zoom(page, 1.2)
+                pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
                 arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                scale_x = scale_y = 1.2
+                scale_x = scale_y = z
                 origin_x = origin_y = 0.0
             for size, box in spans:
                 if size >= 18:
@@ -804,7 +813,8 @@ def _sampled_ink(page, zoom: float, facts: dict) -> None:
     import numpy as np
     import pymupdf as fitz
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csCMYK)
+    z = _matrix_zoom(page, zoom)
+    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
     if pix is None or pix.n < 4 or pix.w < 2 or pix.h < 2:
         return
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].astype(np.int16)
@@ -922,7 +932,8 @@ def _ocr_words(path: str) -> list[str]:
             page = doc[0]
             if (page.get_text("text") or "").strip():
                 return []
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+            z = _matrix_zoom(page, 1.0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
             temp = path + ".e4.png"
             pix.save(temp)
         completed = subprocess.run(
@@ -957,7 +968,8 @@ def _blurry_body(path: str) -> bool:
         page = doc[0]
         if (page.get_text("text") or "").strip():
             return False
-        pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False, colorspace=fitz.csGRAY)
+        z = _matrix_zoom(page, 0.8)
+        pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
         score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         return score < 18
@@ -1031,12 +1043,13 @@ def _reversed(path: str, span: dict) -> tuple[bool, bool]:
         box = fitz.Rect(span.get("bbox") or (0, 0, 0, 0))
         if box.width < 0.4:
             return False, False
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False, colorspace=fitz.csCMYK)
+        z = _matrix_zoom(page, 1.5)
+        pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        x0 = max(0, int(box.x0 * 1.5))
-        y0 = max(0, int(box.y0 * 1.5))
-        x1 = min(arr.shape[1], max(x0 + 1, int(box.x1 * 1.5)))
-        y1 = min(arr.shape[0], max(y0 + 1, int(box.y1 * 1.5)))
+        x0 = max(0, int(box.x0 * z))
+        y0 = max(0, int(box.y0 * z))
+        x1 = min(arr.shape[1], max(x0 + 1, int(box.x1 * z)))
+        y1 = min(arr.shape[0], max(y0 + 1, int(box.y1 * z)))
         crop = arr[y0:y1, x0:x1, :4]
         if crop.size == 0:
             return False, False
@@ -1076,7 +1089,12 @@ def check_e5(path: str) -> dict:
                 note += " reversed"
             warned.append(note)
     if failed:
-        return _row("E5", name, "failed", "Text is under the press minimum: " + ", ".join(failed[:4]) + ".")
+        return _row(
+            "E5",
+            name,
+            "warning",
+            "We strongly recommend larger text. Text is under the press minimum: " + ", ".join(failed[:4]) + ".",
+        )
     if warned:
         return _row("E5", name, "warning", "Small or reversed text: " + ", ".join(warned[:4]) + ".")
     return _row("E5", name, "pass", "Text sizes are in range.")
@@ -1570,13 +1588,13 @@ def _face_in_band(page, src_trim, clip) -> bool:
     cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
     if not os.path.isfile(cascade_path):
         return False
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.6, 0.6), alpha=False, colorspace=fitz.csRGB)
+    scale = _matrix_zoom(page, 0.6)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     faces = cv2.CascadeClassifier(cascade_path).detectMultiScale(gray, 1.2, 4)
     if faces is None or len(faces) == 0:
         return False
-    scale = 0.6
     for (x, y, w, h) in faces:
         box = fitz.Rect(x / scale, y / scale, (x + w) / scale, (y + h) / scale)
         if not box.intersects(src_trim):
@@ -1594,10 +1612,10 @@ def _edge_energy(page, src_trim, clip) -> bool:
         import pymupdf as fitz
     except Exception:
         return False
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False, colorspace=fitz.csGRAY)
+    scale = _matrix_zoom(page, 0.5)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csGRAY)
     gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
     edges = cv2.Canny(gray, 80, 160)
-    scale = 0.5
     mask = np.ones(gray.shape, dtype=bool)
     keep = fitz.Rect(clip.x0 * scale, clip.y0 * scale, clip.x1 * scale, clip.y1 * scale)
     x0 = max(0, int(keep.x0))

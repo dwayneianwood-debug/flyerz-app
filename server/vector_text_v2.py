@@ -407,6 +407,7 @@ def _rebuild(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, reocr,
         "provider": provider,
         "pdf": output_pdf,
         "vector_lines": len(chosen),
+        "edges": list((placed or {}).get("edges") or []),
         "raster_lines": len(raster_lines),
     }
 

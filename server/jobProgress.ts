@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { AsyncLocalStorage } from "async_hooks";
-import type { JobProgress } from "@shared/jobProgress";
+import { fixRows, type JobProgress } from "@shared/jobProgress";
 
 const storage = new AsyncLocalStorage<string>();
 
@@ -36,6 +36,13 @@ export function readJobProgress(jobId: number): JobProgress | null {
     const raw = JSON.parse(fs.readFileSync(file, "utf8")) as JobProgress;
     if (!raw || typeof raw.stage !== "string") return null;
     const started = Number(raw.startedAt) || Date.now();
+    const fixes = Array.isArray(raw.fixes)
+      ? raw.fixes.map((row) => ({
+          id: String(row?.id || ""),
+          label: String(row?.label || ""),
+          percent: Number(row?.percent) || 0,
+        }))
+      : fixRows(String(raw.stageId || ""));
     return {
       stage: raw.stage,
       stageId: String(raw.stageId || ""),
@@ -44,6 +51,7 @@ export function readJobProgress(jobId: number): JobProgress | null {
       updatedAt: Number(raw.updatedAt) || started,
       note: String(raw.note || ""),
       elapsedSec: Math.max(0, Math.round((Date.now() - started) / 1000)),
+      fixes,
     };
   } catch {
     return null;
@@ -72,6 +80,7 @@ export function writeJobProgress(jobId: number, stage: string, note = ""): void 
     startedAt: Number(previous.startedAt) || Date.now(),
     updatedAt: Date.now(),
     note: kept,
+    fixes: fixRows(stage),
   };
   const temporary = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(payload));
