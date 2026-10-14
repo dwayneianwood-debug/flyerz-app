@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Layout } from "@/components/layout";
 import { FileUpload } from "@/components/file-upload";
-import { QuickResultCard, WatcherSettings } from "./print-ready-view";
+import { WatcherSettings } from "./print-ready-view";
+import { DoneJobsList } from "./done-jobs";
 import { PrintFlow } from "./print-flow";
 import type { FlowTab } from "./print-flow-view";
 import { ManualWizard } from "./manual-wizard";
@@ -94,17 +95,12 @@ export default function PrintReady() {
           manual={<ManualWizard><FileUpload /></ManualWizard>}
         />
         {error && <p className="mt-3 text-sm text-red-700" data-testid="text-quick-error">{error}</p>}
-        <div className="mt-6 space-y-4">
-          {cards.map((card) => (
-            <QuickResultCard
-              key={card.id}
-              card={card}
-              copied={copiedId === card.id}
-              onApprove={(id) => void approve(id)}
-              onCopy={(id, message) => void copyMessage(id, message)}
-            />
-          ))}
-        </div>
+        <DoneJobsList
+          cards={cards}
+          copiedId={copiedId}
+          onApprove={(id) => void approve(id)}
+          onCopy={(id, message) => void copyMessage(id, message)}
+        />
         <p className="mt-8 text-sm">
           <a className="underline" href="/manual?attention=1" data-testid="link-designer-queue">Designer queue: amber and red only</a>
         </p>
