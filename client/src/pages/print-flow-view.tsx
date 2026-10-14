@@ -4,6 +4,7 @@ import { BLEED_METHOD_LABELS } from "@/components/bleed-method-selector";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { FlowDropzone } from "./flow-dropzone";
 
 export type FlowTab = "ready" | "manual";
 export type FlowStage = "upload" | "check" | "progress" | "result";
@@ -96,15 +97,7 @@ export function PrintFlowView(props: {
             The full checklist runs first. Bleed stays 5 mm. Nothing is changed until you ask for the press file.
           </p>
           <label className="block text-sm font-semibold mb-2" htmlFor="flow-file">Artwork</label>
-          <input
-            id="flow-file"
-            type="file"
-            accept=".pdf,.jpg,.jpeg,.png,.ai,.eps,.docx,.pptx"
-            className="block w-full text-sm mb-4"
-            data-testid="input-flow-file"
-            onChange={(event) => props.onFiles(event.target.files)}
-          />
-          {props.fileLabel && <p className="text-sm mb-4" data-testid="text-flow-file">{props.fileLabel}</p>}
+          <FlowDropzone onFiles={props.onFiles} fileLabel={props.fileLabel} />
           <label className="block text-sm font-semibold mb-2" htmlFor="flow-product">Product</label>
           <select
             id="flow-product"
