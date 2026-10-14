@@ -137,7 +137,10 @@ def decide_light(facts: dict) -> dict:
     upscale = float(facts.get("upscale") or 1)
     if upscale >= UPSCALE_AMBER:
         reasons.append(f"The picture was enlarged {upscale:.1f} times to reach print size. Glance at fine detail.")
-    if facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
+    shape_note = str(facts.get("shapeNote") or "").strip()
+    if shape_note:
+        reasons.insert(0, shape_note)
+    elif facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
         reasons.append("The picture was a different shape, so the edges were extended. Glance at those edges.")
     # The checklist already says whether leftover pictures are sharp enough.
     if facts.get("vectorAmber") and not facts.get("checklist"):
@@ -746,6 +749,68 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
     return img, False
 
 
+# Cover-fit may crop at most this much on an edge. A wider gap is contained.
+COVER_CROP_MM = 2.0
+
+
+def aspect_fit(src_w: int, src_h: int, trim_w: float, trim_h: float) -> dict:
+    """Cover when the crop is within 2 mm per edge. Otherwise contain, centred.
+
+    gapX and gapY are the empty margin inside the trim on one edge, in millimetres.
+    """
+    src_w = max(1, int(src_w))
+    src_h = max(1, int(src_h))
+    trim_w = float(trim_w)
+    trim_h = float(trim_h)
+    cover = max(trim_w / src_w, trim_h / src_h)
+    crop_x = max(0.0, (src_w * cover - trim_w) / 2.0)
+    crop_y = max(0.0, (src_h * cover - trim_h) / 2.0)
+    if max(crop_x, crop_y) <= COVER_CROP_MM + 0.05:
+        return {"mode": "cover", "cropX": crop_x, "cropY": crop_y, "gapX": 0.0, "gapY": 0.0}
+    contain = min(trim_w / src_w, trim_h / src_h)
+    gap_x = max(0.0, (trim_w - src_w * contain) / 2.0)
+    gap_y = max(0.0, (trim_h - src_h * contain) / 2.0)
+    if max(gap_x, gap_y) <= 0.2:
+        return {"mode": "match", "cropX": 0.0, "cropY": 0.0, "gapX": 0.0, "gapY": 0.0}
+    return {"mode": "contain", "cropX": 0.0, "cropY": 0.0, "gapX": gap_x, "gapY": gap_y}
+
+
+def shape_extension_note(label: str, gap_x: float, gap_y: float) -> str:
+    """Plain amber line when the picture was contained and the background extended."""
+    wide = float(gap_x or 0) > 0.4
+    tall = float(gap_y or 0) > 0.4
+    if wide and tall:
+        where = "around the edges"
+    elif wide:
+        where = "at the sides"
+    elif tall:
+        where = "at the top and bottom"
+    else:
+        return ""
+    name = str(label or "this size").strip() or "this size"
+    return f"Your picture is a different shape from {name}, so we extended the background {where}"
+
+
+def _shape_note_from(payload, label: str) -> str:
+    shape = payload.get("shape") if isinstance(payload, dict) else None
+    if not isinstance(shape, dict) or shape.get("mode") != "contain":
+        return ""
+    return shape_extension_note(label, shape.get("gapX") or 0, shape.get("gapY") or 0)
+
+
+def _shape_note_for(label, vector_built, engine, pending_shape, footer_layout: bool) -> str:
+    """The centred contain note. A footer poster keeps its own layout sentence."""
+    note = _shape_note_from(vector_built if isinstance(vector_built, dict) else {}, label)
+    if note:
+        return note
+    note = _shape_note_from(engine if isinstance(engine, dict) else {}, label)
+    if note:
+        return note
+    if footer_layout or not isinstance(pending_shape, dict):
+        return ""
+    return _shape_note_from({"shape": pending_shape}, label)
+
+
 # A shape just inside the old 64px window must not be mirrored out. The orange-disc
 # check sits at row 40, so the reflected rim stays shallower than that.
 EDGE_SAMPLE_PX = 5
@@ -1321,7 +1386,7 @@ def _colour_pad(band, pad: int, forward: bool):
     return out
 
 
-def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None):
+def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None, protect_art: bool = False):
     import numpy as np
 
     ppm = float(px_per_mm) if px_per_mm else (300.0 / 25.4)
@@ -1347,7 +1412,9 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
         # The pad's first row touches the picture when the pad is below it.
         at_end = not forward
         built = _match_join_colour(built, art, at_end=at_end, depth=max(match_depth, overlap))
-        art = _feather_into_art(built, art, overlap, at_end=at_end)
+        # A shape gap must not be blended back into the artwork. The poster join still is.
+        if not protect_art:
+            art = _feather_into_art(built, art, overlap, at_end=at_end)
         return built
 
     def short_pad(forward: bool, pad: int):
@@ -1377,16 +1444,16 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
     return np.concatenate(parts, axis=0)
 
 
-def _extend_edges(img, top: int, bottom: int, left: int, right: int, px_per_mm: float | None = None):
+def _extend_edges(img, top: int, bottom: int, left: int, right: int, px_per_mm: float | None = None, protect_art: bool = False):
     """Grow a picture without copying one row of pixels down the page."""
     import numpy as np
 
     out = img
     if top or bottom:
-        out = _extend_vertical(out, top, bottom, px_per_mm=px_per_mm)
+        out = _extend_vertical(out, top, bottom, px_per_mm=px_per_mm, protect_art=protect_art)
     if left or right:
         turned = np.ascontiguousarray(np.transpose(out, (1, 0, 2)))
-        turned = _extend_vertical(turned, left, right, px_per_mm=px_per_mm)
+        turned = _extend_vertical(turned, left, right, px_per_mm=px_per_mm, protect_art=protect_art)
         out = np.ascontiguousarray(np.transpose(turned, (1, 0, 2)))
     return out
 
@@ -1588,13 +1655,13 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
         pad = new_h - height
         top = pad // 2
         ppm = float(new_h) / float(trim_h) if trim_h else None
-        fitted = _extend_edges(img, top, pad - top, 0, 0, px_per_mm=ppm)
+        fitted = _extend_edges(img, top, pad - top, 0, 0, px_per_mm=ppm, protect_art=True)
     else:
         new_w = max(width, int(round(height * target)))
         pad = new_w - width
         left = pad // 2
         ppm = float(new_w) / float(trim_w) if trim_w else None
-        fitted = _extend_edges(img, 0, 0, left, pad - left, px_per_mm=ppm)
+        fitted = _extend_edges(img, 0, 0, left, pad - left, px_per_mm=ppm, protect_art=True)
     decisions.append(
         "The picture was a different shape from the product. The whole picture was kept and the gap was filled by continuing the edge colour and texture. It was not stretched and the picture was not copied."
     )
@@ -1719,8 +1786,15 @@ def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
             cwd=repo,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=240,
-            env={**__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(), "PYTHONUNBUFFERED": "1"},
+            env={
+                **__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(),
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+            },
         )
         payload = {}
         if os.path.exists(result.name):
@@ -1886,6 +1960,8 @@ def make_print_ready(
     native_pixels = False
     aspect_extended = False
     aspect_delta = 0.0
+    pending_shape = None
+    footer_layout = False
     upscale = 1.0
     dpi_mode = ""
     dpi_detail = ""
@@ -2067,6 +2143,7 @@ def make_print_ready(
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
             picture = raster
+            pending_shape = aspect_fit(picture.shape[1], picture.shape[0], trim_w, trim_h)
             # Extra bleed on a 300 dpi raster is the trim plus a ring. Extending the
             # shape would treat that ring as the wrong aspect and the trim would be lost.
             kept_source_bleed = None
@@ -2087,7 +2164,8 @@ def make_print_ready(
                 # the band stays at the bottom. A plain side pad is not part of the
                 # read: the smaller scale was dropping small marks such as a card's "7".
                 raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
-                if aspect_extended and _bottom_bar_row(picture) is not None:
+                footer_layout = bool(aspect_extended and _bottom_bar_row(picture) is not None)
+                if footer_layout:
                     vector_source = raster
                 else:
                     vector_source = picture
@@ -2285,6 +2363,8 @@ def make_print_ready(
         built_edges = (vector_built or {}).get("edges") if isinstance(vector_built, dict) else None
         if built_edges:
             engine["edges"] = built_edges
+        if isinstance(vector_built, dict) and isinstance(vector_built.get("shape"), dict):
+            engine["shape"] = vector_built.get("shape")
         decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
         _record_bleed_note(decisions, engine, built_edges)
     else:
@@ -2317,6 +2397,9 @@ def make_print_ready(
     if isinstance(engine, dict) and engine.get("headline"):
         decisions.append(f"Press engine: {engine.get('headline')}.")
 
+    shape_note = _shape_note_for(product.get("label"), vector_built, engine, pending_shape, footer_layout)
+    if shape_note and shape_note not in decisions:
+        decisions.append(shape_note)
     facts = {
         "kind": "image",
         "readable": True,
@@ -2330,6 +2413,7 @@ def make_print_ready(
         "upscale": upscale,
         "aspectExtended": aspect_extended,
         "aspectDelta": aspect_delta,
+        "shapeNote": shape_note,
         "enginePassed": bool(engine.get("passed")) if press_ok else False,
         "contentPullAmber": bool((engine.get("rescue") or {}).get("amber")) if isinstance(engine, dict) else False,
         "contentPullNote": str(((engine.get("rescue") or {}).get("note")) if isinstance(engine, dict) else "") or "",
@@ -2565,7 +2649,7 @@ def _finish(result: dict, output_dir: str) -> dict:
     _mark("done", str(result.get("letteringNote") or "Finished."))
     result_path = os.path.join(output_dir, "result.json")
     with open(result_path, "w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
+        json.dump(result, handle, indent=2, ensure_ascii=False)
     lines = [f"Result: {str(result.get('light') or '').upper()}"]
     for line in result.get("decisions") or []:
         lines.append(f"- {line}")
@@ -2579,7 +2663,20 @@ def _finish(result: dict, output_dir: str) -> dict:
     return result
 
 
+def _force_utf8_stdio() -> None:
+    """The customer note uses × and –. A chunked pipe must see real UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description="Make one file print-ready")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -2625,7 +2722,7 @@ def main() -> None:
             "concerns": list(args.concern or []),
         },
     )
-    text = json.dumps(result)
+    text = json.dumps(result, ensure_ascii=False)
     if args.result:
         with open(args.result, "w", encoding="utf-8") as handle:
             handle.write(text)

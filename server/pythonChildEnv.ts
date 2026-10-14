@@ -1,6 +1,12 @@
 import { getFlyerzTempRoot } from "./envPaths";
 import { progressFileFromContext } from "./jobProgress";
 
+/** Join pipe chunks before decoding. A split × or – byte must not become U+FFFD. */
+export function decodeChildText(chunks: Buffer[]): string {
+  if (!chunks.length) return "";
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 /** Built at call time so a `.env` loaded during startup is included. */
 export function pythonChildEnv(): Record<string, string> {
   const env: Record<string, string> = {

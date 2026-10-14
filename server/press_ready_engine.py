@@ -26,6 +26,13 @@ import numpy as np
 
 from http_headers import external_headers
 
+try:
+    from image_info_cache import install_image_info_cache
+
+    install_image_info_cache()
+except Exception:
+    pass
+
 # A full 300 dpi plate longer than this does not fit the memory leash (A2 and above).
 # Those sheets stay vector. Only the 5 mm bleed strips are rasterized.
 PLATE_LIMIT_MM = 430.0
@@ -878,6 +885,39 @@ def extend_trim(img: np.ndarray, bleed_px: int, analysis: dict) -> tuple[np.ndar
     return canvas, {"edges": report_edges, "methods": methods, "problems": problems, "rounds": step, "amber": amber}
 
 
+def _contain_raster(plane: np.ndarray, trim_w_px: int, trim_h_px: int, trim_w_mm: float, trim_h_mm: float):
+    """Fit the whole picture inside the trim. Fill only outside that rectangle."""
+    src_h, src_w = plane.shape[:2]
+    scale = min(trim_w_px / max(1, src_w), trim_h_px / max(1, src_h))
+    art_w = max(1, min(trim_w_px, int(round(src_w * scale))))
+    art_h = max(1, min(trim_h_px, int(round(src_h * scale))))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    resized = cv2.resize(plane, (art_w, art_h), interpolation=interp)
+    x0 = max(0, (trim_w_px - art_w) // 2)
+    y0 = max(0, (trim_h_px - art_h) // 2)
+    from quick_print import _extend_edges
+
+    ppm = (float(trim_w_px) / float(trim_w_mm)) if trim_w_mm else None
+    filled = _extend_edges(
+        resized,
+        y0,
+        max(0, trim_h_px - y0 - art_h),
+        x0,
+        max(0, trim_w_px - x0 - art_w),
+        px_per_mm=ppm,
+        protect_art=True,
+    )
+    if filled.shape[0] != trim_h_px or filled.shape[1] != trim_w_px:
+        canvas = np.empty((trim_h_px, trim_w_px, 3), np.uint8)
+        canvas[:] = resized[0, 0]
+        copy_h = min(trim_h_px, filled.shape[0])
+        copy_w = min(trim_w_px, filled.shape[1])
+        canvas[:copy_h, :copy_w] = filled[:copy_h, :copy_w]
+        filled = canvas
+    filled[y0:y0 + art_h, x0:x0 + art_w] = resized
+    return filled, (int(x0), int(y0), resized)
+
+
 def compile_raster_canvas(
     img: np.ndarray,
     trim_w_mm: float,
@@ -895,6 +935,8 @@ def compile_raster_canvas(
     existing = _existing_image_bleed(plane, embedded_dpi or 0, trim_w_mm, trim_h_mm)
     kept = False
     trim = plane
+    contained_art = None
+    shape_fit = None
     if existing:
         trim = _crop_trim(plane, existing)
         trim = cover_scale(trim, trim_w_px, trim_h_px) if (
@@ -993,7 +1035,13 @@ def compile_raster_canvas(
                 report["bitmapProblems"] = []
                 return topped, attach_bleed_note(report)
     else:
-        trim = cover_scale(plane, trim_w_px, trim_h_px)
+        from quick_print import aspect_fit
+
+        shape_fit = aspect_fit(src_w, src_h, trim_w_mm, trim_h_mm)
+        if shape_fit.get("mode") == "contain":
+            trim, contained_art = _contain_raster(plane, trim_w_px, trim_h_px, trim_w_mm, trim_h_mm)
+        else:
+            trim = cover_scale(plane, trim_w_px, trim_h_px)
 
     from bleed_builder import repair_light_fringe
 
@@ -1023,7 +1071,39 @@ def compile_raster_canvas(
         report["status"] = "needs-attention"
         report["reason"] = built["problems"][0]
         report["fix"] = "Try a manual bleed style, or move the artwork slightly in from the edge and upload it again."
+    if contained_art is not None and isinstance(shape_fit, dict):
+        x0, y0, art = contained_art
+        report["shape"] = {
+            "mode": "contain",
+            "gapX": round(float(shape_fit.get("gapX") or 0), 3),
+            "gapY": round(float(shape_fit.get("gapY") or 0), 3),
+        }
+        if not rescue.get("applied"):
+            ah, aw = art.shape[:2]
+            y = int(y0) + int(bleed_px)
+            x = int(x0) + int(bleed_px)
+            if y >= 0 and x >= 0 and y + ah <= canvas.shape[0] and x + aw <= canvas.shape[1]:
+                canvas[y:y + ah, x:x + aw] = art
+                report["artBox"] = [int(x0), int(y0), int(aw), int(ah)]
+                report["seamDelta"] = _seam_delta(canvas, x, y, art)
     return canvas, attach_bleed_note(report)
+
+
+def _seam_delta(canvas: np.ndarray, x: int, y: int, art: np.ndarray) -> float:
+    """Mean jump across the join between the original picture and the fill."""
+    ah, aw = art.shape[:2]
+    jumps = []
+    if x > 0:
+        jumps.append(np.abs(canvas[y:y + ah, x].astype(np.int16) - canvas[y:y + ah, x - 1].astype(np.int16)).mean())
+    if x + aw < canvas.shape[1]:
+        jumps.append(np.abs(canvas[y:y + ah, x + aw - 1].astype(np.int16) - canvas[y:y + ah, x + aw].astype(np.int16)).mean())
+    if y > 0:
+        jumps.append(np.abs(canvas[y, x:x + aw].astype(np.int16) - canvas[y - 1, x:x + aw].astype(np.int16)).mean())
+    if y + ah < canvas.shape[0]:
+        jumps.append(np.abs(canvas[y + ah - 1, x:x + aw].astype(np.int16) - canvas[y + ah, x:x + aw].astype(np.int16)).mean())
+    if not jumps:
+        return 0.0
+    return round(float(np.mean(jumps)), 3)
 
 
 def _base_report(analysis, edges, kept, bleed_mm, safe_zone_mm, src_w, src_h, trim_w, trim_h) -> dict:

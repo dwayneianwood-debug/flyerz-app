@@ -4,7 +4,7 @@ import os from "os";
 import path from "path";
 import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
 import { quickPrintProduct, QUICK_PRINT_PRODUCTS } from "@shared/quickPrint";
-import { pythonChildEnv } from "./pythonChildEnv";
+import { decodeChildText, pythonChildEnv } from "./pythonChildEnv";
 import { storage } from "./storage";
 import { jobProgressPath, writeJobProgress } from "./jobProgress";
 
@@ -249,18 +249,18 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
     }, quickPrintKillMs());
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(Buffer.from(chunk));
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -268,6 +268,8 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
     });
     child.on("close", () => {
       clearTimeout(timer);
+      const stdout = decodeChildText(stdoutChunks);
+      const stderr = decodeChildText(stderrChunks);
       const line = stdout.split(/\r?\n/).map((row) => row.trim()).filter((row) => row.startsWith("{")).pop();
       const filePayload = path.join(outputDir, "result.json");
       let parsed: Record<string, unknown> | null = null;
@@ -417,16 +419,16 @@ function pythonJson(script: string, args: string[], killMs: number): Promise<Rec
       env: pythonChildEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
     }, killMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(Buffer.from(chunk));
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -434,6 +436,8 @@ function pythonJson(script: string, args: string[], killMs: number): Promise<Rec
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      const stdout = decodeChildText(stdoutChunks);
+      const stderr = decodeChildText(stderrChunks);
       const line = stdout.split(/\r?\n/).map((row) => row.trim()).filter((row) => row.startsWith("{")).pop();
       if (!line) {
         reject(new Error(stderr.trim().slice(0, 240) || "The check did not finish."));

@@ -93,13 +93,21 @@ def assess_intake(path: str, trim_w: float, trim_h: float) -> dict:
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="Quick check before print-ready")
     parser.add_argument("--input", required=True)
     parser.add_argument("--trim-w", type=float, default=148)
     parser.add_argument("--trim-h", type=float, default=210)
     args = parser.parse_args()
     report = assess_intake(args.input, args.trim_w, args.trim_h)
-    sys.stdout.write(json.dumps(report) + "\n")
+    sys.stdout.write(json.dumps(report, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

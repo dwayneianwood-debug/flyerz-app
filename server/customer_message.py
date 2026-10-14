@@ -19,27 +19,50 @@ def _already_done(line: str, done_text: str) -> bool:
     return False
 
 
-def _resolution_topic(line: str) -> str:
-    """Resolution and AI Resolution Enhancement are one topic each.
+_PPI_LINE = re.compile(r"\babout\s+\d+\s*(?:ppi|dpi)\b", re.I)
 
-    The checklist writes them as "3." and "3b.", and the same rows are sent
-    again without the number. Both copies are the same item.
+
+def _concern_topic(line: str) -> str:
+    """One customer point per subject.
+
+    Resolution, the lowest-picture line, and a second "about N ppi" line are
+    the same point. The two "Ordered product vs file size" wordings are one
+    point. AI Resolution Enhancement stays its own point.
     """
     plain = _NUM_PREFIX.sub("", str(line or "").strip())
     name = plain.split(":", 1)[0].strip().lower()
+    body = plain.lower()
     if "ai resolution" in name:
         return "ai"
+    if "raster text" in body:
+        return ""
     if name.startswith("resolution") or "dpi validation" in name:
         return "resolution"
+    if "lowest picture" in body or _PPI_LINE.search(body):
+        return "resolution"
+    if "ordered product vs file size" in name or "aspect differs" in body:
+        return "size"
     return ""
 
 
-def _plain_resolution(line: str, topic: str) -> str:
+def _plain_topic(line: str, topic: str) -> str:
     plain = _NUM_PREFIX.sub("", str(line or "").strip())
-    detail = plain.split(":", 1)[1].strip() if ":" in plain else plain
+    if ":" in plain:
+        name, detail = plain.split(":", 1)
+        detail = detail.strip()
+    else:
+        name, detail = "", plain
     if topic == "ai":
         return f"AI Resolution Enhancement: {detail}".rstrip(": ").strip()
-    return f"Resolution: {detail}".rstrip(": ").strip()
+    if topic == "resolution":
+        if name.strip().lower().startswith("resolution") or "dpi validation" in name.strip().lower():
+            return f"Resolution: {detail}".rstrip(": ").strip()
+        return plain
+    if topic == "size":
+        if "ordered product" in name.strip().lower():
+            return f"Ordered product vs file size: {detail}".rstrip(": ").strip()
+        return f"Ordered product vs file size: {plain}".strip()
+    return plain
 
 
 def customer_message(actions: list, concerns: list, bleed_note: str = "") -> str:
@@ -52,12 +75,12 @@ def customer_message(actions: list, concerns: list, bleed_note: str = "") -> str
         text = str(line).strip()
         if not text or text in worries or _already_done(text, done_text):
             continue
-        topic = _resolution_topic(text)
+        topic = _concern_topic(text)
         if topic:
             if topic in seen_topics:
                 continue
             seen_topics.add(topic)
-            text = _plain_resolution(text, topic)
+            text = _plain_topic(text, topic)
             if text in worries:
                 continue
         worries.append(text)

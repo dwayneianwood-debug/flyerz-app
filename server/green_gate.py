@@ -10,6 +10,13 @@ from __future__ import annotations
 
 import os
 
+try:
+    from image_info_cache import install_image_info_cache
+
+    install_image_info_cache()
+except Exception:
+    pass
+
 BLEED_MM = 5.0
 SAFE_MM = 3.0
 TAC_LIMIT = 300.0

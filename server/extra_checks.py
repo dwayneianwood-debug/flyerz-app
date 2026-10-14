@@ -1043,43 +1043,80 @@ def _span_sizes(path: str) -> list[dict]:
         doc.close()
 
 
-def _reversed(path: str, span: dict) -> tuple[bool, bool]:
-    """Return (reversed, on rich black)."""
+def _reversed_on(arr, zoom: float, span: dict) -> tuple[bool, bool]:
+    """Same sample as a fresh page render. `arr` is one CMYK pixmap for the page."""
+    import numpy as np
+
+    box = span.get("bbox") or (0, 0, 0, 0)
+    try:
+        x0b, y0b, x1b, y1b = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return False, False
+    if (x1b - x0b) < 0.4:
+        return False, False
+    z = float(zoom)
+    x0 = max(0, int(x0b * z))
+    y0 = max(0, int(y0b * z))
+    x1 = min(arr.shape[1], max(x0 + 1, int(x1b * z)))
+    y1 = min(arr.shape[0], max(y0 + 1, int(y1b * z)))
+    crop = arr[y0:y1, x0:x1, :4]
+    if crop.size == 0:
+        return False, False
+    light = (crop[:, :, 3] < 40) & (crop[:, :, 0] < 40) & (crop[:, :, 1] < 40) & (crop[:, :, 2] < 40)
+    if int(light.sum()) < 4:
+        return False, False
+    pad = 4
+    ring = arr[max(0, y0 - pad):min(arr.shape[0], y1 + pad), max(0, x0 - pad):min(arr.shape[1], x1 + pad), :4]
+    if ring.size == 0:
+        return False, False
+    background = ring.reshape(-1, 4).mean(axis=0)
+    tac = float(background[:4].sum()) / 255.0 * 100.0
+    k = float(background[3]) / 255.0 * 100.0
+    rich = background[0] > 40 and background[1] > 30 and background[2] > 30 and background[3] > 180
+    return (k > 60 or tac > 200), bool(rich)
+
+
+def _cmyk_pages(path: str, pages: list) -> dict:
+    """One CMYK pixmap per page. Small text used to render the whole page again for every span."""
     import numpy as np
     import pymupdf as fitz
 
+    wanted = []
+    for page in pages or []:
+        try:
+            index = int(page)
+        except (TypeError, ValueError):
+            continue
+        if index not in wanted:
+            wanted.append(index)
+    if not wanted:
+        return {}
     doc = _open_pdf(path)
     if doc is None:
-        return False, False
+        return {}
+    rendered = {}
     try:
-        page = doc[int(span.get("page") or 0)]
-        box = fitz.Rect(span.get("bbox") or (0, 0, 0, 0))
-        if box.width < 0.4:
-            return False, False
-        z = _matrix_zoom(page, 1.5)
-        pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
-        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        x0 = max(0, int(box.x0 * z))
-        y0 = max(0, int(box.y0 * z))
-        x1 = min(arr.shape[1], max(x0 + 1, int(box.x1 * z)))
-        y1 = min(arr.shape[0], max(y0 + 1, int(box.y1 * z)))
-        crop = arr[y0:y1, x0:x1, :4]
-        if crop.size == 0:
-            return False, False
-        light = (crop[:, :, 3] < 40) & (crop[:, :, 0] < 40) & (crop[:, :, 1] < 40) & (crop[:, :, 2] < 40)
-        if int(light.sum()) < 4:
-            return False, False
-        pad = 4
-        ring = arr[max(0, y0 - pad):min(arr.shape[0], y1 + pad), max(0, x0 - pad):min(arr.shape[1], x1 + pad), :4]
-        if ring.size == 0:
-            return False, False
-        background = ring.reshape(-1, 4).mean(axis=0)
-        tac = float(background[:4].sum()) / 255.0 * 100.0
-        k = float(background[3]) / 255.0 * 100.0
-        rich = background[0] > 40 and background[1] > 30 and background[2] > 30 and background[3] > 180
-        return (k > 60 or tac > 200), bool(rich)
+        for index in wanted:
+            if index < 0 or index >= doc.page_count:
+                continue
+            page = doc[index]
+            z = _matrix_zoom(page, 1.5)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n).copy()
+            rendered[index] = (arr, z)
+        return rendered
     finally:
         doc.close()
+
+
+def _reversed(path: str, span: dict) -> tuple[bool, bool]:
+    """Return (reversed, on rich black)."""
+    rendered = _cmyk_pages(path, [int(span.get("page") or 0)])
+    found = rendered.get(int(span.get("page") or 0))
+    if not found:
+        return False, False
+    arr, zoom = found
+    return _reversed_on(arr, zoom, span)
 
 
 def check_e5(path: str) -> dict:
@@ -1089,9 +1126,15 @@ def check_e5(path: str) -> dict:
         return _row("E5", name, "pass", "No vector text sizes to measure.")
     failed = []
     warned = []
+    small_pages = []
+    for span in spans:
+        if span["size"] < 8 and span.get("page") not in small_pages:
+            small_pages.append(span.get("page"))
+    rendered = _cmyk_pages(path, small_pages) if small_pages else {}
     for span in spans:
         size = span["size"]
-        reversed_text, rich = _reversed(path, span) if size < 8 else (False, False)
+        found = rendered.get(int(span.get("page") or 0)) if size < 8 else None
+        reversed_text, rich = _reversed_on(found[0], found[1], span) if found else (False, False)
         if size < 5 or (reversed_text and size < 6):
             failed.append(f"{size:.1f} pt" + (" reversed" if reversed_text else ""))
         elif size < 7 or (reversed_text and size < 8) or (reversed_text and rich):
@@ -1708,6 +1751,14 @@ def assess_extras(source: str, press: str = "", order: dict | None = None, apply
     ]
     derived = light_from_extra(checks)
     return {"checks": checks, **derived}
+
+
+try:
+    from image_info_cache import install_image_info_cache
+
+    install_image_info_cache()
+except Exception:
+    pass
 
 
 def main() -> None:

@@ -264,7 +264,7 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
     art_w = max(1, min(art_w, media_w - paste_x))
     art_h = max(1, min(art_h, media_h - paste_y))
     enlarged, provider = _enlarge(clean, art_w, art_h)
-    from quick_print import _extend_edges
+    from quick_print import _extend_edges, aspect_fit
 
     image = _extend_edges(
         enlarged,
@@ -273,6 +273,7 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         paste_x,
         media_w - paste_x - art_w,
         px_per_mm=ppm,
+        protect_art=True,
     )
     if image.shape[0] != media_h or image.shape[1] != media_w:
         # A one-pixel miss is padded. Resampling the whole picture here is a second scale.
@@ -282,6 +283,14 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         copy_w = min(media_w, image.shape[1])
         canvas[:copy_h, :copy_w] = image[:copy_h, :copy_w]
         image = canvas
+    # The extender may not write inside the placed picture. Paste it back exactly.
+    kept_h = min(art_h, image.shape[0] - paste_y, enlarged.shape[0])
+    kept_w = min(art_w, image.shape[1] - paste_x, enlarged.shape[1])
+    if kept_h > 0 and kept_w > 0:
+        image[paste_y:paste_y + kept_h, paste_x:paste_x + kept_w] = enlarged[:kept_h, :kept_w]
+    else:
+        kept_h = 0
+        kept_w = 0
     px_per_src = ((art_w / float(src_w)) + (art_h / float(src_h))) / 2.0
 
     def mapper(x: float, y: float) -> tuple[float, float]:
@@ -306,6 +315,12 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         {"side": side, "method": method, "kind": "photo" if method == "mirror" else ""}
         for side, method in methods.items()
     ]
+    shape = aspect_fit(src_w, src_h, trim_w, trim_h)
+    if kept_h > 1 and kept_w > 1:
+        from press_ready_engine import _seam_delta
+
+        shape = dict(shape)
+        shape["seamDelta"] = _seam_delta(image, int(paste_x), int(paste_y), enlarged[:kept_h, :kept_w])
     return {
         "image": image,
         "provider": provider,
@@ -316,6 +331,7 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
         "off_mm": (off_x_mm, off_y_mm),
         "ppi": ppi,
         "art_box": (int(paste_x), int(paste_y), int(art_w), int(art_h)),
+        "shape": shape,
     }
 
 

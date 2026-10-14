@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import { pythonChildEnv } from "./pythonChildEnv";
+import { decodeChildText, pythonChildEnv } from "./pythonChildEnv";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
 
@@ -31,8 +31,8 @@ export function execPythonAsync(args: string[], label: string, timeoutMs: number
       env: pythonChildEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     let settled = false;
     const finish = (fn: () => void) => {
@@ -46,16 +46,18 @@ export function execPythonAsync(args: string[], label: string, timeoutMs: number
       child.kill("SIGTERM");
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(Buffer.from(chunk));
     });
     child.on("error", (error) => {
       finish(() => reject(new Error(`${label} failed to start Python (${PYTHON_BIN}): ${error.message}`)));
     });
     child.on("close", (status, signal) => {
       finish(() => {
+        const stdout = decodeChildText(stdoutChunks);
+        const stderr = decodeChildText(stderrChunks);
         if (timedOut) {
           reject(new Error(`${label} timed out after ${timeoutMs / 1000} seconds.`));
           return;
