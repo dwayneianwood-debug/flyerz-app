@@ -20,6 +20,13 @@ TECHNICAL = re.compile(r"cut|contour|die|crease|perf|varnish|\buv\b|white|foil",
 FONT_EXTS = (".ttf", ".otf", ".ttc")
 
 
+def _matrix_zoom(page, zoom: float) -> float:
+    """Keep a 300 dpi pixel page at the size of the real catalog page."""
+    from page_zoom import adjusted_zoom
+
+    return adjusted_zoom(float(page.rect.width), float(page.rect.height), float(zoom))
+
+
 def _num(value) -> float | None:
     try:
         number = float(value)
@@ -372,7 +379,8 @@ def _scale_page(path: str, index: int, order_w: float, order_h: float) -> None:
 def _nearly_blank(page) -> bool:
     import pymupdf as fitz
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3), alpha=False, colorspace=fitz.csRGB)
+    z = _matrix_zoom(page, 0.3)
+    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csRGB)
     if pix.width < 2 or pix.height < 2 or pix.n < 3:
         return False
     data = pix.samples
@@ -515,10 +523,12 @@ def _rgb_hits(path: str) -> list[str]:
                 if xref in margin:
                     continue
                 try:
-                    info = doc.extract_image(xref)
+                    from green_gate import _space_and_tac
+
+                    space, _tac = _space_and_tac(doc, xref)
                 except Exception:
                     continue
-                if int(info.get("colorspace") or 0) == 3:
+                if space == 3:
                     hits.append(f"page {index + 1} has an RGB image")
             raw = page.read_contents().decode("latin1", "replace")
             if re.search(r"\b(?:rg|RG)\b|DeviceRGB|CalRGB", raw):
@@ -668,6 +678,12 @@ def _text_ink(path: str) -> list[dict]:
     found = []
     try:
         for page in doc:
+            # A picture page has no type. Building the span map walks the whole plate.
+            try:
+                if not (page.get_text("text") or "").strip():
+                    continue
+            except Exception:
+                pass
             spans = []
             try:
                 data = page.get_text("rawdict") or {}
@@ -693,9 +709,10 @@ def _text_ink(path: str) -> list[dict]:
                 origin_x = float(placed[0])
                 origin_y = float(placed[1])
             else:
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False, colorspace=fitz.csCMYK)
+                z = _matrix_zoom(page, 1.2)
+                pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
                 arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                scale_x = scale_y = 1.2
+                scale_x = scale_y = z
                 origin_x = origin_y = 0.0
             for size, box in spans:
                 if size >= 18:
@@ -804,7 +821,8 @@ def _sampled_ink(page, zoom: float, facts: dict) -> None:
     import numpy as np
     import pymupdf as fitz
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csCMYK)
+    z = _matrix_zoom(page, zoom)
+    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
     if pix is None or pix.n < 4 or pix.w < 2 or pix.h < 2:
         return
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :4].astype(np.int16)
@@ -922,7 +940,8 @@ def _ocr_words(path: str) -> list[str]:
             page = doc[0]
             if (page.get_text("text") or "").strip():
                 return []
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
+            z = _matrix_zoom(page, 1.0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
             temp = path + ".e4.png"
             pix.save(temp)
         completed = subprocess.run(
@@ -957,7 +976,8 @@ def _blurry_body(path: str) -> bool:
         page = doc[0]
         if (page.get_text("text") or "").strip():
             return False
-        pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8), alpha=False, colorspace=fitz.csGRAY)
+        z = _matrix_zoom(page, 0.8)
+        pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
         score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         return score < 18
@@ -1002,6 +1022,11 @@ def _span_sizes(path: str) -> list[dict]:
     try:
         for page in doc:
             try:
+                if not (page.get_text("text") or "").strip():
+                    continue
+            except Exception:
+                pass
+            try:
                 data = page.get_text("rawdict") or {}
             except Exception:
                 data = {}
@@ -1018,42 +1043,80 @@ def _span_sizes(path: str) -> list[dict]:
         doc.close()
 
 
-def _reversed(path: str, span: dict) -> tuple[bool, bool]:
-    """Return (reversed, on rich black)."""
+def _reversed_on(arr, zoom: float, span: dict) -> tuple[bool, bool]:
+    """Same sample as a fresh page render. `arr` is one CMYK pixmap for the page."""
+    import numpy as np
+
+    box = span.get("bbox") or (0, 0, 0, 0)
+    try:
+        x0b, y0b, x1b, y1b = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return False, False
+    if (x1b - x0b) < 0.4:
+        return False, False
+    z = float(zoom)
+    x0 = max(0, int(x0b * z))
+    y0 = max(0, int(y0b * z))
+    x1 = min(arr.shape[1], max(x0 + 1, int(x1b * z)))
+    y1 = min(arr.shape[0], max(y0 + 1, int(y1b * z)))
+    crop = arr[y0:y1, x0:x1, :4]
+    if crop.size == 0:
+        return False, False
+    light = (crop[:, :, 3] < 40) & (crop[:, :, 0] < 40) & (crop[:, :, 1] < 40) & (crop[:, :, 2] < 40)
+    if int(light.sum()) < 4:
+        return False, False
+    pad = 4
+    ring = arr[max(0, y0 - pad):min(arr.shape[0], y1 + pad), max(0, x0 - pad):min(arr.shape[1], x1 + pad), :4]
+    if ring.size == 0:
+        return False, False
+    background = ring.reshape(-1, 4).mean(axis=0)
+    tac = float(background[:4].sum()) / 255.0 * 100.0
+    k = float(background[3]) / 255.0 * 100.0
+    rich = background[0] > 40 and background[1] > 30 and background[2] > 30 and background[3] > 180
+    return (k > 60 or tac > 200), bool(rich)
+
+
+def _cmyk_pages(path: str, pages: list) -> dict:
+    """One CMYK pixmap per page. Small text used to render the whole page again for every span."""
     import numpy as np
     import pymupdf as fitz
 
+    wanted = []
+    for page in pages or []:
+        try:
+            index = int(page)
+        except (TypeError, ValueError):
+            continue
+        if index not in wanted:
+            wanted.append(index)
+    if not wanted:
+        return {}
     doc = _open_pdf(path)
     if doc is None:
-        return False, False
+        return {}
+    rendered = {}
     try:
-        page = doc[int(span.get("page") or 0)]
-        box = fitz.Rect(span.get("bbox") or (0, 0, 0, 0))
-        if box.width < 0.4:
-            return False, False
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False, colorspace=fitz.csCMYK)
-        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        x0 = max(0, int(box.x0 * 1.5))
-        y0 = max(0, int(box.y0 * 1.5))
-        x1 = min(arr.shape[1], max(x0 + 1, int(box.x1 * 1.5)))
-        y1 = min(arr.shape[0], max(y0 + 1, int(box.y1 * 1.5)))
-        crop = arr[y0:y1, x0:x1, :4]
-        if crop.size == 0:
-            return False, False
-        light = (crop[:, :, 3] < 40) & (crop[:, :, 0] < 40) & (crop[:, :, 1] < 40) & (crop[:, :, 2] < 40)
-        if int(light.sum()) < 4:
-            return False, False
-        pad = 4
-        ring = arr[max(0, y0 - pad):min(arr.shape[0], y1 + pad), max(0, x0 - pad):min(arr.shape[1], x1 + pad), :4]
-        if ring.size == 0:
-            return False, False
-        background = ring.reshape(-1, 4).mean(axis=0)
-        tac = float(background[:4].sum()) / 255.0 * 100.0
-        k = float(background[3]) / 255.0 * 100.0
-        rich = background[0] > 40 and background[1] > 30 and background[2] > 30 and background[3] > 180
-        return (k > 60 or tac > 200), bool(rich)
+        for index in wanted:
+            if index < 0 or index >= doc.page_count:
+                continue
+            page = doc[index]
+            z = _matrix_zoom(page, 1.5)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False, colorspace=fitz.csCMYK)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n).copy()
+            rendered[index] = (arr, z)
+        return rendered
     finally:
         doc.close()
+
+
+def _reversed(path: str, span: dict) -> tuple[bool, bool]:
+    """Return (reversed, on rich black)."""
+    rendered = _cmyk_pages(path, [int(span.get("page") or 0)])
+    found = rendered.get(int(span.get("page") or 0))
+    if not found:
+        return False, False
+    arr, zoom = found
+    return _reversed_on(arr, zoom, span)
 
 
 def check_e5(path: str) -> dict:
@@ -1063,9 +1126,15 @@ def check_e5(path: str) -> dict:
         return _row("E5", name, "pass", "No vector text sizes to measure.")
     failed = []
     warned = []
+    small_pages = []
+    for span in spans:
+        if span["size"] < 8 and span.get("page") not in small_pages:
+            small_pages.append(span.get("page"))
+    rendered = _cmyk_pages(path, small_pages) if small_pages else {}
     for span in spans:
         size = span["size"]
-        reversed_text, rich = _reversed(path, span) if size < 8 else (False, False)
+        found = rendered.get(int(span.get("page") or 0)) if size < 8 else None
+        reversed_text, rich = _reversed_on(found[0], found[1], span) if found else (False, False)
         if size < 5 or (reversed_text and size < 6):
             failed.append(f"{size:.1f} pt" + (" reversed" if reversed_text else ""))
         elif size < 7 or (reversed_text and size < 8) or (reversed_text and rich):
@@ -1076,7 +1145,12 @@ def check_e5(path: str) -> dict:
                 note += " reversed"
             warned.append(note)
     if failed:
-        return _row("E5", name, "failed", "Text is under the press minimum: " + ", ".join(failed[:4]) + ".")
+        return _row(
+            "E5",
+            name,
+            "warning",
+            "We strongly recommend larger text. Text is under the press minimum: " + ", ".join(failed[:4]) + ".",
+        )
     if warned:
         return _row("E5", name, "warning", "Small or reversed text: " + ", ".join(warned[:4]) + ".")
     return _row("E5", name, "pass", "Text sizes are in range.")
@@ -1570,13 +1644,13 @@ def _face_in_band(page, src_trim, clip) -> bool:
     cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
     if not os.path.isfile(cascade_path):
         return False
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.6, 0.6), alpha=False, colorspace=fitz.csRGB)
+    scale = _matrix_zoom(page, 0.6)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     faces = cv2.CascadeClassifier(cascade_path).detectMultiScale(gray, 1.2, 4)
     if faces is None or len(faces) == 0:
         return False
-    scale = 0.6
     for (x, y, w, h) in faces:
         box = fitz.Rect(x / scale, y / scale, (x + w) / scale, (y + h) / scale)
         if not box.intersects(src_trim):
@@ -1594,10 +1668,10 @@ def _edge_energy(page, src_trim, clip) -> bool:
         import pymupdf as fitz
     except Exception:
         return False
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False, colorspace=fitz.csGRAY)
+    scale = _matrix_zoom(page, 0.5)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csGRAY)
     gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
     edges = cv2.Canny(gray, 80, 160)
-    scale = 0.5
     mask = np.ones(gray.shape, dtype=bool)
     keep = fitz.Rect(clip.x0 * scale, clip.y0 * scale, clip.x1 * scale, clip.y1 * scale)
     x0 = max(0, int(keep.x0))
@@ -1677,6 +1751,14 @@ def assess_extras(source: str, press: str = "", order: dict | None = None, apply
     ]
     derived = light_from_extra(checks)
     return {"checks": checks, **derived}
+
+
+try:
+    from image_info_cache import install_image_info_cache
+
+    install_image_info_cache()
+except Exception:
+    pass
 
 
 def main() -> None:

@@ -1,5 +1,11 @@
 /** Live stage for a job. Stored beside the job, not in the database. */
 
+export interface FixProgress {
+  id: string;
+  label: string;
+  percent: number;
+}
+
 export interface JobProgress {
   stage: string;
   stageId: string;
@@ -8,6 +14,29 @@ export interface JobProgress {
   updatedAt: number;
   note: string;
   elapsedSec?: number;
+  fixes?: FixProgress[];
+}
+
+const FIX_ORDER = ["checking", "fitting", "reading", "removing", "enlarging", "press", "proof"] as const;
+
+const FIX_LABELS: Record<string, { percent: number; label: string }> = {
+  checking: { percent: 8, label: "Checking the file" },
+  fitting: { percent: 12, label: "Fitting the picture" },
+  reading: { percent: 28, label: "Reading the words" },
+  removing: { percent: 46, label: "Removing the old words" },
+  enlarging: { percent: 64, label: "Enlarging the artwork" },
+  press: { percent: 78, label: "Building the press PDF" },
+  proof: { percent: 90, label: "Making the proof" },
+};
+
+export function fixRows(stageId: string): FixProgress[] {
+  const current = stageId === "done" ? "done" : (stageId in FIX_LABELS ? stageId : "checking");
+  const currentIndex = current === "done" ? FIX_ORDER.length : FIX_ORDER.indexOf(current as typeof FIX_ORDER[number]);
+  return FIX_ORDER.map((key, index) => {
+    const known = FIX_LABELS[key];
+    const percent = index < currentIndex ? 100 : index === currentIndex ? known.percent : 0;
+    return { id: key, label: known.label, percent };
+  });
 }
 
 /** In-progress percents stop at 90 so the bar never sits on a fake 95. */

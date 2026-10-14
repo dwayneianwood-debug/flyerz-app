@@ -137,7 +137,10 @@ def decide_light(facts: dict) -> dict:
     upscale = float(facts.get("upscale") or 1)
     if upscale >= UPSCALE_AMBER:
         reasons.append(f"The picture was enlarged {upscale:.1f} times to reach print size. Glance at fine detail.")
-    if facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
+    shape_note = str(facts.get("shapeNote") or "").strip()
+    if shape_note:
+        reasons.insert(0, shape_note)
+    elif facts.get("aspectExtended") and float(facts.get("aspectDelta") or 0) >= ASPECT_AMBER:
         reasons.append("The picture was a different shape, so the edges were extended. Glance at those edges.")
     # The checklist already says whether leftover pictures are sharp enough.
     if facts.get("vectorAmber") and not facts.get("checklist"):
@@ -404,17 +407,221 @@ def _product_for_trim(trim_w: float, trim_h: float):
     return None
 
 
-def _record_bleed_note(decisions: list, engine) -> None:
-    """Put the per-edge automatic method on the card, beside the generic bleed line."""
-    if not isinstance(engine, dict):
+def incoming_bleed_line(bleed: dict) -> tuple[str, str]:
+    """One sentence for bleed already on the page, and a short story tag.
+
+    A page with no trim box and more than 5 mm on a side is over-bleed.
+    It gets the trim sentence only. It does not also say a shortfall was added
+    or that the file already had exactly 5 mm.
+    """
+    sides = [float((bleed or {}).get(name) or 0) for name in ("left", "right", "top", "bottom")]
+    most = max(sides) if sides else 0.0
+    if (bleed or {}).get("kind") == "existing" and most > BLEED_MM + 0.6:
+        return (
+            f"The page already had about {most:.1f} mm of bleed. Extra bleed is trimmed to 5 mm.",
+            "over",
+        )
+    if (bleed or {}).get("kind") == "existing":
+        return (
+            f"The page is the trim plus about {float(bleed.get('left') or 0):.1f} mm of bleed already. "
+            "That bleed is kept and only the shortfall is added.",
+            "partial",
+        )
+    return ("The PDF already fits this product, so the page was kept and sent to the press engine.", "fit")
+
+
+def extra_bleed_lines(
+    over_incoming: bool,
+    full_kept: bool,
+    existing: bool,
+    press_ok: bool,
+    trimmed: bool = False,
+) -> tuple[bool, list[str]]:
+    """Sentences after the per-edge note. Extra bleed keeps the single trim sentence."""
+    if over_incoming or trimmed:
+        return bool(full_kept or existing), []
+    if full_kept:
+        return True, ["This file already had 5 mm bleed. That bleed was kept and was not added again."]
+    if existing:
+        return True, []
+    if press_ok:
+        return False, ["Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm."]
+    return False, []
+
+
+def _apply_cat_edit(path: str, output_dir: str, decisions: list, request: str) -> str:
+    """One time, date, or number change before the press file is built."""
+    try:
+        from artwork_edits import confirm, propose
+
+        key = "print-flow-" + os.path.basename(output_dir or "job")
+        proposed = propose(path, request, key, os.path.join(output_dir, "edit-preview"))
+        if not isinstance(proposed, dict) or not proposed.get("ok"):
+            reply = str((proposed or {}).get("reply") or "") if isinstance(proposed, dict) else ""
+            decisions.append(reply or "The small text edit could not be applied. The press file was made from the original artwork.")
+            return path
+        dest = os.path.join(output_dir, "edited-source.pdf")
+        done = confirm(key, dest)
+        if done.get("ok") and os.path.isfile(dest) and os.path.getsize(dest) > 100:
+            decisions.append("The time, date, or number you asked for was changed before the press file was made.")
+            return dest
+    except Exception:
+        pass
+    decisions.append("The small text edit could not be applied. The press file was made from the original artwork.")
+    return path
+
+
+def _apply_replicate_edit(path: str, output_dir: str, decisions: list, trim_w: float, trim_h: float) -> tuple[str, bool]:
+    """One Replicate picture pass. A missing token leaves the artwork as sent."""
+    token = ""
+    try:
+        from ai_enhancements import _get_replicate_token
+
+        token = (_get_replicate_token() or "").strip()
+    except Exception:
+        token = ""
+    if not token:
+        decisions.append(
+            "Replicate is not set up on this computer, so the artwork was left as you sent it and the press file was still made."
+        )
+        return path, False
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"):
+        decisions.append(
+            "Replicate is ready. This file stays on the press path, so the picture was not sent out for a separate edit."
+        )
+        return path, False
+    try:
+        from ai_upscale import apply_ai_upscale
+
+        dest = os.path.join(output_dir, "replicate-edit.png")
+        enlarged = apply_ai_upscale(path, {
+            "trim_w_mm": trim_w,
+            "trim_h_mm": trim_h,
+            "bleed_mm": 0,
+            "output_path": dest,
+            "max_scale": 4,
+            "skip_below_ppi": 75,
+        })
+        enhanced = str((enlarged or {}).get("enhanced_path") or "")
+        if enhanced and os.path.exists(enhanced) and not (enlarged or {}).get("used_original"):
+            if str((enlarged or {}).get("provider") or "") == "replicate":
+                decisions.append("The picture was edited with Replicate before the press file was made.")
+            else:
+                decisions.append(
+                    "Replicate did not return a picture, so a local enlargement was used before the press file was made."
+                )
+            return enhanced, True
+    except Exception:
+        pass
+    decisions.append("The Replicate edit could not be applied. The press file was made from the original artwork.")
+    return path, False
+
+
+def _write_before(src: str, dest: str) -> bool:
+    """A small picture of the file Ian sent, for the before side of the result."""
+    try:
+        import cv2
+
+        ext = os.path.splitext(src)[1].lower()
+        image = None
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"):
+            image = cv2.imread(src, cv2.IMREAD_COLOR)
+        else:
+            import numpy as np
+            import pymupdf as fitz
+
+            from page_zoom import adjusted_zoom
+
+            doc = fitz.open(src)
+            try:
+                if doc.page_count < 1:
+                    return False
+                page = doc[0]
+                zoom = adjusted_zoom(page.rect.width, page.rect.height, 1.0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+                if max(pix.w, pix.h) > 900 and max(pix.w, pix.h) > 0:
+                    zoom = zoom * (900.0 / max(pix.w, pix.h))
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+                rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+                image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            finally:
+                doc.close()
+        if image is None:
+            return False
+        height, width = image.shape[:2]
+        scale = 900.0 / max(height, width, 1)
+        if scale < 1:
+            image = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        return bool(cv2.imwrite(dest, image))
+    except Exception:
+        return False
+
+
+def _seed_pixel_page_ink(press_path: str) -> None:
+    """Remember ink from a small render so the checklist does not decode the whole plate."""
+    try:
+        import pymupdf as fitz
+
+        from extra_checks import _sampled_ink, remember_press_ink
+
+        doc = fitz.open(press_path)
+        try:
+            if doc.page_count < 1:
+                return
+            facts = {"max_tac": 0.0, "k90": 0, "k_only": 0, "small_rich": False, "small_k": False}
+            _sampled_ink(doc[0], 0.5, facts)
+            facts["small_k"] = facts["k_only"] > 30
+            facts["small_rich"] = bool(facts["small_rich"] or (facts["k90"] > 30 and facts["k_only"] == 0))
+            remember_press_ink(press_path, facts)
+        finally:
+            doc.close()
+    except Exception:
         return
+
+
+def press_saved_for_rebleed(press_ok: bool, light: str = "green") -> bool:
+    """A finished press file stays available for change-bleed, including a red light."""
+    return bool(press_ok) and str(light or "") in ("green", "amber", "red")
+
+
+def _names_edges(line: str) -> bool:
+    low = str(line or "").lower()
+    return low.startswith("bleed:") and sum(side in low for side in ("top", "bottom", "left", "right")) >= 2
+
+
+def _record_bleed_note(decisions: list, engine, extra_edges=None) -> None:
+    """Put the per-edge automatic method on every card that built or kept bleed."""
     from press_ready_engine import bleed_method_sentence
 
-    sentence = str(engine.get("bleedNote") or "") or bleed_method_sentence(engine.get("edges") or [])
+    edges = []
+    sentence = ""
+    if isinstance(engine, dict):
+        sentence = str(engine.get("bleedNote") or "")
+        edges = list(engine.get("edges") or [])
+    if not edges and extra_edges:
+        edges = list(extra_edges)
+    if not _names_edges(sentence):
+        built = bleed_method_sentence(edges)
+        if built:
+            sentence = built
+    if not _names_edges(sentence):
+        for line in decisions:
+            if _names_edges(line):
+                sentence = str(line)
+                break
     if not sentence:
         return
-    engine["bleedNote"] = sentence
-    if sentence not in decisions:
+    if isinstance(engine, dict):
+        engine["bleedNote"] = sentence
+    replaced = False
+    for index, line in enumerate(decisions):
+        if str(line).startswith("Bleed:"):
+            decisions[index] = sentence
+            replaced = True
+            break
+    if not replaced and sentence not in decisions:
         decisions.append(sentence)
 
 
@@ -471,13 +678,28 @@ def _page_points(path: str):
 
 
 def pixels_as_points_trim(path: str):
-    """Catalog product when a PDF page is a 300 dpi pixel count stored as points."""
+    """Catalog product when a PDF page is a 300 dpi pixel count stored as points.
+
+    A page that already has its own TrimBox is in physical points. An A2 sheet
+    with 10 mm of extra bleed is about the same point size as an A6 picture
+    stored as pixels, so the trim box has to win.
+    """
     if os.path.splitext(path)[1].lower() != ".pdf":
         return None
-    points = _page_points(path)
-    if not points:
-        return None
-    return _pixels_as_points_product(*points)
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        if doc.page_count < 1:
+            return None
+        page = doc[0]
+        media = page.mediabox
+        trim = page.trimbox
+        if abs(float(trim.width) - float(media.width)) >= 1.5 or abs(float(trim.height) - float(media.height)) >= 1.5:
+            return None
+        return _pixels_as_points_product(float(page.rect.width), float(page.rect.height))
+    finally:
+        doc.close()
 
 
 def _pixels_as_points_product(width_pt: float, height_pt: float):
@@ -540,6 +762,68 @@ def _rotate_to_product(img, trim_w: float, trim_h: float, decisions: list) -> tu
         decisions.append("The picture was turned on its side so it matches the product. It was not stretched.")
         return turned, True
     return img, False
+
+
+# Cover-fit may crop at most this much on an edge. A wider gap is contained.
+COVER_CROP_MM = 2.0
+
+
+def aspect_fit(src_w: int, src_h: int, trim_w: float, trim_h: float) -> dict:
+    """Cover when the crop is within 2 mm per edge. Otherwise contain, centred.
+
+    gapX and gapY are the empty margin inside the trim on one edge, in millimetres.
+    """
+    src_w = max(1, int(src_w))
+    src_h = max(1, int(src_h))
+    trim_w = float(trim_w)
+    trim_h = float(trim_h)
+    cover = max(trim_w / src_w, trim_h / src_h)
+    crop_x = max(0.0, (src_w * cover - trim_w) / 2.0)
+    crop_y = max(0.0, (src_h * cover - trim_h) / 2.0)
+    if max(crop_x, crop_y) <= COVER_CROP_MM + 0.05:
+        return {"mode": "cover", "cropX": crop_x, "cropY": crop_y, "gapX": 0.0, "gapY": 0.0}
+    contain = min(trim_w / src_w, trim_h / src_h)
+    gap_x = max(0.0, (trim_w - src_w * contain) / 2.0)
+    gap_y = max(0.0, (trim_h - src_h * contain) / 2.0)
+    if max(gap_x, gap_y) <= 0.2:
+        return {"mode": "match", "cropX": 0.0, "cropY": 0.0, "gapX": 0.0, "gapY": 0.0}
+    return {"mode": "contain", "cropX": 0.0, "cropY": 0.0, "gapX": gap_x, "gapY": gap_y}
+
+
+def shape_extension_note(label: str, gap_x: float, gap_y: float) -> str:
+    """Plain amber line when the picture was contained and the background extended."""
+    wide = float(gap_x or 0) > 0.4
+    tall = float(gap_y or 0) > 0.4
+    if wide and tall:
+        where = "around the edges"
+    elif wide:
+        where = "at the sides"
+    elif tall:
+        where = "at the top and bottom"
+    else:
+        return ""
+    name = str(label or "this size").strip() or "this size"
+    return f"Your picture is a different shape from {name}, so we extended the background {where}"
+
+
+def _shape_note_from(payload, label: str) -> str:
+    shape = payload.get("shape") if isinstance(payload, dict) else None
+    if not isinstance(shape, dict) or shape.get("mode") != "contain":
+        return ""
+    return shape_extension_note(label, shape.get("gapX") or 0, shape.get("gapY") or 0)
+
+
+def _shape_note_for(label, vector_built, engine, pending_shape, footer_layout: bool) -> str:
+    """The centred contain note. A footer poster keeps its own layout sentence."""
+    note = _shape_note_from(vector_built if isinstance(vector_built, dict) else {}, label)
+    if note:
+        return note
+    note = _shape_note_from(engine if isinstance(engine, dict) else {}, label)
+    if note:
+        return note
+    if footer_layout or not isinstance(pending_shape, dict):
+        return ""
+    return _shape_note_from({"shape": pending_shape}, label)
 
 
 # A shape just inside the old 64px window must not be mirrored out. The orange-disc
@@ -1117,7 +1401,7 @@ def _colour_pad(band, pad: int, forward: bool):
     return out
 
 
-def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None):
+def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None, protect_art: bool = False):
     import numpy as np
 
     ppm = float(px_per_mm) if px_per_mm else (300.0 / 25.4)
@@ -1143,7 +1427,9 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
         # The pad's first row touches the picture when the pad is below it.
         at_end = not forward
         built = _match_join_colour(built, art, at_end=at_end, depth=max(match_depth, overlap))
-        art = _feather_into_art(built, art, overlap, at_end=at_end)
+        # A shape gap must not be blended back into the artwork. The poster join still is.
+        if not protect_art:
+            art = _feather_into_art(built, art, overlap, at_end=at_end)
         return built
 
     def short_pad(forward: bool, pad: int):
@@ -1153,16 +1439,17 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
 
     top_part = None
     bottom_part = None
+    # A shape gap must continue the edge colour. The tall mirror repeats a
+    # photograph into vertical streaks, and that streak is inside the cut.
+    def pad_for(forward: bool, pad: int):
+        if pad >= TALL_PAD_PX and not protect_art:
+            return strong_pad(forward, pad, min(pad, height))
+        return short_pad(forward, pad)
+
     if top:
-        if top >= TALL_PAD_PX:
-            top_part = strong_pad(False, top, min(top, height))
-        else:
-            top_part = short_pad(False, top)
+        top_part = pad_for(False, top)
     if bottom:
-        if bottom >= TALL_PAD_PX:
-            bottom_part = strong_pad(True, bottom, min(bottom, height))
-        else:
-            bottom_part = short_pad(True, bottom)
+        bottom_part = pad_for(True, bottom)
     if top_part is not None:
         parts.append(top_part)
     parts.append(art)
@@ -1173,16 +1460,16 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None)
     return np.concatenate(parts, axis=0)
 
 
-def _extend_edges(img, top: int, bottom: int, left: int, right: int, px_per_mm: float | None = None):
+def _extend_edges(img, top: int, bottom: int, left: int, right: int, px_per_mm: float | None = None, protect_art: bool = False):
     """Grow a picture without copying one row of pixels down the page."""
     import numpy as np
 
     out = img
     if top or bottom:
-        out = _extend_vertical(out, top, bottom, px_per_mm=px_per_mm)
+        out = _extend_vertical(out, top, bottom, px_per_mm=px_per_mm, protect_art=protect_art)
     if left or right:
         turned = np.ascontiguousarray(np.transpose(out, (1, 0, 2)))
-        turned = _extend_vertical(turned, left, right, px_per_mm=px_per_mm)
+        turned = _extend_vertical(turned, left, right, px_per_mm=px_per_mm, protect_art=protect_art)
         out = np.ascontiguousarray(np.transpose(turned, (1, 0, 2)))
     return out
 
@@ -1384,13 +1671,13 @@ def _extend_to_product(img, trim_w: float, trim_h: float, source_path: str, deci
         pad = new_h - height
         top = pad // 2
         ppm = float(new_h) / float(trim_h) if trim_h else None
-        fitted = _extend_edges(img, top, pad - top, 0, 0, px_per_mm=ppm)
+        fitted = _extend_edges(img, top, pad - top, 0, 0, px_per_mm=ppm, protect_art=True)
     else:
         new_w = max(width, int(round(height * target)))
         pad = new_w - width
         left = pad // 2
         ppm = float(new_w) / float(trim_w) if trim_w else None
-        fitted = _extend_edges(img, 0, 0, left, pad - left, px_per_mm=ppm)
+        fitted = _extend_edges(img, 0, 0, left, pad - left, px_per_mm=ppm, protect_art=True)
     decisions.append(
         "The picture was a different shape from the product. The whole picture was kept and the gap was filled by continuing the edge colour and texture. It was not stretched and the picture was not copied."
     )
@@ -1427,6 +1714,108 @@ def _boxes_mm(path: str) -> dict:
         doc.close()
 
 
+def _stamp_fogra39(path: str) -> None:
+    """Tag a finished press file with the coated FOGRA39 output intent."""
+    try:
+        import pikepdf
+
+        from generate_icc_profile import get_icc_profile_path
+
+        with open(get_icc_profile_path(), "rb") as handle:
+            icc_data = handle.read()
+        pdf = pikepdf.open(path, allow_overwriting_input=True)
+        try:
+            icc_stream = pikepdf.Stream(pdf, icc_data)
+            icc_stream["/N"] = 4
+            pdf.Root["/OutputIntents"] = pikepdf.Array([
+                pikepdf.Dictionary({
+                    "/Type": pikepdf.Name("/OutputIntent"),
+                    "/S": pikepdf.Name("/GTS_PDFX"),
+                    "/OutputConditionIdentifier": pikepdf.String("FOGRA39"),
+                    "/RegistryName": pikepdf.String("http://www.color.org"),
+                    "/Info": pikepdf.String("Coated FOGRA39 (ISO 12647-2:2004)"),
+                    "/DestOutputProfile": icc_stream,
+                })
+            ])
+            pdf.save(path, recompress_flate=False)
+        finally:
+            pdf.close()
+    except Exception:
+        return
+
+
+def _file_dpi(path: str) -> float:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            dpi = image.info.get("dpi") or (0, 0)
+            return float((dpi[0] if isinstance(dpi, tuple) else dpi) or 0)
+    except Exception:
+        return 0.0
+
+
+def _compile_picture(img, output_pdf: str, trim_w: float, trim_h: float, embedded_dpi: float = 0.0) -> dict:
+    """Place a picture in this process. The per-line trace and the full compile are slower."""
+    from press_ready_engine import compile_raster_canvas, write_cmyk_pdf
+
+    canvas, report = compile_raster_canvas(
+        img, trim_w, trim_h, BLEED_MM, float(embedded_dpi) if embedded_dpi and embedded_dpi >= 150 else None,
+    )
+    write_cmyk_pdf(canvas[:, :, :3], output_pdf, trim_w, trim_h, BLEED_MM)
+    _stamp_fogra39(output_pdf)
+    engine = dict(report or {})
+    bleed_quality = None
+    try:
+        from bleed_builder import check_press_pdf
+
+        bleed_quality = check_press_pdf(output_pdf, trim_w, trim_h, BLEED_MM)
+    except Exception as exc:
+        bleed_quality = {
+            "ok": False,
+            "pages": [],
+            "note": (
+                "The bleed check could not read the press file "
+                f"({str(exc)[:120]}). Check the edges before printing."
+            ),
+        }
+    if isinstance(bleed_quality, dict) and not bleed_quality.get("ok"):
+        engine["passed"] = False
+        engine["status"] = "needs-attention"
+        engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
+    return {"success": True, "pressEngine": engine, "bleedQuality": bleed_quality}
+
+
+def _compile_native_pixels(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
+    """Build a pixels-as-points page in this process. The full compile starts another Python."""
+    from press_ready_engine import compile_vector_press
+
+    built = compile_vector_press(src, output_pdf, trim_w, trim_h, BLEED_MM)
+    if not built.get("used"):
+        return {"success": False}
+    engine = dict(built.get("report") or {})
+    _stamp_fogra39(output_pdf)
+    bleed_quality = None
+    try:
+        from bleed_builder import check_press_pdf
+
+        bleed_quality = check_press_pdf(output_pdf, trim_w, trim_h, BLEED_MM)
+    except Exception as exc:
+        bleed_quality = {
+            "ok": False,
+            "pages": [],
+            "note": (
+                "The bleed check could not read the press file "
+                f"({str(exc)[:120]}). Check the edges before printing."
+            ),
+        }
+    if isinstance(bleed_quality, dict) and not bleed_quality.get("ok"):
+        engine["passed"] = False
+        engine["status"] = "needs-attention"
+        engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
+    return {"success": True, "pressEngine": engine, "bleedQuality": bleed_quality}
+
+
 def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
     script = os.path.join(os.path.dirname(__file__), "compile_press_pdf.py")
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -1455,8 +1844,15 @@ def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
             cwd=repo,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=240,
-            env={**__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(), "PYTHONUNBUFFERED": "1"},
+            env={
+                **__import__("host_paths", fromlist=["c_numeric_env"]).c_numeric_env(),
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+            },
         )
         payload = {}
         if os.path.exists(result.name):
@@ -1537,6 +1933,186 @@ def _blank(light_info: dict, decisions: list, product: dict, quantity, notes: st
     }
 
 
+def detect_edge_frame(bgr) -> dict | None:
+    """A thin keyline on all four edges, or None when the edge is the artwork.
+
+    Business-card exports often draw a 1 px rule at the outer edge. Scaled into
+    the trim, that rule sits inside the cut and the bleed becomes a black bar.
+    """
+    import cv2
+    import numpy as np
+
+    if bgr is None or getattr(bgr, "ndim", 0) != 3 or bgr.shape[0] < 48 or bgr.shape[1] < 48:
+        return None
+    gray = cv2.cvtColor(np.ascontiguousarray(bgr[:, :, :3]), cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    interior = float(np.median(gray[height // 5: height - height // 5, width // 5: width - width // 5]))
+
+    def is_key(line) -> bool:
+        count = int(line.shape[0])
+        mid = line[int(count * 0.08): int(count * 0.92)]
+        if mid.size < 8:
+            return False
+        med = float(np.median(mid))
+        dark = float(np.mean(mid < 45))
+        contrast = abs(med - interior)
+        std = float(np.std(mid))
+        # Paper white is a JPEG fringe. The bleed builder already steps over it.
+        if med >= 240.0 or contrast < 30.0:
+            return False
+        # A solid rule, or a solid grey line. A photograph's edge is neither.
+        if dark >= 0.85 and std < 25.0:
+            return True
+        return contrast >= 40.0 and std < 12.0
+
+    def depth_along(get_line, span: int) -> int:
+        limit = min(8, max(1, span // 20))
+        index = 0
+        skipped = 0
+        # CMYK JPEGs often put one light pixel outside the rule.
+        while index < limit and skipped < 2 and not is_key(get_line(index)):
+            index += 1
+            skipped += 1
+        count = 0
+        while index < limit and is_key(get_line(index)):
+            count += 1
+            index += 1
+            if count > 4:
+                # A flat colour band is the artwork. A keyline is only a few pixels.
+                return 0
+        if count < 1:
+            return 0
+        return index
+
+    top = depth_along(lambda index: gray[index, :], height)
+    bottom = depth_along(lambda index: gray[height - 1 - index, :], height)
+    left = depth_along(lambda index: gray[:, index], width)
+    right = depth_along(lambda index: gray[:, width - 1 - index], width)
+    depths = (int(top), int(bottom), int(left), int(right))
+    if min(depths) < 1 or max(depths) > 6 or max(depths) - min(depths) > 2:
+        return None
+    inset = max(depths) + 2
+    if inset * 2 + 4 >= min(height, width):
+        return None
+    fill = np.median(bgr[inset:inset + 4, inset: width - inset], axis=(0, 1))
+    return {
+        "top": depths[0],
+        "bottom": depths[1],
+        "left": depths[2],
+        "right": depths[3],
+        "fill": [int(round(float(v))) for v in fill[:3]],
+    }
+
+
+def remove_edge_frame(bgr):
+    """Paint a detected keyline with the colour just inside it. Size stays the same."""
+    import numpy as np
+
+    found = detect_edge_frame(bgr)
+    if not found:
+        return bgr, None
+    out = np.array(bgr, copy=True)
+    fill = np.array(found["fill"], np.uint8)
+    height, width = out.shape[:2]
+    top, bottom = int(found["top"]), int(found["bottom"])
+    left, right = int(found["left"]), int(found["right"])
+    if top:
+        out[:top, :] = fill
+    if bottom:
+        out[height - bottom:, :] = fill
+    if left:
+        out[:, :left] = fill
+    if right:
+        out[:, width - right:] = fill
+    _clear_keyline_halo(out, fill)
+    return out, found
+
+
+def _clear_keyline_halo(out, fill) -> None:
+    """A grey pixel just inside a removed rule is still the rule.
+
+    Keyline removal paints the dark stroke. The next pixel is often a grey
+    fringe. Sampling that fringe paints a grey band across the white card.
+    """
+    import numpy as np
+
+    if out is None or getattr(out, "ndim", 0) != 3 or out.shape[0] < 8 or out.shape[1] < 8:
+        return
+    fill_v = np.asarray(fill, np.float32).reshape(3)
+    height, width = out.shape[:2]
+
+    def matches(line) -> bool:
+        dist = np.linalg.norm(line.astype(np.float32) - fill_v, axis=-1)
+        return float(np.median(dist)) < 18.0
+
+    def is_halo(line, interior) -> bool:
+        if not matches(interior):
+            return False
+        dist = np.linalg.norm(line.astype(np.float32) - fill_v, axis=-1)
+        return float(np.mean(dist > 28.0)) >= 0.65
+
+    limit = min(8, height - 3, width - 3)
+    for index in range(limit):
+        if matches(out[:, index]):
+            continue
+        if is_halo(out[:, index], out[:, min(width - 1, index + 2)]):
+            out[:, index] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        col = width - 1 - index
+        if matches(out[:, col]):
+            continue
+        if is_halo(out[:, col], out[:, max(0, col - 2)]):
+            out[:, col] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        if matches(out[index, :]):
+            continue
+        if is_halo(out[index, :], out[min(height - 1, index + 2), :]):
+            out[index, :] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        row = height - 1 - index
+        if matches(out[row, :]):
+            continue
+        if is_halo(out[row, :], out[max(0, row - 2), :]):
+            out[row, :] = np.asarray(fill, np.uint8)
+            continue
+        break
+
+
+def _crop_centered_bleed(img, path: str, trim_w: float, trim_h: float):
+    """Crop a raster that already is the trim plus a centred bleed ring."""
+    bleed = _image_bleed_for_product(path, trim_w, trim_h)
+    if not bleed:
+        return img, None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            dpi = image.info.get("dpi") or (0, 0)
+            dpi_x = float((dpi[0] if isinstance(dpi, tuple) else dpi) or 0)
+    except Exception:
+        return img, None
+    if dpi_x < 150:
+        return img, None
+
+    def px(mm: float) -> int:
+        return int(round(float(mm) / 25.4 * dpi_x))
+
+    top, bottom = px(bleed["top"]), px(bleed["bottom"])
+    left, right = px(bleed["left"]), px(bleed["right"])
+    height, width = img.shape[:2]
+    if top + bottom >= height - 8 or left + right >= width - 8:
+        return img, None
+    if top < 1 and bottom < 1 and left < 1 and right < 1:
+        return img, None
+    return img[top: height - bottom, left: width - right].copy(), bleed
+
+
 def make_print_ready(
     src_path: str,
     output_dir: str,
@@ -1548,6 +2124,7 @@ def make_print_ready(
     quantity=None,
     notes: str = "",
     detect_size: bool = False,
+    options: dict | None = None,
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     locale_seen = {}
@@ -1621,17 +2198,27 @@ def make_print_ready(
     native_pixels = False
     aspect_extended = False
     aspect_delta = 0.0
+    pending_shape = None
+    footer_layout = False
     upscale = 1.0
     dpi_mode = ""
     dpi_detail = ""
     existing_kept = False
+    over_incoming = False
     ocr_low = False
     ocr_doubtful = False
     ocr_doubtful_reason = ""
     vector_built = None
+    engine = {}
+    source_is_picture = _ext(src_path, display) in IMAGE_EXT
+    plate_for_press = None
+    plate_dpi = 0.0
     vector_source = None
     upscale_job = None
     lettering_note = "The original lettering is kept."
+    chosen = options or {}
+    skip_upscale = bool(chosen.get("skipUpscale"))
+    concerns = [str(line) for line in (chosen.get("concerns") or []) if str(line).strip()]
 
     try:
         from press_ready_engine import plate_exceeds_memory
@@ -1651,6 +2238,16 @@ def make_print_ready(
             work_path = opened
             ext = ".pdf"
             decisions.append("The Illustrator file was read onto the normal PDF path.")
+
+        request = str(chosen.get("editRequest") or "").strip()
+        if request:
+            work_path = _apply_cat_edit(work_path, output_dir, decisions, request)
+        if chosen.get("replicateEdit"):
+            work_path, replicate_done = _apply_replicate_edit(work_path, output_dir, decisions, trim_w, trim_h)
+            if replicate_done:
+                skip_upscale = True
+        elif skip_upscale:
+            decisions.append("Upscale with AI was left off, so the original picture was kept.")
 
         live_type = False
         if ext == ".pdf":
@@ -1707,15 +2304,13 @@ def make_print_ready(
                 decisions.append(
                     f"The PDF trim is {measured[0]:.1f} × {measured[1]:.1f} mm."
                 )
-            if fit:
-                bleed = fit["bleed"]
-                if bleed.get("kind") == "existing":
-                    decisions.append(
-                        f"The page is the trim plus about {bleed['left']:.1f} mm of bleed already. "
-                        "That bleed is kept and only the shortfall is added."
-                    )
-                else:
-                    decisions.append("The PDF already fits this product, so the page was kept and sent to the press engine.")
+            if native_pixels:
+                decisions.append("The page was sent straight to the press engine at the matched size.")
+            elif fit:
+                line, story = incoming_bleed_line(fit["bleed"])
+                if story == "over":
+                    over_incoming = True
+                decisions.append(line)
             elif live_type:
                 decisions.append(
                     "This PDF has live type and the wrong proportions. The edges cannot be extended without losing that type."
@@ -1788,7 +2383,19 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
+            raster, frame = remove_edge_frame(raster)
+            if frame:
+                decisions.append(
+                    "A thin border near the cut was removed. The background was continued into the bleed."
+                )
+            # A centred ring of a few millimetres is bleed, not artwork. Leaving it
+            # in the picture scales the keyline into the cut.
+            if not _turned and source_is_picture:
+                cropped, bleed_ring = _crop_centered_bleed(raster, src_path, trim_w, trim_h)
+                if bleed_ring and max(float(bleed_ring[side]) for side in ("left", "right", "top", "bottom")) <= BLEED_MM + 0.5:
+                    raster = cropped
             picture = raster
+            pending_shape = aspect_fit(picture.shape[1], picture.shape[0], trim_w, trim_h)
             # Extra bleed on a 300 dpi raster is the trim plus a ring. Extending the
             # shape would treat that ring as the wrong aspect and the trim would be lost.
             kept_source_bleed = None
@@ -1809,20 +2416,25 @@ def make_print_ready(
                 # the band stays at the bottom. A plain side pad is not part of the
                 # read: the smaller scale was dropping small marks such as a card's "7".
                 raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
-                if aspect_extended and _bottom_bar_row(picture) is not None:
+                # A contact band only changes the sentence when that layout was used.
+                # A tall picture with a band still grows at the sides, and that sentence stays.
+                footer_layout = any("contact band was kept at the bottom" in line for line in decisions)
+                if footer_layout:
                     vector_source = raster
                 else:
                     vector_source = picture
-                try:
-                    from ai_upscale import start_plate_upscale
+                if not skip_upscale:
+                    try:
+                        from ai_upscale import start_plate_upscale
 
-                    upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
-                except Exception as exc:
-                    sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
-                    upscale_job = None
-                fitted_path = os.path.join(output_dir, "fitted.png")
-                _write_png(raster, fitted_path)
-                work_path = fitted_path
+                        upscale_job = start_plate_upscale(vector_source, trim_w, trim_h)
+                    except Exception as exc:
+                        sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
+                        upscale_job = None
+                if not source_is_picture or not skip_upscale:
+                    fitted_path = os.path.join(output_dir, "fitted.png")
+                    _write_png(raster, fitted_path)
+                    work_path = fitted_path
             from vector_text_v2 import font_substitution_enabled, vector_rebuild_enabled
 
             fonts_on = font_substitution_enabled()
@@ -1831,7 +2443,16 @@ def make_print_ready(
             has_lettering = False
             outer_ocr_s = 0.0
             # Font mode on an AI file reads the page itself. Every other raster is read once here.
-            if (not over_raster) and rebuild_on and not live_type and not (fonts_on and detected):
+            # A photograph is placed as the picture. A poster with a contact band
+            # still goes through the type rebuild, which is what keeps its black text K-only.
+            picture_kept = source_is_picture and not footer_layout
+            if (
+                (not over_raster)
+                and rebuild_on
+                and not live_type
+                and not (fonts_on and detected)
+                and not picture_kept
+            ):
                 try:
                     from vector_text_v2 import read_blocks
                     from vector_trace import is_lettering
@@ -1848,7 +2469,13 @@ def make_print_ready(
                 except Exception:
                     has_lettering = False
                     lettering_blocks = None
-            trace_raster = (not over_raster) and rebuild_on and not live_type and (detected or has_lettering)
+            trace_raster = (
+                (not over_raster)
+                and rebuild_on
+                and not live_type
+                and (detected or has_lettering)
+                and not picture_kept
+            )
             if trace_raster:
                 if detected and fonts_on:
                     decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
@@ -1896,14 +2523,27 @@ def make_print_ready(
                 else:
                     lettering_note = str(vector_built.get("reason") or "The vector check failed, so the original lettering was kept.")
                     decisions.append(lettering_note)
+            elif picture_kept:
+                # A photograph traced line by line repeats the edge into streaks and
+                # spends the whole make on letters that stay in the picture anyway.
+                decisions.append("The original picture was kept. Its lettering stays in the picture.")
             elif detected and not rebuild_on:
                 decisions.append("Vector type is switched off. The original lettering is kept and the picture is enlarged.")
             elif live_type:
                 decisions.append("This file already has live type, so the lettering was left as it is.")
             else:
                 decisions.append("This was not treated as AI artwork. The original lettering is kept.")
+            if picture_kept and raster is not None:
+                plate_for_press = raster
+                plate_dpi = _file_dpi(src_path) if over_raster else 0.0
             if over_raster:
                 work_path = src_path
+            elif plate_for_press is not None:
+                # The plate places this picture. A second Lanczos file is not used,
+                # and building it was the extra time on an A3 poster.
+                pass
+            elif skip_upscale:
+                pass
             elif not (vector_built and vector_built.get("ok")):
                 _mark("enlarging", lettering_note)
                 upscaled_path = os.path.join(output_dir, "upscaled.png")
@@ -2001,23 +2641,52 @@ def make_print_ready(
         }
         engine = compiled["pressEngine"]
         press_ok = True
+        built_edges = (vector_built or {}).get("edges") if isinstance(vector_built, dict) else None
+        if built_edges:
+            engine["edges"] = built_edges
+        if isinstance(vector_built, dict) and isinstance(vector_built.get("shape"), dict):
+            engine["shape"] = vector_built.get("shape")
         decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
-        _record_bleed_note(decisions, engine)
+        _record_bleed_note(decisions, engine, built_edges)
     else:
-        compiled = _compile(work_path, press_path, trim_w, trim_h)
+        compiled = {}
+        if native_pixels and ext == ".pdf":
+            compiled = _compile_native_pixels(work_path, press_path, trim_w, trim_h)
+        if not compiled.get("success") and plate_for_press is not None:
+            try:
+                compiled = _compile_picture(plate_for_press, press_path, trim_w, trim_h, plate_dpi)
+            except Exception as exc:
+                sys.stderr.write(f"[COMPILE] Picture plate skipped: {exc}\n")
+                compiled = {}
+        if not compiled.get("success"):
+            compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}
         press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
-        if isinstance(engine, dict) and engine.get("fullBleedKept"):
+        edges = list(engine.get("edges") or []) if isinstance(engine, dict) else []
+        trimmed = any(
+            str(edge.get("method") or "") == "trimmed" or "trimmed to 5" in str(edge.get("note") or "").lower()
+            for edge in edges
+            if isinstance(edge, dict)
+        )
+        kept_now, extra_lines = extra_bleed_lines(
+            over_incoming,
+            bool(isinstance(engine, dict) and engine.get("fullBleedKept")),
+            bool(isinstance(engine, dict) and engine.get("existingBleed")),
+            press_ok,
+            trimmed,
+        )
+        if kept_now:
             existing_kept = True
-            decisions.append("This file already had 5 mm bleed. That bleed was kept and was not added again.")
-        elif isinstance(engine, dict) and engine.get("existingBleed"):
-            existing_kept = True
-        elif press_ok:
-            decisions.append("Automatic bleed added the 5 mm edge. Bleed was not stacked on an existing 5 mm.")
-        _record_bleed_note(decisions, engine)
+        for line in extra_lines:
+            decisions.append(line)
+        built_edges = (vector_built or {}).get("edges") if isinstance(vector_built, dict) else None
+        _record_bleed_note(decisions, engine, built_edges)
     if isinstance(engine, dict) and engine.get("headline"):
         decisions.append(f"Press engine: {engine.get('headline')}.")
 
+    shape_note = _shape_note_for(product.get("label"), vector_built, engine, pending_shape, footer_layout)
+    if shape_note and shape_note not in decisions:
+        decisions.append(shape_note)
     facts = {
         "kind": "image",
         "readable": True,
@@ -2031,6 +2700,7 @@ def make_print_ready(
         "upscale": upscale,
         "aspectExtended": aspect_extended,
         "aspectDelta": aspect_delta,
+        "shapeNote": shape_note,
         "enginePassed": bool(engine.get("passed")) if press_ok else False,
         "contentPullAmber": bool((engine.get("rescue") or {}).get("amber")) if isinstance(engine, dict) else False,
         "contentPullNote": str(((engine.get("rescue") or {}).get("note")) if isinstance(engine, dict) else "") or "",
@@ -2059,6 +2729,10 @@ def make_print_ready(
             facts["checklist"] = checklist
         except Exception:
             checklist = None
+    if press_ok and os.path.isfile(press_path) and (native_pixels or plate_for_press is not None):
+        # The plate is one picture. A full-pixel ink walk decodes it again
+        # and is what pushed a poster make past a minute on a laptop.
+        _seed_pixel_page_ink(press_path)
     if os.path.isfile(src_path):
         try:
             from twenty_five import assess as assess_points
@@ -2123,19 +2797,24 @@ def make_print_ready(
         except Exception:
             pass
     if press_ok and os.path.isfile(press_path):
-        try:
-            from bleed_builder import check_press_pdf
+        cached_bleed = compiled.get("bleedQuality") if isinstance(compiled, dict) else None
+        if isinstance(cached_bleed, dict) and "ok" in cached_bleed:
+            # The compile already measured the edge. A second read decodes the plate again.
+            facts["bleedQuality"] = cached_bleed
+        else:
+            try:
+                from bleed_builder import check_press_pdf
 
-            facts["bleedQuality"] = check_press_pdf(press_path, trim_w, trim_h, BLEED_MM)
-        except Exception as exc:
-            facts["bleedQuality"] = {
-                "ok": False,
-                "pages": [],
-                "note": (
-                    "The bleed check could not read the press file "
-                    f"({str(exc)[:120]}). Check the edges before printing."
-                ),
-            }
+                facts["bleedQuality"] = check_press_pdf(press_path, trim_w, trim_h, BLEED_MM)
+            except Exception as exc:
+                facts["bleedQuality"] = {
+                    "ok": False,
+                    "pages": [],
+                    "note": (
+                        "The bleed check could not read the press file "
+                        f"({str(exc)[:120]}). Check the edges before printing."
+                    ),
+                }
         if facts["bleedQuality"].get("note"):
             decisions.append(str(facts["bleedQuality"]["note"]))
     info = decide_light(facts)
@@ -2151,7 +2830,8 @@ def make_print_ready(
     result["pressEngine"] = engine if isinstance(engine, dict) else None
     if facts.get("bleedQuality"):
         result["bleedQuality"] = facts["bleedQuality"]
-    if press_ok and (info["light"] != "red" or info.get("checklistRed")):
+    if press_saved_for_rebleed(press_ok, str(info.get("light") or "")):
+        # A red light still has a press file. Change-bleed reads that file.
         result["pressPath"] = press_path
         try:
             boxes = _boxes_mm(press_path)
@@ -2178,6 +2858,42 @@ def make_print_ready(
     elif not press_ok:
         result["pressPath"] = ""
     result["decisions"] = decisions
+    bleed_note = str(engine.get("bleedNote") or "") if isinstance(engine, dict) else ""
+    if not bleed_note:
+        for line in decisions:
+            if str(line).startswith("Bleed:"):
+                bleed_note = str(line)
+                break
+    result["bleedNote"] = bleed_note
+    before_path = os.path.join(output_dir, "before.png")
+    if _write_before(src_path, before_path):
+        result["beforePng"] = before_path
+    try:
+        from customer_message import customer_message
+
+        if result.get("pressPath"):
+            if not any("cmyk" in str(line).lower() for line in decisions):
+                decisions.append("The press file was converted to CMYK.")
+            _record_bleed_note(decisions, engine if isinstance(engine, dict) else {}, None)
+            result["decisions"] = decisions
+            worry = list(concerns)
+            if info.get("light") in ("amber", "red"):
+                for line in info.get("reasons") or []:
+                    text = str(line)
+                    if text and text not in worry:
+                        worry.append(text)
+            note = str(engine.get("bleedNote") or "") if isinstance(engine, dict) else ""
+            if not _names_edges(note):
+                for line in decisions:
+                    if _names_edges(line):
+                        note = str(line)
+                        break
+            result["bleedNote"] = note or result.get("bleedNote") or ""
+            result["customerMessage"] = customer_message(decisions, worry, note)
+        else:
+            result["customerMessage"] = str(info.get("clientMessage") or "")
+    except Exception:
+        result["customerMessage"] = ""
     if ink_report:
         result["inkRepair"] = {
             "rewritten": int(ink_report.get("images") or ink_report.get("rewritten") or 0),
@@ -2220,7 +2936,7 @@ def _finish(result: dict, output_dir: str) -> dict:
     _mark("done", str(result.get("letteringNote") or "Finished."))
     result_path = os.path.join(output_dir, "result.json")
     with open(result_path, "w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
+        json.dump(result, handle, indent=2, ensure_ascii=False)
     lines = [f"Result: {str(result.get('light') or '').upper()}"]
     for line in result.get("decisions") or []:
         lines.append(f"- {line}")
@@ -2234,7 +2950,20 @@ def _finish(result: dict, output_dir: str) -> dict:
     return result
 
 
+def _force_utf8_stdio() -> None:
+    """The customer note uses × and –. A chunked pipe must see real UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description="Make one file print-ready")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -2248,6 +2977,10 @@ def main() -> None:
     parser.add_argument("--detect-size", action="store_true")
     parser.add_argument("--progress-file", default="")
     parser.add_argument("--result", default="")
+    parser.add_argument("--edit-request", default="")
+    parser.add_argument("--replicate-edit", action="store_true")
+    parser.add_argument("--skip-upscale", action="store_true")
+    parser.add_argument("--concern", action="append", default=[])
     args = parser.parse_args()
     if args.progress_file:
         os.environ["JOB_PROGRESS_FILE"] = args.progress_file
@@ -2269,8 +3002,14 @@ def main() -> None:
         quantity=args.quantity or None,
         notes=args.notes or "",
         detect_size=bool(args.detect_size or args.product_id == "auto"),
+        options={
+            "editRequest": args.edit_request or "",
+            "replicateEdit": bool(args.replicate_edit),
+            "skipUpscale": bool(args.skip_upscale),
+            "concerns": list(args.concern or []),
+        },
     )
-    text = json.dumps(result)
+    text = json.dumps(result, ensure_ascii=False)
     if args.result:
         with open(args.result, "w", encoding="utf-8") as handle:
             handle.write(text)

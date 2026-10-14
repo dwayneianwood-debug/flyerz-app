@@ -4,7 +4,7 @@ import os from "os";
 import path from "path";
 import type { AuditCheck, AuditResults, FileType } from "@shared/schema";
 import { quickPrintProduct, QUICK_PRINT_PRODUCTS } from "@shared/quickPrint";
-import { pythonChildEnv } from "./pythonChildEnv";
+import { decodeChildText, pythonChildEnv } from "./pythonChildEnv";
 import { storage } from "./storage";
 import { jobProgressPath, writeJobProgress } from "./jobProgress";
 
@@ -37,6 +37,10 @@ export interface QuickRunOptions {
   notes?: string;
   filename?: string;
   detectSize?: boolean;
+  editRequest?: string;
+  replicateEdit?: boolean;
+  skipUpscale?: boolean;
+  concerns?: string[];
 }
 
 export interface QuickRunResult {
@@ -59,6 +63,9 @@ export interface QuickRunResult {
   upscale: number;
   pressEngine: Record<string, unknown> | null;
   enginePassed: boolean;
+  bleedNote?: string;
+  customerMessage?: string;
+  beforePng?: string;
   mediaWidthMm?: number;
   mediaHeightMm?: number;
   trimWidthMm?: number;
@@ -127,6 +134,9 @@ function asResult(raw: Record<string, unknown>): QuickRunResult {
     upscale: Number(raw.upscale) || 0,
     pressEngine: raw.pressEngine && typeof raw.pressEngine === "object" ? raw.pressEngine as Record<string, unknown> : null,
     enginePassed: raw.enginePassed === true,
+    bleedNote: String(raw.bleedNote || (raw.pressEngine && typeof raw.pressEngine === "object" ? (raw.pressEngine as Record<string, unknown>).bleedNote || "" : "")),
+    customerMessage: String(raw.customerMessage || ""),
+    beforePng: raw.beforePng ? String(raw.beforePng) : "",
     mediaWidthMm: raw.mediaWidthMm == null ? undefined : Number(raw.mediaWidthMm),
     mediaHeightMm: raw.mediaHeightMm == null ? undefined : Number(raw.mediaHeightMm),
     trimWidthMm: raw.trimWidthMm == null ? undefined : Number(raw.trimWidthMm),
@@ -219,6 +229,12 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
     "--notes", options.notes || "",
   ];
   if (options.detectSize || options.productId === "auto") args.push("--detect-size");
+  if (options.editRequest) args.push("--edit-request", options.editRequest);
+  if (options.replicateEdit) args.push("--replicate-edit");
+  if (options.skipUpscale) args.push("--skip-upscale");
+  for (const line of options.concerns || []) {
+    if (String(line).trim()) args.push("--concern", String(line).slice(0, 400));
+  }
   const progressFile = options.jobId ? jobProgressPath(options.jobId) : "";
   if (progressFile) {
     if (options.jobId) writeJobProgress(options.jobId, "fitting");
@@ -233,18 +249,18 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
     }, quickPrintKillMs());
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(Buffer.from(chunk));
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -252,6 +268,8 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
     });
     child.on("close", () => {
       clearTimeout(timer);
+      const stdout = decodeChildText(stdoutChunks);
+      const stderr = decodeChildText(stderrChunks);
       const line = stdout.split(/\r?\n/).map((row) => row.trim()).filter((row) => row.startsWith("{")).pop();
       const filePayload = path.join(outputDir, "result.json");
       let parsed: Record<string, unknown> | null = null;
@@ -383,4 +401,94 @@ export function redFallback(message: string): QuickRunResult {
 
 export function tempWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "flyerz-quick-"));
+}
+
+export interface IntakeItem {
+  id: string;
+  num: string;
+  name: string;
+  detail: string;
+  status: string;
+  severity: "red" | "amber" | "green";
+}
+
+function pythonJson(script: string, args: string[], killMs: number): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(PYTHON_BIN, [script, ...args], {
+      cwd: process.cwd(),
+      env: pythonChildEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, killMs);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutChunks.push(Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrChunks.push(Buffer.from(chunk));
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const stdout = decodeChildText(stdoutChunks);
+      const stderr = decodeChildText(stderrChunks);
+      const line = stdout.split(/\r?\n/).map((row) => row.trim()).filter((row) => row.startsWith("{")).pop();
+      if (!line) {
+        reject(new Error(stderr.trim().slice(0, 240) || "The check did not finish."));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (code && parsed.ok === false) {
+          reject(new Error(String(parsed.error || "The bleed could not be changed.")));
+          return;
+        }
+        resolve(parsed);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+export async function runIntakeCheck(inputPath: string, trimW: number, trimH: number): Promise<{ items: IntakeItem[]; red: number; amber: number; green: number }> {
+  const script = path.join(process.cwd(), "server", "intake_check.py");
+  const parsed = await pythonJson(script, ["--input", inputPath, "--trim-w", String(trimW), "--trim-h", String(trimH)], 120_000);
+  const items = Array.isArray(parsed.items) ? parsed.items.map((item) => {
+    const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const severity: "red" | "amber" | "green" = row.severity === "red" || row.severity === "amber" ? row.severity : "green";
+    return {
+      id: String(row.id || ""),
+      num: String(row.num || ""),
+      name: String(row.name || ""),
+      detail: String(row.detail || ""),
+      status: String(row.status || ""),
+      severity,
+    };
+  }) : [];
+  return {
+    items,
+    red: Number(parsed.red) || items.filter((item) => item.severity === "red").length,
+    amber: Number(parsed.amber) || items.filter((item) => item.severity === "amber").length,
+    green: Number(parsed.green) || items.filter((item) => item.severity === "green").length,
+  };
+}
+
+export async function runBleedReapply(pressPath: string, strategy: string, trimW: number, trimH: number, outputDir: string): Promise<{ bleedNote: string; method: string }> {
+  const script = path.join(process.cwd(), "server", "bleed_reapply.py");
+  const parsed = await pythonJson(script, [
+    "--press", pressPath,
+    "--strategy", strategy,
+    "--trim-w", String(trimW),
+    "--trim-h", String(trimH),
+    "--output-dir", outputDir,
+  ], 180_000);
+  if (parsed.ok === false) throw new Error(String(parsed.error || "The bleed could not be changed."));
+  return { bleedNote: String(parsed.bleedNote || ""), method: String(parsed.method || strategy) };
 }

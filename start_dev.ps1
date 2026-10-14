@@ -87,6 +87,12 @@ foreach ($p in @(3000, 5000, 5173)) {
     Stop-ListenersOnPort -Port $p
 }
 
+Write-Step "Fetch the latest commits"
+git fetch --prune origin
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  git fetch did not finish. The copy already on this laptop will still start." -ForegroundColor Yellow
+}
+
 # --- Process purge -----------------------------------------------------------
 if (-not $SkipGlobalKill) {
     Write-Step "Process purge - node, python, Ghostscript CLI"

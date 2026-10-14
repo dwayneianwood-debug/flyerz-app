@@ -45,4 +45,11 @@ export interface QuickPrintCard {
   percent?: number;
   elapsedSec?: number;
   note?: string;
+  bleedNote?: string;
+  customerMessage?: string;
+  hasBefore?: boolean;
+  trimWidthMm?: number | null;
+  trimHeightMm?: number | null;
+  fixes?: { id: string; label: string; percent: number }[];
+  bleedRevision?: number;
 }

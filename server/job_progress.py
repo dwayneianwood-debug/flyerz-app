@@ -20,6 +20,27 @@ STAGES = {
 
 REBUILD_NOTE = "AI rebuild can take 2–3 minutes."
 REBUILD_STAGES = {"reading", "removing", "enlarging"}
+FIX_ORDER = ("checking", "fitting", "reading", "removing", "enlarging", "press", "proof")
+
+
+def _fix_rows(stage_id: str) -> list:
+    """Each press step with its own percent. Finished steps stay at 100."""
+    current = stage_id if stage_id in STAGES else "checking"
+    if current == "done":
+        current_index = len(FIX_ORDER)
+    else:
+        current_index = FIX_ORDER.index(current) if current in FIX_ORDER else 0
+    rows = []
+    for index, key in enumerate(FIX_ORDER):
+        _percent, label = STAGES[key]
+        if index < current_index:
+            percent = 100
+        elif index == current_index:
+            percent = int(STAGES[key][0])
+        else:
+            percent = 0
+        rows.append({"id": key, "label": label, "percent": percent})
+    return rows
 
 
 def write_progress(path: str, stage: str, note: str = "") -> None:
@@ -56,6 +77,7 @@ def write_progress(path: str, stage: str, note: str = "") -> None:
         "startedAt": int(started),
         "updatedAt": int(time.time() * 1000),
         "note": kept_note,
+        "fixes": _fix_rows(stage if stage in STAGES else "checking"),
     }
     if stage in STAGES:
         payload["stage"] = label

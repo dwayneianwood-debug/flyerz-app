@@ -8,6 +8,15 @@ Nothing here sends a message. The screen only prepares one to copy.
 
 from __future__ import annotations
 
+import os
+
+try:
+    from image_info_cache import install_image_info_cache
+
+    install_image_info_cache()
+except Exception:
+    pass
+
 BLEED_MM = 5.0
 SAFE_MM = 3.0
 TAC_LIMIT = 300.0
@@ -274,6 +283,50 @@ def _margin_xrefs(page) -> set[int]:
     return skip
 
 
+_PLATE = {}
+
+
+def _plate_pix(doc, xref):
+    """Decoded plate samples, kept for this file so the checklist does not decode it again."""
+    import pymupdf as fitz
+
+    try:
+        path = os.path.abspath(doc.name or "")
+        stat = os.stat(path)
+        key = (path, int(stat.st_mtime_ns), int(stat.st_size), int(xref))
+    except OSError:
+        key = None
+    if key and key in _PLATE:
+        return _PLATE[key]
+    try:
+        pix = fitz.Pixmap(doc, int(xref))
+    except Exception:
+        return None
+    if key is not None and pix is not None:
+        if len(_PLATE) > 4:
+            _PLATE.clear()
+        _PLATE[key] = pix
+    return pix
+
+
+def _space_and_tac(doc, xref) -> tuple[int, float]:
+    """Channel count and a 99th-percentile TAC, without re-encoding the picture as PNG."""
+    pix = _plate_pix(doc, xref)
+    if pix is None:
+        return 0, 0.0
+    channels = int(pix.n) - int(pix.alpha)
+    space = 4 if channels >= 4 else (3 if channels == 3 else 1)
+    if space != 4 or pix.w < 2 or pix.h < 2:
+        return space, 0.0
+    import numpy as np
+
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    step = max(1, int(max(arr.shape[0], arr.shape[1]) / 400))
+    sample = arr[::step, ::step, :4].astype(np.float32)
+    total = sample.sum(axis=2) / 255.0 * 100.0
+    return space, float(np.percentile(total, 99))
+
+
 def _colour(path: str) -> tuple[dict, dict]:
     import pymupdf as fitz
 
@@ -289,12 +342,11 @@ def _colour(path: str) -> tuple[dict, dict]:
                 if xref in margin:
                     continue
                 images.append(xref)
-                info = doc.extract_image(xref)
-                space = int(info.get("colorspace") or 0)
+                space, image_tac = _space_and_tac(doc, xref)
                 spaces.append(space)
                 if space == 4:
                     saw_cmyk = True
-                    tac = max(tac, _tac(info.get("image") or b""))
+                    tac = max(tac, image_tac)
     finally:
         doc.close()
     vec_ok, vec_tac = _vector_cmyk(path)

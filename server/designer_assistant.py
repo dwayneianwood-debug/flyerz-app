@@ -385,7 +385,13 @@ def _qr(path: str) -> dict:
         is_pdf = _looks_like_pdf(path)
         try:
             for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
+                from page_zoom import adjusted_zoom
+
+                # A 300 dpi picture stored as points is already the pixel grid.
+                # Zoom 2 on that page paints an A0-sized bitmap and the QR read
+                # takes the whole make. The same zoom on a real A4 stays 2.
+                zoom = adjusted_zoom(float(page.rect.width), float(page.rect.height), 2.0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
                 arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
                 gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
                 value, points, _straight = cv2.QRCodeDetector().detectAndDecode(gray)

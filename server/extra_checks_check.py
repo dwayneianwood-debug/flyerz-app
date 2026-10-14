@@ -123,7 +123,7 @@ def test_e2_e5() -> None:
     _sized(tiny, 148, 210, "FINE", size=4)
     e5 = assess_extras(tiny, "", {"explicitSize": True, "widthMm": 148, "heightMm": 210})
     row = next(item for item in e5["checks"] if item["id"] == "extra_E5")
-    check("e5-under-5", row["status"] == "failed", row["detail"])
+    check("e5-under-5", row["status"] == "warning" and "strongly recommend" in row["detail"], row["detail"])
 
 
 def test_e3_and_nuclear() -> None:

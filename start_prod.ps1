@@ -114,6 +114,12 @@ Write-Host ""
 Write-Host "Flyerz start_prod.ps1 - production server" -ForegroundColor Magenta
 Write-Host "Root: $Root"
 
+Write-Step "Fetch the latest commits"
+git fetch --prune origin
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  git fetch did not finish. The copy already on this laptop will still start." -ForegroundColor Yellow
+}
+
 Import-DotEnv -EnvFile (Join-Path $Root '.env')
 # LAN sharing is on for the office. HOST and PORT still come from .env when set.
 $env:LAN_ONLY_MODE = 'true'

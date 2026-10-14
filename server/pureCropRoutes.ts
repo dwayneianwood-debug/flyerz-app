@@ -5,7 +5,7 @@ import path from "path";
 import fs from "fs/promises";
 import fsSync from "fs";
 import { spawn } from "child_process";
-import { pythonChildEnv } from "./pythonChildEnv";
+import { decodeChildText, pythonChildEnv } from "./pythonChildEnv";
 import crypto from "crypto";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
@@ -27,16 +27,20 @@ type PythonResult = { code: number | null; stdout: string; stderr: string };
 function runPython(args: string[]): Promise<PythonResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(PYTHON_BIN, args, { cwd: process.cwd(), env: pythonChildEnv() });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(Buffer.from(chunk));
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(Buffer.from(chunk));
     });
     child.on("error", reject);
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    child.on("close", (code) => resolve({
+      code,
+      stdout: decodeChildText(stdoutChunks),
+      stderr: decodeChildText(stderrChunks),
+    }));
   });
 }
 

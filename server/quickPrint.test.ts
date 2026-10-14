@@ -123,3 +123,18 @@ test("quick print settings, attention queue, and drop folder", async () => {
   const queued = await storage.listJobs({ limit: 20, offset: 0, attention: true });
   assert.equal(queued.jobs.some((job) => job.filename === "from-sales.docx" && job.quickLight === "red"), true);
 });
+
+test("utf-8 pipe chunks keep the times sign and the en dash", async () => {
+  const { decodeChildText } = await import("./pythonChildEnv.ts");
+  const text = "Before 1024×1536 px – product 210×297 mm.";
+  const bytes = Buffer.from(text, "utf8");
+  const chunks: Buffer[] = [];
+  for (let index = 0; index < bytes.length; index += 3) {
+    chunks.push(Buffer.from(bytes.subarray(index, index + 3)));
+  }
+  const joined = decodeChildText(chunks);
+  assert.equal(joined, text);
+  assert.equal(joined.includes("\uFFFD"), false);
+  assert.equal(joined.includes("×"), true);
+  assert.equal(joined.includes("–"), true);
+});

@@ -900,6 +900,17 @@ def _fill_from_paper(plate: np.ndarray, erase: np.ndarray) -> np.ndarray:
     return out
 
 
+def _shared_ink(left: dict, right: dict) -> int:
+    """Pixels in both components. The overlap is the crossing of the two boxes."""
+    x0 = max(int(left["x"]), int(right["x"]))
+    y0 = max(int(left["y"]), int(right["y"]))
+    x1 = min(int(left["x"]) + int(left["w"]), int(right["x"]) + int(right["w"]))
+    y1 = min(int(left["y"]) + int(left["h"]), int(right["y"]) + int(right["h"]))
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    return int(np.count_nonzero(left["pixels"][y0:y1, x0:x1] & right["pixels"][y0:y1, x0:x1]))
+
+
 def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool:
     """True when the trace merged two letters, split one, or changed a letter's shape.
 
@@ -932,7 +943,7 @@ def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool
     for part in drawn:
         covered = []
         for glyph in source:
-            shared = int(np.count_nonzero(part["pixels"] & glyph["pixels"]))
+            shared = _shared_ink(part, glyph)
             if shared >= 0.45 * glyph["area"] and shared >= 0.15 * part["area"]:
                 covered.append(glyph)
         if len(covered) < 2:
@@ -946,7 +957,7 @@ def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool
     for glyph in source:
         hits = []
         for part in drawn:
-            shared = int(np.count_nonzero(part["pixels"] & glyph["pixels"]))
+            shared = _shared_ink(part, glyph)
             if shared >= 0.25 * part["area"] and shared >= 0.20 * glyph["area"]:
                 hits.append((part, shared))
         if len(hits) < 2:
@@ -974,7 +985,7 @@ def _glyph_structure_fails(source_mask: np.ndarray, painted: np.ndarray) -> bool
         for glyph in ordered_source:
             best = 0.0
             for part in ordered_drawn:
-                shared = int(np.count_nonzero(glyph["pixels"] & part["pixels"]))
+                shared = _shared_ink(glyph, part)
                 if shared <= 0:
                     continue
                 x0 = max(0, min(glyph["x"], part["x"]))
@@ -2321,12 +2332,13 @@ def _judge_many(pairs: list, plate_ppi: float) -> list:
     """Score every region at once. One process per core, because painting holds the lock.
 
     Fork shares the crops. Windows has no fork, so a fresh process pool is
-    started instead. Threads do not overlap this paint. A pool that cannot
-    start scores in order.
+    started instead. The pool is stopped as soon as the scores are back. Waiting
+    for those workers to finish exiting was several seconds on a full plate.
     """
     if len(pairs) < 4 or _workers() <= 1:
         return [_judge_pending(item, paths, plate_ppi) for item, paths in pairs]
     workers = min(_workers(), len(pairs))
+    pool = None
     try:
         import multiprocessing as mp
 
@@ -2335,15 +2347,23 @@ def _judge_many(pairs: list, plate_ppi: float) -> list:
             _JUDGE_PAIRS = pairs
             _JUDGE_PPI = float(plate_ppi)
             ctx = mp.get_context("fork")
-            with ctx.Pool(processes=workers) as pool:
-                return pool.map(_judge_index, range(len(pairs)), chunksize=1)
+            pool = ctx.Pool(processes=workers)
+            return pool.map(_judge_index, range(len(pairs)), chunksize=1)
         ctx = mp.get_context("spawn")
         payloads = [(item, paths, float(plate_ppi)) for item, paths in pairs]
-        with ctx.Pool(processes=workers) as pool:
-            return pool.map(_judge_payload, payloads, chunksize=max(1, len(payloads) // (workers * 2)))
+        pool = ctx.Pool(processes=workers)
+        return pool.map(_judge_payload, payloads, chunksize=max(1, len(payloads) // (workers * 2)))
     except Exception as exc:
         sys.stderr.write(f"[vector-trace] region pool fell back ({str(exc)[:160]})\n")
         return [_judge_pending(item, paths, plate_ppi) for item, paths in pairs]
+    finally:
+        if pool is not None:
+            pool.terminate()
+            for proc in list(getattr(pool, "_pool", None) or []):
+                try:
+                    proc.join(0.05)
+                except Exception:
+                    pass
 
 
 def trace_fitted(
@@ -2679,6 +2699,8 @@ def _trace(bgr, trim_w, trim_h, output_pdf, bleed_mm, progress, blocks, started,
             "ppi": int(placed.get("ppi") or MIN_PPI),
             "plate": [int(plate.shape[0]), int(plate.shape[1])],
         },
+        "edges": list((placed or {}).get("edges") or []),
+        "shape": dict((placed or {}).get("shape") or {}),
     }
 
 
@@ -5196,7 +5218,11 @@ def _shift_group(group, dx: float, dy: float):
 
 
 def _potrace_placed(bitmaps: list) -> list:
-    """Paths in each bitmap's own pixel space. One process traces the page."""
+    """Paths in each bitmap's own pixel space. One process traces the page.
+
+    Splitting a page into shorter stacks was slower: the curves are the same,
+    and the extra processes cost more than the single trace.
+    """
     results = [[] for _ in bitmaps]
     usable = [
         index for index, bitmap in enumerate(bitmaps)
