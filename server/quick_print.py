@@ -556,14 +556,42 @@ def _write_before(src: str, dest: str) -> bool:
         return False
 
 
+def _seed_pixel_page_ink(press_path: str) -> None:
+    """Remember ink from a small render so the checklist does not decode the whole plate."""
+    try:
+        import pymupdf as fitz
+
+        from extra_checks import _sampled_ink, remember_press_ink
+
+        doc = fitz.open(press_path)
+        try:
+            if doc.page_count < 1:
+                return
+            facts = {"max_tac": 0.0, "k90": 0, "k_only": 0, "small_rich": False, "small_k": False}
+            _sampled_ink(doc[0], 0.5, facts)
+            facts["small_k"] = facts["k_only"] > 30
+            facts["small_rich"] = bool(facts["small_rich"] or (facts["k90"] > 30 and facts["k_only"] == 0))
+            remember_press_ink(press_path, facts)
+        finally:
+            doc.close()
+    except Exception:
+        return
+
+
+def press_saved_for_rebleed(press_ok: bool, light: str = "green") -> bool:
+    """A finished press file stays available for change-bleed, including a red light."""
+    return bool(press_ok) and str(light or "") in ("green", "amber", "red")
+
+
+def _names_edges(line: str) -> bool:
+    low = str(line or "").lower()
+    return low.startswith("bleed:") and sum(side in low for side in ("top", "bottom", "left", "right")) >= 2
+
+
 def _record_bleed_note(decisions: list, engine, extra_edges=None) -> None:
     """Put the per-edge automatic method on every card that built or kept bleed."""
     from press_ready_engine import bleed_method_sentence
 
-    if any(str(line).startswith("Bleed:") for line in decisions):
-        if isinstance(engine, dict) and not engine.get("bleedNote"):
-            engine["bleedNote"] = next(str(line) for line in decisions if str(line).startswith("Bleed:"))
-        return
     edges = []
     sentence = ""
     if isinstance(engine, dict):
@@ -571,13 +599,26 @@ def _record_bleed_note(decisions: list, engine, extra_edges=None) -> None:
         edges = list(engine.get("edges") or [])
     if not edges and extra_edges:
         edges = list(extra_edges)
-    if not sentence:
-        sentence = bleed_method_sentence(edges)
+    if not _names_edges(sentence):
+        built = bleed_method_sentence(edges)
+        if built:
+            sentence = built
+    if not _names_edges(sentence):
+        for line in decisions:
+            if _names_edges(line):
+                sentence = str(line)
+                break
     if not sentence:
         return
     if isinstance(engine, dict):
         engine["bleedNote"] = sentence
-    if sentence not in decisions:
+    replaced = False
+    for index, line in enumerate(decisions):
+        if str(line).startswith("Bleed:"):
+            decisions[index] = sentence
+            replaced = True
+            break
+    if not replaced and sentence not in decisions:
         decisions.append(sentence)
 
 
@@ -1590,6 +1631,66 @@ def _boxes_mm(path: str) -> dict:
         doc.close()
 
 
+def _stamp_fogra39(path: str) -> None:
+    """Tag a finished press file with the coated FOGRA39 output intent."""
+    try:
+        import pikepdf
+
+        from generate_icc_profile import get_icc_profile_path
+
+        with open(get_icc_profile_path(), "rb") as handle:
+            icc_data = handle.read()
+        pdf = pikepdf.open(path, allow_overwriting_input=True)
+        try:
+            icc_stream = pikepdf.Stream(pdf, icc_data)
+            icc_stream["/N"] = 4
+            pdf.Root["/OutputIntents"] = pikepdf.Array([
+                pikepdf.Dictionary({
+                    "/Type": pikepdf.Name("/OutputIntent"),
+                    "/S": pikepdf.Name("/GTS_PDFX"),
+                    "/OutputConditionIdentifier": pikepdf.String("FOGRA39"),
+                    "/RegistryName": pikepdf.String("http://www.color.org"),
+                    "/Info": pikepdf.String("Coated FOGRA39 (ISO 12647-2:2004)"),
+                    "/DestOutputProfile": icc_stream,
+                })
+            ])
+            pdf.save(path)
+        finally:
+            pdf.close()
+    except Exception:
+        return
+
+
+def _compile_native_pixels(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
+    """Build a pixels-as-points page in this process. The full compile starts another Python."""
+    from press_ready_engine import compile_vector_press
+
+    built = compile_vector_press(src, output_pdf, trim_w, trim_h, BLEED_MM)
+    if not built.get("used"):
+        return {"success": False}
+    engine = dict(built.get("report") or {})
+    _stamp_fogra39(output_pdf)
+    bleed_quality = None
+    try:
+        from bleed_builder import check_press_pdf
+
+        bleed_quality = check_press_pdf(output_pdf, trim_w, trim_h, BLEED_MM)
+    except Exception as exc:
+        bleed_quality = {
+            "ok": False,
+            "pages": [],
+            "note": (
+                "The bleed check could not read the press file "
+                f"({str(exc)[:120]}). Check the edges before printing."
+            ),
+        }
+    if isinstance(bleed_quality, dict) and not bleed_quality.get("ok"):
+        engine["passed"] = False
+        engine["status"] = "needs-attention"
+        engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
+    return {"success": True, "pressEngine": engine, "bleedQuality": bleed_quality}
+
+
 def _compile(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
     script = os.path.join(os.path.dirname(__file__), "compile_press_pdf.py")
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -2187,7 +2288,11 @@ def make_print_ready(
         decisions.append("Automatic bleed added the 5 mm edge. The trim sits 5 mm inside that edge.")
         _record_bleed_note(decisions, engine, built_edges)
     else:
-        compiled = _compile(work_path, press_path, trim_w, trim_h)
+        compiled = {}
+        if native_pixels and ext == ".pdf":
+            compiled = _compile_native_pixels(work_path, press_path, trim_w, trim_h)
+        if not compiled.get("success"):
+            compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}
         press_ok = bool(compiled.get("success") and os.path.exists(press_path) and os.path.getsize(press_path) > 1000)
         edges = list(engine.get("edges") or []) if isinstance(engine, dict) else []
@@ -2253,6 +2358,10 @@ def make_print_ready(
             facts["checklist"] = checklist
         except Exception:
             checklist = None
+    if native_pixels and press_ok and os.path.isfile(press_path):
+        # The plate is one A4 picture. A full-pixel ink walk decodes it again
+        # and is what pushed this make past half a minute on a laptop.
+        _seed_pixel_page_ink(press_path)
     if os.path.isfile(src_path):
         try:
             from twenty_five import assess as assess_points
@@ -2317,19 +2426,24 @@ def make_print_ready(
         except Exception:
             pass
     if press_ok and os.path.isfile(press_path):
-        try:
-            from bleed_builder import check_press_pdf
+        cached_bleed = compiled.get("bleedQuality") if isinstance(compiled, dict) else None
+        if isinstance(cached_bleed, dict) and "ok" in cached_bleed:
+            # The compile already measured the edge. A second read decodes the plate again.
+            facts["bleedQuality"] = cached_bleed
+        else:
+            try:
+                from bleed_builder import check_press_pdf
 
-            facts["bleedQuality"] = check_press_pdf(press_path, trim_w, trim_h, BLEED_MM)
-        except Exception as exc:
-            facts["bleedQuality"] = {
-                "ok": False,
-                "pages": [],
-                "note": (
-                    "The bleed check could not read the press file "
-                    f"({str(exc)[:120]}). Check the edges before printing."
-                ),
-            }
+                facts["bleedQuality"] = check_press_pdf(press_path, trim_w, trim_h, BLEED_MM)
+            except Exception as exc:
+                facts["bleedQuality"] = {
+                    "ok": False,
+                    "pages": [],
+                    "note": (
+                        "The bleed check could not read the press file "
+                        f"({str(exc)[:120]}). Check the edges before printing."
+                    ),
+                }
         if facts["bleedQuality"].get("note"):
             decisions.append(str(facts["bleedQuality"]["note"]))
     info = decide_light(facts)
@@ -2345,7 +2459,8 @@ def make_print_ready(
     result["pressEngine"] = engine if isinstance(engine, dict) else None
     if facts.get("bleedQuality"):
         result["bleedQuality"] = facts["bleedQuality"]
-    if press_ok and (info["light"] != "red" or info.get("checklistRed")):
+    if press_saved_for_rebleed(press_ok, str(info.get("light") or "")):
+        # A red light still has a press file. Change-bleed reads that file.
         result["pressPath"] = press_path
         try:
             boxes = _boxes_mm(press_path)
@@ -2388,6 +2503,7 @@ def make_print_ready(
         if result.get("pressPath"):
             if not any("cmyk" in str(line).lower() for line in decisions):
                 decisions.append("The press file was converted to CMYK.")
+            _record_bleed_note(decisions, engine if isinstance(engine, dict) else {}, None)
             result["decisions"] = decisions
             worry = list(concerns)
             if info.get("light") in ("amber", "red"):
@@ -2395,7 +2511,14 @@ def make_print_ready(
                     text = str(line)
                     if text and text not in worry:
                         worry.append(text)
-            result["customerMessage"] = customer_message(decisions, worry)
+            note = str(engine.get("bleedNote") or "") if isinstance(engine, dict) else ""
+            if not _names_edges(note):
+                for line in decisions:
+                    if _names_edges(line):
+                        note = str(line)
+                        break
+            result["bleedNote"] = note or result.get("bleedNote") or ""
+            result["customerMessage"] = customer_message(decisions, worry, note)
         else:
             result["customerMessage"] = str(info.get("clientMessage") or "")
     except Exception:

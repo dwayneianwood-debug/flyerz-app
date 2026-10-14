@@ -217,11 +217,16 @@ class FinalRoundTest(unittest.TestCase):
             src, os.path.join(folder, "card"), false_w, false_h, "custom", "Custom", filename="pixels.pdf",
         )
         card_elapsed = time.perf_counter() - card_started
-        self.assertLess(card_elapsed, 90.0, f"quick print took {card_elapsed:.1f}s")
+        self.assertLess(card_elapsed, 30.0, f"quick print took {card_elapsed:.1f}s")
         self.assertAlmostEqual(float(result.get("trimW") or 0), 210.0, delta=0.6)
         self.assertAlmostEqual(float(result.get("trimH") or 0), 297.0, delta=0.6)
         text = " ".join(str(line) for line in (result.get("decisions") or []))
         self.assertIn("matched to A4", text)
+        note = str(result.get("bleedNote") or "")
+        self.assertTrue(note.startswith("Bleed:"), note)
+        for side in ("top", "bottom", "left", "right"):
+            self.assertIn(side, note.lower())
+        self.assertIn(note, str(result.get("customerMessage") or ""))
         self.assertNotIn("874.9", text)
         self.assertNotIn("1237.5", text)
         print(f"[TIME] e6e73dae compile {elapsed:.1f}s card {card_elapsed:.1f}s", flush=True)

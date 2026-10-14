@@ -523,10 +523,12 @@ def _rgb_hits(path: str) -> list[str]:
                 if xref in margin:
                     continue
                 try:
-                    info = doc.extract_image(xref)
+                    from green_gate import _space_and_tac
+
+                    space, _tac = _space_and_tac(doc, xref)
                 except Exception:
                     continue
-                if int(info.get("colorspace") or 0) == 3:
+                if space == 3:
                     hits.append(f"page {index + 1} has an RGB image")
             raw = page.read_contents().decode("latin1", "replace")
             if re.search(r"\b(?:rg|RG)\b|DeviceRGB|CalRGB", raw):
@@ -676,6 +678,12 @@ def _text_ink(path: str) -> list[dict]:
     found = []
     try:
         for page in doc:
+            # A picture page has no type. Building the span map walks the whole plate.
+            try:
+                if not (page.get_text("text") or "").strip():
+                    continue
+            except Exception:
+                pass
             spans = []
             try:
                 data = page.get_text("rawdict") or {}
@@ -1013,6 +1021,11 @@ def _span_sizes(path: str) -> list[dict]:
     rows = []
     try:
         for page in doc:
+            try:
+                if not (page.get_text("text") or "").strip():
+                    continue
+            except Exception:
+                pass
             try:
                 data = page.get_text("rawdict") or {}
             except Exception:

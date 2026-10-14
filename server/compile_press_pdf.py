@@ -1655,12 +1655,10 @@ def main():
                     sys.stderr.write(f"PROFILE: [COMPILE] Image Bleed Generation took {(time.time() - _prof_bleed_t0)*1000:.1f}ms\n")
                 if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("automaticChoice"):
                     compile_stats["automatic_bleed"] = _compile_heal_meta["automaticChoice"]
-                if isinstance(_compile_heal_meta, dict) and _compile_heal_meta.get("edgeNotes"):
+                if isinstance(_compile_heal_meta, dict) and (_compile_heal_meta.get("edges") or _compile_heal_meta.get("edgeNotes")):
+                    from press_ready_engine import apply_edge_meta
+
                     engine = compile_stats.get("press_engine") or {}
-                    engine["edges"] = [
-                        {"side": note.split(":", 1)[0].lower(), "method": "auto", "note": note}
-                        for note in _compile_heal_meta["edgeNotes"]
-                    ]
                     if _compile_heal_meta.get("contentPullAmber"):
                         rescue = engine.get("rescue") or {}
                         rescue["amber"] = True
@@ -1668,7 +1666,7 @@ def main():
                             "Some text or a logo is still inside the 3 mm safe zone. It was brought in by 2 mm. Please check it before printing."
                         )
                         engine["rescue"] = rescue
-                    compile_stats["press_engine"] = engine
+                    compile_stats["press_engine"] = apply_edge_meta(engine, _compile_heal_meta)
 
             live_proof_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir=FAI_TEMP_DIR).name
             _tmp_chain.append(live_proof_tmp)
@@ -2031,14 +2029,13 @@ def main():
                                 )
                             if isinstance(_pdf_heal_meta, dict) and _pdf_heal_meta.get("automaticChoice"):
                                 compile_stats["automatic_bleed"] = _pdf_heal_meta["automaticChoice"]
-                            if isinstance(_pdf_heal_meta, dict) and _pdf_heal_meta.get("edgeNotes"):
+                            if isinstance(_pdf_heal_meta, dict) and (_pdf_heal_meta.get("edges") or _pdf_heal_meta.get("edgeNotes")):
+                                from press_ready_engine import apply_edge_meta
+
                                 engine = compile_stats.setdefault("press_engine", {})
-                                engine["edges"] = [
-                                    {"side": note.split(":", 1)[0].lower(), "method": "auto", "note": note}
-                                    for note in _pdf_heal_meta["edgeNotes"]
-                                ]
                                 if _pdf_heal_meta.get("rescue"):
                                     engine["rescue"] = _pdf_heal_meta["rescue"]
+                                compile_stats["press_engine"] = apply_edge_meta(engine, _pdf_heal_meta)
                             del img_bgr
             
                             if page_num == 0 and live_proof_tmp is None:

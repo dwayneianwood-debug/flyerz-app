@@ -7451,31 +7451,51 @@ def auto_resolve_safe_zone(img_bgr: np.ndarray, target_bleed_px: int = 59,
         if out.shape[0] == expect_h and out.shape[1] == expect_w:
             out, edge_methods = finish_raster_bleed(out[:, :, :3] if out.shape[2] > 3 else out, bleed_px_use)
             meta["edgeMethods"] = {side: edge_methods.get(side) for side in ("top", "bottom", "left", "right")}
-            spoken = {
-                "mirror": "mirrored the cleaned edge",
-                "replicate": "repeated the cleaned edge",
-                "stretch": "stretched the cleaned edge",
-                "bgExtract": "extended the cleaned background",
-                "colourBorder": "filled a colour border from the cleaned edge",
-                "gradient_extrapolate": "continued the gradient from the cleaned edge",
-                "frequency_separated": "continued the cleaned edge",
-                "upscale": "upscaled from the cleaned edge",
-                "ai_outpaint": "outpainted from the cleaned edge",
-            }
-            base = spoken.get(internal, "continued the cleaned edge colour")
-            notes = []
-            for side in ("top", "bottom", "left", "right"):
-                method = edge_methods.get(side) or "replicate"
-                if method == "mirror-amber":
-                    text = "mirrored the cleaned edge. Please check it before printing."
-                    meta["contentPullAmber"] = True
-                elif method == "mirror" and internal != "mirror":
-                    text = "mirrored the cleaned edge"
-                else:
-                    text = base
-                notes.append(f"{side.capitalize()}: {text}.")
-            meta["edgeNotes"] = notes
+            meta["edges"], meta["edgeNotes"] = _spoken_edges(internal, edge_methods, meta)
+        else:
+            meta["edges"], meta["edgeNotes"] = _spoken_edges(internal, {}, meta)
+    else:
+        meta["edges"], meta["edgeNotes"] = _spoken_edges(internal, {}, meta)
     return out, meta
+
+
+def _spoken_edges(internal: str, edge_methods: dict, meta: dict) -> tuple[list, list]:
+    """One method line per edge, including when the painter returns the trim alone."""
+    spoken = {
+        "mirror": "mirrored the cleaned edge",
+        "replicate": "repeated the cleaned edge",
+        "stretch": "stretched the cleaned edge",
+        "bgExtract": "extended the cleaned background",
+        "colourBorder": "filled a colour border from the cleaned edge",
+        "gradient_extrapolate": "continued the gradient from the cleaned edge",
+        "frequency_separated": "continued the cleaned edge",
+        "upscale": "upscaled from the cleaned edge",
+        "ai_outpaint": "outpainted from the cleaned edge",
+    }
+    kind = {
+        "mirror": "photo",
+        "gradient_extrapolate": "gradient",
+        "frequency_separated": "pattern",
+    }.get(internal, "")
+    base = spoken.get(internal, "continued the cleaned edge colour")
+    rows = []
+    notes = []
+    for side in ("top", "bottom", "left", "right"):
+        method = (edge_methods or {}).get(side) or ("mirror" if internal == "mirror" else "replicate")
+        if method == "mirror-amber":
+            text = "mirrored the cleaned edge. Please check it before printing."
+            stored = "mirror"
+            meta["contentPullAmber"] = True
+        elif method == "mirror":
+            text = "mirrored the cleaned edge"
+            stored = "mirror"
+        else:
+            text = base
+            stored = "replicate" if method in ("replicate", "colour", "colourBorder") else method
+        note = f"{side.capitalize()}: {text}."
+        notes.append(note)
+        rows.append({"side": side, "method": stored, "kind": kind if stored == "mirror" or internal == method else kind, "note": note})
+    return rows, notes
 
 
 def _expand_each_edge(img: np.ndarray, strategy: str, bleed_px: int, dpi: float) -> np.ndarray:

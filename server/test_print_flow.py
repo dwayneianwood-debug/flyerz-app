@@ -13,7 +13,7 @@ from customer_message import customer_message  # noqa: E402
 from intake_check import assess_intake, severity_for  # noqa: E402
 from job_progress import write_progress  # noqa: E402
 from page_zoom import adjusted_zoom  # noqa: E402
-from quick_print import extra_bleed_lines, incoming_bleed_line  # noqa: E402
+from quick_print import extra_bleed_lines, incoming_bleed_line, press_saved_for_rebleed  # noqa: E402
 from bleed_reapply import bleed_sentence  # noqa: E402
 
 
@@ -109,6 +109,22 @@ class PrintFlowTests(unittest.TestCase):
         self.assertIn("strongly recommend larger text", settled)
         self.assertIn("Please have a look at this: Small text", worried)
         self.assertIn("Low resolution", worried)
+        repeated = customer_message(
+            ["Bleed: top/bottom flat colour, left/right mirrored photo", "The press file was converted to CMYK."],
+            [
+                "3. Resolution / DPI Validation: About 72 ppi.",
+                "3b. AI Resolution Enhancement: Upscale was not applied in this check.",
+                "Resolution / DPI Validation: About 72 ppi.",
+                "AI Resolution Enhancement: Upscale was not applied in this check.",
+                "Small text: we strongly recommend larger text.",
+            ],
+        )
+        self.assertEqual(repeated.lower().count("please have a look at this: resolution:"), 1)
+        self.assertEqual(repeated.lower().count("ai resolution enhancement"), 1)
+        self.assertNotIn("3b.", repeated)
+        self.assertNotIn("3. Resolution", repeated)
+        self.assertIn("Bleed: top/bottom flat colour, left/right mirrored photo", repeated)
+        self.assertIn("strongly recommend larger text", repeated)
 
     def test_each_fix_has_its_own_percent(self):
         folder = tempfile.mkdtemp(prefix="flow-progress-")
@@ -129,19 +145,119 @@ class PrintFlowTests(unittest.TestCase):
         from press_ready_engine import write_cmyk_pdf
 
         folder = tempfile.mkdtemp(prefix="rebleed-")
-        art = np.zeros((80, 120, 3), dtype=np.uint8)
-        art[:, :] = (30, 90, 200)
-        art[:, :8] = (10, 10, 10)
+        bleed = max(1, int(round(5.0 / 25.4 * 300.0)))
+        trim_w = max(1, int(round(40.0 / 25.4 * 300.0)))
+        trim_h = max(1, int(round(30.0 / 25.4 * 300.0)))
+        art = np.zeros((trim_h + 2 * bleed, trim_w + 2 * bleed, 3), dtype=np.uint8)
+        art[:, :] = (20, 20, 20)
+        yy, xx = np.mgrid[0:trim_h, 0:trim_w]
+        art[bleed:bleed + trim_h, bleed:bleed + trim_w, 0] = (xx * 3) % 251
+        art[bleed:bleed + trim_h, bleed:bleed + trim_w, 1] = (yy * 5) % 251
+        art[bleed:bleed + trim_h, bleed:bleed + trim_w, 2] = 90
         press = os.path.join(folder, "press.pdf")
         write_cmyk_pdf(art, press, 40, 30, 5.0)
+        before, before_media, before_cs = _trim_snapshot(press)
         changed = reapply_bleed(press, "mirror", 40, 30, folder)
         self.assertTrue(changed["ok"])
         self.assertIn("mirrored", changed["bleedNote"])
         self.assertGreater(os.path.getsize(changed["pressPath"]), 1000)
+        after, after_media, after_cs = _trim_snapshot(changed["pressPath"])
+        self.assertEqual(before.shape, after.shape)
+        self.assertEqual(before_media, after_media)
+        delta = float(np.abs(before.astype(np.int16) - after.astype(np.int16)).mean())
+        print(f"[TRIM] change-bleed mean delta {delta:.4f} media {after_media} colour {before_cs} -> {after_cs}", flush=True)
+        self.assertLess(delta, 1.0, f"trim mean delta {delta:.3f}")
+        if any("CMYK" in space.upper() for space in before_cs):
+            self.assertTrue(any("CMYK" in space.upper() for space in after_cs), after_cs)
+        self.assertFalse(any("RGB" in space.upper() for space in after_cs), after_cs)
+        import pymupdf as fitz
+
+        from green_gate import _space_and_tac
+
+        plate = fitz.open(press)
+        try:
+            xref = int(plate[0].get_images()[0][0])
+            info = plate.extract_image(xref)
+            space, tac = _space_and_tac(plate, xref)
+        finally:
+            plate.close()
+        self.assertEqual(space, int(info.get("colorspace") or 0))
+        self.assertGreater(tac, 1.0)
+        self.assertLess(tac, 400.0)
+
+    def test_raster_and_press_edges_name_each_side(self):
+        import cv2
+
+        from press_ready_engine import bleed_method_sentence, compile_raster_canvas
+        from quick_print import _record_bleed_note
+
+        root = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures")
+        names = [
+            os.path.join(root, "ian_2026-10-13", "rosanna_olive_flyer.jpg"),
+            os.path.join(root, "ian_2026-10-13", "urbanflex_gym_flyer.jpeg"),
+            os.path.join(root, "catch_fire", "src.jpg"),
+        ]
+        for path in names:
+            image = cv2.imread(path, cv2.IMREAD_COLOR)
+            name = os.path.basename(path)
+            self.assertIsNotNone(image, name)
+            _canvas, report = compile_raster_canvas(image, 148.0, 210.0, 5.0, None)
+            sentence = str(report.get("bleedNote") or "")
+            self.assertTrue(sentence.startswith("Bleed:"), f"{name}: {sentence}")
+            for side in ("top", "bottom", "left", "right"):
+                self.assertIn(side, sentence, name)
+        self.assertTrue(press_saved_for_rebleed(True, "red"))
+        self.assertFalse(press_saved_for_rebleed(False, "red"))
+        decisions = []
+        engine = {"edges": report.get("edges") or [], "headline": "Ready for press"}
+        _record_bleed_note(decisions, engine)
+        self.assertTrue(str(engine.get("bleedNote") or "").startswith("Bleed:"))
+        message = customer_message(decisions, ["3. Resolution / DPI Validation: About 90 ppi."], engine["bleedNote"])
+        self.assertIn(engine["bleedNote"], message)
+        self.assertIn("Please have a look at this: Resolution:", message)
+        self.assertNotIn("3. Resolution", message)
+        built = bleed_method_sentence([
+            {"side": "top", "method": "replicate", "kind": "", "note": "Top: continued the cleaned edge colour."},
+            {"side": "bottom", "method": "replicate", "kind": "", "note": "Bottom: continued the cleaned edge colour."},
+            {"side": "left", "method": "mirror", "kind": "photo", "note": "Left: mirrored the cleaned edge."},
+            {"side": "right", "method": "mirror", "kind": "photo", "note": "Right: mirrored the cleaned edge."},
+        ])
+        self.assertIn("top/bottom", built)
+        self.assertIn("left/right mirrored photo", built)
+        from press_ready_engine import apply_edge_meta
+
+        painted = {}
+        apply_edge_meta(painted, {"edges": [
+            {"side": "top", "method": "replicate", "kind": "", "note": "Top: continued the cleaned edge colour."},
+            {"side": "bottom", "method": "replicate", "kind": "", "note": "Bottom: continued the cleaned edge colour."},
+            {"side": "left", "method": "mirror", "kind": "photo", "note": "Left: mirrored the cleaned edge."},
+            {"side": "right", "method": "mirror", "kind": "photo", "note": "Right: mirrored the cleaned edge."},
+        ]})
+        self.assertIn("top/bottom", str(painted.get("bleedNote") or ""))
+        self.assertIn("left/right mirrored photo", str(painted.get("bleedNote") or ""))
 
     def test_change_bleed_sentence_names_one_method(self):
         self.assertEqual(bleed_sentence("mirror"), "Bleed: top/bottom/left/right mirrored.")
         self.assertIn("pixel-drift", bleed_sentence("stretch"))
+
+
+def _trim_snapshot(path: str):
+    import pymupdf as fitz
+    import numpy as np
+
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        trim = page.trimbox if page.trimbox.width > 2 else page.rect
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=trim, alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3].copy()
+        media = (round(float(page.rect.width), 2), round(float(page.rect.height), 2))
+        spaces = []
+        for item in page.get_images(full=True) or []:
+            spaces.append(str(item[5]) if len(item) > 5 else "")
+        return rgb, media, tuple(spaces)
+    finally:
+        doc.close()
 
 
 if __name__ == "__main__":

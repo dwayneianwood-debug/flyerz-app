@@ -991,7 +991,7 @@ def compile_raster_canvas(
                             edge["note"] = f"{side.capitalize()}: mirrored the cleaned edge. Please check it before printing."
                 _finish_resolution(report, src_w, src_h, trim_w_mm, trim_h_mm, analysis)
                 report["bitmapProblems"] = []
-                return topped, report
+                return topped, attach_bleed_note(report)
     else:
         trim = cover_scale(plane, trim_w_px, trim_h_px)
 
@@ -3666,6 +3666,64 @@ def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, 
     return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, "none"
 
 
+def _press_pixel_page(src_path: str, out_path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float, snapped: dict) -> dict:
+    """One native-pixel read of a pixels-as-points page, then the raster bleed."""
+    import pymupdf as fitz
+
+    try:
+        doc = fitz.open(src_path)
+    except Exception:
+        return {"used": False}
+    try:
+        if doc.page_count < 1:
+            return {"used": False}
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False, colorspace=fitz.csRGB)
+        rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return {"used": False}
+    finally:
+        doc.close()
+    try:
+        canvas, report = compile_raster_canvas(bgr, trim_w_mm, trim_h_mm, bleed_mm, 300.0)
+        write_cmyk_pdf(canvas[:, :, :3], out_path, trim_w_mm, trim_h_mm, bleed_mm)
+    except Exception as exc:
+        sys.stderr.write(f"[COMPILE] Pixel-page press skipped: {exc}\n")
+        return {"used": False}
+    report["pixelsAsPoints"] = True
+    report["sizeNote"] = (
+        f"The page stores a picture's pixels as points, so it was matched to {snapped.get('label')}."
+    )
+    report["contentKind"] = "raster"
+    attach_bleed_note(report)
+    return {"used": True, "report": report, "path": out_path, "pageCount": 1}
+
+
+def apply_edge_meta(engine: dict, meta: dict) -> dict:
+    """Copy per-edge methods from a bleed painter onto the press report."""
+    if not isinstance(engine, dict) or not isinstance(meta, dict):
+        return engine
+    if meta.get("edges"):
+        engine["edges"] = list(meta["edges"])
+    elif meta.get("edgeNotes"):
+        methods = meta.get("edgeMethods") or {}
+        engine["edges"] = [
+            {
+                "side": str(note).split(":", 1)[0].strip().lower(),
+                "method": str(methods.get(str(note).split(":", 1)[0].strip().lower()) or "replicate"),
+                "kind": "",
+                "note": str(note),
+            }
+            for note in meta["edgeNotes"]
+            if ":" in str(note)
+        ]
+    if meta.get("rescue") and not engine.get("rescue"):
+        engine["rescue"] = meta["rescue"]
+    attach_bleed_note(engine)
+    return engine
+
+
 def compile_vector_press(
     src_path: str,
     out_path: str,
@@ -3687,6 +3745,12 @@ def compile_vector_press(
     if snapped:
         trim_w_mm = float(snapped["widthMm"])
         trim_h_mm = float(snapped["heightMm"])
+        # The page is already a 300 dpi picture stored as points. Building it
+        # through Ghostscript decodes that picture over and over. One read,
+        # then the same raster bleed as a JPG, still lands on the catalog size.
+        fast = _press_pixel_page(src_path, out_path, trim_w_mm, trim_h_mm, bleed_mm, snapped)
+        if fast.get("used"):
+            return fast
 
     ext = os.path.splitext(src_path)[1].lower()
     open_path = src_path
