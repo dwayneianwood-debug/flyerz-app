@@ -5,6 +5,7 @@ import { BLEED_STRATEGY_IDS } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { FlowDropzone } from "./flow-dropzone";
+import { editOutcomes, isPictureFile } from "@/lib/edit-outcomes";
 
 export type FlowTab = "ready" | "manual";
 export type FlowStage = "upload" | "check" | "progress" | "result";
@@ -88,6 +89,7 @@ export function PrintFlowView(props: {
 }) {
   const openReds = props.items.filter((item) => item.severity === "red" && !props.acknowledged[item.id]);
   const makeDisabled = props.busy || openReds.length > 0;
+  const pictureOnly = isPictureFile(props.fileLabel);
   return (
     <div data-testid="print-flow">
       {props.stage === "upload" && (
@@ -170,13 +172,18 @@ export function PrintFlowView(props: {
             <p className="text-xs text-muted-foreground mt-1 mb-3">These run once, then the press file is made.</p>
             <label className="flex items-start gap-2 text-sm mb-3">
               <input type="checkbox" className="mt-1 h-5 w-5" checked={props.replicate} data-testid="option-replicate" onChange={(event) => props.onReplicate(event.target.checked)} />
-              <span>Replicate AI edit</span>
+              <span>AI enlarge (pictures only)</span>
             </label>
             <label className="flex items-start gap-2 text-sm mb-2">
-              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.cat} data-testid="option-cat" onChange={(event) => props.onCat(event.target.checked)} />
-              <span>Small time, date, or number edit</span>
+              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.cat && !pictureOnly} disabled={pictureOnly} data-testid="option-cat" onChange={(event) => props.onCat(event.target.checked)} />
+              <span className={pictureOnly ? "text-muted-foreground" : ""}>Small time, date, or number edit</span>
             </label>
-            {props.cat && (
+            <p className={`text-xs mb-2 ${pictureOnly ? "text-amber-700" : "text-muted-foreground"}`} data-testid="text-cat-hint">
+              {pictureOnly
+                ? "Not available: this is a picture file, so the text is part of the picture. Picture-only files need the editable file."
+                : "Only works on PDFs with editable text. Picture-only files need the editable file."}
+            </p>
+            {props.cat && !pictureOnly && (
               <input
                 aria-label="Time date or number edit"
                 className="w-full rounded-md border border-border px-3 py-2 text-sm mb-3"
@@ -233,10 +240,24 @@ function ResultScreen(props: {
   const revision = card.bleedRevision || 0;
   const message = card.customerMessage || card.clientMessage || "";
   const bleed = card.bleedNote || card.decisions.find((line) => line.startsWith("Bleed:")) || "";
+  const outcomes = editOutcomes(card.decisions);
   return (
     <Card className="p-5 border-2 border-primary/30" data-testid="card-print-result">
       <h1 className="text-2xl font-extrabold font-display">Print-ready artwork</h1>
       <p className="text-sm mt-1">{card.filename}{card.productLabel ? ` · ${card.productLabel}` : ""}</p>
+      {outcomes.length > 0 && (
+        <ul className="mt-3 space-y-2" data-testid="list-edit-outcomes">
+          {outcomes.map((line, index) => (
+            <li
+              key={index}
+              className={`rounded-md border px-3 py-2 text-sm font-semibold ${line.tone === "warn" ? "border-amber-300 bg-amber-50 text-amber-950" : "border-emerald-300 bg-emerald-50 text-emerald-950"}`}
+              data-testid={`edit-outcome-${line.tone}`}
+            >
+              {line.tone === "warn" ? "Not applied: " : "Done: "}{line.text}
+            </li>
+          ))}
+        </ul>
+      )}
       {bleed && <p className="mt-3 text-sm font-semibold" data-testid="text-result-bleed-note">{bleed}</p>}
       <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
         <figure>

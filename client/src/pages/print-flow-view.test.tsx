@@ -55,7 +55,7 @@ test("quick check stops on red and offers the options beside it", () => {
   assert.match(html, /Strong recommendation/);
   assert.match(html, /data-testid="ack-dpi"/);
   assert.match(html, /data-testid="panel-pre-fix"/);
-  assert.match(html, /Replicate AI edit/);
+  assert.match(html, /AI enlarge \(pictures only\)/);
   assert.match(html, /Small time, date, or number edit/);
   assert.match(html, /Upscale with AI/);
   assert.match(html, /Make file print ready/);
