@@ -50,6 +50,31 @@ def _office_item() -> dict:
     }
 
 
+def _border_near_cut(path: str) -> dict | None:
+    """Amber when a thin keyline sits on the outer edge. It cuts unevenly."""
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}:
+        return None
+    try:
+        import cv2
+
+        from quick_print import detect_edge_frame
+
+        bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if not detect_edge_frame(bgr):
+            return None
+    except Exception:
+        return None
+    return {
+        "id": "border-near-cut",
+        "num": "",
+        "name": "Border near the cut",
+        "detail": "A thin border sits on the cut and can print unevenly.",
+        "status": "warning",
+        "severity": "amber",
+    }
+
+
 def assess_intake(path: str, trim_w: float, trim_h: float) -> dict:
     ext = os.path.splitext(path or "")[1].lower()
     if ext in OFFICE:
@@ -86,6 +111,9 @@ def assess_intake(path: str, trim_w: float, trim_h: float) -> dict:
                     items.append(_item(row))
         except Exception:
             pass
+        border = _border_near_cut(path)
+        if border:
+            items.append(border)
     red = sum(1 for item in items if item["severity"] == "red")
     amber = sum(1 for item in items if item["severity"] == "amber")
     green = sum(1 for item in items if item["severity"] == "green")

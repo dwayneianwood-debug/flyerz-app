@@ -296,13 +296,10 @@ def place_plate(clean: np.ndarray, boxes: list, trim_w: float, trim_h: float, bl
     def mapper(x: float, y: float) -> tuple[float, float]:
         return paste_x + (float(x) / float(src_w)) * art_w, paste_y + (float(y) / float(src_h)) * art_h
 
-    from quick_print import TALL_PAD_PX
-
     def _pad_method(pad: int) -> str:
+        # This plate protects the artwork, so a gap is edge colour, not a mirror.
         if pad <= 0:
             return "kept"
-        if pad >= TALL_PAD_PX:
-            return "mirror"
         return "colour"
 
     methods = {

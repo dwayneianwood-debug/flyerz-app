@@ -678,13 +678,28 @@ def _page_points(path: str):
 
 
 def pixels_as_points_trim(path: str):
-    """Catalog product when a PDF page is a 300 dpi pixel count stored as points."""
+    """Catalog product when a PDF page is a 300 dpi pixel count stored as points.
+
+    A page that already has its own TrimBox is in physical points. An A2 sheet
+    with 10 mm of extra bleed is about the same point size as an A6 picture
+    stored as pixels, so the trim box has to win.
+    """
     if os.path.splitext(path)[1].lower() != ".pdf":
         return None
-    points = _page_points(path)
-    if not points:
-        return None
-    return _pixels_as_points_product(*points)
+    import pymupdf as fitz
+
+    doc = fitz.open(path)
+    try:
+        if doc.page_count < 1:
+            return None
+        page = doc[0]
+        media = page.mediabox
+        trim = page.trimbox
+        if abs(float(trim.width) - float(media.width)) >= 1.5 or abs(float(trim.height) - float(media.height)) >= 1.5:
+            return None
+        return _pixels_as_points_product(float(page.rect.width), float(page.rect.height))
+    finally:
+        doc.close()
 
 
 def _pixels_as_points_product(width_pt: float, height_pt: float):
@@ -1424,16 +1439,17 @@ def _extend_vertical(img, top: int, bottom: int, px_per_mm: float | None = None,
 
     top_part = None
     bottom_part = None
+    # A shape gap must continue the edge colour. The tall mirror repeats a
+    # photograph into vertical streaks, and that streak is inside the cut.
+    def pad_for(forward: bool, pad: int):
+        if pad >= TALL_PAD_PX and not protect_art:
+            return strong_pad(forward, pad, min(pad, height))
+        return short_pad(forward, pad)
+
     if top:
-        if top >= TALL_PAD_PX:
-            top_part = strong_pad(False, top, min(top, height))
-        else:
-            top_part = short_pad(False, top)
+        top_part = pad_for(False, top)
     if bottom:
-        if bottom >= TALL_PAD_PX:
-            bottom_part = strong_pad(True, bottom, min(bottom, height))
-        else:
-            bottom_part = short_pad(True, bottom)
+        bottom_part = pad_for(True, bottom)
     if top_part is not None:
         parts.append(top_part)
     parts.append(art)
@@ -1728,6 +1744,48 @@ def _stamp_fogra39(path: str) -> None:
         return
 
 
+def _file_dpi(path: str) -> float:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            dpi = image.info.get("dpi") or (0, 0)
+            return float((dpi[0] if isinstance(dpi, tuple) else dpi) or 0)
+    except Exception:
+        return 0.0
+
+
+def _compile_picture(img, output_pdf: str, trim_w: float, trim_h: float, embedded_dpi: float = 0.0) -> dict:
+    """Place a picture in this process. The per-line trace and the full compile are slower."""
+    from press_ready_engine import compile_raster_canvas, write_cmyk_pdf
+
+    canvas, report = compile_raster_canvas(
+        img, trim_w, trim_h, BLEED_MM, float(embedded_dpi) if embedded_dpi and embedded_dpi >= 150 else None,
+    )
+    write_cmyk_pdf(canvas[:, :, :3], output_pdf, trim_w, trim_h, BLEED_MM)
+    _stamp_fogra39(output_pdf)
+    engine = dict(report or {})
+    bleed_quality = None
+    try:
+        from bleed_builder import check_press_pdf
+
+        bleed_quality = check_press_pdf(output_pdf, trim_w, trim_h, BLEED_MM)
+    except Exception as exc:
+        bleed_quality = {
+            "ok": False,
+            "pages": [],
+            "note": (
+                "The bleed check could not read the press file "
+                f"({str(exc)[:120]}). Check the edges before printing."
+            ),
+        }
+    if isinstance(bleed_quality, dict) and not bleed_quality.get("ok"):
+        engine["passed"] = False
+        engine["status"] = "needs-attention"
+        engine["reason"] = bleed_quality.get("note") or "The bleed does not continue the artwork."
+    return {"success": True, "pressEngine": engine, "bleedQuality": bleed_quality}
+
+
 def _compile_native_pixels(src: str, output_pdf: str, trim_w: float, trim_h: float) -> dict:
     """Build a pixels-as-points page in this process. The full compile starts another Python."""
     from press_ready_engine import compile_vector_press
@@ -1875,6 +1933,129 @@ def _blank(light_info: dict, decisions: list, product: dict, quantity, notes: st
     }
 
 
+def detect_edge_frame(bgr) -> dict | None:
+    """A thin keyline on all four edges, or None when the edge is the artwork.
+
+    Business-card exports often draw a 1 px rule at the outer edge. Scaled into
+    the trim, that rule sits inside the cut and the bleed becomes a black bar.
+    """
+    import cv2
+    import numpy as np
+
+    if bgr is None or getattr(bgr, "ndim", 0) != 3 or bgr.shape[0] < 48 or bgr.shape[1] < 48:
+        return None
+    gray = cv2.cvtColor(np.ascontiguousarray(bgr[:, :, :3]), cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    interior = float(np.median(gray[height // 5: height - height // 5, width // 5: width - width // 5]))
+
+    def is_key(line) -> bool:
+        count = int(line.shape[0])
+        mid = line[int(count * 0.08): int(count * 0.92)]
+        if mid.size < 8:
+            return False
+        med = float(np.median(mid))
+        dark = float(np.mean(mid < 45))
+        contrast = abs(med - interior)
+        std = float(np.std(mid))
+        # Paper white is a JPEG fringe. The bleed builder already steps over it.
+        if med >= 240.0 or contrast < 30.0:
+            return False
+        # A solid rule, or a solid grey line. A photograph's edge is neither.
+        if dark >= 0.85 and std < 25.0:
+            return True
+        return contrast >= 40.0 and std < 12.0
+
+    def depth_along(get_line, span: int) -> int:
+        limit = min(8, max(1, span // 20))
+        index = 0
+        skipped = 0
+        # CMYK JPEGs often put one light pixel outside the rule.
+        while index < limit and skipped < 2 and not is_key(get_line(index)):
+            index += 1
+            skipped += 1
+        count = 0
+        while index < limit and is_key(get_line(index)):
+            count += 1
+            index += 1
+            if count > 4:
+                # A flat colour band is the artwork. A keyline is only a few pixels.
+                return 0
+        if count < 1:
+            return 0
+        return index
+
+    top = depth_along(lambda index: gray[index, :], height)
+    bottom = depth_along(lambda index: gray[height - 1 - index, :], height)
+    left = depth_along(lambda index: gray[:, index], width)
+    right = depth_along(lambda index: gray[:, width - 1 - index], width)
+    depths = (int(top), int(bottom), int(left), int(right))
+    if min(depths) < 1 or max(depths) > 6 or max(depths) - min(depths) > 2:
+        return None
+    inset = max(depths) + 2
+    if inset * 2 + 4 >= min(height, width):
+        return None
+    fill = np.median(bgr[inset:inset + 4, inset: width - inset], axis=(0, 1))
+    return {
+        "top": depths[0],
+        "bottom": depths[1],
+        "left": depths[2],
+        "right": depths[3],
+        "fill": [int(round(float(v))) for v in fill[:3]],
+    }
+
+
+def remove_edge_frame(bgr):
+    """Paint a detected keyline with the colour just inside it. Size stays the same."""
+    import numpy as np
+
+    found = detect_edge_frame(bgr)
+    if not found:
+        return bgr, None
+    out = np.array(bgr, copy=True)
+    fill = np.array(found["fill"], np.uint8)
+    height, width = out.shape[:2]
+    top, bottom = int(found["top"]), int(found["bottom"])
+    left, right = int(found["left"]), int(found["right"])
+    if top:
+        out[:top, :] = fill
+    if bottom:
+        out[height - bottom:, :] = fill
+    if left:
+        out[:, :left] = fill
+    if right:
+        out[:, width - right:] = fill
+    return out, found
+
+
+def _crop_centered_bleed(img, path: str, trim_w: float, trim_h: float):
+    """Crop a raster that already is the trim plus a centred bleed ring."""
+    bleed = _image_bleed_for_product(path, trim_w, trim_h)
+    if not bleed:
+        return img, None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            dpi = image.info.get("dpi") or (0, 0)
+            dpi_x = float((dpi[0] if isinstance(dpi, tuple) else dpi) or 0)
+    except Exception:
+        return img, None
+    if dpi_x < 150:
+        return img, None
+
+    def px(mm: float) -> int:
+        return int(round(float(mm) / 25.4 * dpi_x))
+
+    top, bottom = px(bleed["top"]), px(bleed["bottom"])
+    left, right = px(bleed["left"]), px(bleed["right"])
+    height, width = img.shape[:2]
+    if top + bottom >= height - 8 or left + right >= width - 8:
+        return img, None
+    if top < 1 and bottom < 1 and left < 1 and right < 1:
+        return img, None
+    return img[top: height - bottom, left: width - right].copy(), bleed
+
+
 def make_print_ready(
     src_path: str,
     output_dir: str,
@@ -1972,6 +2153,9 @@ def make_print_ready(
     ocr_doubtful_reason = ""
     vector_built = None
     engine = {}
+    source_is_picture = _ext(src_path, display) in IMAGE_EXT
+    plate_for_press = None
+    plate_dpi = 0.0
     vector_source = None
     upscale_job = None
     lettering_note = "The original lettering is kept."
@@ -2142,6 +2326,17 @@ def make_print_ready(
             verdict = assess(assess_path, trim_w, trim_h, BLEED_MM)
             detected = bool(verdict.get("detected"))
             raster, _turned = _rotate_to_product(raster, trim_w, trim_h, decisions)
+            raster, frame = remove_edge_frame(raster)
+            if frame:
+                decisions.append(
+                    "A thin border near the cut was removed. The background was continued into the bleed."
+                )
+            # A centred ring of a few millimetres is bleed, not artwork. Leaving it
+            # in the picture scales the keyline into the cut.
+            if not _turned and source_is_picture:
+                cropped, bleed_ring = _crop_centered_bleed(raster, src_path, trim_w, trim_h)
+                if bleed_ring and max(float(bleed_ring[side]) for side in ("left", "right", "top", "bottom")) <= BLEED_MM + 0.5:
+                    raster = cropped
             picture = raster
             pending_shape = aspect_fit(picture.shape[1], picture.shape[0], trim_w, trim_h)
             # Extra bleed on a 300 dpi raster is the trim plus a ring. Extending the
@@ -2164,7 +2359,9 @@ def make_print_ready(
                 # the band stays at the bottom. A plain side pad is not part of the
                 # read: the smaller scale was dropping small marks such as a card's "7".
                 raster, aspect_extended, aspect_delta = _extend_to_product(raster, trim_w, trim_h, work_path, decisions)
-                footer_layout = bool(aspect_extended and _bottom_bar_row(picture) is not None)
+                # A contact band only changes the sentence when that layout was used.
+                # A tall picture with a band still grows at the sides, and that sentence stays.
+                footer_layout = any("contact band was kept at the bottom" in line for line in decisions)
                 if footer_layout:
                     vector_source = raster
                 else:
@@ -2177,9 +2374,10 @@ def make_print_ready(
                     except Exception as exc:
                         sys.stderr.write(f"[AI-UPSCALE] not started ({str(exc)[:160]})\n")
                         upscale_job = None
-                fitted_path = os.path.join(output_dir, "fitted.png")
-                _write_png(raster, fitted_path)
-                work_path = fitted_path
+                if not source_is_picture or not skip_upscale:
+                    fitted_path = os.path.join(output_dir, "fitted.png")
+                    _write_png(raster, fitted_path)
+                    work_path = fitted_path
             from vector_text_v2 import font_substitution_enabled, vector_rebuild_enabled
 
             fonts_on = font_substitution_enabled()
@@ -2188,7 +2386,16 @@ def make_print_ready(
             has_lettering = False
             outer_ocr_s = 0.0
             # Font mode on an AI file reads the page itself. Every other raster is read once here.
-            if (not over_raster) and rebuild_on and not live_type and not (fonts_on and detected):
+            # A photograph is placed as the picture. A poster with a contact band
+            # still goes through the type rebuild, which is what keeps its black text K-only.
+            picture_kept = source_is_picture and not footer_layout
+            if (
+                (not over_raster)
+                and rebuild_on
+                and not live_type
+                and not (fonts_on and detected)
+                and not picture_kept
+            ):
                 try:
                     from vector_text_v2 import read_blocks
                     from vector_trace import is_lettering
@@ -2205,7 +2412,13 @@ def make_print_ready(
                 except Exception:
                     has_lettering = False
                     lettering_blocks = None
-            trace_raster = (not over_raster) and rebuild_on and not live_type and (detected or has_lettering)
+            trace_raster = (
+                (not over_raster)
+                and rebuild_on
+                and not live_type
+                and (detected or has_lettering)
+                and not picture_kept
+            )
             if trace_raster:
                 if detected and fonts_on:
                     decisions.append("This looks like AI-generated artwork. The words are set as vector type.")
@@ -2253,12 +2466,19 @@ def make_print_ready(
                 else:
                     lettering_note = str(vector_built.get("reason") or "The vector check failed, so the original lettering was kept.")
                     decisions.append(lettering_note)
+            elif picture_kept:
+                # A photograph traced line by line repeats the edge into streaks and
+                # spends the whole make on letters that stay in the picture anyway.
+                decisions.append("The original picture was kept. Its lettering stays in the picture.")
             elif detected and not rebuild_on:
                 decisions.append("Vector type is switched off. The original lettering is kept and the picture is enlarged.")
             elif live_type:
                 decisions.append("This file already has live type, so the lettering was left as it is.")
             else:
                 decisions.append("This was not treated as AI artwork. The original lettering is kept.")
+            if picture_kept and raster is not None:
+                plate_for_press = raster
+                plate_dpi = _file_dpi(src_path) if over_raster else 0.0
             if over_raster:
                 work_path = src_path
             elif skip_upscale:
@@ -2371,6 +2591,12 @@ def make_print_ready(
         compiled = {}
         if native_pixels and ext == ".pdf":
             compiled = _compile_native_pixels(work_path, press_path, trim_w, trim_h)
+        if not compiled.get("success") and plate_for_press is not None:
+            try:
+                compiled = _compile_picture(plate_for_press, press_path, trim_w, trim_h, plate_dpi)
+            except Exception as exc:
+                sys.stderr.write(f"[COMPILE] Picture plate skipped: {exc}\n")
+                compiled = {}
         if not compiled.get("success"):
             compiled = _compile(work_path, press_path, trim_w, trim_h)
         engine = compiled.get("pressEngine") or {}

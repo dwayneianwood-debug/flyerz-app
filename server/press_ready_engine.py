@@ -1173,24 +1173,43 @@ def plan_artwork(img_bgr: np.ndarray, dpi: float = 150.0, safe_zone_mm: float = 
 
 
 def write_cmyk_pdf(canvas_bgr: np.ndarray, path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> None:
+    """One 300 dpi picture, then the coated CMYK conversion.
+
+    Pillow's CMYK mode stores black as cyan, magenta and yellow with an empty
+    K channel. Ghostscript applies relative colorimetric, black-point
+    compensation and K preservation, and the memory leashes stay in that call.
+    """
     import io
 
     import pymupdf as fitz
     from PIL import Image
 
     rgb = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
-    cmyk = Image.fromarray(rgb).convert("CMYK")
     buffer = io.BytesIO()
-    cmyk.save(buffer, format="TIFF", dpi=(300, 300))
-    data = buffer.getvalue()
+    Image.fromarray(rgb).save(buffer, format="PNG")
     width_pt = (trim_w_mm + 2 * bleed_mm) * MM_TO_PT
     height_pt = (trim_h_mm + 2 * bleed_mm) * MM_TO_PT
+    raw_path = path + ".rgb.pdf"
     doc = fitz.open()
     page = doc.new_page(width=width_pt, height=height_pt)
-    page.insert_image(page.rect, stream=data)
+    page.insert_image(page.rect, stream=buffer.getvalue())
     _set_boxes(page, trim_w_mm, trim_h_mm, bleed_mm)
-    doc.save(path, deflate=True, garbage=4)
+    doc.save(raw_path, deflate=True, garbage=4)
     doc.close()
+    try:
+        convert_cmyk_keep_text(raw_path, path)
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+    fixed = fitz.open(path)
+    try:
+        for fixed_page in fixed:
+            _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
+        boxed = path + ".box.pdf"
+        fixed.save(boxed, deflate=True, garbage=4)
+    finally:
+        fixed.close()
+    os.replace(boxed, path)
 
 
 def _set_boxes(page, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> None:
@@ -1256,8 +1275,21 @@ def preflight_pdf(
         failures.append("The bleed box does not cover the page.")
     pix = page.get_pixmap(matrix=fitz.Matrix(0.4, 0.4), alpha=False, colorspace=fitz.csRGB)
     samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-    corners = (samples[1, 1], samples[1, -2], samples[-2, 1], samples[-2, -2])
-    if any(int(colour.min()) > 248 for colour in corners) and not report.get("allowWhite"):
+    def _paper(colour) -> bool:
+        return int(np.min(colour[:3])) > 248
+
+    height, width = samples.shape[:2]
+    inset = min(10, height - 1, width - 1)
+    # A white corner is a hole when the edge beside it has ink. Paper stays white.
+    spots = (
+        (samples[1, 1], samples[1, inset], samples[inset, 1]),
+        (samples[1, width - 2], samples[1, width - 1 - inset], samples[inset, width - 2]),
+        (samples[height - 2, 1], samples[height - 2, inset], samples[height - 1 - inset, 1]),
+        (samples[height - 2, width - 2], samples[height - 2, width - 1 - inset], samples[height - 1 - inset, width - 2]),
+    )
+    white_hole = any(_paper(corner) and not (_paper(along_x) and _paper(along_y)) for corner, along_x, along_y in spots)
+    corners = tuple(spot[0] for spot in spots)
+    if white_hole and not report.get("allowWhite"):
         failures.append("A corner of the bleed is white.")
     text = page.get_text("text") or ""
     if require_text and require_text not in text:
@@ -3719,14 +3751,22 @@ def _vector_page_bleed(page, trim_w_mm: float, trim_h_mm: float) -> tuple[dict, 
     still has to be this product. Equal boxes use the centred partial-bleed rule.
     """
     media = page.mediabox
+    crop = page.cropbox if page.cropbox.width > 2 and page.cropbox.height > 2 else media
     trim = page.trimbox if page.trimbox.width > 2 and page.trimbox.height > 2 else media
-    boxes_differ = abs(trim.width - media.width) >= 1.5 or abs(trim.height - media.height) >= 1.5
+    # Corel pages put crop marks in a CropBox whose origin is not the MediaBox.
+    # The visible page is the crop. Measuring the trim against the media shifts
+    # the art: marks land in the top of the cut and the bottom is clipped.
+    frame = crop
+    boxes_differ = abs(trim.width - frame.width) >= 1.5 or abs(trim.height - frame.height) >= 1.5
+    if not boxes_differ and (abs(trim.width - media.width) >= 1.5 or abs(trim.height - media.height) >= 1.5):
+        frame = media
+        boxes_differ = True
     if boxes_differ:
         existing = {
-            "left": max(0.0, (trim.x0 - media.x0) * 25.4 / 72.0),
-            "bottom": max(0.0, (trim.y0 - media.y0) * 25.4 / 72.0),
-            "right": max(0.0, (media.x1 - trim.x1) * 25.4 / 72.0),
-            "top": max(0.0, (media.y1 - trim.y1) * 25.4 / 72.0),
+            "left": max(0.0, (trim.x0 - frame.x0) * 25.4 / 72.0),
+            "bottom": max(0.0, (trim.y0 - frame.y0) * 25.4 / 72.0),
+            "right": max(0.0, (frame.x1 - trim.x1) * 25.4 / 72.0),
+            "top": max(0.0, (frame.y1 - trim.y1) * 25.4 / 72.0),
         }
         trim_w = trim.width * 25.4 / 72.0
         trim_h = trim.height * 25.4 / 72.0
