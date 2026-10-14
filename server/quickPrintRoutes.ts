@@ -130,6 +130,7 @@ async function runJob(jobId: number, inputPath: string, filename: string, body: 
       replicateEdit: body.replicateEdit === true || body.replicateEdit === "1",
       skipUpscale: body.skipUpscale === true || body.skipUpscale === "1",
       concerns: Array.isArray(body.concerns) ? body.concerns.map((line: unknown) => String(line)) : [],
+      hiddenBleed: body.hiddenBleed === "ignore" ? "ignore" : undefined,
     });
     await saveQuickResult(jobId, result);
     writeJobProgress(jobId, "done");

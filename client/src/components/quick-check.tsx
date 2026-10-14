@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { defaultBleedOptions } from "@shared/schema";
 import { UPLOAD_LIMIT_BYTES, uploadTooLargeMessage } from "@shared/uploadLimit";
+import { HiddenBleedChoice, type HiddenBleedChoiceValue, type HiddenBleedFinding } from "@/components/hidden-bleed-choice";
 
 interface QuickCheckItem {
   id: string;
@@ -44,6 +45,7 @@ interface QuickCheckResult {
   originalFilename: string;
   fileType: string;
   artworkSize: ArtworkSize;
+  hiddenBleed?: HiddenBleedFinding;
 }
 
 export function QuickCheck() {
@@ -51,6 +53,7 @@ export function QuickCheck() {
   const { toast } = useToast();
   const [result, setResult] = useState<QuickCheckResult | null>(null);
   const [expandedCheck, setExpandedCheck] = useState<string | null>(null);
+  const [hiddenBleedChoice, setHiddenBleedChoice] = useState<HiddenBleedChoiceValue>("use");
   const [fixingItems, setFixingItems] = useState<Set<string>>(new Set());
 
   const [targetWidth, setTargetWidth] = useState("");
@@ -91,6 +94,7 @@ export function QuickCheck() {
     },
     onSuccess: (data) => {
       setResult(data);
+      setHiddenBleedChoice("use");
       if (data.allPassed) {
         toast({ title: "All checks passed!", description: "Your artwork is print-ready." });
       } else {
@@ -113,7 +117,7 @@ export function QuickCheck() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...params,
-          bleedOptions: defaultBleedOptions,
+          bleedOptions: { ...defaultBleedOptions, hiddenBleed: hiddenBleedChoice },
         }),
         credentials: "include",
       });
@@ -304,6 +308,8 @@ export function QuickCheck() {
           </p>
         )}
       </Card>
+
+      <HiddenBleedChoice finding={result?.hiddenBleed} value={hiddenBleedChoice} onChange={setHiddenBleedChoice} />
 
       {!result && (
         <Card

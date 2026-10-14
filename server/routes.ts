@@ -46,6 +46,7 @@ import { registerPureCropRoutes } from "./pureCropRoutes";
 import { isPassThroughExtension, isRasterExtension, isVectorExtension } from "@shared/artwork-types";
 import { registerQuickPrintRoutes } from "./quickPrintRoutes";
 import { PRESS_FILE_MISSING, firstExistingPressFile } from "./pressDownload";
+import { sanitizeHiddenBleedChoice } from "./hiddenBleed";
 import {
   IllustratorIntakeError,
   INVALID_UPLOAD_MESSAGE,
@@ -619,6 +620,9 @@ function sanitizeBleedOptions(parsed: any) {
     enableWhiteEdgeRisk: parsed.enableWhiteEdgeRisk !== false,
     enablePdfxCompliance: parsed.enablePdfxCompliance !== false,
   };
+
+  const hiddenBleed = sanitizeHiddenBleedChoice(parsed.hiddenBleed);
+  if (hiddenBleed) result.hiddenBleed = hiddenBleed;
 
   if (parsed.clientOptimized) {
     result.clientOptimized = true;

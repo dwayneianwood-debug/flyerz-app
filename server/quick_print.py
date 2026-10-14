@@ -2125,6 +2125,7 @@ def make_print_ready(
     notes: str = "",
     detect_size: bool = False,
     options: dict | None = None,
+    hidden_bleed: str = "use",
 ) -> dict:
     os.makedirs(output_dir, exist_ok=True)
     locale_seen = {}
@@ -2205,6 +2206,7 @@ def make_print_ready(
     dpi_detail = ""
     existing_kept = False
     over_incoming = False
+    hidden_report = None
     ocr_low = False
     ocr_doubtful = False
     ocr_doubtful_reason = ""
@@ -2281,6 +2283,17 @@ def make_print_ready(
                         "This file is large, so it was prepared from a smaller working picture. The press file is still built."
                     )
         if ext == ".pdf":
+            # Hidden bleed recovery (FLYERZ_HIDDEN_BLEED=1 only). First step, boxes only, no re-render.
+            # Any failure hands back work_path unchanged, so the normal path runs exactly as before.
+            try:
+                from hidden_bleed import maybe_recover_for_pipeline
+                recovered_path, hidden_report = maybe_recover_for_pipeline(
+                    work_path, output_dir, hidden_bleed or "use", BLEED_MM)
+                if hidden_report.get("recovered"):
+                    work_path = recovered_path
+                    decisions.append("This file already had artwork past the page edge. That hidden bleed was brought back and used.")
+            except Exception:
+                hidden_report = None
             measured = _pdf_trim_mm(work_path)
             fit = None
             if not native_pixels and measured:
@@ -2826,6 +2839,8 @@ def make_print_ready(
     result["extraChecks"] = list((facts.get("extraChecks") or {}).get("checks") or [])
     result["upscale"] = round(upscale, 3)
     result["existingBleedKept"] = existing_kept
+    if hidden_report and hidden_report.get("enabled"):
+        result["hiddenBleed"] = hidden_report
     result["enginePassed"] = facts["enginePassed"]
     result["pressEngine"] = engine if isinstance(engine, dict) else None
     if facts.get("bleedQuality"):
@@ -2981,6 +2996,7 @@ def main() -> None:
     parser.add_argument("--replicate-edit", action="store_true")
     parser.add_argument("--skip-upscale", action="store_true")
     parser.add_argument("--concern", action="append", default=[])
+    parser.add_argument("--hidden-bleed", choices=["use", "ignore"], default="use")
     args = parser.parse_args()
     if args.progress_file:
         os.environ["JOB_PROGRESS_FILE"] = args.progress_file
@@ -3008,6 +3024,7 @@ def main() -> None:
             "skipUpscale": bool(args.skip_upscale),
             "concerns": list(args.concern or []),
         },
+        hidden_bleed=args.hidden_bleed,
     )
     text = json.dumps(result, ensure_ascii=False)
     if args.result:

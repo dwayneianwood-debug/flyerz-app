@@ -14,6 +14,7 @@ import crypto from "crypto";
 import { checksAllPassed } from "./checkVerdict";
 import { hasValidCropBox, isNoCropRoute } from "@shared/crop-box";
 import { isPrintToolType } from "@shared/artwork-types";
+import { recoverHiddenBleed, recoveredTrimMatches, shouldTryHiddenBleed } from "./hiddenBleed";
 import {
   auditIllustratorFile,
   extractIllustratorPage,
@@ -621,7 +622,23 @@ async function processFileInternal(jobId: number, applyFixes: boolean, bleedOpti
         }
       }
       const hasCropCoords = hasValidCropBox(effectiveBleed as any);
-      const skipPreResize = hasCropCoords || isNoCropRoute(effectiveBleed as any);
+      let skipPreResize = hasCropCoords || isNoCropRoute(effectiveBleed as any);
+
+      // Hidden bleed recovery (FLYERZ_HIDDEN_BLEED=1 only): FIRST step, page boxes only, no re-render.
+      // The recovered file has TrimBox = original page and 5 mm MediaBox/BleedBox, so the existing-bleed
+      // path keeps it instead of adding bleed again. Any failure keeps the original input silently.
+      if (!hasCropCoords && shouldTryHiddenBleed(effectiveBleed as any, pipelineType)) {
+        const recoveredPath = path.join(dir, `${jobId}_${basename}_hidden_bleed.pdf`);
+        const bleedMm = Number((effectiveBleed as any)?.defaultBleedSize) || 5;
+        const rec = recoverHiddenBleed(inputForBleed, recoveredPath, bleedMm);
+        if (rec.recovered && recoveredTrimMatches(rec.trimMm, effectiveBleed?.targetWidth, effectiveBleed?.targetHeight)) {
+          inputForBleed = recoveredPath;
+          skipPreResize = true;
+          console.log(`[FAI] Hidden bleed recovered for job ${jobId}: ${rec.reason || "artwork past every edge"}`);
+        } else if (rec.recovered) {
+          console.log(`[FAI] Hidden bleed found for job ${jobId} but trim ${rec.trimMm?.join("x")}mm differs from target; using normal bleed options`);
+        }
+      }
 
       console.time("[TIMER] Node fileProcessor: prepress spawns (resize if any + smart_bleed)");
       let result!: ReturnType<typeof runPythonBleed>;

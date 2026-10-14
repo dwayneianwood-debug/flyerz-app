@@ -416,6 +416,8 @@ export interface BleedOptions {
   enableGutterCollisionCheck: boolean;
   enableWhiteEdgeRisk: boolean;
   enablePdfxCompliance: boolean;
+  /** Hidden bleed recovery choice (only read when FLYERZ_HIDDEN_BLEED=1). Default: use. */
+  hiddenBleed?: "use" | "ignore";
 }
 
 export const defaultBleedOptions: BleedOptions = {

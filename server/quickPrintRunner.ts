@@ -41,6 +41,8 @@ export interface QuickRunOptions {
   replicateEdit?: boolean;
   skipUpscale?: boolean;
   concerns?: string[];
+  /** Hidden bleed recovery choice; only used by quick_print.py when FLYERZ_HIDDEN_BLEED=1. */
+  hiddenBleed?: "use" | "ignore";
 }
 
 export interface QuickRunResult {
@@ -235,6 +237,7 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
   for (const line of options.concerns || []) {
     if (String(line).trim()) args.push("--concern", String(line).slice(0, 400));
   }
+  if (options.hiddenBleed === "ignore") args.push("--hidden-bleed", "ignore");
   const progressFile = options.jobId ? jobProgressPath(options.jobId) : "";
   if (progressFile) {
     if (options.jobId) writeJobProgress(options.jobId, "fitting");

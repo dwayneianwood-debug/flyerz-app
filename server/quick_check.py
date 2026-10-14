@@ -826,7 +826,15 @@ def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
         checks = apply_print_ready_gate(checks)
         all_passed = all(c["passed"] for c in checks)
 
-        return {
+        hidden_bleed = None
+        if _pdf_like(file_type):
+            try:
+                from hidden_bleed import quick_check_finding  # None unless FLYERZ_HIDDEN_BLEED=1
+                hidden_bleed = quick_check_finding(input_path)
+            except Exception as _hb_err:
+                sys.stderr.write(f"[FAI] Hidden bleed check skipped: {_hb_err}\n")
+
+        out = {
             "checks": checks,
             "allPassed": all_passed,
             "passCount": sum(1 for c in checks if c["passed"]),
@@ -834,6 +842,9 @@ def run_quick_check(input_path, file_type, target_w_mm=None, target_h_mm=None):
             "artworkSize": artwork_size,
             "pageCount": page_count,
         }
+        if hidden_bleed is not None:
+            out["hiddenBleed"] = hidden_bleed
+        return out
 
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
