@@ -106,7 +106,7 @@ export default function PrintReady() {
           ))}
         </div>
         <p className="mt-8 text-sm">
-          <a className="underline" href="/?attention=1" data-testid="link-designer-queue">Designer queue: amber and red only</a>
+          <a className="underline" href="/manual?attention=1" data-testid="link-designer-queue">Designer queue: amber and red only</a>
         </p>
         <WatcherSettings
           enabled={watcherEnabled}

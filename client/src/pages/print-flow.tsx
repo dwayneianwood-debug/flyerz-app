@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { QUICK_PRINT_DEFAULT_PRODUCT_ID, type QuickPrintCard } from "@shared/quickPrint";
 import { fixRows } from "@shared/jobProgress";
 import { messageFromStartResponse } from "@/lib/upload-reply";
-import { FlowTabs, PrintFlowView, type FixRow, type FlowStage, type FlowTab, type IntakeItem } from "./print-flow-view";
+import { PrintFlowView, type FixRow, type FlowStage, type FlowTab, type IntakeItem } from "./print-flow-view";
 
 const EMPTY_CARD = (id: number, filename: string): QuickPrintCard => ({
   id,
@@ -186,7 +186,6 @@ export function PrintFlow(props: { tab: FlowTab; onTab: (tab: FlowTab) => void; 
 
   return (
     <div>
-      <FlowTabs active={props.tab} onReady={() => props.onTab("ready")} onManual={() => props.onTab("manual")} />
       {props.tab === "manual" ? props.manual : (
         <PrintFlowView
           stage={stage}

@@ -141,6 +141,18 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
               </Button>
             </Link>
 
+            <Link href="/manual">
+              <Button
+                variant={location === "/manual" ? "secondary" : "ghost"}
+                size="sm"
+                className="font-medium rounded-full"
+                data-testid="nav-manual"
+              >
+                <span className="hidden sm:inline">Fix my artwork manually</span>
+                <span className="sm:hidden">Manual</span>
+              </Button>
+            </Link>
+
             <div className="relative" ref={toolsRef}>
               <Button 
                 variant={isToolsPage || toolsOpen ? "secondary" : "ghost"} 
@@ -179,7 +191,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                         </div>
                       </div>
                     </Link>
-                    <Link href="/?tools=resizer" onClick={() => setToolsOpen(false)}>
+                    <Link href="/manual" onClick={() => setToolsOpen(false)}>
                       <div className="flex items-center gap-3 p-3 rounded-lg cursor-pointer hover:bg-muted/60 transition-colors group" data-testid="tool-link-resizer">
                         <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center group-hover:bg-primary/15 transition-colors shrink-0">
                           <Maximize2 className="w-4 h-4 text-primary" />

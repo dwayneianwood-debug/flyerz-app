@@ -1,4 +1,5 @@
 import { Switch, Route } from "wouter";
+import ManualPage from "@/pages/manual";
 import { queryClient } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
@@ -22,6 +23,7 @@ function Router() {
       <Route path="/dashboard/rules" component={DashboardRules}/>
       <Route path="/" component={Dashboard}/>
       <Route path="/print-ready" component={PrintReady}/>
+      <Route path="/manual" component={ManualPage}/>
       <Route path="/job/:id" component={JobDetails}/>
       <Route path="/crop" component={PureCrop}/>
       <Route path="/shrink" component={SafeMarginShrink}/>
