@@ -27,6 +27,17 @@ SCHOOL = os.path.join(ROOT, "tests", "fixtures", "ian_2026-10-14", "school_readi
 PROGRAMME = os.path.join(ROOT, "tests", "fixtures", "ian_2026-10-14", "school_programme.jpg")
 
 
+def _gray_corr(left: np.ndarray, right: np.ndarray) -> float:
+    import cv2
+
+    a = cv2.resize(cv2.cvtColor(left, cv2.COLOR_RGB2GRAY), (120, 80)).astype(np.float32)
+    b = cv2.resize(cv2.cvtColor(right, cv2.COLOR_RGB2GRAY), (120, 80)).astype(np.float32)
+    a -= a.mean()
+    b -= b.mean()
+    denom = float(np.sqrt((a * a).sum() * (b * b).sum())) + 1e-6
+    return float((a * b).sum() / denom)
+
+
 def _trim_rgb(path: str, zoom: float = 2.0):
     import pymupdf as fitz
 
@@ -122,51 +133,109 @@ class Round14bTest(unittest.TestCase):
         self.assertLess(float(dark[:, -8:].mean()), 0.05)
 
     def test_corel_trim_keeps_the_art_and_drops_the_marks(self):
+        """The Make button compiles through the press PDF, not a manual trim clip."""
         import pymupdf as fitz
 
+        from compile_press_pdf import page_existing_bleed, page_raster_clip_rect
+
         samples = (
-            ("3b6b2fc9.pdf", 90.0, 50.0),
-            ("89d8ed50.pdf", 105.0, 148.0),
-            ("a0304881.pdf", 105.0, 148.0),
-            ("c494fc76.pdf", 105.0, 148.0),
+            ("3b6b2fc9.pdf", 90.0, 50.0, "card-90x50", "Business card 90 × 50"),
+            ("89d8ed50.pdf", 105.0, 148.0, "a6", "A6"),
+            ("a0304881.pdf", 105.0, 148.0, "a6", "A6"),
+            ("c494fc76.pdf", 105.0, 148.0, "a6", "A6"),
         )
-        for name, trim_w, trim_h in samples:
-            doc = fitz.open(os.path.join(NEW, name))
+        for name, trim_w, trim_h, product_id, label in samples:
+            path = os.path.join(NEW, name)
+            report = assess_intake(path, trim_w, trim_h)
+            self.assertTrue(report.get("items") is not None or report.get("light"), name)
+            doc = fitz.open(path)
             try:
-                self.assertEqual(doc.page_count, 2)
+                self.assertEqual(doc.page_count, 2, name)
                 for page in doc:
-                    existing, mode = _vector_page_bleed(page, trim_w, trim_h)
-                    self.assertEqual(mode, "boxes", name)
-                    for side in ("left", "right", "top", "bottom"):
-                        self.assertGreaterEqual(existing[side], 5.0, f"{name} {side}")
-                    self.assertLess(max(existing.values()) - min(existing.values()), 0.4, name)
+                    info = page_existing_bleed(page, trim_w, trim_h)
+                    self.assertIsNotNone(info, name)
+                    sides = [float(info[side]) for side in ("left", "right", "top", "bottom")]
+                    self.assertLess(max(sides) - min(sides), 1.2, f"{name} {info}")
+                    self.assertGreater(min(sides), 8.0, name)
             finally:
                 doc.close()
+            folder = tempfile.mkdtemp(prefix="corel-14b-")
+            made = make_print_ready(
+                path, folder, trim_w, trim_h, product_id, label,
+                filename=name,
+                options={"skipUpscale": True},
+            )
+            press = made.get("pressPath") or ""
+            self.assertTrue(os.path.isfile(press), made.get("customerMessage"))
+            self._assert_press_matches_marks(path, press, trim_w, trim_h, name)
 
-        path = os.path.join(NEW, "89d8ed50.pdf")
-        doc = fitz.open(path)
+    def _assert_press_matches_marks(self, src_path, press_path, trim_w, trim_h, name):
+        import pymupdf as fitz
+
+        from compile_press_pdf import page_existing_bleed, page_raster_clip_rect
+
+        src = fitz.open(src_path)
+        out = fitz.open(press_path)
+        try:
+            self.assertEqual(out.page_count, src.page_count, name)
+            for index in range(src.page_count):
+                page = src[index]
+                info = page_existing_bleed(page, trim_w, trim_h)
+                clip = page_raster_clip_rect(page)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), clip=clip, alpha=False)
+                rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+                full_w = info["trim_w_mm"] + info["left"] + info["right"]
+                full_h = info["trim_h_mm"] + info["top"] + info["bottom"]
+                x0 = int(round(info["left"] / full_w * rgb.shape[1]))
+                y0 = int(round(info["top"] / full_h * rgb.shape[0]))
+                x1 = int(round((info["left"] + info["trim_w_mm"]) / full_w * rgb.shape[1]))
+                y1 = int(round((info["top"] + info["trim_h_mm"]) / full_h * rgb.shape[0]))
+                mark = rgb[y0:y1, x0:x1]
+                press = out[index]
+                trim = press.trimbox if press.trimbox.width > 2 else press.rect
+                placed = press.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), clip=trim, alpha=False)
+                got = np.frombuffer(placed.samples, dtype=np.uint8).reshape(placed.h, placed.w, 3)
+                score = _gray_corr(mark, got)
+                self.assertGreater(score, 0.72, f"{name} page {index + 1} corr {score:.3f}")
+                full = press.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                page_rgb = np.frombuffer(full.samples, dtype=np.uint8).reshape(full.h, full.w, 3)
+                dark = page_rgb.max(axis=2) < 45
+                band = max(2, int(round(1.6 / 25.4 * 1.2 * 72)))
+                ring = np.concatenate([
+                    dark[:band].ravel(), dark[-band:].ravel(), dark[:, :band].ravel(), dark[:, -band:].ravel(),
+                ])
+                self.assertLess(float(ring.mean()), 0.02, f"{name} page {index + 1} crop marks {ring.mean():.3f}")
+        finally:
+            src.close()
+            out.close()
+
+    def test_be09_left_edge_continues_the_white_interior(self):
+        import pymupdf as fitz
+
+        path = os.path.join(NEW, "be09ef80.jpg")
+        self.assertIsNotNone(detect_edge_frame(__import__("cv2").imread(path, __import__("cv2").IMREAD_COLOR)))
+        folder = tempfile.mkdtemp(prefix="be09-14b-")
+        made = make_print_ready(
+            path, folder, 90, 50, "card-90x50", "Business card 90 × 50",
+            filename="be09ef80.jpg",
+            options={"skipUpscale": True, "concerns": ["Border near the cut: A thin border sits on the cut and can print unevenly."]},
+        )
+        self.assertIn("thin border near the cut was removed", made.get("customerMessage") or "")
+        press = made.get("pressPath") or ""
+        self.assertTrue(os.path.isfile(press))
+        doc = fitz.open(press)
         try:
             page = doc[0]
-            trim = page.trimbox
-            bleed = 5.0 * 72.0 / 25.4
-            clip = fitz.Rect(trim.x0 - bleed, trim.y0 - bleed, trim.x1 + bleed, trim.y1 + bleed)
-            out = fitz.open()
-            placed = out.new_page(width=clip.width, height=clip.height)
-            placed.show_pdf_page(placed.rect, doc, 0, clip=clip)
-            pix = placed.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
             rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-            black = rgb.max(axis=2) < 40
-            ring = np.concatenate([
-                black[:6].ravel(), black[-6:].ravel(), black[:, :6].ravel(), black[:, -6:].ravel(),
-            ])
-            self.assertLess(float(ring.mean()), 0.02)
-            ink = rgb.min(axis=2) < 250
-            ys = np.where(ink)[0]
-            self.assertLess(int(ys.min()), int(0.05 * rgb.shape[0]))
-            self.assertGreater(int(ys.max()), int(0.90 * rgb.shape[0]))
-            out.close()
         finally:
             doc.close()
+        ppm = 3.0 * 72.0 / 25.4
+        # 2 mm into the bleed, and 1.5 mm inside the cut. Both are the white interior.
+        bleed = rgb[:, int(2.0 * ppm): int(2.0 * ppm) + 3]
+        inside = rgb[:, int(6.5 * ppm): int(6.5 * ppm) + 3]
+        self.assertGreater(float(np.median(bleed)), 230.0, float(np.median(bleed)))
+        self.assertGreater(float(np.median(inside)), 230.0, float(np.median(inside)))
 
     def test_school_picture_is_not_mirrored_into_the_cut(self):
         folder = tempfile.mkdtemp(prefix="school-14b-")

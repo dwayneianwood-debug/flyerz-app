@@ -7266,12 +7266,19 @@ def apply_existing_bleed(
 
     dpi_f = float(dpi) if dpi and dpi > 0 else 300.0
     ppm = dpi_f / 25.4
+    # clear is the clean paper outside the trim, before crop marks. It is
+    # shorter than the geometric inset, so the marks are cropped off and only
+    # the shortfall out to the target bleed is extended.
+    clear = info.get("clear") if isinstance(info.get("clear"), dict) else {}
     keep = {}
     add = {}
     for side in ("top", "bottom", "left", "right"):
         have = float(info.get(side) or 0)
-        keep[side] = min(have, float(target_bleed_mm))
-        add[side] = max(0.0, float(target_bleed_mm) - have)
+        usable = have
+        if clear.get(side) is not None:
+            usable = min(have, float(clear[side]))
+        keep[side] = min(usable, float(target_bleed_mm))
+        add[side] = max(0.0, float(target_bleed_mm) - usable)
 
     height, width = img.shape[:2]
     full_w = trim_w + float(info["left"]) + float(info["right"])

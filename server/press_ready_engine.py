@@ -383,6 +383,19 @@ def _boxes_on_side(boxes: list, side: str, width: int, height: int, margin: int)
     return False
 
 
+def _paper_strip(strip: np.ndarray) -> bool:
+    """True when the edge's middle colour is the white interior, not a photograph."""
+    flat = np.asarray(strip, np.float32).reshape(-1, strip.shape[-1])[:, :3]
+    if flat.size < 3:
+        return False
+    med = np.median(flat, axis=0)
+    mean = float(med.mean())
+    chroma = float(med.max() - med.min())
+    if mean > 246.0:
+        return True
+    return mean > 220.0 and chroma < 12.0
+
+
 def analyse_bgr(img_bgr: np.ndarray, dpi: float = 300.0, safe_zone_mm: float = SAFE_ZONE_MM) -> dict:
     plane = _bgr(img_bgr)
     height, width = plane.shape[:2]
@@ -418,12 +431,15 @@ def analyse_bgr(img_bgr: np.ndarray, dpi: float = 300.0, safe_zone_mm: float = S
         text = _boxes_on_side([b for b in texts if b["kind"] == "text"], side, width, height, margin) or _textish(strip)
         logo = _boxes_on_side([b for b in texts if b["kind"] == "logo"], side, width, height, margin)
         face = _boxes_on_side(faces, side, width, height, _px(8.0, proxy_dpi))
+        # A white card with a logo on one part of the edge is still paper.
+        # Inpainting that mix paints a grey band across the white interior.
+        paper = _paper_strip(strip)
         if text or logo or face:
-            kind = "flat" if std <= 12.0 else "content-cut"
+            kind = "flat" if std <= 12.0 or paper else "content-cut"
+        elif paper or std <= 12.0:
+            kind = "flat"
         elif _is_gradient(strip):
             kind = "gradient"
-        elif std <= 12.0:
-            kind = "flat"
         elif _is_pattern(strip):
             kind = "pattern"
         else:
@@ -1179,37 +1195,49 @@ def write_cmyk_pdf(canvas_bgr: np.ndarray, path: str, trim_w_mm: float, trim_h_m
     K channel. Ghostscript applies relative colorimetric, black-point
     compensation and K preservation, and the memory leashes stay in that call.
     """
-    import io
-
     import pymupdf as fitz
-    from PIL import Image
 
-    rgb = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
-    buffer = io.BytesIO()
-    Image.fromarray(rgb).save(buffer, format="PNG")
+    rgb = np.ascontiguousarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+    height, width = rgb.shape[:2]
     width_pt = (trim_w_mm + 2 * bleed_mm) * MM_TO_PT
     height_pt = (trim_h_mm + 2 * bleed_mm) * MM_TO_PT
     raw_path = path + ".rgb.pdf"
     doc = fitz.open()
     page = doc.new_page(width=width_pt, height=height_pt)
-    page.insert_image(page.rect, stream=buffer.getvalue())
+    pix = fitz.Pixmap(fitz.csRGB, width, height, rgb.tobytes(), False)
+    pix.set_dpi(300, 300)
+    page.insert_image(page.rect, pixmap=pix)
     _set_boxes(page, trim_w_mm, trim_h_mm, bleed_mm)
-    doc.save(raw_path, deflate=True, garbage=4)
+    # Temporary. Ghostscript rewrites it, so this copy is not compressed.
+    doc.save(raw_path, deflate=False, garbage=0)
     doc.close()
+    del pix
     try:
         convert_cmyk_keep_text(raw_path, path)
     finally:
         if os.path.exists(raw_path):
             os.remove(raw_path)
-    fixed = fitz.open(path)
+    _set_boxes_inplace(path, trim_w_mm, trim_h_mm, bleed_mm)
+
+
+def _set_boxes_inplace(path: str, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> None:
+    """Write the trim into the boxes without recompressing the plate."""
+    import pikepdf
+
+    bleed_pt = float(bleed_mm) * MM_TO_PT
+    trim_w = float(trim_w_mm) * MM_TO_PT
+    trim_h = float(trim_h_mm) * MM_TO_PT
+    pdf = pikepdf.open(path, allow_overwriting_input=True)
     try:
-        for fixed_page in fixed:
-            _set_boxes(fixed_page, trim_w_mm, trim_h_mm, bleed_mm)
-        boxed = path + ".box.pdf"
-        fixed.save(boxed, deflate=True, garbage=4)
+        for page in pdf.pages:
+            media = [float(v) for v in page.mediabox]
+            page.mediabox = media
+            page.cropbox = media
+            page.bleedbox = media
+            page.trimbox = [media[0] + bleed_pt, media[1] + bleed_pt, media[0] + bleed_pt + trim_w, media[1] + bleed_pt + trim_h]
+        pdf.save(path, recompress_flate=False)
     finally:
-        fixed.close()
-    os.replace(boxed, path)
+        pdf.close()
 
 
 def _set_boxes(page, trim_w_mm: float, trim_h_mm: float, bleed_mm: float) -> None:
@@ -3844,6 +3872,103 @@ def apply_edge_meta(engine: dict, meta: dict) -> dict:
     return engine
 
 
+def _crop_mark_trim(page, trim_w_mm: float, trim_h_mm: float):
+    """Crop-mark trim in page.rect space when it does not meet the TrimBox.
+
+    Corel writes an off-centre TrimBox on a page whose origin is not the media.
+    The marks are the real trim. show_pdf_page clips in page.rect space, so the
+    TrimBox numbers shift the art and leave the marks inside the cut.
+    """
+    import fitz
+
+    try:
+        if int(page.rotation or 0) % 360:
+            return None
+    except Exception:
+        return None
+    try:
+        from compile_press_pdf import _mark_clear_mm, _mark_trim_rect, _thin_mark_segs
+    except Exception:
+        return None
+    segs = _thin_mark_segs(page)
+    mark = _mark_trim_rect(segs)
+    if mark is None or mark.width < 20 or mark.height < 20:
+        return None
+    mark_w = mark.width * 25.4 / 72.0
+    mark_h = mark.height * 25.4 / 72.0
+    near = (
+        min(abs(mark_w - float(trim_w_mm)), abs(mark_w - float(trim_h_mm))) <= 3.0
+        and min(abs(mark_h - float(trim_h_mm)), abs(mark_h - float(trim_w_mm))) <= 3.0
+    )
+    if not near:
+        return None
+    try:
+        boxed = fitz.Rect(page.trimbox) * page.transformation_matrix
+    except Exception:
+        boxed = fitz.Rect(page.trimbox)
+    shift = max(
+        abs(mark.x0 - boxed.x0),
+        abs(mark.y0 - boxed.y0),
+        abs(mark.x1 - boxed.x1),
+        abs(mark.y1 - boxed.y1),
+    ) * 25.4 / 72.0
+    if shift <= 1.0:
+        return None
+    clear = _mark_clear_mm(segs, mark) or {}
+    keep = {}
+    for side in ("left", "right", "top", "bottom"):
+        if side in clear:
+            keep[side] = max(0.0, min(5.0, float(clear[side])))
+        else:
+            keep[side] = 0.0
+    return {"trim": fitz.Rect(mark), "keep": keep}
+
+
+def _place_crop_mark_trim(new_page, src, index, src_page, trim_w_mm: float, trim_h_mm: float, bleed_mm: float):
+    """Centre the marked trim on the product and keep only the clean bleed."""
+    found = _crop_mark_trim(src_page, trim_w_mm, trim_h_mm)
+    if not found:
+        return None
+    import fitz
+
+    mark = found["trim"]
+    keep = found["keep"]
+    frame = src_page.rect
+    clip = fitz.Rect(
+        max(frame.x0, mark.x0 - keep["left"] * MM_TO_PT),
+        max(frame.y0, mark.y0 - keep["top"] * MM_TO_PT),
+        min(frame.x1, mark.x1 + keep["right"] * MM_TO_PT),
+        min(frame.y1, mark.y1 + keep["bottom"] * MM_TO_PT),
+    )
+    if clip.width < 2 or clip.height < 2:
+        return None
+    kept_l = max(0.0, mark.x0 - clip.x0)
+    kept_t = max(0.0, mark.y0 - clip.y0)
+    kept_r = max(0.0, clip.x1 - mark.x1)
+    kept_b = max(0.0, clip.y1 - mark.y1)
+    trim_w_pt = float(trim_w_mm) * MM_TO_PT
+    trim_h_pt = float(trim_h_mm) * MM_TO_PT
+    sx = trim_w_pt / max(float(mark.width), 1.0)
+    sy = trim_h_pt / max(float(mark.height), 1.0)
+    bleed_pt = float(bleed_mm) * MM_TO_PT
+    out_trim = fitz.Rect(bleed_pt, bleed_pt, bleed_pt + trim_w_pt, bleed_pt + trim_h_pt)
+    dest = fitz.Rect(
+        out_trim.x0 - kept_l * sx,
+        out_trim.y0 - kept_t * sy,
+        out_trim.x1 + kept_r * sx,
+        out_trim.y1 + kept_b * sy,
+    )
+    new_page.show_pdf_page(dest, src, index, clip=clip)
+    page_rect = new_page.rect
+    short = (
+        max(0.0, dest.x0 - page_rect.x0),
+        max(0.0, page_rect.x1 - dest.x1),
+        max(0.0, dest.y0 - page_rect.y0),
+        max(0.0, page_rect.y1 - dest.y1),
+    )
+    return {"placed": (float(dest.x0), float(dest.y0), float(dest.x1), float(dest.y1)), "short": short}
+
+
 def compile_vector_press(
     src_path: str,
     out_path: str,
@@ -3961,6 +4086,22 @@ def compile_vector_press(
     for index in range(src.page_count):
         src_page = src[index]
         new_page = doc.new_page(width=out_w, height=out_h)
+        placed_marks = _place_crop_mark_trim(
+            new_page, src, index, src_page, trim_w_mm, trim_h_mm, bleed_mm,
+        )
+        if placed_marks is not None:
+            kept = True
+            short_mm = max(placed_marks["short"]) * 25.4 / 72.0
+            have = max(0.0, float(bleed_mm) - short_mm)
+            most = have
+            page_mirrored.append(False)
+            if max(placed_marks["short"]) >= 0.4:
+                extended = True
+                edge_placements.append(placed_marks["placed"])
+            else:
+                edge_placements.append(None)
+            _set_boxes(new_page, trim_w_mm, trim_h_mm, bleed_mm)
+            continue
         existing, mode = _vector_page_bleed(src_page, trim_w_mm, trim_h_mm)
         have = min(existing.values()) if existing else 0.0
         most = max(existing.values()) if existing else 0.0

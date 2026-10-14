@@ -243,12 +243,227 @@ def _embedded_image_dpi(path: str) -> float | None:
         return None
 
 
-def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float | None = None) -> dict | None:
-    """Visual bleed from a TrimBox, or from the page size when every box equals the MediaBox.
+def _thin_mark_segs(page) -> list:
+    """Short black strokes. Corel crop marks are these, not the TrimBox."""
+    segs = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return segs
+    for drawing in drawings:
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        width = float(rect.width)
+        height = float(rect.height)
+        if min(width, height) > 1.6 or not (8.0 < max(width, height) < 80.0):
+            continue
+        colour = drawing.get("color")
+        if colour is not None and max(float(channel) for channel in list(colour)[:3]) > 0.25:
+            continue
+        segs.append((float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1), width, height))
+    return segs
 
-    A file often has no TrimBox. If the page is the ordered trim plus about 0.4–15 mm
-    on a side, that extra is bleed that is already in the file. A real TrimBox may
-    be uneven, including a side with no bleed.
+
+def _cluster_values(values: list, tol: float = 4.0) -> list:
+    groups = []
+    for value in sorted(values):
+        if not groups or abs(value - groups[-1][-1]) > tol:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [sum(group) / len(group) for group in groups]
+
+
+def _mark_trim_rect(segs: list):
+    """The trim rectangle the crop marks point at, in PDF user space."""
+    import fitz
+
+    xs = []
+    ys = []
+    for x0, y0, x1, y1, width, height in segs:
+        if width < 1.6 and height > 8.0:
+            xs.append((x0 + x1) / 2.0)
+        if height < 1.6 and width > 8.0:
+            ys.append((y0 + y1) / 2.0)
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    xc = _cluster_values(xs)
+    yc = _cluster_values(ys)
+    if len(xc) != 2 or len(yc) != 2:
+        return None
+    rect = fitz.Rect(min(xc), min(yc), max(xc), max(yc))
+    if rect.width < 20 or rect.height < 20:
+        return None
+    return rect
+
+
+def _mark_clear_mm(segs: list, trim) -> dict:
+    """Clean millimetres outside the trim before a crop mark starts.
+
+    The mark stops a few millimetres short of the corner. Keeping a full 5 mm
+    would print the tip of that mark. The clearance stops before the tip.
+    """
+    mm = 25.4 / 72.0
+    gap = {"left": 99.0, "right": 99.0, "top": 99.0, "bottom": 99.0}
+    for x0, y0, x1, y1, width, height in segs:
+        if height < 1.6 and width > 8.0:
+            y = (y0 + y1) / 2.0
+            on_top = abs(y - trim.y1) < 3.0
+            on_bottom = abs(y - trim.y0) < 3.0
+            if not (on_top or on_bottom):
+                continue
+            if x1 <= trim.x0 + 2.0:
+                gap["left"] = min(gap["left"], (trim.x0 - x1) * mm)
+            if x0 >= trim.x1 - 2.0:
+                gap["right"] = min(gap["right"], (x0 - trim.x1) * mm)
+        elif width < 1.6 and height > 8.0:
+            x = (x0 + x1) / 2.0
+            on_left = abs(x - trim.x0) < 3.0
+            on_right = abs(x - trim.x1) < 3.0
+            if not (on_left or on_right):
+                continue
+            if y0 >= trim.y1 - 2.0:
+                gap["top"] = min(gap["top"], (y0 - trim.y1) * mm)
+            if y1 <= trim.y0 + 2.0:
+                gap["bottom"] = min(gap["bottom"], (trim.y0 - y1) * mm)
+    clear = {}
+    for side, value in gap.items():
+        if value < 90.0:
+            clear[side] = max(0.0, min(5.0, value - 0.45))
+    return clear
+
+
+def _art_trim_rect(page, frame):
+    """Ink bounds of the raster, used when crop marks and the TrimBox disagree and the marks are not a rectangle."""
+    import fitz
+
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), clip=frame, alpha=False, colorspace=fitz.csGRAY)
+    except Exception:
+        return None
+    if pix.w < 8 or pix.h < 8:
+        return None
+    import numpy as np
+
+    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+    ink = gray < 245
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if rows.size < 4 or cols.size < 4:
+        return None
+    scale = 2.0
+    return fitz.Rect(
+        frame.x0 + float(cols[0]) * scale,
+        frame.y0 + float(rows[0]) * scale,
+        frame.x0 + float(cols[-1] + 1) * scale,
+        frame.y0 + float(rows[-1] + 1) * scale,
+    )
+
+
+def _bleed_from_visible_page(page, trim, trim_w_mm, trim_h_mm) -> dict | None:
+    """Insets on the visible page. Crop-mark drawings use that page, y up."""
+    import fitz
+
+    frame = fitz.Rect(0.0, 0.0, float(page.rect.width), float(page.rect.height))
+    segs = _thin_mark_segs(page)
+    mark = _mark_trim_rect(segs)
+    use = None
+    clear = None
+    if mark is not None:
+        mark_w = mark.width * 25.4 / 72.0
+        mark_h = mark.height * 25.4 / 72.0
+        box_w = trim.width * 25.4 / 72.0
+        box_h = trim.height * 25.4 / 72.0
+        near_box = abs(mark_w - box_w) <= 3.0 and abs(mark_h - box_h) <= 3.0
+        near_order = False
+        if trim_w_mm and trim_h_mm:
+            near_order = (
+                min(abs(mark_w - float(trim_w_mm)), abs(mark_w - float(trim_h_mm))) <= 3.0
+                and min(abs(mark_h - float(trim_h_mm)), abs(mark_h - float(trim_w_mm))) <= 3.0
+            )
+        if near_box or near_order:
+            use = mark
+            clear = _mark_clear_mm(segs, mark)
+    if use is None:
+        art = _art_trim_on_page(page, frame, trim_w_mm, trim_h_mm, trim)
+        if art is None:
+            return None
+        use = art
+    use = fitz.Rect(
+        max(frame.x0, use.x0),
+        max(frame.y0, use.y0),
+        min(frame.x1, use.x1),
+        min(frame.y1, use.y1),
+    )
+    if use.width < 10 or use.height < 10:
+        return None
+    top = (frame.y1 - use.y1) * 25.4 / 72.0
+    bottom = (use.y0 - frame.y0) * 25.4 / 72.0
+    left = (use.x0 - frame.x0) * 25.4 / 72.0
+    right = (frame.x1 - use.x1) * 25.4 / 72.0
+    if min(top, bottom, left, right) < -0.2 or max(top, bottom, left, right) < 0.4:
+        return None
+    found = {
+        "top": float(top),
+        "bottom": float(bottom),
+        "left": float(left),
+        "right": float(right),
+        "trim_w_mm": float(use.width * 25.4 / 72.0),
+        "trim_h_mm": float(use.height * 25.4 / 72.0),
+    }
+    if clear:
+        found["clear"] = {side: round(float(clear[side]), 3) for side in clear}
+    return found
+
+
+def _art_trim_on_page(page, frame, trim_w_mm, trim_h_mm, trim):
+    """Ink rectangle on the visible page when the marks are not a clean rectangle."""
+    import fitz
+
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(0.35, 0.35), alpha=False, colorspace=fitz.csGRAY)
+    except Exception:
+        return None
+    if pix.w < 8 or pix.h < 8:
+        return None
+    import numpy as np
+
+    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+    ink = gray < 245
+    # Crop marks sit in the outer margin. Ignore a 2 mm rim so they do not set the bounds.
+    rim = max(1, int(round(2.0 / 25.4 * 72.0 * 0.35)))
+    core = ink[rim:gray.shape[0] - rim, rim:gray.shape[1] - rim]
+    if core.size == 0 or not core.any():
+        return None
+    rows = np.where(core.any(axis=1))[0]
+    cols = np.where(core.any(axis=0))[0]
+    scale = 1.0 / 0.35
+    # Pixmap y is down. Drawing space is y up.
+    x0 = float(cols[0] + rim) * scale
+    x1 = float(cols[-1] + rim + 1) * scale
+    y_top = float(rows[0] + rim) * scale
+    y_bot = float(rows[-1] + rim + 1) * scale
+    rect = fitz.Rect(x0, frame.height - y_bot, x1, frame.height - y_top)
+    width = rect.width * 25.4 / 72.0
+    height = rect.height * 25.4 / 72.0
+    box_w = trim.width * 25.4 / 72.0
+    box_h = trim.height * 25.4 / 72.0
+    near = abs(width - box_w) <= 4.0 and abs(height - box_h) <= 4.0
+    if trim_w_mm and trim_h_mm:
+        near = near or (abs(width - float(trim_w_mm)) <= 4.0 and abs(height - float(trim_h_mm)) <= 4.0)
+    if not near:
+        return None
+    return rect
+
+
+def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float | None = None) -> dict | None:
+    """Visual bleed from the trim the raster actually shows.
+
+    The raster is the CropBox. A TrimBox measured against the MediaBox shifts
+    the art when those boxes do not share an origin. Corel also writes an
+    off-centre TrimBox that does not meet the crop marks: the marks (or the
+    art bounds, when the marks are not a rectangle) are the trim.
     """
     try:
         media = page.mediabox
@@ -274,29 +489,122 @@ def page_existing_bleed(page, trim_w_mm: float | None = None, trim_h_mm: float |
                     "trim_h_mm": float(trim_h_mm),
                 }
         return None
-    top = (media.y1 - trim.y1) * 25.4 / 72.0
-    bottom = (trim.y0 - media.y0) * 25.4 / 72.0
-    left = (trim.x0 - media.x0) * 25.4 / 72.0
-    right = (media.x1 - trim.x1) * 25.4 / 72.0
+    # Corel puts the crop marks on the visible page and an off-centre TrimBox
+    # in PDF space. The raster is that visible page, so the trim is the marks.
+    try:
+        shifted = abs(page.cropbox.x0) > 0.8 or abs(page.cropbox.y0) > 0.8 or abs(page.cropbox.x0 - page.rect.x0) > 0.8
+    except Exception:
+        shifted = False
+    if shifted:
+        visible = _bleed_from_visible_page(page, trim, trim_w_mm, trim_h_mm)
+        if visible:
+            return visible
+    try:
+        frame = page.cropbox if page.cropbox.width > 2 and page.cropbox.height > 2 else media
+    except Exception:
+        frame = media
+    use = trim
+    clear = None
+    segs = _thin_mark_segs(page)
+    mark = _mark_trim_rect(segs)
+    if mark is not None:
+        shift = max(
+            abs(mark.x0 - trim.x0),
+            abs(mark.x1 - trim.x1),
+            abs(mark.y0 - trim.y0),
+            abs(mark.y1 - trim.y1),
+        ) * 25.4 / 72.0
+        mark_w = mark.width * 25.4 / 72.0
+        mark_h = mark.height * 25.4 / 72.0
+        box_w = trim.width * 25.4 / 72.0
+        box_h = trim.height * 25.4 / 72.0
+        near_box = abs(mark_w - box_w) <= 3.0 and abs(mark_h - box_h) <= 3.0
+        near_order = False
+        if trim_w_mm and trim_h_mm:
+            near_order = (
+                min(abs(mark_w - float(trim_w_mm)), abs(mark_w - float(trim_h_mm))) <= 3.0
+                and min(abs(mark_h - float(trim_h_mm)), abs(mark_h - float(trim_w_mm))) <= 3.0
+            )
+        if shift > 1.0 and (near_box or near_order):
+            use = mark
+            clear = _mark_clear_mm(segs, mark)
+        elif shift > 1.0:
+            art = _art_trim_rect(page, frame)
+            if art is not None:
+                art_w = art.width * 25.4 / 72.0
+                art_h = art.height * 25.4 / 72.0
+                art_near = abs(art_w - box_w) <= 4.0 and abs(art_h - box_h) <= 4.0
+                if trim_w_mm and trim_h_mm:
+                    art_near = art_near or (
+                        abs(art_w - float(trim_w_mm)) <= 4.0 and abs(art_h - float(trim_h_mm)) <= 4.0
+                    )
+                if art_near:
+                    use = art
+    elif trim_w_mm and trim_h_mm:
+        # Marks and the TrimBox disagree in position even when the strokes did
+        # not cluster. The ink rectangle is the trim when it matches the order.
+        uneven = max(
+            abs((trim.x0 - frame.x0) - (frame.x1 - trim.x1)),
+            abs((trim.y0 - frame.y0) - (frame.y1 - trim.y1)),
+        ) * 25.4 / 72.0
+        if uneven > 4.0:
+            art = _art_trim_rect(page, frame)
+            if art is not None:
+                art_w = art.width * 25.4 / 72.0
+                art_h = art.height * 25.4 / 72.0
+                if abs(art_w - float(trim_w_mm)) <= 4.0 and abs(art_h - float(trim_h_mm)) <= 4.0:
+                    use = art
+    import fitz
+
+    use = fitz.Rect(
+        max(frame.x0, use.x0),
+        max(frame.y0, use.y0),
+        min(frame.x1, use.x1),
+        min(frame.y1, use.y1),
+    )
+    if use.width < 10 or use.height < 10:
+        return None
+    top = (frame.y1 - use.y1) * 25.4 / 72.0
+    bottom = (use.y0 - frame.y0) * 25.4 / 72.0
+    left = (use.x0 - frame.x0) * 25.4 / 72.0
+    right = (frame.x1 - use.x1) * 25.4 / 72.0
     if min(top, bottom, left, right) < -0.2 or max(top, bottom, left, right) < 0.4:
         return None
-    return {
+    found = {
         "top": float(top),
         "bottom": float(bottom),
         "left": float(left),
         "right": float(right),
-        "trim_w_mm": float(trim.width * 25.4 / 72.0),
-        "trim_h_mm": float(trim.height * 25.4 / 72.0),
+        "trim_w_mm": float(use.width * 25.4 / 72.0),
+        "trim_h_mm": float(use.height * 25.4 / 72.0),
     }
+    if clear:
+        found["clear"] = {side: round(float(clear[side]), 3) for side in clear}
+    return found
 
 
 def page_raster_clip_rect(page) -> "fitz.Rect":
     """
-    Bake-in clip for PyMuPDF rasterization: strictly CropBox (not MediaBox).
-    Avoids embedding printer margins / ghost canvas from oversized MediaBox.
+    Bake-in clip for PyMuPDF rasterization: the visible CropBox.
+
+    get_pixmap's clip is in page.rect space. Passing a CropBox whose origin is
+    negative cuts off that side. page.rect is the CropBox in clip space, so an
+    oversized MediaBox is still left out.
     """
     import fitz
 
+    try:
+        crop = page.cropbox
+        rect = page.rect
+        if (
+            abs(crop.x0 - rect.x0) > 0.5
+            or abs(crop.y0 - rect.y0) > 0.5
+            or abs(crop.width - rect.width) > 0.5
+            or abs(crop.height - rect.height) > 0.5
+        ):
+            return fitz.Rect(rect)
+    except Exception:
+        pass
     return fitz.Rect(page.cropbox)
 
 

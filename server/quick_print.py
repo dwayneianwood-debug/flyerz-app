@@ -1737,7 +1737,7 @@ def _stamp_fogra39(path: str) -> None:
                     "/DestOutputProfile": icc_stream,
                 })
             ])
-            pdf.save(path)
+            pdf.save(path, recompress_flate=False)
         finally:
             pdf.close()
     except Exception:
@@ -2024,7 +2024,64 @@ def remove_edge_frame(bgr):
         out[:, :left] = fill
     if right:
         out[:, width - right:] = fill
+    _clear_keyline_halo(out, fill)
     return out, found
+
+
+def _clear_keyline_halo(out, fill) -> None:
+    """A grey pixel just inside a removed rule is still the rule.
+
+    Keyline removal paints the dark stroke. The next pixel is often a grey
+    fringe. Sampling that fringe paints a grey band across the white card.
+    """
+    import numpy as np
+
+    if out is None or getattr(out, "ndim", 0) != 3 or out.shape[0] < 8 or out.shape[1] < 8:
+        return
+    fill_v = np.asarray(fill, np.float32).reshape(3)
+    height, width = out.shape[:2]
+
+    def matches(line) -> bool:
+        dist = np.linalg.norm(line.astype(np.float32) - fill_v, axis=-1)
+        return float(np.median(dist)) < 18.0
+
+    def is_halo(line, interior) -> bool:
+        if not matches(interior):
+            return False
+        dist = np.linalg.norm(line.astype(np.float32) - fill_v, axis=-1)
+        return float(np.mean(dist > 28.0)) >= 0.65
+
+    limit = min(8, height - 3, width - 3)
+    for index in range(limit):
+        if matches(out[:, index]):
+            continue
+        if is_halo(out[:, index], out[:, min(width - 1, index + 2)]):
+            out[:, index] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        col = width - 1 - index
+        if matches(out[:, col]):
+            continue
+        if is_halo(out[:, col], out[:, max(0, col - 2)]):
+            out[:, col] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        if matches(out[index, :]):
+            continue
+        if is_halo(out[index, :], out[min(height - 1, index + 2), :]):
+            out[index, :] = np.asarray(fill, np.uint8)
+            continue
+        break
+    for index in range(limit):
+        row = height - 1 - index
+        if matches(out[row, :]):
+            continue
+        if is_halo(out[row, :], out[max(0, row - 2), :]):
+            out[row, :] = np.asarray(fill, np.uint8)
+            continue
+        break
 
 
 def _crop_centered_bleed(img, path: str, trim_w: float, trim_h: float):
@@ -2481,6 +2538,10 @@ def make_print_ready(
                 plate_dpi = _file_dpi(src_path) if over_raster else 0.0
             if over_raster:
                 work_path = src_path
+            elif plate_for_press is not None:
+                # The plate places this picture. A second Lanczos file is not used,
+                # and building it was the extra time on an A3 poster.
+                pass
             elif skip_upscale:
                 pass
             elif not (vector_built and vector_built.get("ok")):
@@ -2668,9 +2729,9 @@ def make_print_ready(
             facts["checklist"] = checklist
         except Exception:
             checklist = None
-    if native_pixels and press_ok and os.path.isfile(press_path):
-        # The plate is one A4 picture. A full-pixel ink walk decodes it again
-        # and is what pushed this make past half a minute on a laptop.
+    if press_ok and os.path.isfile(press_path) and (native_pixels or plate_for_press is not None):
+        # The plate is one picture. A full-pixel ink walk decodes it again
+        # and is what pushed a poster make past a minute on a laptop.
         _seed_pixel_page_ink(press_path)
     if os.path.isfile(src_path):
         try:
