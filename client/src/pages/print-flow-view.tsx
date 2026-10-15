@@ -1,4 +1,5 @@
 import React from "react";
+import { REPLICATE_OFF_NOTE } from "@/lib/replicate-switch";
 import { QUICK_PRINT_PRODUCTS, type QuickPrintCard } from "@shared/quickPrint";
 import { BLEED_METHOD_LABELS } from "@/components/bleed-method-selector";
 import { BLEED_STRATEGY_IDS } from "@shared/schema";
@@ -66,6 +67,8 @@ export function PrintFlowView(props: {
   cat: boolean;
   catText: string;
   upscale: boolean;
+  /** Replicate is switched off in the top bar. Both AI ticks are greyed out. */
+  replicateOff?: boolean;
   fixes: FixRow[];
   card: QuickPrintCard | null;
   bleedOpen: boolean;
@@ -171,8 +174,8 @@ export function PrintFlowView(props: {
             <h2 className="text-lg font-bold font-display">Before the fix</h2>
             <p className="text-xs text-muted-foreground mt-1 mb-3">These run once, then the press file is made.</p>
             <label className="flex items-start gap-2 text-sm mb-3">
-              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.replicate} data-testid="option-replicate" onChange={(event) => props.onReplicate(event.target.checked)} />
-              <span>AI enlarge (pictures only)</span>
+              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.replicate && !props.replicateOff} disabled={props.replicateOff} data-testid="option-replicate" onChange={(event) => props.onReplicate(event.target.checked)} />
+              <span className={props.replicateOff ? "text-muted-foreground" : ""}>AI enlarge (pictures only)</span>
             </label>
             <label className="flex items-start gap-2 text-sm mb-2">
               <input type="checkbox" className="mt-1 h-5 w-5" checked={props.cat && !pictureOnly} disabled={pictureOnly} data-testid="option-cat" onChange={(event) => props.onCat(event.target.checked)} />
@@ -194,9 +197,12 @@ export function PrintFlowView(props: {
               />
             )}
             <label className="flex items-start gap-2 text-sm mb-4">
-              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.upscale} data-testid="option-upscale" onChange={(event) => props.onUpscale(event.target.checked)} />
-              <span>Upscale with AI</span>
+              <input type="checkbox" className="mt-1 h-5 w-5" checked={props.upscale && !props.replicateOff} disabled={props.replicateOff} data-testid="option-upscale" onChange={(event) => props.onUpscale(event.target.checked)} />
+              <span className={props.replicateOff ? "text-muted-foreground" : ""}>Upscale with AI</span>
             </label>
+            {props.replicateOff && (
+              <p className="text-xs text-amber-700 mb-3" data-testid="text-replicate-off">{REPLICATE_OFF_NOTE}</p>
+            )}
             <Button type="button" className="w-full font-bold min-h-12" disabled={makeDisabled} data-testid="button-make-print-ready" onClick={props.onMake}>
               Make file print ready
             </Button>

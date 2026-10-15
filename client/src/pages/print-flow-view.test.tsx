@@ -126,3 +126,12 @@ test("the manual tab keeps the upload wizard", () => {
   assert.match(html, /Size/);
   assert.match(html, /Crop &amp; Submit|Crop & Submit/);
 });
+
+test("when Replicate is switched off both AI ticks are greyed out with the reason", () => {
+  const off = renderToStaticMarkup(<PrintFlowView {...base} stage="check" replicate upscale replicateOff />);
+  assert.match(off, /Replicate is switched off in settings/);
+  assert.match(off, /disabled=""[^>]*data-testid="option-upscale"|data-testid="option-upscale"[^>]*disabled=""/);
+  assert.match(off, /disabled=""[^>]*data-testid="option-replicate"|data-testid="option-replicate"[^>]*disabled=""/);
+  const on = renderToStaticMarkup(<PrintFlowView {...base} stage="check" />);
+  assert.equal(on.includes("Replicate is switched off in settings"), false);
+});

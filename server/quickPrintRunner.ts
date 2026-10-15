@@ -40,6 +40,8 @@ export interface QuickRunOptions {
   editRequest?: string;
   replicateEdit?: boolean;
   skipUpscale?: boolean;
+  /** The user ticked Upscale with AI. Only then may Replicate be called. */
+  aiUpscale?: boolean;
   concerns?: string[];
   /** Hidden bleed recovery choice; only used by quick_print.py when FLYERZ_HIDDEN_BLEED=1. */
   hiddenBleed?: "use" | "ignore";
@@ -234,6 +236,7 @@ export function runQuickPrintFile(inputPath: string, outputDir: string, options:
   if (options.editRequest) args.push("--edit-request", options.editRequest);
   if (options.replicateEdit) args.push("--replicate-edit");
   if (options.skipUpscale) args.push("--skip-upscale");
+  if (options.aiUpscale) args.push("--ai-upscale");
   for (const line of options.concerns || []) {
     if (String(line).trim()) args.push("--concern", String(line).slice(0, 400));
   }

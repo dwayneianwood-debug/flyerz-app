@@ -115,6 +115,13 @@ def replicate_credit_status() -> str:
     if not token:
         return "none"
     try:
+        from host_paths import replicate_switch_on
+
+        if not replicate_switch_on():
+            return "none"
+    except Exception:
+        pass
+    try:
         req = urllib.request.Request(
             "https://api.replicate.com/v1/account",
             headers=external_headers({"Authorization": f"Bearer {token}"}),

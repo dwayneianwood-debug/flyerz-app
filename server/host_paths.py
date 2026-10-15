@@ -18,13 +18,42 @@ FONT_DIR = os.path.join(_HERE, "fonts")
 _ON = {"1", "on", "true", "yes"}
 
 
-def esrgan_enabled() -> bool:
-    """Real-ESRGAN is opt-in. The trace plate is local Lanczos unless this is set.
+def replicate_settings_path() -> str:
+    override = (os.environ.get("REPLICATE_SETTINGS_PATH") or "").strip()
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(os.path.dirname(_HERE), "data", "replicate-settings.json")
 
-    VECTOR_SKIP_ESRGAN=1 still forces the local plate, even when VECTOR_ESRGAN is set.
+
+def replicate_switch_on() -> bool:
+    """The in-app Replicate On / Off switch. Read from the file on every call. Default On."""
+    import json
+
+    try:
+        with open(replicate_settings_path(), "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+        if isinstance(parsed, dict) and parsed.get("enabled") is False:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def esrgan_enabled() -> bool:
+    """Real-ESRGAN through Replicate. Never when the switch is Off.
+
+    Inside a quick-print job, FLYERZ_REPLICATE_TICK says whether the user ticked an AI box:
+    ticked means on (switch permitting), unticked means never. With no tick setting
+    (other tools and checks) the old VECTOR_ESRGAN opt-in applies.
+    VECTOR_SKIP_ESRGAN=1 still forces the local plate.
     """
     if (os.environ.get("VECTOR_SKIP_ESRGAN") or "").strip().lower() in _ON:
         return False
+    if not replicate_switch_on():
+        return False
+    tick = os.environ.get("FLYERZ_REPLICATE_TICK")
+    if tick is not None and tick != "":
+        return tick.strip().lower() in _ON
     return (os.environ.get("VECTOR_ESRGAN") or "").strip().lower() in _ON
 
 

@@ -203,6 +203,14 @@ def replicate_available() -> bool:
     if not token:
         _REPLICATE["ok"] = False
         return False
+    try:
+        from host_paths import replicate_switch_on
+
+        if not replicate_switch_on():
+            _REPLICATE["ok"] = False
+            return False
+    except Exception:
+        pass
     request = urllib.request.Request(
         "https://api.replicate.com/v1/account",
         headers=external_headers({"Authorization": f"Bearer {token}"}),

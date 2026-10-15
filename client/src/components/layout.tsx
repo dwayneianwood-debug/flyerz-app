@@ -6,6 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { usePwaInstall } from "@/hooks/use-pwa-install";
 import logoPath from "@assets/flyerz_logo.png";
 import { useBeta } from "@/lib/beta-flag";
+import { useReplicateSwitch } from "@/lib/replicate-switch";
 
 interface LayoutProps {
   children: ReactNode;
@@ -23,6 +24,7 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
   const [location] = useLocation();
   const { canInstall, install } = usePwaInstall();
   const betaMode = useBeta();
+  const replicate = useReplicateSwitch();
   const [toolsOpen, setToolsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -140,6 +142,24 @@ export function Layout({ children, currentPhase, onStepBack }: LayoutProps) {
                 <span className="sm:hidden">Print</span>
               </Button>
             </Link>
+
+            <button
+              type="button"
+              role="switch"
+              aria-checked={replicate.enabled !== false}
+              onClick={() => replicate.set(replicate.enabled === false)}
+              disabled={replicate.enabled === null}
+              title="Replicate AI is only called when you tick an AI box. Off means it is never called."
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold shrink-0 ${
+                replicate.enabled === false
+                  ? "border-amber-500 bg-amber-100 text-amber-900"
+                  : "border-emerald-500 bg-emerald-100 text-emerald-900"
+              }`}
+              data-testid="switch-replicate"
+            >
+              <span className={`h-2.5 w-2.5 rounded-full ${replicate.enabled === false ? "bg-amber-500" : "bg-emerald-500"}`} />
+              <span>Replicate AI: {replicate.enabled === null ? "…" : replicate.enabled ? "On" : "Off"}</span>
+            </button>
 
             <Link href="/manual">
               <Button

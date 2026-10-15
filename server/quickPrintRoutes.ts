@@ -1,3 +1,4 @@
+import { readReplicateSettings, writeReplicateSettings } from "./replicateSettings";
 import type { Express } from "express";
 import fs from "fs";
 import path from "path";
@@ -129,6 +130,7 @@ async function runJob(jobId: number, inputPath: string, filename: string, body: 
       editRequest: String(body.editRequest || ""),
       replicateEdit: body.replicateEdit === true || body.replicateEdit === "1",
       skipUpscale: body.skipUpscale === true || body.skipUpscale === "1",
+      aiUpscale: body.skipUpscale === false || body.skipUpscale === "0",
       concerns: Array.isArray(body.concerns) ? body.concerns.map((line: unknown) => String(line)) : [],
       hiddenBleed: body.hiddenBleed === "ignore" ? "ignore" : undefined,
     });
@@ -145,6 +147,18 @@ async function runJob(jobId: number, inputPath: string, filename: string, body: 
 
 export function registerQuickPrintRoutes(app: Express) {
   startQuickPrintWatcher();
+
+  app.get("/api/replicate/settings", (_req, res) => {
+    res.json(readReplicateSettings());
+  });
+
+  app.post("/api/replicate/settings", (req, res) => {
+    try {
+      res.json(writeReplicateSettings(req.body || {}));
+    } catch (error) {
+      res.status(400).json({ message: error instanceof Error ? error.message : "Could not save the Replicate setting." });
+    }
+  });
 
   app.get("/api/quick-print/settings", (_req, res) => {
     res.json(readQuickPrintSettings());

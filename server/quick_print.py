@@ -473,6 +473,14 @@ def _apply_cat_edit(path: str, output_dir: str, decisions: list, request: str) -
 
 def _apply_replicate_edit(path: str, output_dir: str, decisions: list, trim_w: float, trim_h: float) -> tuple[str, bool]:
     """One Replicate picture pass. A missing token leaves the artwork as sent."""
+    try:
+        from host_paths import replicate_switch_on
+
+        if not replicate_switch_on():
+            decisions.append("Replicate is switched off in settings, so the artwork was left as you sent it and the press file was still made.")
+            return path, False
+    except Exception:
+        pass
     token = ""
     try:
         from ai_enhancements import _get_replicate_token
@@ -2250,6 +2258,14 @@ def make_print_ready(
                 skip_upscale = True
         elif skip_upscale:
             decisions.append("Upscale with AI was left off, so the original picture was kept.")
+        if chosen.get("aiUpscale") and not skip_upscale and not chosen.get("replicateEdit"):
+            try:
+                from host_paths import replicate_switch_on
+
+                if not replicate_switch_on():
+                    decisions.append("Replicate is switched off in settings, so it was not used.")
+            except Exception:
+                pass
 
         live_type = False
         if ext == ".pdf":
@@ -2591,7 +2607,7 @@ def make_print_ready(
                     work_path = str(enlarged["enhanced_path"])
                     provider = str(enlarged.get("provider") or "basic")
                     if provider == "replicate":
-                        decisions.append("The picture was enlarged with Real-ESRGAN. The original lettering was kept.")
+                        decisions.append("The picture was enlarged with Replicate (Real-ESRGAN). The original lettering was kept.")
                     else:
                         decisions.append("The picture was enlarged with Lanczos on this computer. The original lettering was kept.")
                 else:
@@ -2995,9 +3011,12 @@ def main() -> None:
     parser.add_argument("--edit-request", default="")
     parser.add_argument("--replicate-edit", action="store_true")
     parser.add_argument("--skip-upscale", action="store_true")
+    parser.add_argument("--ai-upscale", action="store_true")
     parser.add_argument("--concern", action="append", default=[])
     parser.add_argument("--hidden-bleed", choices=["use", "ignore"], default="use")
     args = parser.parse_args()
+    # Replicate runs only when the user ticked an AI box. Nothing else may call it.
+    os.environ["FLYERZ_REPLICATE_TICK"] = "1" if (args.replicate_edit or (args.ai_upscale and not args.skip_upscale)) else "0"
     if args.progress_file:
         os.environ["JOB_PROGRESS_FILE"] = args.progress_file
         _mark("fitting", "Fitting the picture to the product.")
@@ -3022,6 +3041,7 @@ def main() -> None:
             "editRequest": args.edit_request or "",
             "replicateEdit": bool(args.replicate_edit),
             "skipUpscale": bool(args.skip_upscale),
+            "aiUpscale": bool(args.ai_upscale),
             "concerns": list(args.concern or []),
         },
         hidden_bleed=args.hidden_bleed,

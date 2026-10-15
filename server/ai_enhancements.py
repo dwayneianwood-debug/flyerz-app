@@ -273,6 +273,13 @@ def _download_to_ramdisk(url: str, suffix: str = "_enhanced.png") -> str:
 
 def _call_replicate(enhancement_name: str, model_owner: str, model_name: str,
                      model_input: dict, version: str = "", timeout_s: float | None = None) -> tuple:
+    try:
+        from host_paths import replicate_switch_on
+
+        if not replicate_switch_on():
+            return None, "Replicate is switched off in settings"
+    except Exception:
+        pass
     token = _get_replicate_token()
     if not token:
         return None, "REPLICATE_API_TOKEN not configured — enhancement requires API access"

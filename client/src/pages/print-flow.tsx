@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useReplicateSwitch } from "@/lib/replicate-switch";
 import { QUICK_PRINT_DEFAULT_PRODUCT_ID, type QuickPrintCard } from "@shared/quickPrint";
 import { fixRows } from "@shared/jobProgress";
 import { messageFromStartResponse } from "@/lib/upload-reply";
@@ -32,6 +33,8 @@ export function PrintFlow(props: { tab: FlowTab; onTab: (tab: FlowTab) => void; 
   const [checkId, setCheckId] = useState("");
   const [items, setItems] = useState<IntakeItem[]>([]);
   const [acknowledged, setAcknowledged] = useState<Record<string, boolean>>({});
+  const replicateSwitch = useReplicateSwitch();
+  const replicateOff = replicateSwitch.enabled === false;
   const [replicate, setReplicate] = useState(false);
   const [cat, setCat] = useState(false);
   const [catText, setCatText] = useState("");
@@ -118,9 +121,9 @@ export function PrintFlow(props: { tab: FlowTab; onTab: (tab: FlowTab) => void; 
           productId,
           customWidth: customW,
           customHeight: customH,
-          replicateEdit: replicate,
+          replicateEdit: replicate && !replicateOff,
           editRequest: cat ? catText : "",
-          skipUpscale: !upscale,
+          skipUpscale: !(upscale && !replicateOff),
           concerns,
         }),
       });
@@ -200,6 +203,7 @@ export function PrintFlow(props: { tab: FlowTab; onTab: (tab: FlowTab) => void; 
           cat={cat}
           catText={catText}
           upscale={upscale}
+          replicateOff={replicateOff}
           fixes={fixes}
           card={card}
           bleedOpen={bleedOpen}
