@@ -150,11 +150,13 @@ def _band_slivers(doc_bytes: bytes, page_index: int, bleed_mm: float, dpi: int =
     if h <= 2 * b + 2 or w <= 2 * b + 2:
         return {s: 0.0 for s in SIDES}
     inner = slice(b + 1, None)
+    # The outermost pixel row/column is a partly covered pixel when the page size is not a whole
+    # number of pixels, so it reads white even for artwork that reaches the edge exactly. Skip it.
     bands = {
-        "top": (img[0:b, b:w - b], img[b + 1, b:w - b]),
-        "bottom": (img[h - b:h, b:w - b], img[h - b - 2, b:w - b]),
-        "left": (img[b:h - b, 0:b].transpose(1, 0, 2), img[b:h - b, b + 1]),
-        "right": (img[b:h - b, w - b:w].transpose(1, 0, 2), img[b:h - b, w - b - 2]),
+        "top": (img[1:b, b:w - b], img[b + 1, b:w - b]),
+        "bottom": (img[h - b:h - 1, b:w - b], img[h - b - 2, b:w - b]),
+        "left": (img[b:h - b, 1:b].transpose(1, 0, 2), img[b:h - b, b + 1]),
+        "right": (img[b:h - b, w - b:w - 1].transpose(1, 0, 2), img[b:h - b, w - b - 2]),
     }
     del inner
     for side, (band, edge) in bands.items():
@@ -300,6 +302,7 @@ def maybe_recover_for_pipeline(pdf_in: str, out_dir: str, choice: str = "use",
     if not report["enabled"] or choice == "ignore":
         return pdf_in, report
     try:
+        out_dir = os.path.abspath(out_dir)  # a relative dir broke the later open() when cwd differed
         os.makedirs(out_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(pdf_in))[0]
         out = os.path.join(out_dir, f"{base}_hidden_bleed.pdf")
